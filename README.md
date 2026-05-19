@@ -1,15 +1,43 @@
 # maw-rs
 
-Rust port of maw-js portable core.
+Rust port of the maw-js portable core.
 
-## Phase 1
+`maw-rs` is intentionally starting with deterministic, side-effect-free crates.
+Each crate copies the same JSON fixture contract from `maw-js/test/spec/` and
+must pass those fixtures in Rust before runtime IO, transports, or CLI commands
+move over.
 
-- Cargo workspace scaffolded.
-- `crates/maw-matcher` ports maw-js target normalization and name-resolution logic.
-- Rust tests consume the same portable JSON fixtures from maw-js `test/spec/`.
+## Phase 1 status
 
-Run:
+Cargo workspace scaffolded and pushed to `main`.
+
+| Crate | maw-js source | Portable fixture |
+| --- | --- | --- |
+| `maw-matcher` | `src/core/matcher/resolve-target.ts`, `normalize-target.ts` | `matcher-resolve-target.fixtures.json`, `normalize-target.fixtures.json` |
+| `maw-calver` | `scripts/calver.ts` | `calver.fixtures.json` |
+| `maw-policy` | `src/plugin/default-active.ts`, `src/plugin/tier.ts`, `src/plugin/manifest-constants.ts` | `plugin-policy.fixtures.json` |
+| `maw-worktree` | `src/core/fleet/worktree-window-match.ts` | `worktree-window-match.fixtures.json` |
+| `maw-transport` | `src/core/transport/transport.ts` | `transport-router.fixtures.json` |
+| `maw-routing` | `src/core/routing.ts` | `routing.fixtures.json` |
+
+Current local gates:
 
 ```bash
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Phase 2 plan
+
+1. Add side-effecting transport implementations behind the `maw-transport` policy:
+   - tmux via the `tmux` CLI
+   - HTTP federation via `reqwest`
+   - Zenoh via the Rust stylos/themion ecosystem
+2. Add runtime adapters for fleet/worktree/session discovery around the pure crates.
+3. Keep maw-js and maw-rs running side-by-side until command parity is proven.
+
+## Phase 3 plan
+
+1. Add a `maw-rs` CLI with `clap`.
+2. Port high-value fast-path commands first: `ls`, `hey`, `peek`, and target resolution helpers.
+3. Validate each command against maw-js fixtures or captured golden outputs before replacing any default `maw` entrypoint.
