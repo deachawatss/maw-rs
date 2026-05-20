@@ -116,6 +116,7 @@ dependencies = [
  "maw-calver",
  "maw-feed",
  "maw-fuzzy",
+ "maw-hub",
  "maw-identity",
  "maw-matcher",
  "maw-peer",

@@ -12,6 +12,9 @@ use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
+use maw_hub::{
+    load_workspace_configs, validate_workspace_config, WorkspaceConfig, WorkspaceConfigValidation,
+};
 use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
@@ -53,6 +56,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     match command {
         "--help" | "-h" | "help" => usage_ok(),
         "auth" => run_auth_plan(&argv[1..]),
+        "hub" => run_hub_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
@@ -409,6 +413,200 @@ fn auth_usage_error(message: &str) -> CliOutput {
         stdout: String::new(),
         stderr: format!(
             "{message}\nusage: maw-rs auth sign-v3 --peer-key <key> --from <oracle:node> [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--plan-json]\n       maw-rs auth verify-request [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--cached-pubkey <key>] [--header <key=value>]... [--plan-json]\n"
+        ),
+    }
+}
+
+fn run_hub_plan(argv: &[String]) -> CliOutput {
+    let action = match parse_hub_plan_args(argv) {
+        Ok(action) => action,
+        Err(message) => return hub_usage_error(&message),
+    };
+    match action {
+        HubPlanAction::ValidateWorkspace {
+            plan_json,
+            id,
+            hub_url,
+            token,
+            shared_agents,
+        } => {
+            let raw = serde_json::json!({
+                "id": id,
+                "hubUrl": hub_url,
+                "token": token,
+                "sharedAgents": shared_agents,
+            });
+            let validation = validate_workspace_config(&raw);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_hub_validate_json(&raw, &validation)
+                } else if validation.ok() {
+                    "ok\n".to_owned()
+                } else {
+                    format!("invalid: {}\n", validation.reason().unwrap_or("unknown"))
+                },
+                stderr: String::new(),
+            }
+        }
+        HubPlanAction::LoadWorkspaces {
+            plan_json,
+            config_dir,
+        } => match load_workspace_configs(&config_dir) {
+            Ok(report) => CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_hub_load_json(&report.configs, &report.warnings)
+                } else {
+                    format!(
+                        "configs={} warnings={}\n",
+                        report.configs.len(),
+                        report.warnings.len()
+                    )
+                },
+                stderr: String::new(),
+            },
+            Err(error) => CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("hub load-workspaces: {error}\n"),
+            },
+        },
+    }
+}
+
+enum HubPlanAction {
+    ValidateWorkspace {
+        plan_json: bool,
+        id: String,
+        hub_url: String,
+        token: String,
+        shared_agents: Vec<String>,
+    },
+    LoadWorkspaces {
+        plan_json: bool,
+        config_dir: String,
+    },
+}
+
+fn parse_hub_plan_args(argv: &[String]) -> Result<HubPlanAction, String> {
+    let Some(kind) = argv.first().map(String::as_str) else {
+        return Err("hub: expected validate-workspace or load-workspaces".to_owned());
+    };
+    match kind {
+        "validate-workspace" => parse_hub_validate_args(&argv[1..]),
+        "load-workspaces" => parse_hub_load_args(&argv[1..]),
+        other => Err(format!("hub: unknown subcommand {other}")),
+    }
+}
+
+fn parse_hub_validate_args(argv: &[String]) -> Result<HubPlanAction, String> {
+    let mut plan_json = false;
+    let mut id = String::new();
+    let mut hub_url = String::new();
+    let mut token = String::new();
+    let mut shared_agents = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--id" => {
+                id = take_hub_value(argv, index, "--id")?;
+                index += 1;
+            }
+            "--hub-url" => {
+                hub_url = take_hub_value(argv, index, "--hub-url")?;
+                index += 1;
+            }
+            "--token" => {
+                token = take_hub_value(argv, index, "--token")?;
+                index += 1;
+            }
+            "--shared-agent" => {
+                shared_agents.push(take_hub_value(argv, index, "--shared-agent")?);
+                index += 1;
+            }
+            other => return Err(format!("hub validate-workspace: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(HubPlanAction::ValidateWorkspace {
+        plan_json,
+        id,
+        hub_url,
+        token,
+        shared_agents,
+    })
+}
+
+fn parse_hub_load_args(argv: &[String]) -> Result<HubPlanAction, String> {
+    let mut plan_json = false;
+    let mut config_dir = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--config-dir" => {
+                config_dir = Some(take_hub_value(argv, index, "--config-dir")?);
+                index += 1;
+            }
+            other => return Err(format!("hub load-workspaces: unknown argument {other}")),
+        }
+        index += 1;
+    }
+    Ok(HubPlanAction::LoadWorkspaces {
+        plan_json,
+        config_dir: config_dir
+            .ok_or_else(|| "hub load-workspaces: --config-dir is required".to_owned())?,
+    })
+}
+
+fn take_hub_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
+    argv.get(index + 1)
+        .cloned()
+        .ok_or_else(|| format!("hub: missing {name} value"))
+}
+
+fn render_hub_validate_json(
+    raw: &serde_json::Value,
+    validation: &WorkspaceConfigValidation,
+) -> String {
+    let reason = validation.reason().map_or("null".to_owned(), json_string);
+    format!(
+        "{{\"command\":\"hub\",\"kind\":\"validate-workspace\",\"input\":{},\"ok\":{},\"reason\":{reason}}}\n",
+        raw,
+        validation.ok()
+    )
+}
+
+fn render_hub_load_json(configs: &[WorkspaceConfig], warnings: &[String]) -> String {
+    let configs = configs
+        .iter()
+        .map(render_workspace_config_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let warnings = json_string_array(warnings);
+    format!(
+        "{{\"command\":\"hub\",\"kind\":\"load-workspaces\",\"configs\":[{configs}],\"warnings\":{warnings}}}\n"
+    )
+}
+
+fn render_workspace_config_json(config: &WorkspaceConfig) -> String {
+    format!(
+        "{{\"id\":{},\"hubUrl\":{},\"token\":{},\"sharedAgents\":{}}}",
+        json_string(&config.id),
+        json_string(&config.hub_url),
+        json_string(&config.token),
+        json_string_array(&config.shared_agents)
+    )
+}
+
+fn hub_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs hub validate-workspace [--id <id>] [--hub-url <ws-url>] [--token <token>] [--shared-agent <agent>]... [--plan-json]\n       maw-rs hub load-workspaces --config-dir <dir> [--plan-json]\n"
         ),
     }
 }
