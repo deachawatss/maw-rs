@@ -24,6 +24,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-split` | `src/vendor/mpr-plugins/split/impl.ts`, `src/commands/plugins/tmux/safety.ts` | `split-policy.fixtures.json` |
 | `maw-peer` | `src/commands/shared/peer-sources.ts` | `peer-source-resolver.fixtures.json` |
 | `maw-tmux` | `src/core/transport/tmux-class.ts`, `src/commands/shared/discover-live-state.ts` | tmux parser unit tests, `discover-tmux-live-state.fixtures.json` |
+| `maw-hub` | `src/transports/hub-config.ts` | `test/isolated/hub-config.test.ts`, hub config loader coverage |
 
 Current local gates:
 
@@ -36,7 +37,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 1. Add side-effecting transport implementations behind the `maw-transport` policy:
    - tmux via the `tmux` CLI
-   - HTTP federation via `reqwest`
+   - HTTP federation via injectable IO first; runtime HTTP client wiring later
    - Zenoh via the Rust stylos/themion ecosystem
 2. Add runtime adapters for fleet/worktree/session discovery around the pure crates.
 3. Keep maw-js and maw-rs running side-by-side until command parity is proven.
