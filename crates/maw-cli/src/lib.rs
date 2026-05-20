@@ -6,9 +6,10 @@
 use maw_auth::{
     consent_request_id_from_bytes, generate_pair_code_from_bytes, hash_consent_pin,
     is_valid_pair_code_shape, normalize_pair_code, pretty_pair_code, redact_pair_code,
-    sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof,
-    verify_consent_pin, verify_request, AutoPairIdentity, FromVerifyDecision, Headers,
-    VerifyRequestArgs,
+    request_consent_plan, sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3,
+    verify_auto_pair_proof, verify_consent_pin, verify_request, AutoPairIdentity, ConsentAction,
+    ConsentRequestArgs, ConsentRequestResult, ConsentStore, FromVerifyDecision, Headers,
+    PeerPendingRequest, PeerPostResult, PendingRequest, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -114,6 +115,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "federation-sync" => run_federation_sync_plan(&argv[1..]),
         "auto-pair-proof" => run_auto_pair_proof_plan(&argv[1..]),
         "consent-pin" => run_consent_pin_plan(&argv[1..]),
+        "consent-request" => run_consent_request_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
@@ -4407,6 +4409,274 @@ fn consent_pin_usage() -> &'static str {
     "usage: maw-rs consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]"
 }
 
+#[allow(clippy::too_many_lines)]
+fn run_consent_request_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut from = None::<String>;
+    let mut to = None::<String>;
+    let mut action = None::<ConsentAction>;
+    let mut summary = None::<String>;
+    let mut peer_url = None::<String>;
+    let mut request_id = None::<String>;
+    let mut pin = None::<String>;
+    let mut now_ms = None::<i64>;
+    let mut peer_post = PeerPostResult::Skipped;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--from" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --from value");
+                };
+                from = Some(value.to_owned());
+                index += 1;
+            }
+            "--to" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --to value");
+                };
+                to = Some(value.to_owned());
+                index += 1;
+            }
+            "--action" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --action value");
+                };
+                match parse_consent_action(value) {
+                    Ok(parsed) => action = Some(parsed),
+                    Err(message) => return consent_request_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--summary" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --summary value");
+                };
+                summary = Some(value.to_owned());
+                index += 1;
+            }
+            "--peer-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error(
+                        "consent-request: missing --peer-url value",
+                    );
+                };
+                peer_url = Some(value.to_owned());
+                index += 1;
+            }
+            "--request-id" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error(
+                        "consent-request: missing --request-id value",
+                    );
+                };
+                request_id = Some(value.to_owned());
+                index += 1;
+            }
+            "--pin" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --pin value");
+                };
+                pin = Some(value.to_owned());
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error("consent-request: missing --now value");
+                };
+                match parse_i64_arg(value, "consent-request: --now") {
+                    Ok(parsed) => now_ms = Some(parsed),
+                    Err(message) => return consent_request_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--peer-ok" => peer_post = PeerPostResult::Ok,
+            "--peer-http-status" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error(
+                        "consent-request: missing --peer-http-status value",
+                    );
+                };
+                match value.parse::<u16>() {
+                    Ok(status) => peer_post = PeerPostResult::HttpStatus(status),
+                    Err(_) => {
+                        return consent_request_usage_error(
+                            "consent-request: --peer-http-status must be u16",
+                        )
+                    }
+                }
+                index += 1;
+            }
+            "--peer-network-error" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return consent_request_usage_error(
+                        "consent-request: missing --peer-network-error value",
+                    );
+                };
+                peer_post = PeerPostResult::NetworkError(value.to_owned());
+                index += 1;
+            }
+            arg => {
+                return consent_request_usage_error(&format!(
+                    "consent-request: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(from) = from else {
+        return consent_request_usage_error("consent-request: missing --from value");
+    };
+    let Some(to) = to else {
+        return consent_request_usage_error("consent-request: missing --to value");
+    };
+    let Some(action) = action else {
+        return consent_request_usage_error("consent-request: missing --action value");
+    };
+    let Some(summary) = summary else {
+        return consent_request_usage_error("consent-request: missing --summary value");
+    };
+    let Some(request_id) = request_id else {
+        return consent_request_usage_error("consent-request: missing --request-id value");
+    };
+    let Some(pin) = pin else {
+        return consent_request_usage_error("consent-request: missing --pin value");
+    };
+    let Some(now_ms) = now_ms else {
+        return consent_request_usage_error("consent-request: missing --now value");
+    };
+
+    let request_args = ConsentRequestArgs {
+        from,
+        to,
+        action,
+        summary,
+        peer_url,
+        request_id,
+        pin: pin.clone(),
+        now_ms,
+        peer_post,
+    };
+    let mut store = ConsentStore::default();
+    let result = request_consent_plan(&mut store, request_args);
+    let pending = result
+        .request_id
+        .as_deref()
+        .and_then(|request_id| store.read_pending(request_id));
+    let pin_redacted = redact_pair_code(&pin);
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_consent_request_plan_json(&result, pending.as_ref(), &pin_redacted)
+        } else {
+            render_consent_request_plan_text(&result, &pin_redacted)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_consent_action(value: &str) -> Result<ConsentAction, String> {
+    match value {
+        "hey" => Ok(ConsentAction::Hey),
+        "team-invite" => Ok(ConsentAction::TeamInvite),
+        "plugin-install" => Ok(ConsentAction::PluginInstall),
+        _ => Err("consent-request: invalid --action value".to_owned()),
+    }
+}
+
+fn render_consent_request_plan_json(
+    result: &ConsentRequestResult,
+    pending: Option<&PendingRequest>,
+    pin_redacted: &str,
+) -> String {
+    format!(
+        "{{\"command\":\"consent-request\",\"ok\":{},\"requestId\":{},\"pin\":null,\"pinRedacted\":{},\"expiresAt\":{},\"error\":{},\"alreadyTrusted\":{},\"peerUrl\":{},\"peerMethod\":{},\"peerBody\":{},\"pending\":{}}}\n",
+        result.ok,
+        json_optional_string(result.request_id.as_deref()),
+        json_string(pin_redacted),
+        json_optional_string(result.expires_at.as_deref()),
+        json_optional_string(result.error.as_deref()),
+        result.already_trusted,
+        json_optional_string(result.peer_url.as_deref()),
+        json_optional_string(result.peer_method.as_deref()),
+        render_peer_pending_request_json(result.peer_body.as_ref()),
+        render_pending_request_json(pending)
+    )
+}
+
+fn render_consent_request_plan_text(result: &ConsentRequestResult, pin_redacted: &str) -> String {
+    format!(
+        "consent-request ok={} requestId={} pin={} peerUrl={}\n",
+        result.ok,
+        result.request_id.as_deref().unwrap_or("-"),
+        pin_redacted,
+        result.peer_url.as_deref().unwrap_or("-")
+    )
+}
+
+fn render_peer_pending_request_json(request: Option<&PeerPendingRequest>) -> String {
+    request.map_or_else(|| "null".to_owned(), |request| {
+        format!(
+            "{{\"id\":{},\"from\":{},\"to\":{},\"action\":{},\"summary\":{},\"pinHash\":{},\"createdAt\":{},\"expiresAt\":{},\"status\":{},\"pin\":null}}",
+            json_string(&request.id),
+            json_string(&request.from),
+            json_string(&request.to),
+            json_string(request.action.as_str()),
+            json_string(&request.summary),
+            json_string(&request.pin_hash),
+            json_string(&request.created_at),
+            json_string(&request.expires_at),
+            json_string(consent_status_name(request.status))
+        )
+    })
+}
+
+fn render_pending_request_json(request: Option<&PendingRequest>) -> String {
+    request.map_or_else(|| "null".to_owned(), |request| {
+        format!(
+            "{{\"id\":{},\"from\":{},\"to\":{},\"action\":{},\"summary\":{},\"pinHash\":{},\"createdAt\":{},\"expiresAt\":{},\"status\":{}}}",
+            json_string(&request.id),
+            json_string(&request.from),
+            json_string(&request.to),
+            json_string(request.action.as_str()),
+            json_string(&request.summary),
+            json_string(&request.pin_hash),
+            json_string(&request.created_at),
+            json_string(&request.expires_at),
+            json_string(consent_status_name(request.status))
+        )
+    })
+}
+
+fn consent_status_name(status: maw_auth::ConsentStatus) -> &'static str {
+    match status {
+        maw_auth::ConsentStatus::Pending => "pending",
+        maw_auth::ConsentStatus::Approved => "approved",
+        maw_auth::ConsentStatus::Rejected => "rejected",
+        maw_auth::ConsentStatus::Expired => "expired",
+    }
+}
+
+fn json_optional_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_owned(), json_string)
+}
+
+fn consent_request_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", consent_request_usage()),
+    }
+}
+
+fn consent_request_usage() -> &'static str {
+    "usage: maw-rs consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]"
+}
+
 fn run_pair_code_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut code = None::<String>;
@@ -6163,7 +6433,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
