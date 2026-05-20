@@ -973,6 +973,11 @@ pub fn build_legacy_from_sign_payload(
 }
 
 #[must_use]
+pub fn sign_hmac_sig(secret: &str, payload: &str) -> String {
+    hmac_sha256_hex(secret, payload)
+}
+
+#[must_use]
 pub fn verify_hmac_sig(secret: &str, payload: &str, signature_hex: &str) -> bool {
     if signature_hex.is_empty() || !signature_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;

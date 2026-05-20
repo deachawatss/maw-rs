@@ -1,7 +1,7 @@
 use maw_auth::{
     build_from_sign_payload, build_legacy_from_sign_payload, hash_body, is_loopback,
     is_refuse_decision, resolve_from_address, sign, sign_headers_at, sign_headers_v3_at,
-    sign_request_v3, verify, verify_hmac_sig, verify_request, FromAddressConfig,
+    sign_hmac_sig, sign_request_v3, verify, verify_hmac_sig, verify_request, FromAddressConfig,
     FromVerifyDecision, Headers, VerifyRequestArgs, DEFAULT_ORACLE,
 };
 
@@ -13,7 +13,8 @@ const NOW: i64 = 1_700_000_000;
 fn direct_hmac(secret: &str, payload: &str) -> String {
     // sign() includes maw's colon payload shape, so use verify_hmac_sig round-trip
     // by deriving the expected from the implementation under test's public helper.
-    let sig = maw_auth_private_hmac_for_tests(secret, payload);
+    let sig = sign_hmac_sig(secret, payload);
+    assert_eq!(sig, maw_auth_private_hmac_for_tests(secret, payload));
     assert!(verify_hmac_sig(secret, payload, &sig));
     sig
 }
