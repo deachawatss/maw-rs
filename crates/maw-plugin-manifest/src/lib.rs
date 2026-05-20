@@ -1,11 +1,11 @@
 //! Plugin manifest validators ported from maw-js `src/plugin/manifest-validate.ts`.
 //!
-//! This first slice locks the same `parseCli` and `parseApi` contracts covered
-//! by `test/plugin-manifest-validate-edges.test.ts`.
+//! This crate locks the same optional-field validator contracts covered by
+//! `test/plugin-manifest-validate-edges.test.ts`.
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginCli {
@@ -55,6 +55,41 @@ impl ApiMethod {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginHooks {
+    pub gate: Option<Vec<String>>,
+    pub filter: Option<Vec<String>>,
+    pub on: Option<Vec<String>>,
+    pub late: Option<Vec<String>>,
+    pub wake: Option<PluginLifecycleHook>,
+    pub sleep: Option<PluginLifecycleHook>,
+    pub serve: Option<PluginLifecycleHook>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginLifecycleHook {
+    pub script: Option<String>,
+    pub handler: Option<String>,
+    pub ensures: Option<Vec<String>>,
+    pub policy: Option<HookPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookPolicy {
+    BestEffort,
+    FailFast,
+}
+
+impl HookPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BestEffort => "best-effort",
+            Self::FailFast => "fail-fast",
+        }
+    }
+}
+
 /// Parse the optional `cli` section.
 ///
 /// # Errors
@@ -77,17 +112,11 @@ pub fn parse_cli(manifest: &Value) -> Result<Option<PluginCli>, String> {
     };
 
     let aliases = if let Some(aliases) = cli.get("aliases") {
-        let Some(values) = aliases.as_array() else {
-            return Err("plugin.json: cli.aliases must be an array of strings".to_owned());
-        };
-        let mut parsed = Vec::with_capacity(values.len());
-        for value in values {
-            let Some(alias) = value.as_str() else {
-                return Err("plugin.json: cli.aliases must be an array of strings".to_owned());
-            };
-            parsed.push(alias.to_owned());
-        }
-        Some(parsed)
+        Some(parse_string_array(
+            aliases,
+            "plugin.json: cli.aliases must be an array of strings",
+            false,
+        )?)
     } else {
         None
     };
@@ -160,7 +189,7 @@ pub fn parse_api(manifest: &Value) -> Result<Option<PluginApi>, String> {
             _ => {
                 return Err(
                     "plugin.json: api.methods must be an array of \"GET\" | \"POST\"".to_owned(),
-                )
+                );
             }
         };
         parsed.push(parsed_method);
@@ -170,4 +199,149 @@ pub fn parse_api(manifest: &Value) -> Result<Option<PluginApi>, String> {
         path: path.to_owned(),
         methods: parsed,
     }))
+}
+
+/// Parse the optional `hooks` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed hook shapes.
+pub fn parse_hooks(manifest: &Value) -> Result<Option<PluginHooks>, String> {
+    let Some(hooks) = manifest.get("hooks") else {
+        return Ok(None);
+    };
+    let Some(hooks) = hooks.as_object() else {
+        return Err("plugin.json: hooks must be an object".to_owned());
+    };
+
+    let gate = parse_optional_string_array(
+        hooks,
+        "gate",
+        "plugin.json: hooks.gate must be an array of strings",
+        false,
+    )?;
+    let filter = parse_optional_string_array(
+        hooks,
+        "filter",
+        "plugin.json: hooks.filter must be an array of strings",
+        false,
+    )?;
+    let on = parse_optional_string_array(
+        hooks,
+        "on",
+        "plugin.json: hooks.on must be an array of strings",
+        false,
+    )?;
+    let late = parse_optional_string_array(
+        hooks,
+        "late",
+        "plugin.json: hooks.late must be an array of strings",
+        false,
+    )?;
+
+    Ok(Some(PluginHooks {
+        gate,
+        filter,
+        on,
+        late,
+        wake: parse_lifecycle_hook(hooks, "wake")?,
+        sleep: parse_lifecycle_hook(hooks, "sleep")?,
+        serve: parse_lifecycle_hook(hooks, "serve")?,
+    }))
+}
+
+fn parse_lifecycle_hook(
+    hooks: &Map<String, Value>,
+    key: &'static str,
+) -> Result<Option<PluginLifecycleHook>, String> {
+    let Some(raw) = hooks.get(key) else {
+        return Ok(None);
+    };
+    let Some(hook) = raw.as_object() else {
+        return Err(format!("plugin.json: hooks.{key} must be an object"));
+    };
+
+    let script = match hook.get("script") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|script| !script.is_empty())
+                .ok_or_else(|| {
+                    format!("plugin.json: hooks.{key}.script must be a non-empty string")
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    let handler = match hook.get("handler") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|handler| !handler.is_empty())
+                .ok_or_else(|| {
+                    format!("plugin.json: hooks.{key}.handler must be a non-empty string")
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    let ensures = parse_optional_string_array(
+        hook,
+        "ensures",
+        &format!("plugin.json: hooks.{key}.ensures must be an array of non-empty strings"),
+        true,
+    )?;
+
+    let policy = match hook.get("policy") {
+        Some(Value::String(value)) if value == "best-effort" => Some(HookPolicy::BestEffort),
+        Some(Value::String(value)) if value == "fail-fast" => Some(HookPolicy::FailFast),
+        Some(_) => {
+            return Err(format!(
+                "plugin.json: hooks.{key}.policy must be \"best-effort\" or \"fail-fast\""
+            ));
+        }
+        None => None,
+    };
+
+    Ok(Some(PluginLifecycleHook {
+        script,
+        handler,
+        ensures,
+        policy,
+    }))
+}
+
+fn parse_optional_string_array(
+    object: &Map<String, Value>,
+    key: &str,
+    error: &str,
+    reject_empty: bool,
+) -> Result<Option<Vec<String>>, String> {
+    object
+        .get(key)
+        .map(|value| parse_string_array(value, error, reject_empty))
+        .transpose()
+}
+
+fn parse_string_array(
+    value: &Value,
+    error: &str,
+    reject_empty: bool,
+) -> Result<Vec<String>, String> {
+    let Some(values) = value.as_array() else {
+        return Err(error.to_owned());
+    };
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(item) = value.as_str() else {
+            return Err(error.to_owned());
+        };
+        if reject_empty && item.is_empty() {
+            return Err(error.to_owned());
+        }
+        parsed.push(item.to_owned());
+    }
+    Ok(parsed)
 }

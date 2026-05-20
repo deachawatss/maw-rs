@@ -1,4 +1,4 @@
-use maw_plugin_manifest::{parse_api, parse_cli, ApiMethod, CliFlagKind};
+use maw_plugin_manifest::{parse_api, parse_cli, parse_hooks, ApiMethod, CliFlagKind, HookPolicy};
 use serde_json::json;
 
 #[test]
@@ -68,6 +68,69 @@ fn parse_api_rejects_malformed_api_objects() {
     );
 }
 
+#[test]
+fn parse_hooks_validates_lifecycle_hook_branches() {
+    assert_eq!(
+        parse_hooks(&json!({})).expect("missing hooks is valid"),
+        None
+    );
+
+    let parsed = parse_hooks(&json!({
+        "hooks": {
+            "wake": { "script": "wake.ts", "handler": "onWake", "ensures": ["db"], "policy": "best-effort" },
+            "sleep": {},
+            "serve": {}
+        }
+    }))
+    .expect("valid hooks")
+    .expect("hooks present");
+    let wake = parsed.wake.expect("wake present");
+    assert_eq!(wake.script, Some("wake.ts".to_owned()));
+    assert_eq!(wake.handler, Some("onWake".to_owned()));
+    assert_eq!(wake.ensures, Some(vec!["db".to_owned()]));
+    assert_eq!(wake.policy, Some(HookPolicy::BestEffort));
+    assert_eq!(HookPolicy::FailFast.as_str(), "fail-fast");
+    assert!(parsed.sleep.is_some());
+    assert!(parsed.serve.is_some());
+
+    expect_hooks_error(
+        &json!({ "hooks": { "wake": [] } }),
+        "plugin.json: hooks.wake must be an object",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "wake": { "script": "" } } }),
+        "plugin.json: hooks.wake.script must be a non-empty string",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "sleep": { "handler": "" } } }),
+        "plugin.json: hooks.sleep.handler must be a non-empty string",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "serve": { "ensures": [""] } } }),
+        "plugin.json: hooks.serve.ensures must be an array of non-empty strings",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "wake": { "policy": "hard" } } }),
+        "plugin.json: hooks.wake.policy must be",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": [] }),
+        "plugin.json: hooks must be an object",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "on": [1] } }),
+        "plugin.json: hooks.on must be an array of strings",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "gate": [1] } }),
+        "plugin.json: hooks.gate must be an array of strings",
+    );
+    expect_hooks_error(
+        &json!({ "hooks": { "filter": "not-array" } }),
+        "plugin.json: hooks.filter must be an array of strings",
+    );
+}
+
 fn expect_error(input: &serde_json::Value, expected: &str) {
     let error = parse_cli(input).expect_err("expected parse_cli error");
     assert!(
@@ -78,6 +141,14 @@ fn expect_error(input: &serde_json::Value, expected: &str) {
 
 fn expect_api_error(input: &serde_json::Value, expected: &str) {
     let error = parse_api(input).expect_err("expected parse_api error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_hooks_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_hooks(input).expect_err("expected parse_hooks error");
     assert!(
         error.contains(expected),
         "{error:?} did not contain {expected:?}"
