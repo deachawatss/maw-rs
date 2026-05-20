@@ -900,6 +900,17 @@ pub struct InvokeContext {
     pub args: Vec<String>,
 }
 
+impl InvokeSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Api => "api",
+            Self::Peer => "peer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvokeResult {
     pub ok: bool,
@@ -945,6 +956,24 @@ pub trait PluginInvokeRuntime {
         ctx: &InvokeContext,
         wasm_bytes: &[u8],
     ) -> InvokeResult;
+}
+
+#[derive(Debug, Default)]
+pub struct MvpWasmInvokeRuntime;
+
+impl PluginInvokeRuntime for MvpWasmInvokeRuntime {
+    fn invoke_ts(&mut self, _plugin: &LoadedPlugin, _ctx: &InvokeContext) -> InvokeResult {
+        InvokeResult::error("TS plugin runtime is not available")
+    }
+
+    fn invoke_wasm(
+        &mut self,
+        _plugin: &LoadedPlugin,
+        ctx: &InvokeContext,
+        wasm_bytes: &[u8],
+    ) -> InvokeResult {
+        invoke_wasm_mvp(ctx, wasm_bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1555,6 +1584,351 @@ fn help_hook_keys(hooks: Option<&PluginHooks>) -> Option<Vec<&'static str>> {
         keys.push("serve");
     }
     Some(keys)
+}
+
+fn invoke_wasm_mvp(ctx: &InvokeContext, wasm_bytes: &[u8]) -> InvokeResult {
+    let module = match MvpWasmModule::parse(wasm_bytes) {
+        Ok(module) => module,
+        Err(error) => return InvokeResult::error(format!("wasm compile error: {error}")),
+    };
+    if !module.exports_handle || !module.exports_memory {
+        return InvokeResult::error("wasm missing required handle+memory exports");
+    }
+    if module.has_imports {
+        return InvokeResult::error("wasm instantiation failed: unresolved imports");
+    }
+
+    let mut memory = vec![0_u8; 65_536];
+    for segment in &module.data_segments {
+        let start = segment.offset;
+        if start < memory.len() {
+            let len = segment.bytes.len().min(memory.len() - start);
+            memory[start..start + len].copy_from_slice(&segment.bytes[..len]);
+        }
+    }
+
+    let ctx_json = serde_json::json!({
+        "source": ctx.source.as_str(),
+        "args": &ctx.args,
+    })
+    .to_string();
+    write_linear_memory(&mut memory, 0, ctx_json.as_bytes());
+
+    read_wasm_result_from_memory(&memory, module.handle_result)
+}
+
+#[derive(Debug, Default)]
+struct MvpWasmModule {
+    has_imports: bool,
+    exports_memory: bool,
+    exports_handle: bool,
+    handle_result: i32,
+    data_segments: Vec<MvpDataSegment>,
+}
+
+#[derive(Debug)]
+struct MvpDataSegment {
+    offset: usize,
+    bytes: Vec<u8>,
+}
+
+impl MvpWasmModule {
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.get(..8) != Some(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]) {
+            return Err("failed to parse WebAssembly module".to_owned());
+        }
+        let mut cursor = WasmCursor::new(&bytes[8..]);
+        let mut module = Self::default();
+        let mut imported_func_count = 0_u32;
+        let mut defined_func_count = 0_u32;
+        let mut exported_handle_index = None;
+        while !cursor.is_empty() {
+            let id = cursor.read_u8()?;
+            if id == 0 || id > 12 {
+                return Err("failed to parse WebAssembly module".to_owned());
+            }
+            let section_len = cursor.read_leb_usize()?;
+            let section = cursor.read_bytes(section_len)?;
+            match id {
+                2 => {
+                    let count = count_section_items(section)?;
+                    module.has_imports = count > 0;
+                    imported_func_count = count_imported_functions(section)?;
+                }
+                3 => defined_func_count = count_section_items(section)?,
+                7 => exported_handle_index = parse_exports(section, &mut module)?,
+                10 => {
+                    if let Some(index) = exported_handle_index {
+                        module.handle_result = parse_handle_result(
+                            section,
+                            index,
+                            imported_func_count,
+                            defined_func_count,
+                        )?;
+                    }
+                }
+                11 => module.data_segments = parse_data_segments(section)?,
+                _ => {}
+            }
+        }
+        Ok(module)
+    }
+}
+
+struct WasmCursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> WasmCursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.offset >= self.bytes.len()
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        let Some(byte) = self.bytes.get(self.offset).copied() else {
+            return Err("failed to parse WebAssembly module".to_owned());
+        };
+        self.offset += 1;
+        Ok(byte)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
+        let Some(bytes) = self.bytes.get(self.offset..self.offset + len) else {
+            return Err("failed to parse WebAssembly module".to_owned());
+        };
+        self.offset += len;
+        Ok(bytes)
+    }
+
+    fn read_leb_u32(&mut self) -> Result<u32, String> {
+        let mut result = 0_u32;
+        let mut shift = 0;
+        loop {
+            let byte = self.read_u8()?;
+            result |= u32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift += 7;
+            if shift >= 32 {
+                return Err("failed to parse WebAssembly module".to_owned());
+            }
+        }
+    }
+
+    fn read_leb_usize(&mut self) -> Result<usize, String> {
+        usize::try_from(self.read_leb_u32()?)
+            .map_err(|_| "failed to parse WebAssembly module".to_owned())
+    }
+}
+
+fn count_section_items(section: &[u8]) -> Result<u32, String> {
+    WasmCursor::new(section).read_leb_u32()
+}
+
+fn count_imported_functions(section: &[u8]) -> Result<u32, String> {
+    let mut cursor = WasmCursor::new(section);
+    let count = cursor.read_leb_u32()?;
+    let mut funcs = 0_u32;
+    for _ in 0..count {
+        skip_name(&mut cursor)?;
+        skip_name(&mut cursor)?;
+        let kind = cursor.read_u8()?;
+        match kind {
+            0x00 => {
+                let _type_index = cursor.read_leb_u32()?;
+                funcs += 1;
+            }
+            0x01 | 0x02 => skip_limits(&mut cursor)?,
+            0x03 => {
+                let _content_type = cursor.read_u8()?;
+                let _mutable = cursor.read_u8()?;
+            }
+            _ => return Err("failed to parse WebAssembly module".to_owned()),
+        }
+    }
+    Ok(funcs)
+}
+
+fn parse_exports(section: &[u8], module: &mut MvpWasmModule) -> Result<Option<u32>, String> {
+    let mut cursor = WasmCursor::new(section);
+    let count = cursor.read_leb_u32()?;
+    let mut handle = None;
+    for _ in 0..count {
+        let name = read_name(&mut cursor)?;
+        let kind = cursor.read_u8()?;
+        let index = cursor.read_leb_u32()?;
+        if name == "memory" && kind == 0x02 {
+            module.exports_memory = true;
+        }
+        if name == "handle" && kind == 0x00 {
+            module.exports_handle = true;
+            handle = Some(index);
+        }
+    }
+    Ok(handle)
+}
+
+fn parse_handle_result(
+    section: &[u8],
+    handle_index: u32,
+    imported_func_count: u32,
+    defined_func_count: u32,
+) -> Result<i32, String> {
+    if handle_index < imported_func_count {
+        return Err("failed to parse WebAssembly module".to_owned());
+    }
+    let body_index = handle_index - imported_func_count;
+    if body_index >= defined_func_count {
+        return Err("failed to parse WebAssembly module".to_owned());
+    }
+    let mut cursor = WasmCursor::new(section);
+    let count = cursor.read_leb_u32()?;
+    for index in 0..count {
+        let body_len = cursor.read_leb_usize()?;
+        let body = cursor.read_bytes(body_len)?;
+        if index == body_index {
+            return parse_const_i32_body(body);
+        }
+    }
+    Err("failed to parse WebAssembly module".to_owned())
+}
+
+fn parse_const_i32_body(body: &[u8]) -> Result<i32, String> {
+    let mut cursor = WasmCursor::new(body);
+    let local_groups = cursor.read_leb_u32()?;
+    for _ in 0..local_groups {
+        let _count = cursor.read_leb_u32()?;
+        let _type = cursor.read_u8()?;
+    }
+    if cursor.read_u8()? != 0x41 {
+        return Err("failed to parse WebAssembly module".to_owned());
+    }
+    let value = read_signed_leb_i32(&mut cursor)?;
+    if cursor.read_u8()? != 0x0b {
+        return Err("failed to parse WebAssembly module".to_owned());
+    }
+    Ok(value)
+}
+
+fn parse_data_segments(section: &[u8]) -> Result<Vec<MvpDataSegment>, String> {
+    let mut cursor = WasmCursor::new(section);
+    let count = cursor.read_leb_u32()?;
+    let mut segments = Vec::new();
+    for _ in 0..count {
+        let flag = cursor.read_leb_u32()?;
+        if flag != 0 {
+            return Err("failed to parse WebAssembly module".to_owned());
+        }
+        if cursor.read_u8()? != 0x41 {
+            return Err("failed to parse WebAssembly module".to_owned());
+        }
+        let offset = usize::try_from(read_signed_leb_i32(&mut cursor)?)
+            .map_err(|_| "failed to parse WebAssembly module".to_owned())?;
+        if cursor.read_u8()? != 0x0b {
+            return Err("failed to parse WebAssembly module".to_owned());
+        }
+        let len = cursor.read_leb_usize()?;
+        segments.push(MvpDataSegment {
+            offset,
+            bytes: cursor.read_bytes(len)?.to_vec(),
+        });
+    }
+    Ok(segments)
+}
+
+fn read_name(cursor: &mut WasmCursor<'_>) -> Result<String, String> {
+    let len = cursor.read_leb_usize()?;
+    let bytes = cursor.read_bytes(len)?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| "failed to parse WebAssembly module".to_owned())
+}
+
+fn skip_name(cursor: &mut WasmCursor<'_>) -> Result<(), String> {
+    let len = cursor.read_leb_usize()?;
+    let _bytes = cursor.read_bytes(len)?;
+    Ok(())
+}
+
+fn skip_limits(cursor: &mut WasmCursor<'_>) -> Result<(), String> {
+    let flags = cursor.read_u8()?;
+    let _min = cursor.read_leb_u32()?;
+    if flags & 0x01 != 0 {
+        let _max = cursor.read_leb_u32()?;
+    }
+    Ok(())
+}
+
+fn read_signed_leb_i32(cursor: &mut WasmCursor<'_>) -> Result<i32, String> {
+    let mut result = 0_i32;
+    let mut shift = 0;
+    let mut byte;
+    loop {
+        byte = cursor.read_u8()?;
+        result |= i32::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        if shift >= 32 {
+            return Err("failed to parse WebAssembly module".to_owned());
+        }
+    }
+    if shift < 32 && byte & 0x40 != 0 {
+        result |= !0_i32 << shift;
+    }
+    Ok(result)
+}
+
+fn write_linear_memory(memory: &mut [u8], ptr: usize, bytes: &[u8]) {
+    if ptr >= memory.len() {
+        return;
+    }
+    let len = bytes.len().min(memory.len() - ptr);
+    memory[ptr..ptr + len].copy_from_slice(&bytes[..len]);
+}
+
+fn read_wasm_result_from_memory(memory: &[u8], result_ptr: i32) -> InvokeResult {
+    if result_ptr <= 0 {
+        return InvokeResult::ok();
+    }
+    let Ok(start) = usize::try_from(result_ptr) else {
+        return InvokeResult::ok();
+    };
+    if start >= memory.len() {
+        return InvokeResult::ok();
+    }
+
+    if let Some(output) = read_length_prefixed_wasm_output(memory, start) {
+        return InvokeResult::output(output);
+    }
+    let end = memory[start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(memory.len(), |offset| start + offset);
+    let output = String::from_utf8_lossy(&memory[start..end]).into_owned();
+    if output.is_empty() {
+        InvokeResult::ok()
+    } else {
+        InvokeResult::output(output)
+    }
+}
+
+fn read_length_prefixed_wasm_output(data: &[u8], start: usize) -> Option<String> {
+    let len_bytes = data.get(start..start + 4)?;
+    let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+    if len == 0 || len >= 1_000_000 {
+        return None;
+    }
+    let payload_start = start + 4;
+    let payload = data.get(payload_start..payload_start + len)?;
+    Some(String::from_utf8_lossy(payload).into_owned())
 }
 
 fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
