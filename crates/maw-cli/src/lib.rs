@@ -5,7 +5,8 @@
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_matcher::{
-    resolve_by_name, resolve_session_target, resolve_worktree_target, ResolveOptions, ResolveResult,
+    normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
+    ResolveOptions, ResolveResult,
 };
 use std::fmt::Write as _;
 
@@ -26,11 +27,40 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "--help" | "-h" | "help" => usage_ok(),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
+        "normalize" => run_normalize_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_normalize_plan(argv: &[String]) -> CliOutput {
+    let plan_json = argv.iter().any(|arg| arg == "--plan-json");
+    let target = argv.iter().find(|arg| arg.as_str() != "--plan-json");
+    let Some(target) = target else {
+        return CliOutput {
+            code: 2,
+            stdout: String::new(),
+            stderr:
+                "normalize: expected <target>\nusage: maw-rs normalize <target> [--plan-json]\n"
+                    .to_owned(),
+        };
+    };
+    let normalized = normalize_target(target);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"normalize\",\"input\":{},\"normalized\":{}}}\n",
+                json_string(target),
+                json_string(&normalized)
+            )
+        } else {
+            format!("{normalized}\n")
+        },
+        stderr: String::new(),
     }
 }
 
@@ -155,7 +185,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n"
         .to_owned()
 }
 
