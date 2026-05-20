@@ -393,6 +393,149 @@ fn target_and_capability_validators_cover_valid_invalid_and_warning_branches() {
         .contains("unknown capability namespace"));
 }
 
+#[test]
+fn transport_engine_and_namespace_defaults_match_maw_js() {
+    assert_eq!(
+        parse_transport(&json!({ "transport": {} }))
+            .expect("empty transport")
+            .expect("transport present")
+            .peer,
+        None
+    );
+    assert_eq!(
+        parse_transport(&json!({ "transport": { "peer": true } }))
+            .expect("peer true")
+            .expect("transport present")
+            .peer,
+        Some(true)
+    );
+
+    let empty_serve = parse_engine(&json!({ "engine": { "serve": {} } }))
+        .expect("empty serve")
+        .expect("engine present")
+        .serve
+        .expect("serve present");
+    assert_eq!(empty_serve.command, None);
+    let partial_serve = parse_engine(
+        &json!({ "engine": { "serve": { "prefix": "/api/plugin", "health": "/health" } } }),
+    )
+    .expect("partial serve")
+    .expect("engine present")
+    .serve
+    .expect("serve present");
+    assert_eq!(partial_serve.prefix, Some("/api/plugin".to_owned()));
+    assert_eq!(partial_serve.health, Some("/health".to_owned()));
+    assert_eq!(
+        parse_engine(&json!({ "engine": { "serve": { "events": [] } } }))
+            .expect("empty events")
+            .expect("engine present")
+            .serve
+            .expect("serve present")
+            .events,
+        Some(Vec::new())
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "prefix": 1 } } }),
+        "plugin.json: engine.serve.prefix must start with /api/",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "events": "MessageSend" } } }),
+        "plugin.json: engine.serve.events must be an array of non-empty strings",
+    );
+
+    assert_eq!(
+        parse_capability_namespaces(&json!({ "capabilityNamespaces": [] }))
+            .expect("empty namespaces"),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        parse_capability_namespaces(
+            &json!({ "capabilityNamespaces": ["custom", "custom", "x-1"] })
+        )
+        .expect("dedup namespaces"),
+        Some(vec!["custom".to_owned(), "x-1".to_owned()])
+    );
+    expect_capability_namespaces_error(
+        &json!({ "capabilityNamespaces": "custom" }),
+        "plugin.json: capabilityNamespaces must be an array of slug strings",
+    );
+    expect_capability_namespaces_error(
+        &json!({ "capabilityNamespaces": ["Custom"] }),
+        "plugin.json: capabilityNamespaces must be an array of slug strings",
+    );
+}
+
+#[test]
+fn capability_dependency_artifact_tier_and_late_hook_defaults_match_maw_js() {
+    let caps = parse_capabilities(
+        &json!({ "capabilities": ["sdk", "sdk:identity", "custom", "custom:thing"] }),
+        &["custom"],
+    )
+    .expect("known and declared capabilities")
+    .expect("capabilities present");
+    assert!(caps.warnings.is_empty());
+    assert_eq!(
+        caps.capabilities,
+        vec![
+            "sdk".to_owned(),
+            "sdk:identity".to_owned(),
+            "custom".to_owned(),
+            "custom:thing".to_owned()
+        ]
+    );
+    let caps = parse_capabilities(
+        &json!({ "capabilities": ["mystery", "unknown:value"] }),
+        &["custom"],
+    )
+    .expect("unknown capability warnings")
+    .expect("capabilities present");
+    assert_eq!(caps.warnings.len(), 2);
+    assert!(caps.warnings[0].contains("unknown capability namespace \"mystery\" in \"mystery\""));
+    assert!(
+        caps.warnings[1].contains("unknown capability namespace \"unknown\" in \"unknown:value\"")
+    );
+    assert!(caps.warnings[1].contains("custom"));
+
+    assert_eq!(
+        parse_dependencies(&json!({ "dependencies": [] }))
+            .expect("empty compact deps")
+            .expect("dependencies present")
+            .plugins,
+        Some(Vec::new())
+    );
+    assert_eq!(
+        parse_dependencies(&json!({ "dependencies": { "plugins": ["trace", "x-1"] } }))
+            .expect("object deps")
+            .expect("dependencies present")
+            .plugins,
+        Some(vec!["trace".to_owned(), "x-1".to_owned()])
+    );
+    expect_artifact_error(
+        &json!({ "artifact": { "path": "dist/plugin.js" } }),
+        "plugin.json: artifact.sha256 must be a string or null",
+    );
+    assert_eq!(
+        parse_tier(&json!({ "tier": "standard" })).expect("standard tier"),
+        Some(PluginTier::Standard)
+    );
+    expect_tier_error(
+        &json!({ "tier": 1 }),
+        "plugin.json: tier must be \"core\", \"standard\", or \"extra\" (got 1)",
+    );
+
+    let hooks = parse_hooks(&json!({ "hooks": { "gate": [], "filter": ["Clean"], "on": ["MessageSend"], "late": ["After"] } }))
+        .expect("default hook arrays")
+        .expect("hooks present");
+    assert_eq!(hooks.gate, Some(Vec::new()));
+    assert_eq!(hooks.filter, Some(vec!["Clean".to_owned()]));
+    assert_eq!(hooks.on, Some(vec!["MessageSend".to_owned()]));
+    assert_eq!(hooks.late, Some(vec!["After".to_owned()]));
+    expect_hooks_error(
+        &json!({ "hooks": { "late": [1] } }),
+        "plugin.json: hooks.late must be an array of strings",
+    );
+}
+
 fn expect_error(input: &serde_json::Value, expected: &str) {
     let error = parse_cli(input).expect_err("expected parse_cli error");
     assert!(

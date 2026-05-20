@@ -548,8 +548,11 @@ pub fn parse_capabilities(
         if !is_known_capability_namespace(namespace)
             && !extra_namespaces.iter().any(|extra| extra == &namespace)
         {
+            let mut known = known_capability_namespaces();
+            known.extend(extra_namespaces.iter().copied());
             warnings.push(format!(
-                "plugin.json: unknown capability namespace \"{namespace}\" in \"{capability}\""
+                "plugin.json: unknown capability namespace \"{namespace}\" in \"{capability}\" (known: {})",
+                known.join(", ")
             ));
         }
     }
@@ -785,10 +788,13 @@ fn is_slug(value: &str) -> bool {
 }
 
 fn is_known_capability_namespace(namespace: &str) -> bool {
-    matches!(
-        namespace,
-        "net" | "fs" | "peer" | "sdk" | "proc" | "ffi" | "tmux" | "shell" | "attach"
-    )
+    known_capability_namespaces().contains(&namespace)
+}
+
+fn known_capability_namespaces() -> Vec<&'static str> {
+    vec![
+        "net", "fs", "peer", "sdk", "proc", "ffi", "tmux", "shell", "attach",
+    ]
 }
 
 fn parse_optional_string_array(
