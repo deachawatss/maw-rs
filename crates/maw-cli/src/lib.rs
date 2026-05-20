@@ -5,12 +5,15 @@
 
 use maw_auth::{
     approve_consent_plan, consent_request_id_from_bytes, generate_pair_code_from_bytes,
-    hash_consent_pin, is_valid_pair_code_shape, normalize_pair_code, pretty_pair_code,
+    hash_consent_pin, is_valid_pair_code_shape, normalize_pair_code, pair_api_accept_plan,
+    pair_api_generate_plan, pair_api_probe_plan, pair_api_status_plan, pretty_pair_code,
     redact_pair_code, reject_consent_plan, request_consent_plan, sign_auto_pair_proof,
     sign_headers_v3_at, sign_request_v3, verify_auto_pair_proof, verify_consent_pin,
     verify_request, ApprovedBy, AutoPairIdentity, ConsentAction, ConsentApprovalResult,
     ConsentRequestArgs, ConsentRequestResult, ConsentStore, FromVerifyDecision, Headers,
-    PeerPendingRequest, PeerPostResult, PendingRequest, TrustEntry, VerifyRequestArgs,
+    PairAcceptInput, PairApiAcceptResult, PairApiConfig, PairApiGenerateResult, PairApiProbeResult,
+    PairApiStatusResult, PairCodeStore, PeerPendingRequest, PeerPostResult, PendingRequest,
+    TrustEntry, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -119,6 +122,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "consent-request" => run_consent_request_plan(&argv[1..]),
         "consent-approval" => run_consent_approval_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
+        "pair-api" => run_pair_api_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
@@ -5022,6 +5026,364 @@ fn pair_code_usage_error(message: &str) -> CliOutput {
 
 fn pair_code_usage() -> &'static str {
     "usage: maw-rs pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_pair_api_plan(argv: &[String]) -> CliOutput {
+    let Some(endpoint) = argv.first().map(String::as_str) else {
+        return pair_api_usage_error("pair-api: expected generate, probe, accept, or status");
+    };
+    if !matches!(endpoint, "generate" | "probe" | "accept" | "status") {
+        return pair_api_usage_error("pair-api: expected generate, probe, accept, or status");
+    }
+
+    let mut plan_json = false;
+    let mut node = None::<String>;
+    let mut oracle = None::<String>;
+    let mut port = None::<u16>;
+    let mut base_url = None::<String>;
+    let mut federation_token = None::<String>;
+    let mut pubkey = None::<String>;
+    let mut now_ms = None::<u64>;
+    let mut code = None::<String>;
+    let mut expires_sec = None::<u64>;
+    let mut ttl_ms = None::<u64>;
+    let mut seed_codes = Vec::<SeedPairCode>::new();
+    let mut remote_node = None::<String>;
+    let mut remote_url = None::<String>;
+    let mut seed_accepted = None::<PairAcceptInput>;
+
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --node value");
+                };
+                node = Some(value.to_owned());
+                index += 1;
+            }
+            "--oracle" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --oracle value");
+                };
+                oracle = Some(value.to_owned());
+                index += 1;
+            }
+            "--port" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --port value");
+                };
+                match parse_u16_arg(value, "pair-api: --port") {
+                    Ok(parsed) => port = Some(parsed),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--base-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --base-url value");
+                };
+                base_url = Some(value.to_owned());
+                index += 1;
+            }
+            "--federation-token" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --federation-token value");
+                };
+                federation_token = Some(value.to_owned());
+                index += 1;
+            }
+            "--pubkey" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --pubkey value");
+                };
+                pubkey = Some(value.to_owned());
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --now value");
+                };
+                match parse_u64_arg(value, "pair-api: --now") {
+                    Ok(parsed) => now_ms = Some(parsed),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --code value");
+                };
+                code = Some(value.to_owned());
+                index += 1;
+            }
+            "--expires-sec" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --expires-sec value");
+                };
+                match parse_u64_arg(value, "pair-api: --expires-sec") {
+                    Ok(parsed) => expires_sec = Some(parsed),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--ttl-ms" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --ttl-ms value");
+                };
+                match parse_u64_arg(value, "pair-api: --ttl-ms") {
+                    Ok(parsed) => ttl_ms = Some(parsed),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--seed-code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --seed-code value");
+                };
+                match parse_seed_pair_code(value) {
+                    Ok(seed) => seed_codes.push(seed),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--remote-node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --remote-node value");
+                };
+                remote_node = Some(value.to_owned());
+                index += 1;
+            }
+            "--remote-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --remote-url value");
+                };
+                remote_url = Some(value.to_owned());
+                index += 1;
+            }
+            "--seed-accepted" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_api_usage_error("pair-api: missing --seed-accepted value");
+                };
+                match parse_seed_accepted(value) {
+                    Ok(input) => seed_accepted = Some(input),
+                    Err(message) => return pair_api_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => return pair_api_usage_error(&format!("pair-api: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    let Some(code) = code else {
+        return pair_api_usage_error("pair-api: missing --code value");
+    };
+    let Some(now_ms) = now_ms else {
+        return pair_api_usage_error("pair-api: missing --now value");
+    };
+    let config = match build_pair_api_config(node, oracle, port, base_url, federation_token, pubkey)
+    {
+        Ok(config) => config,
+        Err(message) => return pair_api_usage_error(&message),
+    };
+    let mut store = PairCodeStore::default();
+    for seed in seed_codes {
+        let _ = store.register_at(&seed.code, seed.ttl_ms, seed.created_at_ms);
+    }
+    if let Some(input) = seed_accepted.clone() {
+        let _ = pair_api_accept_plan(&mut store, &config, &code, Some(input), now_ms);
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: match endpoint {
+            "generate" => {
+                let result =
+                    pair_api_generate_plan(&mut store, &config, &code, expires_sec, ttl_ms, now_ms);
+                if plan_json {
+                    render_pair_api_generate_json(&result)
+                } else {
+                    format!(
+                        "pair-api generate status={} code={}\n",
+                        result.status, result.code
+                    )
+                }
+            }
+            "probe" => {
+                let result = pair_api_probe_plan(&store, &config, &code, now_ms);
+                if plan_json {
+                    render_pair_api_probe_json(&result)
+                } else {
+                    format!("pair-api probe status={} ok={}\n", result.status, result.ok)
+                }
+            }
+            "accept" => {
+                let input = remote_node.map(|node| PairAcceptInput {
+                    node,
+                    url: remote_url,
+                });
+                let result = pair_api_accept_plan(&mut store, &config, &code, input, now_ms);
+                if plan_json {
+                    render_pair_api_accept_json(&result)
+                } else {
+                    format!(
+                        "pair-api accept status={} ok={}\n",
+                        result.status, result.ok
+                    )
+                }
+            }
+            "status" => {
+                let result = pair_api_status_plan(&store, &code, now_ms);
+                if plan_json {
+                    render_pair_api_status_json(&result)
+                } else {
+                    format!(
+                        "pair-api status status={} ok={}\n",
+                        result.status, result.ok
+                    )
+                }
+            }
+            _ => unreachable!(),
+        },
+        stderr: String::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SeedPairCode {
+    code: String,
+    ttl_ms: u64,
+    created_at_ms: u64,
+}
+
+fn parse_seed_pair_code(value: &str) -> Result<SeedPairCode, String> {
+    let mut parts = value.split(':');
+    let Some(code) = parts.next().filter(|part| !part.is_empty()) else {
+        return Err("pair-api: --seed-code must be code:ttl_ms:created_at_ms".to_owned());
+    };
+    let Some(ttl_ms) = parts.next() else {
+        return Err("pair-api: --seed-code must be code:ttl_ms:created_at_ms".to_owned());
+    };
+    let Some(created_at_ms) = parts.next() else {
+        return Err("pair-api: --seed-code must be code:ttl_ms:created_at_ms".to_owned());
+    };
+    if parts.next().is_some() {
+        return Err("pair-api: --seed-code must be code:ttl_ms:created_at_ms".to_owned());
+    }
+    Ok(SeedPairCode {
+        code: code.to_owned(),
+        ttl_ms: parse_u64_arg(ttl_ms, "pair-api: --seed-code ttl_ms")?,
+        created_at_ms: parse_u64_arg(created_at_ms, "pair-api: --seed-code created_at_ms")?,
+    })
+}
+
+fn parse_seed_accepted(value: &str) -> Result<PairAcceptInput, String> {
+    let Some((node, url)) = value.split_once('=') else {
+        return Err("pair-api: --seed-accepted must be node=url".to_owned());
+    };
+    if node.is_empty() || url.is_empty() {
+        return Err("pair-api: --seed-accepted must be node=url".to_owned());
+    }
+    Ok(PairAcceptInput {
+        node: node.to_owned(),
+        url: Some(url.to_owned()),
+    })
+}
+
+fn build_pair_api_config(
+    node: Option<String>,
+    oracle: Option<String>,
+    port: Option<u16>,
+    base_url: Option<String>,
+    federation_token: Option<String>,
+    pubkey: Option<String>,
+) -> Result<PairApiConfig, String> {
+    Ok(PairApiConfig {
+        node: node.ok_or_else(|| "pair-api: missing --node value".to_owned())?,
+        oracle: oracle.ok_or_else(|| "pair-api: missing --oracle value".to_owned())?,
+        port: port.ok_or_else(|| "pair-api: missing --port value".to_owned())?,
+        base_url: base_url.ok_or_else(|| "pair-api: missing --base-url value".to_owned())?,
+        federation_token: federation_token
+            .ok_or_else(|| "pair-api: missing --federation-token value".to_owned())?,
+        pubkey: pubkey.ok_or_else(|| "pair-api: missing --pubkey value".to_owned())?,
+    })
+}
+
+fn render_pair_api_generate_json(result: &PairApiGenerateResult) -> String {
+    format!(
+        "{{\"command\":\"pair-api\",\"endpoint\":\"generate\",\"status\":{},\"ok\":{},\"code\":{},\"expiresAt\":{},\"ttlMs\":{},\"node\":{},\"port\":{},\"federationToken\":null}}\n",
+        result.status,
+        result.ok,
+        json_string(&result.code),
+        result.expires_at,
+        result.ttl_ms,
+        json_string(&result.node),
+        result.port
+    )
+}
+
+fn render_pair_api_probe_json(result: &PairApiProbeResult) -> String {
+    format!(
+        "{{\"command\":\"pair-api\",\"endpoint\":\"probe\",\"status\":{},\"ok\":{},\"error\":{},\"node\":{}}}\n",
+        result.status,
+        result.ok,
+        json_optional_string(result.error.as_deref()),
+        json_optional_string(result.node.as_deref())
+    )
+}
+
+fn render_pair_api_accept_json(result: &PairApiAcceptResult) -> String {
+    format!(
+        "{{\"command\":\"pair-api\",\"endpoint\":\"accept\",\"status\":{},\"ok\":{},\"error\":{},\"node\":{},\"url\":{},\"federationToken\":null}}\n",
+        result.status,
+        result.ok,
+        json_optional_string(result.error.as_deref()),
+        json_optional_string(result.node.as_deref()),
+        json_optional_string(result.url.as_deref())
+    )
+}
+
+fn render_pair_api_status_json(result: &PairApiStatusResult) -> String {
+    format!(
+        "{{\"command\":\"pair-api\",\"endpoint\":\"status\",\"status\":{},\"ok\":{},\"error\":{},\"consumed\":{},\"remoteNode\":{},\"remoteUrl\":{}}}\n",
+        result.status,
+        result.ok,
+        json_optional_string(result.error.as_deref()),
+        json_optional_bool(result.consumed),
+        json_optional_string(result.remote_node.as_deref()),
+        json_optional_string(result.remote_url.as_deref())
+    )
+}
+
+fn json_optional_bool(value: Option<bool>) -> String {
+    value.map_or_else(|| "null".to_owned(), |value| value.to_string())
+}
+
+fn parse_u64_arg(value: &str, name: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{name} must be a non-negative integer"))
+}
+
+fn parse_u16_arg(value: &str, name: &str) -> Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("{name} must be a u16"))
+}
+
+fn pair_api_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", pair_api_usage()),
+    }
+}
+
+fn pair_api_usage() -> &'static str {
+    "usage: maw-rs pair-api <generate|probe|accept|status> --code <code> --node <node> --oracle <oracle> --port <port> --base-url <url> --federation-token <token> --pubkey <pubkey> --now <ms> [--expires-sec <sec>|--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--remote-node <node> --remote-url <url>] [--seed-accepted <node=url>] [--plan-json]"
 }
 
 #[allow(clippy::too_many_lines)]
