@@ -265,6 +265,48 @@ pub enum TmuxAttachAction {
     Recover { session: String },
 }
 
+/// Spawn command selected by `cmdTmuxAttach` or its recovery path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// Candidate shown by maw-js attach recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRecoveryCandidate {
+    pub oracle: String,
+    pub label: String,
+}
+
+/// Fleet entry fragment used to seed attach recovery candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRecoveryFleetEntry {
+    pub session: String,
+    pub first_window_name: Option<String>,
+    pub repo: Option<String>,
+}
+
+/// Pure attach recovery decision after candidate construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachRecoveryDecision {
+    NoCandidates,
+    AutoWake {
+        command: SpawnCommand,
+        label: String,
+    },
+    PrintCandidates {
+        candidates: Vec<AttachRecoveryCandidate>,
+    },
+    Prompt {
+        candidates: Vec<AttachRecoveryCandidate>,
+    },
+    WakeChoice {
+        command: SpawnCommand,
+    },
+    InvalidChoice,
+}
+
 /// Options for Rust's maw-js-compatible `maw tmux kill` action wrapper.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxKillCommandOptions {
@@ -1678,6 +1720,124 @@ pub fn decide_tmux_attach_action(
     }
 }
 
+/// Build the `tmux` process command selected for a live attach action.
+#[must_use]
+pub fn tmux_attach_spawn_command(action: &TmuxAttachAction) -> Option<SpawnCommand> {
+    match action {
+        TmuxAttachAction::SwitchClient { session } => Some(SpawnCommand {
+            program: "tmux".to_owned(),
+            args: vec!["switch-client".to_owned(), "-t".to_owned(), session.clone()],
+        }),
+        TmuxAttachAction::Attach { session } => Some(SpawnCommand {
+            program: "tmux".to_owned(),
+            args: vec!["attach".to_owned(), "-t".to_owned(), session.clone()],
+        }),
+        TmuxAttachAction::Print { .. } | TmuxAttachAction::Recover { .. } => None,
+    }
+}
+
+/// Strip `-oracle` from bare repo names while preserving org/repo slugs.
+#[must_use]
+pub fn wake_arg_for_similar_oracle(candidate: &str) -> String {
+    if candidate.contains('/') {
+        candidate.to_owned()
+    } else {
+        candidate
+            .strip_suffix("-oracle")
+            .unwrap_or(candidate)
+            .to_owned()
+    }
+}
+
+fn maw_wake_attach_command(oracle: &str) -> SpawnCommand {
+    SpawnCommand {
+        program: "maw".to_owned(),
+        args: vec!["wake".to_owned(), oracle.to_owned(), "-a".to_owned()],
+    }
+}
+
+/// Build attach recovery candidates from a stale fleet session and similar oracle repos.
+#[must_use]
+pub fn attach_recovery_candidates(
+    target: &str,
+    session: &str,
+    source: &str,
+    fleet_entries: &[AttachRecoveryFleetEntry],
+    cloned_repos: &[String],
+) -> Vec<AttachRecoveryCandidate> {
+    let mut candidates = Vec::new();
+    if source.starts_with("fleet-stem")
+        || source.starts_with("fleet-window")
+        || source.starts_with("live-session")
+    {
+        if let Some(entry) = fleet_entries.iter().find(|entry| entry.session == session) {
+            if let Some(window) = &entry.first_window_name {
+                let oracle = window.strip_suffix("-oracle").unwrap_or(window).to_owned();
+                let cloned = entry
+                    .repo
+                    .as_deref()
+                    .and_then(|repo| {
+                        cloned_repos
+                            .iter()
+                            .find(|path| path.ends_with(&format!("/{repo}")))
+                    })
+                    .is_some();
+                candidates.push(AttachRecoveryCandidate {
+                    oracle,
+                    label: format!(
+                        "{window} ({})",
+                        if cloned { "cloned" } else { "not cloned" }
+                    ),
+                });
+            }
+        }
+    }
+
+    for similar in similar_oracle_candidates_from_repos(target, cloned_repos) {
+        let oracle = wake_arg_for_similar_oracle(&similar);
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.oracle == oracle)
+        {
+            candidates.push(AttachRecoveryCandidate {
+                oracle,
+                label: similar,
+            });
+        }
+    }
+    candidates
+}
+
+/// Decide attach recovery behavior after candidates are known.
+#[must_use]
+pub fn decide_attach_recovery(
+    candidates: &[AttachRecoveryCandidate],
+    is_tty: bool,
+    choice: Option<usize>,
+) -> AttachRecoveryDecision {
+    match candidates.len() {
+        0 => AttachRecoveryDecision::NoCandidates,
+        1 => AttachRecoveryDecision::AutoWake {
+            command: maw_wake_attach_command(&candidates[0].oracle),
+            label: candidates[0].label.clone(),
+        },
+        _ if !is_tty => AttachRecoveryDecision::PrintCandidates {
+            candidates: candidates.to_vec(),
+        },
+        _ => match choice {
+            Some(choice) if (1..=candidates.len()).contains(&choice) => {
+                AttachRecoveryDecision::WakeChoice {
+                    command: maw_wake_attach_command(&candidates[choice - 1].oracle),
+                }
+            }
+            Some(_) => AttachRecoveryDecision::InvalidChoice,
+            None => AttachRecoveryDecision::Prompt {
+                candidates: candidates.to_vec(),
+            },
+        },
+    }
+}
+
 /// Return the session component from a tmux target.
 #[must_use]
 pub fn tmux_session_from_target(resolved: &str) -> String {
@@ -2676,6 +2836,141 @@ mod tests {
             TmuxAttachAction::Recover {
                 session: "ghost-session".to_owned()
             }
+        );
+
+        assert_eq!(
+            tmux_attach_spawn_command(&TmuxAttachAction::SwitchClient {
+                session: "some-session".to_owned()
+            }),
+            Some(SpawnCommand {
+                program: "tmux".to_owned(),
+                args: vec![
+                    "switch-client".to_owned(),
+                    "-t".to_owned(),
+                    "some-session".to_owned()
+                ],
+            })
+        );
+        assert_eq!(
+            tmux_attach_spawn_command(&TmuxAttachAction::Attach {
+                session: "some-session".to_owned()
+            }),
+            Some(SpawnCommand {
+                program: "tmux".to_owned(),
+                args: vec![
+                    "attach".to_owned(),
+                    "-t".to_owned(),
+                    "some-session".to_owned()
+                ],
+            })
+        );
+        assert_eq!(
+            tmux_attach_spawn_command(&TmuxAttachAction::Print {
+                session: "some-session".to_owned()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn tmux_attach_recovery_candidates_and_choices_match_maw_js() {
+        let cloned_repos = vec![
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-oracle".to_owned(),
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-helper-oracle".to_owned(),
+            "/opt/Code/github.com/Org/sleeping-oracle".to_owned(),
+        ];
+        assert_eq!(
+            wake_arg_for_similar_oracle("pulse-oracle"),
+            "pulse".to_owned()
+        );
+        assert_eq!(
+            wake_arg_for_similar_oracle("Soul-Brews-Studio/pulse-oracle"),
+            "Soul-Brews-Studio/pulse-oracle".to_owned()
+        );
+
+        let candidates = attach_recovery_candidates(
+            "pulse",
+            "ghost",
+            "session-name",
+            &[],
+            &["/opt/Code/github.com/Soul-Brews-Studio/pulse-oracle".to_owned()],
+        );
+        assert_eq!(
+            candidates,
+            vec![AttachRecoveryCandidate {
+                oracle: "Soul-Brews-Studio/pulse-oracle".to_owned(),
+                label: "Soul-Brews-Studio/pulse-oracle".to_owned(),
+            }]
+        );
+        assert_eq!(
+            decide_attach_recovery(&candidates, false, None),
+            AttachRecoveryDecision::AutoWake {
+                command: SpawnCommand {
+                    program: "maw".to_owned(),
+                    args: vec![
+                        "wake".to_owned(),
+                        "Soul-Brews-Studio/pulse-oracle".to_owned(),
+                        "-a".to_owned()
+                    ],
+                },
+                label: "Soul-Brews-Studio/pulse-oracle".to_owned(),
+            }
+        );
+
+        let candidates = attach_recovery_candidates(
+            "44-sleeping",
+            "44-sleeping",
+            "fleet-stem (44-sleeping)",
+            &[AttachRecoveryFleetEntry {
+                session: "44-sleeping".to_owned(),
+                first_window_name: Some("sleeping-oracle".to_owned()),
+                repo: Some("Org/sleeping-oracle".to_owned()),
+            }],
+            &cloned_repos,
+        );
+        assert_eq!(
+            candidates[0],
+            AttachRecoveryCandidate {
+                oracle: "sleeping".to_owned(),
+                label: "sleeping-oracle (cloned)".to_owned(),
+            }
+        );
+
+        let candidates =
+            attach_recovery_candidates("pulse", "pulse", "session-name", &[], &cloned_repos);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            decide_attach_recovery(&candidates, false, None),
+            AttachRecoveryDecision::PrintCandidates {
+                candidates: candidates.clone()
+            }
+        );
+        assert_eq!(
+            decide_attach_recovery(&candidates, true, None),
+            AttachRecoveryDecision::Prompt {
+                candidates: candidates.clone()
+            }
+        );
+        assert_eq!(
+            decide_attach_recovery(&candidates, true, Some(2)),
+            AttachRecoveryDecision::WakeChoice {
+                command: SpawnCommand {
+                    program: "maw".to_owned(),
+                    args: vec![
+                        "wake".to_owned(),
+                        "Soul-Brews-Studio/pulse-helper-oracle".to_owned(),
+                        "-a".to_owned()
+                    ],
+                }
+            }
+        );
+        assert_eq!(
+            decide_attach_recovery(&candidates, true, Some(3)),
+            AttachRecoveryDecision::InvalidChoice
+        );
+        assert_eq!(
+            decide_attach_recovery(&[], true, None),
+            AttachRecoveryDecision::NoCandidates
         );
     }
 
