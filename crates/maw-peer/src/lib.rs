@@ -399,3 +399,200 @@ pub fn safe_probe_host(url: &str) -> String {
         host.to_owned()
     }
 }
+
+/// Parsed `/info` body shape for deterministic `probePeer` ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeInfoBody {
+    pub maw: ProbeMawHandshake,
+    pub node: Option<String>,
+    pub name: Option<String>,
+    pub nickname: Option<String>,
+}
+
+/// Deterministic stand-in for the maw-js `/info` fetch result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeInfoOutcome {
+    Body(ProbeInfoBody),
+    HttpStatus { status: u16, ok: bool },
+    InvalidJson,
+    FetchCode { code: String, message: String },
+    FetchCodeWithoutMessage { code: String },
+    FetchName { name: String, message: String },
+}
+
+/// Deterministic stand-in for the best-effort `/api/identity` fetch result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeRemoteIdentity {
+    Body {
+        pubkey: Option<String>,
+        oracle: Option<String>,
+        node: Option<String>,
+    },
+    Missing,
+    HttpError,
+    MalformedJson,
+    FetchError,
+}
+
+/// Peer's self-reported `<oracle>:<node>` identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    pub oracle: String,
+    pub node: String,
+}
+
+/// Deterministic plan input for maw-js `probePeer` runtime branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbePeerPlan {
+    pub url: String,
+    pub now: String,
+    pub dns_error: Option<ProbeLastError>,
+    pub info: ProbeInfoOutcome,
+    pub identity: Option<ProbeRemoteIdentity>,
+}
+
+/// Deterministic output for maw-js `probePeer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbePeerResult {
+    pub node: Option<String>,
+    pub nickname: Option<String>,
+    pub pubkey: Option<String>,
+    pub identity: Option<PeerIdentity>,
+    pub error: Option<ProbeLastError>,
+}
+
+/// Port of maw-js `probePeer` control flow over deterministic outcomes.
+///
+/// This deliberately stops short of real DNS/fetch IO; it locks the portable
+/// branch behavior before the runtime adapter is wired.
+#[must_use]
+pub fn probe_peer_from_plan(plan: &ProbePeerPlan) -> ProbePeerResult {
+    if let Some(err) = &plan.dns_error {
+        return probe_failure(err.clone());
+    }
+
+    let body = match &plan.info {
+        ProbeInfoOutcome::Body(body) => body,
+        ProbeInfoOutcome::HttpStatus { status, ok } => {
+            return probe_failure(ProbeLastError {
+                code: classify_probe_error(&ProbeFailureInput::Http {
+                    status: *status,
+                    ok: *ok,
+                }),
+                message: format!("HTTP {status} from {}/info", plan.url),
+                at: plan.now.clone(),
+            });
+        }
+        ProbeInfoOutcome::InvalidJson => {
+            return probe_bad_body("/info body was not valid JSON", &plan.now);
+        }
+        ProbeInfoOutcome::FetchCode { code, message } => {
+            return probe_failure(ProbeLastError {
+                code: classify_probe_error(&ProbeFailureInput::Code(code.clone())),
+                message: message.clone(),
+                at: plan.now.clone(),
+            });
+        }
+        ProbeInfoOutcome::FetchCodeWithoutMessage { code } => {
+            return probe_failure(ProbeLastError {
+                code: classify_probe_error(&ProbeFailureInput::Code(code.clone())),
+                message: format!("fetch {}/info failed", plan.url),
+                at: plan.now.clone(),
+            });
+        }
+        ProbeInfoOutcome::FetchName { name, message } => {
+            return probe_failure(ProbeLastError {
+                code: classify_probe_error(&ProbeFailureInput::Name(name.clone())),
+                message: message.clone(),
+                at: plan.now.clone(),
+            });
+        }
+    };
+
+    if !is_valid_maw_handshake(&body.maw) {
+        return probe_bad_body(
+            "/info response missing valid \"maw\" handshake field",
+            &plan.now,
+        );
+    }
+
+    let node = body
+        .node
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .or_else(|| body.name.as_deref().filter(|value| !value.is_empty()));
+    let Some(node) = node else {
+        return probe_bad_body(
+            "/info response had neither \"node\" nor \"name\" string",
+            &plan.now,
+        );
+    };
+
+    let nickname = body
+        .nickname
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let identity_fields = plan.identity.as_ref().and_then(parse_remote_identity);
+
+    ProbePeerResult {
+        node: Some(node.to_owned()),
+        nickname,
+        pubkey: identity_fields
+            .as_ref()
+            .and_then(|fields| fields.pubkey.clone()),
+        identity: identity_fields.and_then(|fields| fields.identity),
+        error: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRemoteIdentity {
+    pubkey: Option<String>,
+    identity: Option<PeerIdentity>,
+}
+
+fn parse_remote_identity(identity: &ProbeRemoteIdentity) -> Option<ParsedRemoteIdentity> {
+    let ProbeRemoteIdentity::Body {
+        pubkey,
+        oracle,
+        node,
+    } = identity
+    else {
+        return None;
+    };
+
+    let pubkey = pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let node = node.as_deref().filter(|value| !value.is_empty());
+    let identity = node.map(|node| PeerIdentity {
+        oracle: oracle
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("mawjs")
+            .to_owned(),
+        node: node.to_owned(),
+    });
+
+    Some(ParsedRemoteIdentity { pubkey, identity })
+}
+
+fn probe_bad_body(message: &str, now: &str) -> ProbePeerResult {
+    probe_failure(ProbeLastError {
+        code: ProbeErrorCode::BadBody,
+        message: message.to_owned(),
+        at: now.to_owned(),
+    })
+}
+
+fn probe_failure(error: ProbeLastError) -> ProbePeerResult {
+    ProbePeerResult {
+        node: None,
+        nickname: None,
+        pubkey: None,
+        identity: None,
+        error: Some(error),
+    }
+}
