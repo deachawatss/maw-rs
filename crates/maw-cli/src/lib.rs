@@ -22,8 +22,10 @@ use maw_matcher::{
     ResolveOptions, ResolveResult,
 };
 use maw_peer::{
-    resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
-    PeerSourceMode, PeerSourceResult,
+    classify_probe_error, format_probe_error, is_valid_maw_handshake, pick_probe_hint,
+    probe_exit_code, resolve_peer_sources, safe_probe_host, DiscoveryResult, DiscoveryRow,
+    NamedPeerConfig, PeerConfig, PeerSourceMode, PeerSourceResult, ProbeErrorCode,
+    ProbeFailureInput, ProbeLastError, ProbeMawHandshake,
 };
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
@@ -92,6 +94,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "route" => run_route_plan(&argv[1..]),
         "discover" => run_discover_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
+        "peer-probe" => run_peer_probe_plan(&argv[1..]),
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
         "split-policy" => run_split_policy_plan(&argv[1..]),
         "transport" => run_transport_plan(&argv[1..]),
@@ -3108,6 +3111,239 @@ fn render_split_policy_plan_text(decision: SplitPolicyDecision) -> String {
     )
 }
 
+fn run_peer_probe_plan(argv: &[String]) -> CliOutput {
+    let Some(action) = argv.first().map(String::as_str) else {
+        return peer_probe_usage_error("peer-probe: missing action");
+    };
+    match action {
+        "classify" => run_peer_probe_classify_plan(&argv[1..]),
+        "format" => run_peer_probe_format_plan(&argv[1..]),
+        "handshake" => run_peer_probe_handshake_plan(&argv[1..]),
+        _ => peer_probe_usage_error("peer-probe: invalid action"),
+    }
+}
+
+fn run_peer_probe_classify_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut input = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--http-status" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error(
+                        "peer-probe classify: missing --http-status value",
+                    );
+                };
+                let Ok(status) = value.parse::<u16>() else {
+                    return peer_probe_usage_error(
+                        "peer-probe classify: --http-status must be an integer",
+                    );
+                };
+                input = Some(ProbeFailureInput::Http { status, ok: false });
+                index += 1;
+            }
+            "--code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe classify: missing --code value");
+                };
+                input = Some(ProbeFailureInput::Code(value.to_owned()));
+                index += 1;
+            }
+            "--cause-code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error(
+                        "peer-probe classify: missing --cause-code value",
+                    );
+                };
+                input = Some(ProbeFailureInput::CauseCode(value.to_owned()));
+                index += 1;
+            }
+            "--name" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe classify: missing --name value");
+                };
+                input = Some(ProbeFailureInput::Name(value.to_owned()));
+                index += 1;
+            }
+            "--non-object" => input = Some(ProbeFailureInput::NonObject),
+            arg => {
+                return peer_probe_usage_error(&format!(
+                    "peer-probe classify: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    let Some(input) = input else {
+        return peer_probe_usage_error("peer-probe classify: missing input");
+    };
+    let code = classify_probe_error(&input);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"peer-probe\",\"action\":\"classify\",\"ok\":true,\"code\":{},\"exitCode\":{},\"hint\":{}}}\n",
+                json_string(code.as_str()),
+                probe_exit_code(code),
+                json_string(maw_peer::probe_hint(code))
+            )
+        } else {
+            format!("{}\n", code.as_str())
+        },
+        stderr: String::new(),
+    }
+}
+
+fn run_peer_probe_format_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut code = None;
+    let mut message = None;
+    let mut at = "now".to_owned();
+    let mut url = None;
+    let mut alias = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe format: missing --code value");
+                };
+                code = parse_probe_error_code(value);
+                if code.is_none() {
+                    return peer_probe_usage_error("peer-probe format: invalid --code value");
+                }
+                index += 1;
+            }
+            "--message" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe format: missing --message value");
+                };
+                message = Some(value.to_owned());
+                index += 1;
+            }
+            "--at" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe format: missing --at value");
+                };
+                value.clone_into(&mut at);
+                index += 1;
+            }
+            "--url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe format: missing --url value");
+                };
+                url = Some(value.to_owned());
+                index += 1;
+            }
+            "--alias" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe format: missing --alias value");
+                };
+                alias = Some(value.to_owned());
+                index += 1;
+            }
+            arg => {
+                return peer_probe_usage_error(&format!(
+                    "peer-probe format: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    let (Some(code), Some(message), Some(url), Some(alias)) = (code, message, url, alias) else {
+        return peer_probe_usage_error("peer-probe format: missing required value");
+    };
+    let err = ProbeLastError { code, message, at };
+    let formatted = format_probe_error(&err, &url, &alias);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"peer-probe\",\"action\":\"format\",\"ok\":true,\"code\":{},\"host\":{},\"hint\":{},\"formatted\":{}}}\n",
+                json_string(code.as_str()),
+                json_string(&safe_probe_host(&url)),
+                json_string(pick_probe_hint(&err)),
+                json_string(&formatted)
+            )
+        } else {
+            formatted + "\n"
+        },
+        stderr: String::new(),
+    }
+}
+
+fn run_peer_probe_handshake_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut handshake = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--legacy-true" => handshake = Some(ProbeMawHandshake::LegacyTrue),
+            "--schema" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return peer_probe_usage_error("peer-probe handshake: missing --schema value");
+                };
+                handshake = Some(ProbeMawHandshake::SchemaObject(value.to_owned()));
+                index += 1;
+            }
+            "--empty-object" => handshake = Some(ProbeMawHandshake::EmptyObject),
+            "--other-truthy" => handshake = Some(ProbeMawHandshake::OtherTruthy),
+            "--missing" => handshake = Some(ProbeMawHandshake::Missing),
+            arg => {
+                return peer_probe_usage_error(&format!(
+                    "peer-probe handshake: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    let Some(handshake) = handshake else {
+        return peer_probe_usage_error("peer-probe handshake: missing shape");
+    };
+    let valid = is_valid_maw_handshake(&handshake);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            format!(
+                "{{\"command\":\"peer-probe\",\"action\":\"handshake\",\"ok\":true,\"valid\":{valid}}}\n"
+            )
+        } else {
+            format!("valid={valid}\n")
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_probe_error_code(value: &str) -> Option<ProbeErrorCode> {
+    match value {
+        "DNS" => Some(ProbeErrorCode::Dns),
+        "REFUSED" => Some(ProbeErrorCode::Refused),
+        "TIMEOUT" => Some(ProbeErrorCode::Timeout),
+        "HTTP_4XX" => Some(ProbeErrorCode::Http4xx),
+        "HTTP_5XX" => Some(ProbeErrorCode::Http5xx),
+        "TLS" => Some(ProbeErrorCode::Tls),
+        "BAD_BODY" => Some(ProbeErrorCode::BadBody),
+        "UNKNOWN" => Some(ProbeErrorCode::Unknown),
+        _ => None,
+    }
+}
+
+fn peer_probe_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", peer_probe_usage()),
+    }
+}
+
+fn peer_probe_usage() -> &'static str {
+    "usage: maw-rs peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]\n       maw-rs peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]\n       maw-rs peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]"
+}
+
 fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut mode = PeerSourceMode::Both;
@@ -4949,7 +5185,10 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
+  peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
+  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
