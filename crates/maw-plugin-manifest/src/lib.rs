@@ -829,3 +829,231 @@ fn parse_string_array(
     }
     Ok(parsed)
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginManifest {
+    pub name: String,
+    pub version: String,
+    pub weight: Option<u64>,
+    pub tier: Option<PluginTier>,
+    pub wasm: Option<String>,
+    pub entry: Option<String>,
+    pub sdk: String,
+    pub cli: Option<PluginCli>,
+    pub api: Option<PluginApi>,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub hooks: Option<PluginHooks>,
+    pub cron: Option<PluginCron>,
+    pub module: Option<PluginModule>,
+    pub transport: Option<PluginTransport>,
+    pub engine: Option<PluginEngine>,
+    pub target: Option<PluginTarget>,
+    pub capability_namespaces: Option<Vec<String>>,
+    pub capabilities: Option<Vec<String>>,
+    pub capability_warnings: Vec<String>,
+    pub dependencies: Option<PluginDependencies>,
+    pub artifact: Option<PluginArtifact>,
+}
+
+/// Parse and validate a `plugin.json` text.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed manifests.
+pub fn parse_manifest(json_text: &str, dir: &std::path::Path) -> Result<PluginManifest, String> {
+    let raw: Value =
+        serde_json::from_str(json_text).map_err(|_| "plugin.json: invalid JSON".to_owned())?;
+    let object = parse_manifest_object(&raw)?;
+    let name = parse_manifest_name(object)?;
+    let version = parse_manifest_version(object)?;
+    let weight = parse_manifest_weight(object)?;
+    let sdk = parse_manifest_sdk(object)?;
+    let wasm = parse_declared_manifest_file(object, "wasm", dir)?;
+    let entry = parse_declared_manifest_file(object, "entry", dir)?;
+
+    let capability_namespaces = parse_capability_namespaces(&raw)?;
+    let extra_namespaces: Vec<&str> = capability_namespaces
+        .as_ref()
+        .map_or_else(Vec::new, |namespaces| {
+            namespaces.iter().map(String::as_str).collect()
+        });
+    let capabilities = parse_capabilities(&raw, &extra_namespaces)?;
+    let (capabilities, capability_warnings) = capabilities.map_or((None, Vec::new()), |parsed| {
+        (Some(parsed.capabilities), parsed.warnings)
+    });
+
+    Ok(PluginManifest {
+        name,
+        version,
+        weight,
+        tier: parse_tier(&raw)?,
+        wasm,
+        entry,
+        sdk,
+        cli: parse_cli(&raw)?,
+        api: parse_api(&raw)?,
+        description: object
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        author: object
+            .get("author")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        hooks: parse_hooks(&raw)?,
+        cron: parse_cron(&raw)?,
+        module: parse_module(&raw)?,
+        transport: parse_transport(&raw)?,
+        engine: parse_engine(&raw)?,
+        target: parse_target(&raw)?,
+        capability_namespaces,
+        capabilities,
+        capability_warnings,
+        dependencies: parse_dependencies(&raw)?,
+        artifact: parse_artifact(&raw)?,
+    })
+}
+
+fn parse_manifest_object(raw: &Value) -> Result<&Map<String, Value>, String> {
+    raw.as_object()
+        .ok_or_else(|| "plugin.json: must be a JSON object".to_owned())
+}
+
+fn parse_manifest_name(object: &Map<String, Value>) -> Result<String, String> {
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| is_slug(name))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "plugin.json: name must match /^[a-z0-9-]+$/ (got {})",
+                manifest_field_for_error(object, "name")
+            )
+        })
+}
+
+fn parse_manifest_version(object: &Map<String, Value>) -> Result<String, String> {
+    object
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|version| is_semver(version))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "plugin.json: version must be semver N.N.N (got {})",
+                manifest_field_for_error(object, "version")
+            )
+        })
+}
+
+fn parse_manifest_weight(object: &Map<String, Value>) -> Result<Option<u64>, String> {
+    let Some(value) = object.get("weight") else {
+        return Ok(None);
+    };
+    let valid_weight = value
+        .as_u64()
+        .filter(|weight| *weight <= 99)
+        .ok_or_else(weight_error)?;
+    Ok(Some(valid_weight))
+}
+
+fn parse_manifest_sdk(object: &Map<String, Value>) -> Result<String, String> {
+    object
+        .get("sdk")
+        .and_then(Value::as_str)
+        .filter(|sdk| is_semver_range(sdk))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "plugin.json: sdk must be a semver range (got {})",
+                manifest_field_for_error(object, "sdk")
+            )
+        })
+}
+
+fn parse_declared_manifest_file(
+    object: &Map<String, Value>,
+    key: &str,
+    dir: &std::path::Path,
+) -> Result<Option<String>, String> {
+    let Some(path) = object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
+    };
+    let declared_path = dir.join(path);
+    if declared_path.exists() {
+        Ok(Some(path.to_owned()))
+    } else {
+        Err(format!(
+            "plugin.json: {key} file not found: {}",
+            declared_path.display()
+        ))
+    }
+}
+
+fn manifest_field_for_error(object: &Map<String, Value>, key: &str) -> String {
+    object
+        .get(key)
+        .map_or("undefined".to_owned(), Value::to_string)
+}
+
+fn weight_error() -> String {
+    "plugin.json: weight must be a number 0-99 (lower = runs first, default 50)".to_owned()
+}
+
+fn is_semver(value: &str) -> bool {
+    let (core_and_pre, build_ok) = split_once_optional(value, '+');
+    if !build_ok || core_and_pre.is_empty() {
+        return false;
+    }
+    let (core, pre_ok) = split_once_optional(core_and_pre, '-');
+    pre_ok && is_semver_core(core)
+}
+
+fn is_semver_range(value: &str) -> bool {
+    if value == "*" {
+        return true;
+    }
+    for op in [">=", "<=", "^", "~", ">", "<"] {
+        if let Some(rest) = value.strip_prefix(op) {
+            return is_semver(rest);
+        }
+    }
+    is_semver(value)
+}
+
+fn split_once_optional(value: &str, separator: char) -> (&str, bool) {
+    let mut parts = value.split(separator);
+    let Some(first) = parts.next() else {
+        return (value, false);
+    };
+    if parts.next().is_some_and(str::is_empty) {
+        return (first, false);
+    }
+    if parts.next().is_some() {
+        return (first, false);
+    }
+    (first, true)
+}
+
+fn is_semver_core(core: &str) -> bool {
+    let mut parts = core.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && [major, minor, patch]
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
