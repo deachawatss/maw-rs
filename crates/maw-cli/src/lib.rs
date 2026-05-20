@@ -9,6 +9,10 @@ use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
     ResolveOptions, ResolveResult,
 };
+use maw_worktree::{
+    resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
+    WorktreeWindowResolution,
+};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,11 +34,174 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "resolve" => run_resolve_plan(&argv[1..]),
         "normalize" => run_normalize_plan(&argv[1..]),
         "calver" => run_calver_plan(&argv[1..]),
+        "worktree-window" => run_worktree_window_plan(&argv[1..]),
         _ => CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_worktree_window_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut main_repo_name = None;
+    let mut wt_name = None;
+    let mut sessions: Vec<WorktreeSession> = Vec::new();
+    let mut current_session: Option<WorktreeSession> = None;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--main-repo-name" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return worktree_window_usage_error(
+                        "worktree-window: missing --main-repo-name value",
+                    );
+                };
+                main_repo_name = Some(value.to_owned());
+                index += 1;
+            }
+            "--wt-name" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return worktree_window_usage_error("worktree-window: missing --wt-name value");
+                };
+                wt_name = Some(value.to_owned());
+                index += 1;
+            }
+            "--session" => {
+                if let Some(session) = current_session.take() {
+                    sessions.push(session);
+                }
+                let Some(value) = argv.get(index + 1) else {
+                    return worktree_window_usage_error("worktree-window: missing --session value");
+                };
+                current_session = Some(WorktreeSession {
+                    name: value.to_owned(),
+                    windows: Vec::new(),
+                });
+                index += 1;
+            }
+            "--window" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return worktree_window_usage_error("worktree-window: missing --window value");
+                };
+                let Some(session) = &mut current_session else {
+                    return worktree_window_usage_error(
+                        "worktree-window: --window must follow a --session",
+                    );
+                };
+                match parse_worktree_window(value) {
+                    Ok(window) => session.windows.push(window),
+                    Err(message) => return worktree_window_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return worktree_window_usage_error(&format!(
+                    "worktree-window: unknown argument {arg}"
+                ));
+            }
+        }
+        index += 1;
+    }
+    if let Some(session) = current_session.take() {
+        sessions.push(session);
+    }
+
+    let Some(main_repo_name) = main_repo_name else {
+        return worktree_window_usage_error("worktree-window: expected --main-repo-name <repo>");
+    };
+    let Some(wt_name) = wt_name else {
+        return worktree_window_usage_error("worktree-window: expected --wt-name <worktree>");
+    };
+
+    let result = resolve_worktree_window(&main_repo_name, &wt_name, &sessions);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_worktree_window_plan_json(&main_repo_name, &wt_name, &result)
+        } else {
+            render_worktree_window_plan_text(&main_repo_name, &wt_name, &result)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn worktree_window_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n"
+        ),
+    }
+}
+
+fn parse_worktree_window(value: &str) -> Result<WorktreeWindow, String> {
+    let mut parts = value.splitn(3, ':');
+    let index = parts
+        .next()
+        .ok_or_else(|| "worktree-window: missing window index".to_owned())?
+        .parse::<u32>()
+        .map_err(|_| "worktree-window: invalid window index".to_owned())?;
+    let Some(name) = parts.next() else {
+        return Err("worktree-window: window must use <index:name:active>".to_owned());
+    };
+    let active = match parts.next() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return Err("worktree-window: window active must be true or false".to_owned()),
+    };
+    Ok(WorktreeWindow {
+        index,
+        name: name.to_owned(),
+        active,
+    })
+}
+
+fn render_worktree_window_plan_json(
+    main_repo_name: &str,
+    wt_name: &str,
+    result: &WorktreeWindowResolution,
+) -> String {
+    let mut fields = vec![
+        "\"command\":\"worktree-window\"".to_owned(),
+        format!("\"mainRepoName\":{}", json_string(main_repo_name)),
+        format!("\"wtName\":{}", json_string(wt_name)),
+    ];
+    match result {
+        WorktreeWindowResolution::Bound { window } => {
+            fields.push("\"kind\":\"bound\"".to_owned());
+            fields.push(format!("\"window\":{}", json_string(window)));
+        }
+        WorktreeWindowResolution::Ambiguous { query, candidates } => {
+            fields.push("\"kind\":\"ambiguous\"".to_owned());
+            fields.push(format!("\"query\":{}", json_string(query)));
+            fields.push(format!("\"candidates\":{}", json_string_array(candidates)));
+        }
+        WorktreeWindowResolution::None => fields.push("\"kind\":\"none\"".to_owned()),
+    }
+    format!("{{{}}}\n", fields.join(","))
+}
+
+fn render_worktree_window_plan_text(
+    main_repo_name: &str,
+    wt_name: &str,
+    result: &WorktreeWindowResolution,
+) -> String {
+    match result {
+        WorktreeWindowResolution::Bound { window } => {
+            format!("worktree-window {main_repo_name} {wt_name}: bound {window}\n")
+        }
+        WorktreeWindowResolution::Ambiguous { query, candidates } => format!(
+            "worktree-window {main_repo_name} {wt_name}: ambiguous {query} candidates={}\n",
+            candidates.join(", ")
+        ),
+        WorktreeWindowResolution::None => {
+            format!("worktree-window {main_repo_name} {wt_name}: none\n")
+        }
     }
 }
 
@@ -345,7 +512,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n"
         .to_owned()
 }
 

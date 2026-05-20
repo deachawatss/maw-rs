@@ -113,6 +113,7 @@ dependencies = [
  "maw-bring",
  "maw-calver",
  "maw-matcher",
+ "maw-worktree",
  "serde",
  "serde_json",
 ]

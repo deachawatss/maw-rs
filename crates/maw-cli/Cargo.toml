@@ -14,6 +14,7 @@ path = "src/main.rs"
 maw-bring = { path = "../maw-bring" }
 maw-calver = { path = "../maw-calver" }
 maw-matcher = { path = "../maw-matcher" }
+maw-worktree = { path = "../maw-worktree" }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
