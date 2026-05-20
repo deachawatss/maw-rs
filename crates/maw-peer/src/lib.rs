@@ -646,6 +646,22 @@ impl Default for PeerStoreFile {
     }
 }
 
+/// Stale peer row used by doctor `--fix-stale` preview and mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePeer {
+    pub alias: String,
+    pub url: String,
+    pub age_ms: Option<u64>,
+}
+
+/// Doctor check-shaped result for peers stale/fix-stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDoctorCheck {
+    pub name: String,
+    pub ok: bool,
+    pub message: String,
+}
+
 /// Deterministic peer-store environment for maw-js path resolution parity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerStoreEnv {
@@ -779,6 +795,80 @@ pub fn clear_stale_peer_store_tmp(env: &PeerStoreEnv) {
     {
         let _ = fs::remove_file(tmp_peer_store_path(&path));
     }
+}
+
+/// Enumerate stale peers from the peer store in stable alias order.
+#[must_use]
+pub fn stale_peers(env: &PeerStoreEnv, now_ms: u64) -> Vec<StalePeer> {
+    let ttl_ms = parse_stale_ttl_ms(env.var("MAW_PEER_STALE_TTL_MS"));
+    load_peer_store(env)
+        .peers
+        .into_iter()
+        .filter(|(_, peer)| is_peer_stale(peer, ttl_ms, now_ms))
+        .map(|(alias, peer)| {
+            let age_ms = stale_age_ms(&peer, now_ms);
+            StalePeer {
+                alias,
+                url: peer.url,
+                age_ms,
+            }
+        })
+        .collect()
+}
+
+/// Return the maw-js `peers:stale` doctor check shape.
+#[must_use]
+pub fn stale_peer_check(env: &PeerStoreEnv, now_ms: u64) -> PeerDoctorCheck {
+    let stale = stale_peers(env, now_ms);
+    if stale.is_empty() {
+        return PeerDoctorCheck {
+            name: "peers:stale".to_owned(),
+            ok: true,
+            message: "no stale peers".to_owned(),
+        };
+    }
+    let days = parse_stale_ttl_ms(env.var("MAW_PEER_STALE_TTL_MS")) / 86_400_000;
+    PeerDoctorCheck {
+        name: "peers:stale".to_owned(),
+        ok: false,
+        message: format!(
+            "{} stale peer{} (>{days}d) — run 'maw doctor --fix-stale' to remove",
+            stale.len(),
+            if stale.len() == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+/// Remove stale peers through the peer-store mutation path.
+///
+/// # Errors
+///
+/// Returns peer-store mutation write failures.
+pub fn remove_stale_peers(env: &PeerStoreEnv, now_ms: u64) -> io::Result<PeerDoctorCheck> {
+    let stale = stale_peers(env, now_ms);
+    if stale.is_empty() {
+        return Ok(PeerDoctorCheck {
+            name: "peers:fix-stale".to_owned(),
+            ok: true,
+            message: "no stale peers".to_owned(),
+        });
+    }
+    let mut removed = 0;
+    mutate_peer_store(env, |data| {
+        for stale_peer in &stale {
+            if data.peers.remove(&stale_peer.alias).is_some() {
+                removed += 1;
+            }
+        }
+    })?;
+    Ok(PeerDoctorCheck {
+        name: "peers:fix-stale".to_owned(),
+        ok: true,
+        message: format!(
+            "removed {removed} stale peer{}",
+            if removed == 1 { "" } else { "s" }
+        ),
+    })
 }
 
 fn read_peer_store_unlocked(path: &Path) -> PeerStoreFile {
