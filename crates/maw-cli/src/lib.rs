@@ -11,10 +11,10 @@ use maw_auth::{
     request_consent_plan, sign_auto_pair_proof, sign_headers_v3_at, sign_request_v3, trust_key,
     verify_auto_pair_proof, verify_consent_pin, verify_request, ApprovedBy, AutoPairAddOutcome,
     AutoPairIdentity, AutoPairInput, ConsentAction, ConsentApprovalResult, ConsentRequestArgs,
-    ConsentRequestResult, ConsentStatus, ConsentStore, FromVerifyDecision, Headers,
+    ConsentRequestResult, ConsentStatus, ConsentStore, FromVerifyDecision, Headers, LookupResult,
     PairAcceptInput, PairApiAcceptResult, PairApiAutoResult, PairApiConfig, PairApiGenerateResult,
-    PairApiProbeResult, PairApiStatusResult, PairCodeStore, PeerPendingRequest, PeerPostResult,
-    PendingRequest, RecentHelloStore, TrustEntry, VerifyRequestArgs,
+    PairApiProbeResult, PairApiStatusResult, PairCodeStore, PairEntry, PeerPendingRequest,
+    PeerPostResult, PendingRequest, RecentHelloStore, TrustEntry, VerifyRequestArgs,
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
@@ -131,6 +131,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "consent-pending-status" => run_consent_pending_status_plan(&argv[1..]),
         "recent-hello" => run_recent_hello_plan(&argv[1..]),
         "pair-code" => run_pair_code_plan(&argv[1..]),
+        "pair-code-store" => run_pair_code_store_plan(&argv[1..]),
         "pair-api" => run_pair_api_plan(&argv[1..]),
         "pair-api-auto" => run_pair_api_auto_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
@@ -5945,6 +5946,186 @@ fn pair_code_usage() -> &'static str {
 }
 
 #[allow(clippy::too_many_lines)]
+fn run_pair_code_store_plan(argv: &[String]) -> CliOutput {
+    let Some(mode) = argv.first().map(String::as_str) else {
+        return pair_code_store_usage_error(
+            "pair-code-store: expected register, lookup, or consume",
+        );
+    };
+    if !matches!(mode, "register" | "lookup" | "consume") {
+        return pair_code_store_usage_error(
+            "pair-code-store: expected register, lookup, or consume",
+        );
+    }
+
+    let mut plan_json = false;
+    let mut code = None::<String>;
+    let mut now_ms = None::<u64>;
+    let mut ttl_ms = None::<u64>;
+    let mut seed_codes = Vec::<SeedPairCode>::new();
+
+    let mut index = 1;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_store_usage_error("pair-code-store: missing --code value");
+                };
+                if value.is_empty() {
+                    return pair_code_store_usage_error("pair-code-store: missing --code value");
+                }
+                code = Some(value.to_owned());
+                index += 1;
+            }
+            "--now" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_store_usage_error("pair-code-store: missing --now value");
+                };
+                match parse_u64_arg(value, "pair-code-store: --now") {
+                    Ok(parsed) => now_ms = Some(parsed),
+                    Err(message) => return pair_code_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--ttl-ms" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_store_usage_error("pair-code-store: missing --ttl-ms value");
+                };
+                match parse_u64_arg(value, "pair-code-store: --ttl-ms") {
+                    Ok(parsed) => ttl_ms = Some(parsed),
+                    Err(message) => return pair_code_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--seed-code" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return pair_code_store_usage_error(
+                        "pair-code-store: missing --seed-code value",
+                    );
+                };
+                match parse_pair_code_store_seed(value) {
+                    Ok(seed) => seed_codes.push(seed),
+                    Err(message) => return pair_code_store_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return pair_code_store_usage_error(&format!(
+                    "pair-code-store: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let Some(code) = code else {
+        return pair_code_store_usage_error("pair-code-store: missing --code value");
+    };
+    let Some(now_ms) = now_ms else {
+        return pair_code_store_usage_error("pair-code-store: missing --now value");
+    };
+    let mut store = PairCodeStore::default();
+    for seed in seed_codes {
+        let _ = store.register_at(&seed.code, seed.ttl_ms, seed.created_at_ms);
+    }
+
+    let normalized = normalize_pair_code(&code);
+    let result = match mode {
+        "register" => {
+            let Some(ttl_ms) = ttl_ms else {
+                return pair_code_store_usage_error("pair-code-store: missing --ttl-ms value");
+            };
+            PairCodeStorePlanResult::Register(store.register_at(&code, ttl_ms, now_ms))
+        }
+        "lookup" => PairCodeStorePlanResult::Lookup(store.lookup_at(&code, now_ms)),
+        "consume" => PairCodeStorePlanResult::Lookup(store.consume_at(&code, now_ms)),
+        _ => unreachable!(),
+    };
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_pair_code_store_plan_json(mode, &normalized, &result)
+        } else {
+            format!(
+                "pair-code-store mode={mode} code={normalized} state={}\n",
+                pair_code_store_result_state(&result)
+            )
+        },
+        stderr: String::new(),
+    }
+}
+
+enum PairCodeStorePlanResult {
+    Register(PairEntry),
+    Lookup(LookupResult),
+}
+
+fn parse_pair_code_store_seed(value: &str) -> Result<SeedPairCode, String> {
+    parse_seed_pair_code(value)
+        .map_err(|message| message.replace("pair-api: --seed-code", "pair-code-store: --seed-code"))
+}
+
+fn pair_code_store_result_state(result: &PairCodeStorePlanResult) -> &'static str {
+    match result {
+        PairCodeStorePlanResult::Register(_)
+        | PairCodeStorePlanResult::Lookup(LookupResult::Live(_)) => "live",
+        PairCodeStorePlanResult::Lookup(LookupResult::NotFound) => "not-found",
+        PairCodeStorePlanResult::Lookup(LookupResult::Expired) => "expired",
+        PairCodeStorePlanResult::Lookup(LookupResult::Consumed) => "consumed",
+    }
+}
+
+fn pair_code_store_result_entry(result: &PairCodeStorePlanResult) -> String {
+    match result {
+        PairCodeStorePlanResult::Register(entry)
+        | PairCodeStorePlanResult::Lookup(LookupResult::Live(entry)) => {
+            render_pair_code_store_entry_json(entry)
+        }
+        PairCodeStorePlanResult::Lookup(
+            LookupResult::NotFound | LookupResult::Expired | LookupResult::Consumed,
+        ) => "null".to_owned(),
+    }
+}
+
+fn render_pair_code_store_entry_json(entry: &PairEntry) -> String {
+    format!(
+        "{{\"code\":{},\"expiresAt\":{},\"createdAt\":{},\"consumed\":{}}}",
+        json_string(&entry.code),
+        entry.expires_at,
+        entry.created_at,
+        entry.consumed
+    )
+}
+
+fn render_pair_code_store_plan_json(
+    mode: &str,
+    normalized: &str,
+    result: &PairCodeStorePlanResult,
+) -> String {
+    format!(
+        "{{\"command\":\"pair-code-store\",\"mode\":{},\"normalized\":{},\"state\":{},\"entry\":{}}}\n",
+        json_string(mode),
+        json_string(normalized),
+        json_string(pair_code_store_result_state(result)),
+        pair_code_store_result_entry(result)
+    )
+}
+
+fn pair_code_store_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", pair_code_store_usage()),
+    }
+}
+
+fn pair_code_store_usage() -> &'static str {
+    "usage: maw-rs pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_pair_api_plan(argv: &[String]) -> CliOutput {
     let Some(endpoint) = argv.first().map(String::as_str) else {
         return pair_api_usage_error("pair-api: expected generate, probe, accept, or status");
@@ -8205,7 +8386,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  consent-expiry --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...> --now <ms> [--plan-json]\n  consent-cleanup --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>... --delete <id> [--plan-json]\n  consent-trust-revoke [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --revoke <from:to:action> [--plan-json]\n  consent-trust-check [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --check <from:to:action> [--plan-json]\n  consent-pending-read [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --id <id> [--plan-json]\n  consent-pending-status [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --set-status <id:pending|approved|rejected|expired> [--plan-json]\n  recent-hello [--hello <zid:seen_at_ms>]... --zid <zid> --now <ms> [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-identity [--node <name>] [--url <url>] [--agent <oracle=node>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  auto-pair-proof --node <node> --oracle <oracle> --url <url> --pubkey <pubkey> --token <token> [--proof <hex>] [--plan-json]\n  consent-pin (--pin <pin> [--expected-hash <sha256>]|--request-id-bytes <b0,b1,...>) [--plan-json]\n  consent-request --from <from> --to <to> --action <hey|team-invite|plugin-install> --summary <summary> --request-id <id> --pin <pin> --now <ms> [--peer-url <url>] [--peer-ok|--peer-http-status <status>|--peer-network-error <message>] [--plan-json]\n  consent-store <trust|pending> [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... [--check <from:to:action>] [--key <from:to:action>] [--set-status <id:status>] [--plan-json]\n  consent-expiry --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...> --now <ms> [--plan-json]\n  consent-cleanup --request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>... --delete <id> [--plan-json]\n  consent-trust-revoke [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --revoke <from:to:action> [--plan-json]\n  consent-trust-check [--entry <from=...,to=...,action=...,approved_at=...,approved_by=...>]... --check <from:to:action> [--plan-json]\n  consent-pending-read [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --id <id> [--plan-json]\n  consent-pending-status [--request <id=...,from=...,to=...,action=...,summary=...,pin_hash=...,created_at=...,expires_at=...,status=...>]... --set-status <id:pending|approved|rejected|expired> [--plan-json]\n  recent-hello [--hello <zid:seen_at_ms>]... --zid <zid> --now <ms> [--plan-json]\n  pair-code (--code <code>|--bytes <b0,b1,...>) [--plan-json]\n  pair-code-store <register|lookup|consume> --code <code> --now <ms> [--ttl-ms <ms>] [--seed-code <code:ttl_ms:created_at_ms>]... [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
