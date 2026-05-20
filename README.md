@@ -30,6 +30,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-xdg` | `src/core/xdg.ts`, `src/core/paths.ts`, `src/cli/instance-preset.ts` | `test/core-xdg.test.ts`, `test/paths.test.ts`, `test/00-resolve-home.test.ts` |
 | `maw-bind` | `src/core/bind-host.ts` | `test/bind-heuristic.test.ts` |
 | `maw-fuzzy` | `src/core/util/fuzzy.ts` | `test/fuzzy-match.test.ts` |
+| `maw-plugin-scaffold` | `src/commands/shared/plugin-create-scaffold.ts` | `test/plugin-create.test.ts` (pure validation/manifest cases) |
 
 Current local gates:
 
