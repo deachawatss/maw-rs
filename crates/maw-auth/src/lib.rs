@@ -46,6 +46,14 @@ pub struct FromAddressConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoPairIdentity {
+    pub node: String,
+    pub oracle: String,
+    pub url: String,
+    pub pubkey: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FromVerifyDecision {
     AcceptLegacy {
         reason: String,
@@ -268,6 +276,34 @@ pub fn verify_hmac_sig(secret: &str, payload: &str, signature_hex: &str) -> bool
     let expected = hmac_sha256_hex(secret, payload);
     expected.len() == signature_hex.len()
         && constant_time_eq(expected.as_bytes(), signature_hex.as_bytes())
+}
+
+#[must_use]
+pub fn sign_auto_pair_proof(identity: &AutoPairIdentity, federation_token: &str) -> String {
+    hmac_sha256_hex(federation_token, &canonical_auto_pair_identity(identity))
+}
+
+#[must_use]
+pub fn verify_auto_pair_proof(
+    identity: &AutoPairIdentity,
+    federation_token: &str,
+    proof: &str,
+) -> bool {
+    if proof.len() != 64 || !proof.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return false;
+    }
+    let expected = sign_auto_pair_proof(identity, federation_token);
+    constant_time_eq(expected.as_bytes(), proof.as_bytes())
+}
+
+fn canonical_auto_pair_identity(identity: &AutoPairIdentity) -> String {
+    [
+        identity.oracle.as_str(),
+        identity.node.as_str(),
+        identity.url.as_str(),
+        identity.pubkey.as_str(),
+    ]
+    .join("\n")
 }
 
 struct SignedInput {

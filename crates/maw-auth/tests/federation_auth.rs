@@ -214,3 +214,64 @@ fn verify_request_accepts_legacy_from_signing_and_identifies_refusals() {
         from: FROM.to_owned(),
     }));
 }
+
+// Ported from maw-js `test/scout-pair-proof.test.ts` and
+// `src/transports/scout-pair-proof.ts`.
+#[test]
+fn auto_pair_proofs_sign_stable_canonical_identity_fields() {
+    use maw_auth::{sign_auto_pair_proof, AutoPairIdentity};
+
+    let identity = AutoPairIdentity {
+        node: "m5".to_owned(),
+        oracle: "mawjs".to_owned(),
+        url: "http://m5.local:3456".to_owned(),
+        pubkey: "pub-abc".to_owned(),
+    };
+
+    let proof = sign_auto_pair_proof(&identity, "token-a");
+    assert_eq!(proof.len(), 64);
+    assert!(proof.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_eq!(sign_auto_pair_proof(&identity.clone(), "token-a"), proof);
+    assert_ne!(
+        sign_auto_pair_proof(
+            &AutoPairIdentity {
+                node: "other".to_owned(),
+                ..identity
+            },
+            "token-a",
+        ),
+        proof
+    );
+}
+
+// Ported from maw-js `test/scout-pair-proof.test.ts` and
+// `src/transports/scout-pair-proof.ts`.
+#[test]
+fn auto_pair_proofs_verify_valid_proofs_and_reject_wrong_inputs() {
+    use maw_auth::{sign_auto_pair_proof, verify_auto_pair_proof, AutoPairIdentity};
+
+    let identity = AutoPairIdentity {
+        node: "m5".to_owned(),
+        oracle: "mawjs".to_owned(),
+        url: "http://m5.local:3456".to_owned(),
+        pubkey: "pub-abc".to_owned(),
+    };
+    let proof = sign_auto_pair_proof(&identity, "token-a");
+
+    assert!(verify_auto_pair_proof(&identity, "token-a", &proof));
+    assert!(!verify_auto_pair_proof(&identity, "token-b", &proof));
+    assert!(!verify_auto_pair_proof(
+        &AutoPairIdentity {
+            pubkey: "pub-other".to_owned(),
+            ..identity.clone()
+        },
+        "token-a",
+        &proof,
+    ));
+    assert!(!verify_auto_pair_proof(&identity, "token-a", &proof[2..]));
+    assert!(!verify_auto_pair_proof(
+        &identity,
+        "token-a",
+        &"z".repeat(64)
+    ));
+}
