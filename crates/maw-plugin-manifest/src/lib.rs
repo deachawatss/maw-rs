@@ -4,9 +4,13 @@
 //! `test/plugin-manifest-validate-edges.test.ts`.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginCli {
@@ -864,6 +868,7 @@ pub struct LoadedPlugin {
     pub wasm_path: PathBuf,
     pub entry_path: Option<PathBuf>,
     pub kind: LoadedPluginKind,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,6 +876,39 @@ pub enum LoadedPluginKind {
     Ts,
     Wasm,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginNameAndTier {
+    pub name: String,
+    pub tier: PluginTier,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoverPackagesOptions {
+    pub scan_dirs: Vec<PathBuf>,
+    pub disabled_plugins: Vec<String>,
+    pub runtime_version: String,
+    pub use_cache: bool,
+}
+
+impl Default for DiscoverPackagesOptions {
+    fn default() -> Self {
+        Self {
+            scan_dirs: scan_dirs(),
+            disabled_plugins: Vec::new(),
+            runtime_version: runtime_sdk_version(),
+            use_cache: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverPackagesReport {
+    pub plugins: Vec<LoadedPlugin>,
+    pub warnings: Vec<String>,
+}
+
+static DISCOVER_CACHE: OnceLock<Mutex<Option<Vec<LoadedPlugin>>>> = OnceLock::new();
 
 /// Parse and validate a `plugin.json` text.
 ///
@@ -969,9 +1007,196 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String
         } else {
             LoadedPluginKind::Wasm
         },
+        disabled: false,
         dir: dir.to_path_buf(),
         manifest,
     }))
+}
+
+/// Scan plugin roots and return packages that pass maw-js Phase A registry gates.
+///
+/// # Errors
+///
+/// This function does not expose filesystem errors; unreadable roots, malformed manifests,
+/// and refused plugins are skipped like maw-js `discoverPackages`.
+#[must_use]
+pub fn discover_packages(options: &DiscoverPackagesOptions) -> DiscoverPackagesReport {
+    discover_packages_with_profile(options, |_| None)
+}
+
+/// Scan plugin roots with an injected active-profile resolver.
+///
+/// # Errors
+///
+/// This function does not expose filesystem errors; unreadable roots, malformed manifests,
+/// and refused plugins are skipped like maw-js `discoverPackages`.
+#[must_use]
+pub fn discover_packages_with_profile<F>(
+    options: &DiscoverPackagesOptions,
+    resolve_active_profile_filter: F,
+) -> DiscoverPackagesReport
+where
+    F: FnOnce(&[PluginNameAndTier]) -> Option<BTreeSet<String>>,
+{
+    if options.use_cache {
+        if let Some(cached) = cached_discover_plugins() {
+            return DiscoverPackagesReport {
+                plugins: cached,
+                warnings: Vec::new(),
+            };
+        }
+    }
+
+    let mut plugins = Vec::new();
+    let mut warnings = Vec::new();
+    let mut legacy_count = 0usize;
+
+    for base_dir in &options.scan_dirs {
+        let Ok(entries) = std::fs::read_dir(base_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() && !file_type.is_symlink() {
+                continue;
+            }
+            match discover_plugin_dir(&entry.path(), options) {
+                PluginDiscovery::Loaded(loaded) => plugins.push(loaded),
+                PluginDiscovery::Legacy(loaded) => {
+                    legacy_count += 1;
+                    plugins.push(loaded);
+                }
+                PluginDiscovery::Warning(warning) => warnings.push(warning),
+                PluginDiscovery::Skip => {}
+            }
+        }
+    }
+
+    apply_weight_overrides(options.scan_dirs.first(), &mut plugins);
+    plugins.sort_by_key(|plugin| plugin.manifest.weight.unwrap_or(50));
+
+    let filter = resolve_active_profile_filter(
+        &plugins
+            .iter()
+            .map(|plugin| PluginNameAndTier {
+                name: plugin.manifest.name.clone(),
+                tier: plugin.manifest.tier.unwrap_or(PluginTier::Core),
+            })
+            .collect::<Vec<_>>(),
+    );
+    if let Some(filter) = filter {
+        plugins.retain(|plugin| filter.contains(&plugin.manifest.name));
+    }
+
+    if legacy_count > 0 {
+        warnings.push(format!(
+            "{legacy_count} legacy plugin{} loaded without artifact hash — build them to enforce integrity.",
+            if legacy_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    if options.use_cache {
+        cache_discover_plugins(plugins.clone());
+    }
+
+    DiscoverPackagesReport { plugins, warnings }
+}
+
+/// Clear registry discovery cache.
+pub fn reset_discover_cache() {
+    if let Ok(mut cache) = discover_cache().lock() {
+        *cache = None;
+    }
+}
+
+/// Default plugin scan roots.
+#[must_use]
+pub fn scan_dirs() -> Vec<PathBuf> {
+    std::env::var_os("MAW_PLUGINS_DIR").map_or_else(
+        || {
+            let home = std::env::var_os("MAW_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".maw")))
+                .unwrap_or_else(|| PathBuf::from(".maw"));
+            vec![home.join("plugins")]
+        },
+        |path| vec![PathBuf::from(path)],
+    )
+}
+
+/// Runtime SDK version placeholder for registry gates.
+#[must_use]
+pub fn runtime_sdk_version() -> String {
+    env!("CARGO_PKG_VERSION").to_owned()
+}
+
+/// Compute a `sha256:<hex>` digest for a file.
+///
+/// # Errors
+///
+/// Returns the filesystem read error text if the file cannot be read.
+pub fn hash_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    let digest = Sha256::digest(bytes);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok(format!("sha256:{hex}"))
+}
+
+/// True when the top-level plugin install path is a symlink/dev install.
+#[must_use]
+pub fn is_dev_mode_install(plugin_dir: &Path) -> bool {
+    std::fs::symlink_metadata(plugin_dir).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Minimal maw-js-compatible semver range satisfaction.
+#[must_use]
+pub fn satisfies(version: &str, range: &str) -> bool {
+    let Some(version) = parse_semver_core(version) else {
+        return false;
+    };
+    let range = range.trim();
+    if range == "*" {
+        return true;
+    }
+
+    let (op, rest) = semver_operator(range);
+    let Some(target) = parse_semver_core(rest) else {
+        return false;
+    };
+
+    match op {
+        Some("^") => caret_satisfies(version, target),
+        Some("~") => {
+            compare_semver(version, target).is_ge()
+                && version.0 == target.0
+                && version.1 == target.1
+        }
+        Some(">=") => compare_semver(version, target).is_ge(),
+        Some("<=") => compare_semver(version, target).is_le(),
+        Some(">") => compare_semver(version, target).is_gt(),
+        Some("<") => compare_semver(version, target).is_lt(),
+        _ => compare_semver(version, target).is_eq(),
+    }
+}
+
+/// Format maw-js SDK mismatch warning text.
+#[must_use]
+pub fn format_sdk_mismatch_error(name: &str, manifest_sdk: &str, runtime_version: &str) -> String {
+    [
+        format!("✗ plugin '{name}' requires maw SDK {manifest_sdk}"),
+        format!("  your maw: {runtime_version}  (SDK {runtime_version})"),
+        String::new(),
+        "  fix:".to_owned(),
+        "    • maw update                                    (upgrade maw)".to_owned(),
+        format!("    • maw plugin install {name}@<old-version>      (older compat release)"),
+        "    • (manual) edit plugin.json \"sdk\" to accept this version and rebuild".to_owned(),
+    ]
+    .join("\n")
 }
 
 fn resolve_dir_path(dir: &Path, path: &str) -> PathBuf {
@@ -981,6 +1206,153 @@ fn resolve_dir_path(dir: &Path, path: &str) -> PathBuf {
         std::env::current_dir().map_or_else(|_| PathBuf::from(".").join(dir), |cwd| cwd.join(dir))
     };
     base.join(path)
+}
+
+fn discover_cache() -> &'static Mutex<Option<Vec<LoadedPlugin>>> {
+    DISCOVER_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
+    discover_cache().lock().ok().and_then(|cache| cache.clone())
+}
+
+fn cache_discover_plugins(plugins: Vec<LoadedPlugin>) {
+    if let Ok(mut cache) = discover_cache().lock() {
+        *cache = Some(plugins);
+    }
+}
+
+enum PluginDiscovery {
+    Loaded(LoadedPlugin),
+    Legacy(LoadedPlugin),
+    Warning(String),
+    Skip,
+}
+
+fn discover_plugin_dir(pkg_dir: &Path, options: &DiscoverPackagesOptions) -> PluginDiscovery {
+    let Some(mut loaded) = load_manifest_from_dir(pkg_dir).ok().flatten() else {
+        return PluginDiscovery::Skip;
+    };
+    let manifest = &loaded.manifest;
+
+    if !satisfies(&options.runtime_version, &manifest.sdk) {
+        return PluginDiscovery::Warning(format_sdk_mismatch_error(
+            &manifest.name,
+            &manifest.sdk,
+            &options.runtime_version,
+        ));
+    }
+
+    if let Some(warning) = artifact_refusal_warning(pkg_dir, manifest) {
+        return PluginDiscovery::Warning(warning);
+    }
+
+    if options
+        .disabled_plugins
+        .iter()
+        .any(|disabled| disabled == &loaded.manifest.name)
+    {
+        loaded.disabled = true;
+    }
+
+    let has_artifact = loaded.manifest.artifact.is_some();
+    if has_artifact {
+        PluginDiscovery::Loaded(loaded)
+    } else {
+        PluginDiscovery::Legacy(loaded)
+    }
+}
+
+fn artifact_refusal_warning(pkg_dir: &Path, manifest: &PluginManifest) -> Option<String> {
+    let artifact = manifest.artifact.as_ref()?;
+    if is_dev_mode_install(pkg_dir) {
+        return None;
+    }
+    let Some(expected_sha) = &artifact.sha256 else {
+        return Some(format!(
+            "plugin '{}' is unbuilt — run `maw plugin build` in {}",
+            manifest.name,
+            pkg_dir.display()
+        ));
+    };
+    let artifact_path = pkg_dir.join(&artifact.path);
+    if !artifact_path.exists() {
+        return Some(format!(
+            "plugin '{}' artifact missing: {}",
+            manifest.name, artifact.path
+        ));
+    }
+    match hash_file(&artifact_path) {
+        Ok(observed) if observed == *expected_sha => None,
+        Ok(observed) => Some(format!(
+            "plugin '{}' artifact hash mismatch — refusing to load.\n  expected: {}\n  actual:   {}",
+            manifest.name, expected_sha, observed
+        )),
+        Err(error) => Some(format!(
+            "plugin '{}' artifact hash failed: {error}",
+            manifest.name
+        )),
+    }
+}
+
+fn apply_weight_overrides(primary_plugin_dir: Option<&PathBuf>, plugins: &mut [LoadedPlugin]) {
+    let Some(primary_plugin_dir) = primary_plugin_dir else {
+        return;
+    };
+    let overrides_path = primary_plugin_dir.join(".overrides.json");
+    let Ok(raw) = std::fs::read_to_string(overrides_path) else {
+        return;
+    };
+    let Ok(overrides) = serde_json::from_str::<BTreeMap<String, u64>>(&raw) else {
+        return;
+    };
+    for plugin in plugins {
+        if let Some(weight) = overrides.get(&plugin.manifest.name) {
+            plugin.manifest.weight = Some(*weight);
+        }
+    }
+}
+
+fn parse_semver_core(value: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = value.trim();
+    let without_build = trimmed.split_once('+').map_or(trimmed, |(core, _)| core);
+    let core = without_build
+        .split_once('-')
+        .map_or(without_build, |(core, _)| core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn semver_operator(range: &str) -> (Option<&'static str>, &str) {
+    for op in [">=", "<=", "^", "~", ">", "<"] {
+        if let Some(rest) = range.strip_prefix(op) {
+            return (Some(op), rest);
+        }
+    }
+    (None, range)
+}
+
+fn compare_semver(left: (u64, u64, u64), right: (u64, u64, u64)) -> std::cmp::Ordering {
+    left.cmp(&right)
+}
+
+fn caret_satisfies(version: (u64, u64, u64), target: (u64, u64, u64)) -> bool {
+    if compare_semver(version, target).is_lt() {
+        return false;
+    }
+    if target.0 > 0 {
+        return version.0 == target.0;
+    }
+    if target.1 > 0 {
+        return version.0 == 0 && version.1 == target.1;
+    }
+    version.0 == 0 && version.1 == 0 && version.2 == target.2
 }
 
 fn parse_manifest_object(raw: &Value) -> Result<&Map<String, Value>, String> {
