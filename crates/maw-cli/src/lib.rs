@@ -4387,6 +4387,7 @@ fn run_peer_probe_plan(argv: &[String]) -> CliOutput {
         "constants" => run_peer_probe_constants_plan(&argv[1..]),
         "format" => run_peer_probe_format_plan(&argv[1..]),
         "handshake" => run_peer_probe_handshake_plan(&argv[1..]),
+        "handshake-constants" => run_peer_probe_handshake_constants_plan(&argv[1..]),
         _ => peer_probe_usage_error("peer-probe: invalid action"),
     }
 }
@@ -4610,6 +4611,30 @@ fn run_peer_probe_handshake_plan(argv: &[String]) -> CliOutput {
     }
 }
 
+fn run_peer_probe_handshake_constants_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    for arg in argv {
+        match arg.as_str() {
+            "--plan-json" => plan_json = true,
+            other => {
+                return peer_probe_handshake_constants_usage_error(&format!(
+                    "peer-probe handshake-constants: unknown argument {other}"
+                ));
+            }
+        }
+    }
+
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_peer_probe_handshake_constants_json()
+        } else {
+            "peer-probe handshake validShapes=legacy-true,schema-object-non-empty invalidShapes=empty-object,other-truthy,missing,schema-object-empty\n".to_owned()
+        },
+        stderr: String::new(),
+    }
+}
+
 fn parse_probe_error_code(value: &str) -> Option<ProbeErrorCode> {
     match value {
         "DNS" => Some(ProbeErrorCode::Dns),
@@ -4628,6 +4653,10 @@ fn render_peer_probe_constants_json() -> String {
     "{\"command\":\"peer-probe\",\"action\":\"constants\",\"codes\":[\"DNS\",\"REFUSED\",\"TIMEOUT\",\"HTTP_4XX\",\"HTTP_5XX\",\"TLS\",\"BAD_BODY\",\"UNKNOWN\"],\"exitCodes\":{\"DNS\":3,\"REFUSED\":4,\"TIMEOUT\":5,\"HTTP_4XX\":6,\"HTTP_5XX\":6,\"TLS\":2,\"BAD_BODY\":2,\"UNKNOWN\":2}}\n".to_owned()
 }
 
+fn render_peer_probe_handshake_constants_json() -> String {
+    "{\"command\":\"peer-probe\",\"action\":\"handshake-constants\",\"validShapes\":[\"legacy-true\",\"schema-object-non-empty\"],\"invalidShapes\":[\"empty-object\",\"other-truthy\",\"missing\",\"schema-object-empty\"]}\n".to_owned()
+}
+
 fn peer_probe_usage_error(message: &str) -> CliOutput {
     CliOutput {
         code: 2,
@@ -4637,7 +4666,7 @@ fn peer_probe_usage_error(message: &str) -> CliOutput {
 }
 
 fn peer_probe_usage() -> &'static str {
-    "usage: maw-rs peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]\n       maw-rs peer-probe constants [--plan-json]\n       maw-rs peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]\n       maw-rs peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]"
+    "usage: maw-rs peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]\n       maw-rs peer-probe constants [--plan-json]\n       maw-rs peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]\n       maw-rs peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]\n       maw-rs peer-probe handshake-constants [--plan-json]"
 }
 
 fn peer_probe_constants_usage_error(message: &str) -> CliOutput {
@@ -4650,6 +4679,18 @@ fn peer_probe_constants_usage_error(message: &str) -> CliOutput {
 
 fn peer_probe_constants_usage() -> &'static str {
     "usage: maw-rs peer-probe constants [--plan-json]"
+}
+
+fn peer_probe_handshake_constants_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", peer_probe_handshake_constants_usage()),
+    }
+}
+
+fn peer_probe_handshake_constants_usage() -> &'static str {
+    "usage: maw-rs peer-probe handshake-constants [--plan-json]"
 }
 
 fn run_peer_sources_plan(argv: &[String]) -> CliOutput {
