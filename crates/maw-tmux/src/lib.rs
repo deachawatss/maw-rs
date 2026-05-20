@@ -5,7 +5,7 @@
 //! Real process execution is intentionally injected through [`TmuxRunner`].
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     error::Error,
     ffi::OsString,
     fmt,
@@ -97,6 +97,21 @@ pub struct SendTextReport {
     pub used_buffer: bool,
     pub enter_attempts: u32,
     pub warned_pending: bool,
+}
+
+/// Options for lock-protected `split-window` construction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SplitWindowLockedOptions {
+    pub vertical: Option<bool>,
+    pub pct: Option<u32>,
+    pub shell_command: Option<String>,
+}
+
+/// Pane tags: title plus tmux `@custom` options.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneTags {
+    pub title: String,
+    pub meta: BTreeMap<String, String>,
 }
 
 /// Error returned by an injected tmux runner.
@@ -580,6 +595,33 @@ where
         self.runner.run("split-window", &args)
     }
 
+    /// Build and run the tmux args used by maw-js `splitWindowLocked`.
+    ///
+    /// This method does not sleep; callers that need cross-call settling own scheduling/locking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux rejects the split.
+    pub fn split_window_locked(
+        &mut self,
+        target: &str,
+        options: &SplitWindowLockedOptions,
+    ) -> Result<(), TmuxError> {
+        let mut args = vec!["-t".to_owned(), target.to_owned()];
+        match options.vertical {
+            Some(true) => args.push("-v".to_owned()),
+            Some(false) => args.push("-h".to_owned()),
+            None => {}
+        }
+        if let Some(pct) = options.pct {
+            args.extend(["-l".to_owned(), format!("{pct}%")]);
+        }
+        if let Some(shell_command) = &options.shell_command {
+            args.push(shell_command.clone());
+        }
+        self.runner.run("split-window", &args).map(|_| ())
+    }
+
     /// Select a pane, optionally setting its title.
     ///
     /// # Errors
@@ -595,6 +637,73 @@ where
             args.extend(["-T".to_owned(), title.clone()]);
         }
         self.runner.run("select-pane", &args).map(|_| ())
+    }
+
+    /// Set pane title and/or tmux `@custom` metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first runner error from title or metadata writes.
+    pub fn tag_pane(
+        &mut self,
+        target: &str,
+        title: Option<&str>,
+        meta: &[(String, String)],
+    ) -> Result<(), TmuxError> {
+        if let Some(title) = title {
+            self.runner.run(
+                "select-pane",
+                &[
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "-T".to_owned(),
+                    title.to_owned(),
+                ],
+            )?;
+        }
+        for (raw_key, value) in meta {
+            let key = normalize_pane_tag_key(raw_key);
+            self.runner.run(
+                "set-option",
+                &[
+                    "-p".to_owned(),
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    key,
+                    value.clone(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Read pane title and tmux `@custom` metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when the title probe fails. Metadata probe is best-effort.
+    pub fn read_pane_tags(&mut self, target: &str) -> Result<PaneTags, TmuxError> {
+        let title = self
+            .runner
+            .run(
+                "display-message",
+                &[
+                    "-p".to_owned(),
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "#{pane_title}".to_owned(),
+                ],
+            )?
+            .trim()
+            .to_owned();
+        let raw = self.try_run(
+            "show-options",
+            &["-p".to_owned(), "-t".to_owned(), target.to_owned()],
+        );
+        Ok(PaneTags {
+            title,
+            meta: parse_pane_tag_options(&raw),
+        })
     }
 
     /// Select a tmux layout.
@@ -910,6 +1019,59 @@ fn prompt_has_input(line: &str) -> bool {
         }
     }
     false
+}
+
+/// Normalize pane metadata keys to tmux `@custom` option names.
+#[must_use]
+pub fn normalize_pane_tag_key(raw_key: &str) -> String {
+    if raw_key.starts_with('@') {
+        raw_key.to_owned()
+    } else {
+        format!("@{raw_key}")
+    }
+}
+
+/// Parse `show-options -p -t <pane>` output for tmux `@custom` metadata.
+#[must_use]
+pub fn parse_pane_tag_options(raw: &str) -> BTreeMap<String, String> {
+    let mut meta = BTreeMap::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Some((key, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !key.starts_with('@') {
+            continue;
+        }
+        let value = parse_tmux_option_value(rest.trim());
+        meta.insert(key.to_owned(), value);
+    }
+    meta
+}
+
+fn parse_tmux_option_value(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        return unescape_tmux_quoted_value(&value[1..value.len() - 1]);
+    }
+    value.to_owned()
+}
+
+fn unescape_tmux_quoted_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escaped {
+        out.push('\\');
+    }
+    out
 }
 
 /// Shell-quote one tmux command argument using the same safe-character policy as maw-js.
@@ -1310,6 +1472,123 @@ mod tests {
             client.runner.calls[5].1,
             vec!["-t", "%10", "-l", "hello | world"]
         );
+    }
+
+    #[test]
+    fn split_window_locked_builds_maw_js_args() {
+        let runner = FakeRunner::with_responses(vec![Ok(""), Ok(""), Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        client
+            .split_window_locked("main:0", &SplitWindowLockedOptions::default())
+            .expect("default split ok");
+        client
+            .split_window_locked(
+                "main:1",
+                &SplitWindowLockedOptions {
+                    vertical: Some(true),
+                    pct: Some(33),
+                    shell_command: Some("zsh".to_owned()),
+                },
+            )
+            .expect("vertical split ok");
+        client
+            .split_window_locked(
+                "main:2",
+                &SplitWindowLockedOptions {
+                    vertical: Some(false),
+                    pct: Some(20),
+                    shell_command: None,
+                },
+            )
+            .expect("horizontal split ok");
+
+        assert_eq!(
+            client.runner.calls,
+            vec![
+                (
+                    "split-window".to_owned(),
+                    vec!["-t", "main:0"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    "split-window".to_owned(),
+                    vec!["-t", "main:1", "-v", "-l", "33%", "zsh"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    "split-window".to_owned(),
+                    vec!["-t", "main:2", "-h", "-l", "20%"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_pane_sets_title_and_meta_with_auto_at_prefix() {
+        let runner = FakeRunner::with_responses(vec![Ok(""), Ok(""), Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        let meta = vec![
+            ("agent-name".to_owned(), "scout".to_owned()),
+            ("@role".to_owned(), "teammate".to_owned()),
+        ];
+        client
+            .tag_pane("s:0.1", Some("oracle main"), &meta)
+            .expect("tag pane ok");
+
+        assert_eq!(
+            client.runner.calls,
+            vec![
+                (
+                    "select-pane".to_owned(),
+                    vec!["-t", "s:0.1", "-T", "oracle main"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    "set-option".to_owned(),
+                    vec!["-p", "-t", "s:0.1", "@agent-name", "scout"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+                (
+                    "set-option".to_owned(),
+                    vec!["-p", "-t", "s:0.1", "@role", "teammate"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_pane_tags_parses_quoted_meta_options() {
+        let runner = FakeRunner::with_responses(vec![
+            Ok("oracle\n"),
+            Ok("@agent-name \"scout\"\n@role teammate\n@quote \"say \\\"hi\\\"\"\nwindow-style default\n"),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        let tags = client.read_pane_tags("s:0.1").expect("read tags ok");
+        assert_eq!(tags.title, "oracle");
+        assert_eq!(
+            tags.meta,
+            BTreeMap::from([
+                ("@agent-name".to_owned(), "scout".to_owned()),
+                ("@quote".to_owned(), "say \"hi\"".to_owned()),
+                ("@role".to_owned(), "teammate".to_owned()),
+            ])
+        );
+        assert_eq!(client.runner.calls[0].0, "display-message");
+        assert_eq!(client.runner.calls[1].0, "show-options");
     }
 
     #[test]
