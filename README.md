@@ -19,6 +19,11 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-worktree` | `src/core/fleet/worktree-window-match.ts` | `worktree-window-match.fixtures.json` |
 | `maw-transport` | `src/core/transport/transport.ts` | `transport-router.fixtures.json` |
 | `maw-routing` | `src/core/routing.ts` | `routing.fixtures.json` |
+| `maw-identity` | `src/core/fleet/session-name.ts`, `src/core/fleet/node-identity.ts` | `canonical-session-name.fixtures.json`, `canonical-node-identity.fixtures.json` |
+| `maw-bring` | `src/commands/shared/bring-flags.ts` | `bring-to-flag.fixtures.json`, `bring-to-target.fixtures.json`, `bring-self-guard.fixtures.json` |
+| `maw-split` | `src/vendor/mpr-plugins/split/impl.ts`, `src/commands/plugins/tmux/safety.ts` | `split-policy.fixtures.json` |
+| `maw-peer` | `src/commands/shared/peer-sources.ts` | `peer-source-resolver.fixtures.json` |
+| `maw-tmux` | `src/core/transport/tmux-class.ts`, `src/commands/shared/discover-live-state.ts` | tmux parser unit tests, `discover-tmux-live-state.fixtures.json` |
 
 Current local gates:
 
