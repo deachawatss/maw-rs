@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 maw-bring = { path = "../maw-bring" }
+maw-bind = { path = "../maw-bind" }
 maw-calver = { path = "../maw-calver" }
 maw-feed = { path = "../maw-feed" }
 maw-fuzzy = { path = "../maw-fuzzy" }

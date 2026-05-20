@@ -3,6 +3,7 @@
 //! This crate intentionally starts with plan-only output so command parity can
 //! be tested against maw-js parser contracts before host IO is wired.
 
+use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
@@ -47,6 +48,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     };
     match command {
         "--help" | "-h" | "help" => usage_ok(),
+        "bind-host" => run_bind_host_plan(&argv[1..]),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "feed" => run_feed_plan(&argv[1..]),
         "fuzzy" => run_fuzzy_plan(&argv[1..]),
@@ -65,6 +67,123 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
+    }
+}
+
+fn run_bind_host_plan(argv: &[String]) -> CliOutput {
+    let parsed = match parse_bind_host_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return bind_host_usage_error(&message),
+    };
+    let result = resolve_bind_host(
+        &parsed.config,
+        parsed.maw_host.as_deref(),
+        parsed.peers_store_len,
+    );
+    CliOutput {
+        code: 0,
+        stdout: if parsed.plan_json {
+            render_bind_host_plan_json(&parsed.config, parsed.maw_host.as_deref(), &result)
+        } else {
+            format!("{}\n", result.hostname)
+        },
+        stderr: String::new(),
+    }
+}
+
+struct BindHostArgs {
+    plan_json: bool,
+    config: BindConfig,
+    maw_host: Option<String>,
+    peers_store_len: Result<usize, String>,
+}
+
+fn parse_bind_host_args(argv: &[String]) -> Result<BindHostArgs, String> {
+    let mut options = BindHostArgs {
+        plan_json: false,
+        config: BindConfig::default(),
+        maw_host: None,
+        peers_store_len: Ok(0),
+    };
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => options.plan_json = true,
+            "--config-peers-len" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("bind-host: missing --config-peers-len value".to_owned());
+                };
+                options.config.peers_len = parse_usize_arg(value, "bind-host: --config-peers-len")?;
+                index += 1;
+            }
+            "--config-named-peers-len" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("bind-host: missing --config-named-peers-len value".to_owned());
+                };
+                options.config.named_peers_len =
+                    parse_usize_arg(value, "bind-host: --config-named-peers-len")?;
+                index += 1;
+            }
+            "--maw-host" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("bind-host: missing --maw-host value".to_owned());
+                };
+                options.maw_host = Some(value.to_owned());
+                index += 1;
+            }
+            "--peers-store-len" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("bind-host: missing --peers-store-len value".to_owned());
+                };
+                options.peers_store_len =
+                    Ok(parse_usize_arg(value, "bind-host: --peers-store-len")?);
+                index += 1;
+            }
+            "--peers-store-error" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("bind-host: missing --peers-store-error value".to_owned());
+                };
+                options.peers_store_len = Err(value.to_owned());
+                index += 1;
+            }
+            arg => return Err(format!("bind-host: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+
+    Ok(options)
+}
+
+fn render_bind_host_plan_json(
+    config: &BindConfig,
+    maw_host: Option<&str>,
+    result: &BindHostResult,
+) -> String {
+    let mut input_fields = vec![
+        format!("\"configPeersLen\":{}", config.peers_len),
+        format!("\"configNamedPeersLen\":{}", config.named_peers_len),
+    ];
+    if let Some(maw_host) = maw_host {
+        input_fields.push(format!("\"mawHost\":{}", json_string(maw_host)));
+    }
+    let reason = result
+        .reason
+        .map_or("null".to_owned(), |reason| json_string(reason.as_str()));
+    format!(
+        "{{\"command\":\"bind-host\",\"input\":{{{}}},\"hostname\":{},\"reason\":{reason}}}\n",
+        input_fields.join(","),
+        json_string(&result.hostname)
+    )
+}
+
+fn bind_host_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n"
+        ),
     }
 }
 
@@ -2057,7 +2176,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
