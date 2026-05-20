@@ -48,7 +48,9 @@ use maw_tmux::{
     TmuxLiveStateResult, TmuxPane,
 };
 use maw_transport::{
-    classify_error, Transport, TransportFailureReason, TransportResult, TransportRouter,
+    classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
+    FederationStatus, PairStatus, PeerFederationStatus, PeerFederationStatusResult,
+    SymmetricFederationStatus, Transport, TransportFailureReason, TransportResult, TransportRouter,
     TransportTarget,
 };
 use maw_worktree::{
@@ -104,6 +106,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
         "discover" => run_discover_plan(&argv[1..]),
+        "federation-health" => run_federation_health_plan(&argv[1..]),
         "federation-sync" => run_federation_sync_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
         "peer-probe" => run_peer_probe_plan(&argv[1..]),
@@ -3816,6 +3819,221 @@ fn federation_sync_usage() -> &'static str {
 }
 
 #[allow(clippy::too_many_lines)]
+fn run_federation_health_plan(argv: &[String]) -> CliOutput {
+    let mut plan_json = false;
+    let mut local_url = "http://localhost:3456".to_owned();
+    let mut node = "local".to_owned();
+    let mut peers = Vec::<FederationPeerStatus>::new();
+    let mut remote_statuses = Vec::<(String, PeerFederationStatusResult)>::new();
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_health_usage_error(
+                        "federation-health: missing --node value",
+                    );
+                };
+                value.clone_into(&mut node);
+                index += 1;
+            }
+            "--local-url" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_health_usage_error(
+                        "federation-health: missing --local-url value",
+                    );
+                };
+                value.clone_into(&mut local_url);
+                index += 1;
+            }
+            "--peer" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_health_usage_error(
+                        "federation-health: missing --peer value",
+                    );
+                };
+                match parse_federation_health_peer(value) {
+                    Ok(peer) => peers.push(peer),
+                    Err(message) => return federation_health_usage_error(&message),
+                }
+                index += 1;
+            }
+            "--remote" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return federation_health_usage_error(
+                        "federation-health: missing --remote value",
+                    );
+                };
+                match parse_federation_health_remote(value) {
+                    Ok(remote) => remote_statuses.push(remote),
+                    Err(message) => return federation_health_usage_error(&message),
+                }
+                index += 1;
+            }
+            arg => {
+                return federation_health_usage_error(&format!(
+                    "federation-health: unknown argument {arg}"
+                ))
+            }
+        }
+        index += 1;
+    }
+
+    let base = FederationStatus { local_url, peers };
+    let status = classify_symmetric_federation_status(&base, &remote_statuses, &node);
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_federation_health_plan_json(&status)
+        } else {
+            render_federation_health_plan_text(&status)
+        },
+        stderr: String::new(),
+    }
+}
+
+fn parse_federation_health_peer(value: &str) -> Result<FederationPeerStatus, String> {
+    let parts: Vec<&str> = value.split('|').collect();
+    if parts.len() != 6 {
+        return Err("federation-health: --peer must use <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>".to_owned());
+    }
+    Ok(FederationPeerStatus {
+        url: parts[0].to_owned(),
+        node: optional_dash(parts[1]),
+        reachable: parse_reachable(parts[2], "federation-health: --peer")?,
+        latency: parse_optional_u64(parts[3], "federation-health: --peer latency must be u64")?,
+        agents: parse_csv(parts[4]),
+        clock_warning: match parts[5] {
+            "ok" => false,
+            "clock" => true,
+            _ => return Err("federation-health: --peer clock flag must be ok or clock".to_owned()),
+        },
+    })
+}
+
+fn parse_federation_health_remote(
+    value: &str,
+) -> Result<(String, PeerFederationStatusResult), String> {
+    let parts: Vec<&str> = value.split('|').collect();
+    let Some(url) = parts.first() else {
+        return Err("federation-health: --remote must use <url|kind|...>".to_owned());
+    };
+    let Some(kind) = parts.get(1) else {
+        return Err("federation-health: --remote must use <url|kind|...>".to_owned());
+    };
+    let status = match *kind {
+        "missing-peers" if parts.len() == 2 => PeerFederationStatusResult::MissingPeers,
+        "http" if parts.len() == 3 => PeerFederationStatusResult::HttpStatus(
+            parts[2]
+                .parse::<u16>()
+                .map_err(|_| "federation-health: --remote http status must be u16".to_owned())?,
+        ),
+        "fetch-error" if parts.len() == 3 => {
+            PeerFederationStatusResult::FetchError(parts[2].to_owned())
+        }
+        "peer" if parts.len() == 5 => PeerFederationStatusResult::Ok(PeerFederationStatus {
+            peers: vec![FederationPeerView {
+                url: optional_dash(parts[2]),
+                node: optional_dash(parts[3]),
+                reachable: Some(parse_reachable(parts[4], "federation-health: --remote peer")?),
+            }],
+        }),
+        _ => {
+            return Err(
+                "federation-health: --remote must use <url|missing-peers>, <url|http|status>, <url|fetch-error|message>, or <url|peer|view-url|view-node|reachable>".to_owned(),
+            )
+        }
+    };
+    Ok(((*url).to_owned(), status))
+}
+
+fn parse_reachable(value: &str, prefix: &str) -> Result<bool, String> {
+    match value {
+        "reachable" => Ok(true),
+        "unreachable" => Ok(false),
+        _ => Err(format!(
+            "{prefix} reachability must be reachable or unreachable"
+        )),
+    }
+}
+
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn optional_dash(value: &str) -> Option<String> {
+    (!value.is_empty() && value != "-").then(|| value.to_owned())
+}
+
+fn render_federation_health_plan_json(status: &SymmetricFederationStatus) -> String {
+    format!(
+        "{{\"command\":\"federation-health\",\"localUrl\":{},\"localNode\":{},\"healthyPairs\":{},\"totalPairs\":{},\"pairs\":{}}}\n",
+        json_string(&status.local_url),
+        json_string(&status.local_node),
+        status.healthy_pairs,
+        status.total_pairs,
+        render_pair_statuses_json(&status.pairs)
+    )
+}
+
+fn render_pair_statuses_json(pairs: &[PairStatus]) -> String {
+    format!(
+        "[{}]",
+        pairs
+            .iter()
+            .map(render_pair_status_json)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn render_pair_status_json(pair: &PairStatus) -> String {
+    let mut fields = vec![
+        format!("\"url\":{}", json_string(&pair.url)),
+        format!("\"pair\":{}", json_string(pair.pair.as_str())),
+        format!("\"forward\":{}", pair.forward),
+        format!("\"agents\":{}", json_string_array(&pair.agents)),
+        format!("\"clockWarning\":{}", pair.clock_warning),
+    ];
+    push_json_opt(&mut fields, "node", pair.node.as_deref());
+    match pair.reverse {
+        Some(reverse) => fields.push(format!("\"reverse\":{reverse}")),
+        None => fields.push("\"reverse\":null".to_owned()),
+    }
+    match pair.latency {
+        Some(latency) => fields.push(format!("\"latency\":{latency}")),
+        None => fields.push("\"latency\":null".to_owned()),
+    }
+    push_json_opt(&mut fields, "reason", pair.reason.as_deref());
+    format!("{{{}}}", fields.join(","))
+}
+
+fn render_federation_health_plan_text(status: &SymmetricFederationStatus) -> String {
+    format!(
+        "federation-health healthyPairs={} totalPairs={}\n",
+        status.healthy_pairs, status.total_pairs
+    )
+}
+
+fn federation_health_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n{}\n", federation_health_usage()),
+    }
+}
+
+fn federation_health_usage() -> &'static str {
+    "usage: maw-rs federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|missing-peers|http|fetch-error|peer...>]... [--plan-json]"
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_discover_plan(argv: &[String]) -> CliOutput {
     let mut plan_json = false;
     let mut json = false;
@@ -5469,7 +5687,7 @@ fn usage_ok() -> CliOutput {
 
 fn usage_text() -> String {
     "usage: maw-rs <command> [args]\ncommands:\n  auto-wake <target> --site <view|hey|api-send|api-wake|peek|bud|wake-cmd> [--fleet-known|--unknown-fleet] [--live|--not-live] [--wake] [--no-wake] [--canonical-target] [--manifest-source <source>]... [--manifest-live <true|false>] [--plan-json]
-  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
+  auth sign-v3 --peer-key <hex> --from <addr> [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--plan-json]\n  auth verify-request [--method <method>] [--path <path>] [--now <ts>] [--body <body>] [--cached-pubkey <hex>] [--header <KEY=VALUE>]... [--plan-json]\n  hub validate-workspace --name <name> --url <url> [--plan-json]\n  hub load-workspaces --dir <dir> [--plan-json]\n  xdg paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg core-paths [--home <dir>] [--env <KEY=VALUE>]... [--plan-json]\n  xdg validate-instance --name <name> [--plan-json]\n  plugin-scaffold validate-name --name <name> [--plan-json]\n  plugin-scaffold manifest --name <name> (--rust|--as) [--plan-json]\n  plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n  plugin-manifest load --dir <dir> [--plan-json]\n  plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n  plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n  bind-host [--config-peers-len <n>] [--config-named-peers-len <n>] [--maw-host <host>] [--peers-store-len <n>|--peers-store-error <err>] [--plan-json]\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  feed parse-line <line> [--plan-json]\n  feed describe <event> [--message <message>] [--plan-json]\n  feed active --now <ms> --window <ms> [--event <oracle:ts:message>]... [--plan-json]\n  fuzzy distance <left> <right> [--plan-json]\n  fuzzy match <input> [--candidate <candidate>]... [--max-results <n>] [--max-distance <n>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  discover [--peers config|scout|both] [--peer <url>] [--named-peer <name=url>] [--discovered <node|host|oracle|locator[,locator]>]... [--pane <id|command|target|title|pid|cwd|last_activity>]... [--json] [--tree] [--awake] [--plan-json]\n  federation-health [--node <name>] [--local-url <url>] [--peer <url|node|-|reachable|unreachable|latency|-|agents|ok|clock>]... [--remote <url|kind|...>]... [--plan-json]\n  federation-sync [--node <name>] [--agent <oracle=node>]... [--identity <peer|url|node|agents|reachable|unreachable[,error]>]... [--dry-run] [--check] [--force] [--prune] [--plan-json]\n  peer-probe classify (--http-status <n>|--code <code>|--cause-code <code>|--name <name>|--non-object) [--plan-json]
   peer-probe format --code <code> --message <msg> --url <url> --alias <alias> [--at <ts>] [--plan-json]
   peer-probe handshake (--legacy-true|--schema <schema>|--empty-object|--other-truthy|--missing) [--plan-json]
   peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
