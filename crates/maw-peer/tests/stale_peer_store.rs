@@ -22,6 +22,8 @@ fn peer(added_at: &str, last_seen: Option<&str>) -> PeerRecord {
         pubkey: None,
         pubkey_first_seen: None,
         identity: None,
+        one_way: None,
+        last_symmetric_check: None,
     }
 }
 
@@ -93,6 +95,8 @@ fn peer_store_path_empty_stale_tmp_save_and_load_round_trip_match_maw_js() {
             pubkey: None,
             pubkey_first_seen: None,
             identity: None,
+            one_way: None,
+            last_symmetric_check: None,
         },
     );
     save_peer_store(&env, &PeerStoreFile { version: 1, peers }).unwrap();
@@ -143,6 +147,8 @@ fn state_path_is_primary_while_legacy_home_peers_are_migrated_on_mutation() {
                 pubkey: None,
                 pubkey_first_seen: None,
                 identity: None,
+                one_way: None,
+                last_symmetric_check: None,
             },
         );
     })
@@ -207,6 +213,8 @@ fn mutate_peer_store_reads_inside_lock_and_tolerates_malformed_existing_contents
                 pubkey: None,
                 pubkey_first_seen: None,
                 identity: None,
+                one_way: None,
+                last_symmetric_check: None,
             },
         );
     })
@@ -234,6 +242,8 @@ fn mutate_peer_store_reads_inside_lock_and_tolerates_malformed_existing_contents
                 pubkey: None,
                 pubkey_first_seen: None,
                 identity: None,
+                one_way: None,
+                last_symmetric_check: None,
             },
         );
     })
@@ -275,6 +285,8 @@ fn read_errors_and_unlocked_parse_errors_recover_as_empty_stores() {
                 pubkey: None,
                 pubkey_first_seen: None,
                 identity: None,
+                one_way: None,
+                last_symmetric_check: None,
             },
         );
     })
@@ -499,6 +511,8 @@ fn store_from<const N: usize>(peers: [(&str, &str, String, Option<String>); N]) 
                     pubkey: None,
                     pubkey_first_seen: None,
                     identity: None,
+                    one_way: None,
+                    last_symmetric_check: None,
                 },
             )
         })

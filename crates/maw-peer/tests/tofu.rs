@@ -21,6 +21,8 @@ fn peer(url: &str) -> PeerRecord {
         pubkey: None,
         pubkey_first_seen: None,
         identity: None,
+        one_way: None,
+        last_symmetric_check: None,
     }
 }
 

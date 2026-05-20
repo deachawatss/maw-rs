@@ -15,6 +15,8 @@ fn peer(url: &str) -> PeerRecord {
         pubkey: None,
         pubkey_first_seen: None,
         identity: None,
+        one_way: None,
+        last_symmetric_check: None,
     }
 }
 
@@ -43,6 +45,13 @@ fn cmd_peer_add_refuses_tofu_mismatch_before_overwriting_existing_peer() {
         alias: "frank".to_owned(),
         url: "http://new-frank".to_owned(),
         node: None,
+        authenticated_pubkey: Some("auth-pubkey".to_owned()),
+        authenticated_identity: Some(PeerIdentity {
+            oracle: "bob-oracle".to_owned(),
+            node: "bob-node".to_owned(),
+        }),
+        mark_symmetric_check: true,
+        one_way: Some(false),
         now: "2026-05-18T12:00:00.000Z".to_owned(),
         peers,
         probe: ok_probe("new-node", Some("observed-key")),
@@ -74,16 +83,20 @@ fn cmd_peer_add_bootstraps_pubkey_identity_probe_error_and_preserves_cached_pin_
         alias: "bob".to_owned(),
         url: "https://bob.example".to_owned(),
         node: Some("operator-node".to_owned()),
+        authenticated_pubkey: Some("auth-pubkey".to_owned()),
+        authenticated_identity: Some(PeerIdentity {
+            oracle: "bob-oracle".to_owned(),
+            node: "bob-node".to_owned(),
+        }),
+        mark_symmetric_check: true,
+        one_way: Some(false),
         now: "2026-05-18T12:00:00.000Z".to_owned(),
         peers: BTreeMap::new(),
         probe: ProbePeerResult {
             node: None,
             nickname: Some("bobby".to_owned()),
-            pubkey: Some("auth-pubkey".to_owned()),
-            identity: Some(PeerIdentity {
-                oracle: "bob-oracle".to_owned(),
-                node: "bob-node".to_owned(),
-            }),
+            pubkey: None,
+            identity: None,
             error: Some(probe_error.clone()),
         },
     })
@@ -99,6 +112,11 @@ fn cmd_peer_add_bootstraps_pubkey_identity_probe_error_and_preserves_cached_pin_
     assert_eq!(result.peer.pubkey.as_deref(), Some("auth-pubkey"));
     assert_eq!(
         result.peer.pubkey_first_seen.as_deref(),
+        Some("2026-05-18T12:00:00.000Z")
+    );
+    assert_eq!(result.peer.one_way, Some(false));
+    assert_eq!(
+        result.peer.last_symmetric_check.as_deref(),
         Some("2026-05-18T12:00:00.000Z")
     );
     assert_eq!(
@@ -119,10 +137,16 @@ fn cmd_peer_add_bootstraps_pubkey_identity_probe_error_and_preserves_cached_pin_
         oracle: "cached-oracle".to_owned(),
         node: "cached-node".to_owned(),
     });
+    cached.one_way = Some(true);
+    cached.last_symmetric_check = Some("previous-check".to_owned());
     let readd = cmd_peer_add_from_plan(&PeerAddPlan {
         alias: "carol".to_owned(),
         url: "http://new-carol".to_owned(),
         node: None,
+        authenticated_pubkey: None,
+        authenticated_identity: None,
+        mark_symmetric_check: false,
+        one_way: None,
         now: "2026-05-18T12:01:00.000Z".to_owned(),
         peers: BTreeMap::from([("carol".to_owned(), cached)]),
         probe: ProbePeerResult {
