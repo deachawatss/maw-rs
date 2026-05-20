@@ -147,6 +147,92 @@ pub struct TmuxTransportSession {
     pub windows: Vec<TmuxTransportWindow>,
 }
 
+/// HTTP federation transport configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpTransportConfig {
+    pub peers: Vec<String>,
+    pub self_host: String,
+}
+
+/// Result of an HTTP feed publish attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpPostResult {
+    pub ok: bool,
+    pub status: u16,
+}
+
+/// Captured warning for failed best-effort HTTP feed publishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpFeedWarning {
+    pub peer: String,
+    pub reason: String,
+}
+
+/// Side-effect seam for HTTP federation transport.
+pub trait HttpTransportIo {
+    /// List local sessions before aggregating remote peer sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific error string when local listing fails.
+    fn list_local_sessions(&mut self) -> Result<Vec<TmuxTransportSession>, String>;
+
+    /// Return local + remote sessions, preserving any source metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific error string when aggregation fails.
+    fn get_all_sessions(
+        &mut self,
+        local_sessions: &[TmuxTransportSession],
+    ) -> Result<Vec<TransportSession>, String>;
+
+    /// Resolve a window in a single remote session.
+    fn find_target_window(&mut self, sessions: &[TransportSession], query: &str) -> Option<String>;
+
+    /// Send keys to a remote peer/source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific error string when peer send fails.
+    fn send_peer_keys(&mut self, source: &str, target: &str, message: &str)
+        -> Result<bool, String>;
+
+    /// POST a feed event to a peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an implementation-specific error string when publishing fails.
+    fn post_peer_feed(
+        &mut self,
+        url: &str,
+        method: &str,
+        body: &str,
+        timeout_ms: u64,
+    ) -> Result<HttpPostResult, String>;
+
+    /// Return configured timeout for a named transport.
+    fn timeout_for(&self, transport: &str) -> u64;
+}
+
+/// Session shape used by HTTP federation, including source peer metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportSession {
+    pub name: String,
+    pub source: Option<String>,
+    pub windows: Vec<TmuxTransportWindow>,
+}
+
+impl From<TmuxTransportSession> for TransportSession {
+    fn from(value: TmuxTransportSession) -> Self {
+        Self {
+            name: value.name,
+            source: None,
+            windows: value.windows,
+        }
+    }
+}
+
 /// Minimal portable transport trait.
 pub trait Transport {
     fn name(&self) -> &str;
@@ -328,6 +414,135 @@ where
     #[must_use]
     pub const fn io(&self) -> &Io {
         &self.io
+    }
+}
+
+/// Portable HTTP federation fallback transport.
+pub struct HttpFederationTransport<Io> {
+    config: HttpTransportConfig,
+    io: Io,
+    connected: bool,
+    message_handlers: usize,
+    presence_handlers: usize,
+    feed_handlers: usize,
+}
+
+impl<Io> HttpFederationTransport<Io> {
+    #[must_use]
+    pub const fn new(config: HttpTransportConfig, io: Io) -> Self {
+        Self {
+            config,
+            io,
+            connected: false,
+            message_handlers: 0,
+            presence_handlers: 0,
+            feed_handlers: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn connected(&self) -> bool {
+        self.connected
+    }
+
+    pub fn connect(&mut self) {
+        self.connected = !self.config.peers.is_empty();
+    }
+
+    pub const fn disconnect(&mut self) {
+        self.connected = false;
+    }
+
+    pub const fn on_message(&mut self) {
+        self.message_handlers += 1;
+    }
+
+    pub const fn on_presence(&mut self) {
+        self.presence_handlers += 1;
+    }
+
+    pub const fn on_feed(&mut self) {
+        self.feed_handlers += 1;
+    }
+
+    #[must_use]
+    pub const fn handler_counts(&self) -> (usize, usize, usize) {
+        (
+            self.message_handlers,
+            self.presence_handlers,
+            self.feed_handlers,
+        )
+    }
+
+    pub const fn publish_presence(&self) {}
+
+    #[must_use]
+    pub const fn io(&self) -> &Io {
+        &self.io
+    }
+}
+
+impl<Io> HttpFederationTransport<Io>
+where
+    Io: HttpTransportIo,
+{
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        "http-federation"
+    }
+
+    #[must_use]
+    pub fn can_reach(&self, target: &TransportTarget) -> bool {
+        !self.config.peers.is_empty() && !is_local_host(target.host.as_deref())
+    }
+
+    /// Send to the first remote sourced session whose window name contains the oracle query.
+    pub fn send(&mut self, target: &TransportTarget, message: &str) -> bool {
+        let Ok(local_sessions) = self.io.list_local_sessions() else {
+            return false;
+        };
+        let Ok(all_sessions) = self.io.get_all_sessions(&local_sessions) else {
+            return false;
+        };
+        let query = target.oracle.to_lowercase();
+        for session in &all_sessions {
+            let Some(source) = &session.source else {
+                continue;
+            };
+            if source == "local" {
+                continue;
+            }
+            let matches = session
+                .windows
+                .iter()
+                .any(|window| window.name.to_lowercase().contains(&query));
+            if !matches {
+                continue;
+            }
+            let single = [session.clone()];
+            let Some(tmux_target) = self.io.find_target_window(&single, &target.oracle) else {
+                continue;
+            };
+            return self
+                .io
+                .send_peer_keys(source, &tmux_target, message)
+                .unwrap_or(false);
+        }
+        false
+    }
+
+    /// Publish a feed event to every configured peer and return warnings for rejected posts.
+    pub fn publish_feed(&mut self, event_json: &str) -> Vec<HttpFeedWarning> {
+        let peers = self.config.peers.clone();
+        let timeout = self.io.timeout_for("http");
+        let mut warnings = Vec::new();
+        for peer in peers {
+            let url = format!("{peer}/api/feed");
+            if let Err(reason) = self.io.post_peer_feed(&url, "POST", event_json, timeout) {
+                warnings.push(HttpFeedWarning { peer, reason });
+            }
+        }
+        warnings
     }
 }
 
@@ -530,5 +745,304 @@ mod tmux_transport_tests {
         assert_eq!(transport.handler_counts(), (1, 1, 1));
         transport.publish_presence();
         transport.publish_feed();
+    }
+}
+
+#[cfg(test)]
+mod http_transport_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeHttpIo {
+        local_sessions: Vec<TmuxTransportSession>,
+        all_sessions: Vec<TransportSession>,
+        sent: Vec<(String, String, String)>,
+        posts: Vec<(String, String, String, u64)>,
+        queries: Vec<String>,
+        find_result: Option<String>,
+        fail_post_url: Option<String>,
+    }
+
+    impl HttpTransportIo for FakeHttpIo {
+        fn list_local_sessions(&mut self) -> Result<Vec<TmuxTransportSession>, String> {
+            Ok(self.local_sessions.clone())
+        }
+
+        fn get_all_sessions(
+            &mut self,
+            local_sessions: &[TmuxTransportSession],
+        ) -> Result<Vec<TransportSession>, String> {
+            assert_eq!(local_sessions, self.local_sessions.as_slice());
+            Ok(self.all_sessions.clone())
+        }
+
+        fn find_target_window(
+            &mut self,
+            sessions: &[TransportSession],
+            query: &str,
+        ) -> Option<String> {
+            assert_eq!(sessions.len(), 1);
+            self.queries.push(query.to_owned());
+            self.find_result.clone()
+        }
+
+        fn send_peer_keys(
+            &mut self,
+            source: &str,
+            target: &str,
+            message: &str,
+        ) -> Result<bool, String> {
+            self.sent
+                .push((source.to_owned(), target.to_owned(), message.to_owned()));
+            Ok(true)
+        }
+
+        fn post_peer_feed(
+            &mut self,
+            url: &str,
+            method: &str,
+            body: &str,
+            timeout_ms: u64,
+        ) -> Result<HttpPostResult, String> {
+            self.posts.push((
+                url.to_owned(),
+                method.to_owned(),
+                body.to_owned(),
+                timeout_ms,
+            ));
+            if self.fail_post_url.as_deref() == Some(url) {
+                Err("boom".to_owned())
+            } else {
+                Ok(HttpPostResult {
+                    ok: true,
+                    status: 200,
+                })
+            }
+        }
+
+        fn timeout_for(&self, transport: &str) -> u64 {
+            assert_eq!(transport, "http");
+            1234
+        }
+    }
+
+    fn window(name: &str) -> TmuxTransportWindow {
+        TmuxTransportWindow {
+            index: 0,
+            name: name.to_owned(),
+            active: true,
+        }
+    }
+
+    fn local_session(name: &str, window_name: &str) -> TmuxTransportSession {
+        TmuxTransportSession {
+            name: name.to_owned(),
+            windows: vec![window(window_name)],
+        }
+    }
+
+    fn sourced_session(name: &str, window_name: &str, source: Option<&str>) -> TransportSession {
+        TransportSession {
+            name: name.to_owned(),
+            source: source.map(str::to_owned),
+            windows: vec![window(window_name)],
+        }
+    }
+
+    #[test]
+    fn http_transport_connects_only_when_peers_are_configured() {
+        let mut offline = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: Vec::new(),
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo::default(),
+        );
+        assert_eq!(offline.name(), "http-federation");
+        assert!(!offline.connected());
+        offline.connect();
+        assert!(!offline.connected());
+
+        let mut online = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: vec!["http://peer".to_owned()],
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo::default(),
+        );
+        online.connect();
+        assert!(online.connected());
+        online.disconnect();
+        assert!(!online.connected());
+    }
+
+    #[test]
+    fn http_transport_can_reach_only_remote_targets_when_peers_exist() {
+        let no_peers = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: Vec::new(),
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo::default(),
+        );
+        assert!(!no_peers.can_reach(&TransportTarget {
+            oracle: "mawjs".to_owned(),
+            host: Some("m5".to_owned()),
+            tmux_target: None,
+        }));
+
+        let transport = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: vec!["http://peer".to_owned()],
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo::default(),
+        );
+        for host in [None, Some("local"), Some("localhost")] {
+            assert!(!transport.can_reach(&TransportTarget {
+                oracle: "mawjs".to_owned(),
+                host: host.map(str::to_owned),
+                tmux_target: None,
+            }));
+        }
+        assert!(transport.can_reach(&TransportTarget {
+            oracle: "mawjs".to_owned(),
+            host: Some("m5".to_owned()),
+            tmux_target: None,
+        }));
+    }
+
+    #[test]
+    fn http_transport_sends_through_peer_that_owns_matching_window() {
+        let local_sessions = vec![local_session("local", "local-oracle")];
+        let all_sessions = vec![
+            sourced_session("local", "local-oracle", Some("local")),
+            sourced_session("remote-a", "other-oracle", Some("http://peer-a")),
+            sourced_session("remote-b", "target-oracle", Some("http://peer-b")),
+        ];
+        let io = FakeHttpIo {
+            local_sessions,
+            all_sessions,
+            find_result: Some("remote-b:0".to_owned()),
+            ..FakeHttpIo::default()
+        };
+        let mut transport = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: vec!["http://peer-a".to_owned(), "http://peer-b".to_owned()],
+                self_host: "local".to_owned(),
+            },
+            io,
+        );
+        assert!(transport.send(
+            &TransportTarget {
+                oracle: "target".to_owned(),
+                host: Some("remote".to_owned()),
+                tmux_target: None,
+            },
+            "hello",
+        ));
+        assert_eq!(transport.io().queries, vec!["target".to_owned()]);
+        assert_eq!(
+            transport.io().sent,
+            vec![(
+                "http://peer-b".to_owned(),
+                "remote-b:0".to_owned(),
+                "hello".to_owned(),
+            ),]
+        );
+    }
+
+    #[test]
+    fn http_transport_returns_false_when_no_remote_session_resolves() {
+        let io = FakeHttpIo {
+            all_sessions: vec![
+                sourced_session("local", "target-oracle", None),
+                sourced_session("remote-a", "other-oracle", Some("http://peer-a")),
+                sourced_session("remote-b", "target-oracle", Some("http://peer-b")),
+            ],
+            find_result: None,
+            ..FakeHttpIo::default()
+        };
+        let mut transport = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: vec!["http://peer".to_owned()],
+                self_host: "local".to_owned(),
+            },
+            io,
+        );
+        assert!(!transport.send(
+            &TransportTarget {
+                oracle: "target".to_owned(),
+                host: Some("remote".to_owned()),
+                tmux_target: None,
+            },
+            "hello",
+        ));
+        assert!(transport.io().sent.is_empty());
+    }
+
+    #[test]
+    fn http_transport_publishes_feed_events_to_every_peer_and_warns_on_rejections() {
+        let mut transport = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: vec![
+                    "http://a".to_owned(),
+                    "http://b".to_owned(),
+                    "http://c".to_owned(),
+                ],
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo {
+                fail_post_url: Some("http://b/api/feed".to_owned()),
+                ..FakeHttpIo::default()
+            },
+        );
+        let warnings = transport.publish_feed("{\"message\":\"hello\"}");
+        assert_eq!(
+            transport.io().posts,
+            vec![
+                (
+                    "http://a/api/feed".to_owned(),
+                    "POST".to_owned(),
+                    "{\"message\":\"hello\"}".to_owned(),
+                    1234,
+                ),
+                (
+                    "http://b/api/feed".to_owned(),
+                    "POST".to_owned(),
+                    "{\"message\":\"hello\"}".to_owned(),
+                    1234,
+                ),
+                (
+                    "http://c/api/feed".to_owned(),
+                    "POST".to_owned(),
+                    "{\"message\":\"hello\"}".to_owned(),
+                    1234,
+                ),
+            ]
+        );
+        assert_eq!(
+            warnings,
+            vec![HttpFeedWarning {
+                peer: "http://b".to_owned(),
+                reason: "boom".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn http_transport_accepts_handlers_and_ignores_presence() {
+        let mut transport = HttpFederationTransport::new(
+            HttpTransportConfig {
+                peers: Vec::new(),
+                self_host: "local".to_owned(),
+            },
+            FakeHttpIo::default(),
+        );
+        transport.on_message();
+        transport.on_presence();
+        transport.on_feed();
+        assert_eq!(transport.handler_counts(), (1, 1, 1));
+        transport.publish_presence();
     }
 }
