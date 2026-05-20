@@ -26,6 +26,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-tmux` | `src/core/transport/tmux-class.ts`, `src/commands/shared/discover-live-state.ts` | tmux parser unit tests, `discover-tmux-live-state.fixtures.json` |
 | `maw-hub` | `src/transports/hub-config.ts` | `test/isolated/hub-config.test.ts`, hub config loader coverage |
 | `maw-feed` | `src/lib/feed.ts` | `test/isolated/feed-lib-coverage.test.ts` |
+| `maw-auth` | `src/lib/federation-auth.ts` | federation auth pure helper and O6 decision tests |
 
 Current local gates:
 
