@@ -1,9 +1,19 @@
-//! XDG/legacy maw path resolver ported from maw-js `src/core/xdg.ts`.
+//! XDG/legacy maw path resolver ported from maw-js `src/core/xdg.ts`,
+//! `src/core/paths.ts`, and `src/cli/instance-preset.ts`.
 
 use std::{
     collections::BTreeMap,
+    fs, io,
     path::{Path, PathBuf},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MawCorePaths {
+    pub runtime_home: PathBuf,
+    pub config_dir: PathBuf,
+    pub fleet_dir: PathBuf,
+    pub config_file: PathBuf,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MawXdgEnv {
@@ -46,6 +56,54 @@ impl MawXdgEnv {
 #[must_use]
 pub fn is_maw_xdg_enabled(env: &MawXdgEnv) -> bool {
     truthy_env(env.var("MAW_XDG"))
+}
+
+/// Resolve the maw instance home directory, mirroring maw-js `resolveHome()`.
+#[must_use]
+pub fn resolve_home(env: &MawXdgEnv) -> PathBuf {
+    maw_runtime_home_dir(env)
+}
+
+/// Resolve import-time core paths from maw-js `src/core/paths.ts`.
+#[must_use]
+pub fn maw_core_paths(env: &MawXdgEnv) -> MawCorePaths {
+    let runtime_home = resolve_home(env);
+    let config_dir = maw_config_dir(env);
+    let fleet_dir = config_dir.join("fleet");
+    let config_file = config_dir.join("maw.config.json");
+    MawCorePaths {
+        runtime_home,
+        config_dir,
+        fleet_dir,
+        config_file,
+    }
+}
+
+/// Resolve core paths and create the fleet directory like maw-js module import.
+///
+/// # Errors
+///
+/// Returns any filesystem error from creating the `<config>/fleet` directory.
+pub fn ensure_maw_core_paths(env: &MawXdgEnv) -> io::Result<MawCorePaths> {
+    let paths = maw_core_paths(env);
+    fs::create_dir_all(&paths.fleet_dir)?;
+    Ok(paths)
+}
+
+/// Validate `maw serve --as <name>` instance names.
+///
+/// Mirrors maw-js `INSTANCE_NAME_RE`: lowercase alphanumeric first character,
+/// then lowercase alphanumeric, `_`, or `-`, with max length 32.
+#[must_use]
+pub fn is_valid_instance_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if name.len() > 32 || !is_lower_alnum(first) {
+        return false;
+    }
+    chars.all(|ch| is_lower_alnum(ch) || matches!(ch, '_' | '-'))
 }
 
 #[must_use]
@@ -134,6 +192,10 @@ pub fn maw_state_path(env: &MawXdgEnv, parts: &[&str]) -> PathBuf {
 #[must_use]
 pub fn maw_cache_path(env: &MawXdgEnv, parts: &[&str]) -> PathBuf {
     join_parts(maw_cache_dir(env), parts)
+}
+
+fn is_lower_alnum(ch: char) -> bool {
+    ch.is_ascii_lowercase() || ch.is_ascii_digit()
 }
 
 fn truthy_env(value: Option<&str>) -> bool {

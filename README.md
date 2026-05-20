@@ -27,7 +27,7 @@ Cargo workspace scaffolded and pushed to `main`.
 | `maw-hub` | `src/transports/hub-config.ts` | `test/isolated/hub-config.test.ts`, hub config loader coverage |
 | `maw-feed` | `src/lib/feed.ts` | `test/isolated/feed-lib-coverage.test.ts` |
 | `maw-auth` | `src/lib/federation-auth.ts` | federation auth pure helper and O6 decision tests |
-| `maw-xdg` | `src/core/xdg.ts` | `test/core-xdg.test.ts` |
+| `maw-xdg` | `src/core/xdg.ts`, `src/core/paths.ts`, `src/cli/instance-preset.ts` | `test/core-xdg.test.ts`, `test/paths.test.ts`, `test/00-resolve-home.test.ts` |
 | `maw-bind` | `src/core/bind-host.ts` | `test/bind-heuristic.test.ts` |
 | `maw-fuzzy` | `src/core/util/fuzzy.ts` | `test/fuzzy-match.test.ts` |
 
