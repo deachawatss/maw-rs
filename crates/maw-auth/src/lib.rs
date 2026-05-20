@@ -526,6 +526,11 @@ pub fn verify_consent_pin(pin: &str, expected_hash: &str) -> bool {
 }
 
 #[must_use]
+pub fn consent_request_id_from_bytes(bytes: &[u8]) -> String {
+    hex_lower(&bytes.iter().copied().take(12).collect::<Vec<_>>())
+}
+
+#[must_use]
 pub fn trust_key(from: &str, to: &str, action: ConsentAction) -> String {
     format!("{from}→{to}:{}", action.as_str())
 }

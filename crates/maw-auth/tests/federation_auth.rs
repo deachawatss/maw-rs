@@ -611,3 +611,21 @@ fn consent_approve_and_reject_plans_match_maw_js_state_machine() {
     );
     assert!(!store.is_trusted("a", "b", ConsentAction::Hey));
 }
+
+// Ported from maw-js `src/core/consent/request.ts` and
+// `test/core/consent/consent.test.ts` newRequestId cases.
+#[test]
+fn consent_request_id_generation_matches_maw_js_24_hex_contract() {
+    use maw_auth::consent_request_id_from_bytes;
+
+    let id = consent_request_id_from_bytes(&[0, 1, 2, 10, 15, 16, 31, 127, 128, 200, 254, 255]);
+    assert_eq!(id, "0001020a0f101f7f80c8feff");
+    assert_eq!(id.len(), 24);
+    assert!(id
+        .chars()
+        .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+    assert_eq!(
+        consent_request_id_from_bytes(&[0xab; 20]),
+        "abababababababababababab"
+    );
+}
