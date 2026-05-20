@@ -3,6 +3,8 @@
 //! This crate does not perform network discovery. Callers pass already-fetched
 //! scout discovery data, keeping the fixture-tested policy deterministic.
 
+use std::collections::BTreeMap;
+
 /// Peer source mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSourceMode {
@@ -595,4 +597,229 @@ fn probe_failure(error: ProbeLastError) -> ProbePeerResult {
         identity: None,
         error: Some(error),
     }
+}
+
+/// Peer store record subset used by maw-js `probe-all`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub url: String,
+    pub node: Option<String>,
+    pub added_at: String,
+    pub last_seen: Option<String>,
+    pub last_error: Option<ProbeLastError>,
+}
+
+/// Deterministic input for maw-js `cmdProbeAll`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAllPlan {
+    pub timeout_ms: u64,
+    pub now: String,
+    pub peers: Vec<(String, PeerRecord)>,
+    /// URL → probe result → elapsed milliseconds.
+    pub probe_results: Vec<(String, ProbePeerResult, u64)>,
+    /// Aliases removed after load and before mutation.
+    pub removed_before_mutate: Vec<String>,
+}
+
+/// Renderable per-peer probe-all row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAllRow {
+    pub alias: String,
+    pub url: String,
+    pub node: Option<String>,
+    pub last_seen: Option<String>,
+    pub ok: bool,
+    pub ms: u64,
+    pub error: Option<ProbeLastError>,
+}
+
+/// Deterministic result for maw-js `cmdProbeAll`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeAllResult {
+    pub rows: Vec<ProbeAllRow>,
+    pub ok_count: usize,
+    pub fail_count: usize,
+    pub worst_exit_code: i32,
+    pub probe_calls: Vec<(String, u64)>,
+    pub mutate_calls: usize,
+    pub peers_after: BTreeMap<String, PeerRecord>,
+}
+
+/// Port of maw-js `cmdProbeAll` over deterministic store/probe inputs.
+#[must_use]
+pub fn probe_all_from_plan(plan: &ProbeAllPlan) -> ProbeAllResult {
+    let mut peers_after: BTreeMap<String, PeerRecord> = plan.peers.iter().cloned().collect();
+    let probe_results: BTreeMap<String, (ProbePeerResult, u64)> = plan
+        .probe_results
+        .iter()
+        .map(|(url, result, ms)| (url.clone(), (result.clone(), *ms)))
+        .collect();
+    let mut entries = plan.peers.clone();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut probe_calls = Vec::with_capacity(entries.len());
+    let mut rows = Vec::with_capacity(entries.len());
+    for (alias, peer) in entries {
+        probe_calls.push((peer.url.clone(), plan.timeout_ms));
+        let (probe, ms) = probe_results
+            .get(&peer.url)
+            .cloned()
+            .unwrap_or_else(|| (probe_failure_without_error(), 0));
+        let error = probe.error.clone();
+        rows.push(ProbeAllRow {
+            alias,
+            url: peer.url,
+            node: probe.node.or(peer.node),
+            last_seen: peer.last_seen,
+            ok: error.is_none(),
+            ms,
+            error,
+        });
+    }
+
+    let mutate_calls = usize::from(!rows.is_empty());
+    if mutate_calls == 1 {
+        for alias in &plan.removed_before_mutate {
+            peers_after.remove(alias);
+        }
+        for row in &mut rows {
+            let Some(peer) = peers_after.get_mut(&row.alias) else {
+                continue;
+            };
+            if row.ok {
+                peer.last_error = None;
+                peer.last_seen = Some(plan.now.clone());
+                row.last_seen = Some(plan.now.clone());
+                if let Some(node) = &row.node {
+                    peer.node = Some(node.clone());
+                }
+            } else if let Some(error) = &row.error {
+                peer.last_error = Some(error.clone());
+            }
+        }
+    }
+
+    let ok_count = rows.iter().filter(|row| row.ok).count();
+    let fail_count = rows.len() - ok_count;
+    let worst_exit_code = rows
+        .iter()
+        .filter_map(|row| row.error.as_ref())
+        .map(|err| probe_exit_code(err.code))
+        .max()
+        .unwrap_or(0);
+
+    ProbeAllResult {
+        rows,
+        ok_count,
+        fail_count,
+        worst_exit_code,
+        probe_calls,
+        mutate_calls,
+        peers_after,
+    }
+}
+
+fn probe_failure_without_error() -> ProbePeerResult {
+    ProbePeerResult {
+        node: None,
+        nickname: None,
+        pubkey: None,
+        identity: None,
+        error: None,
+    }
+}
+
+/// Render maw-js `formatProbeAll` table output.
+#[must_use]
+pub fn format_probe_all(result: &ProbeAllResult) -> String {
+    if result.rows.is_empty() {
+        return "no peers".to_owned();
+    }
+
+    let header = ["alias", "url", "node", "lastSeen", "result"].map(str::to_owned);
+    let rows: Vec<[String; 5]> = result
+        .rows
+        .iter()
+        .map(|row| {
+            [
+                row.alias.clone(),
+                row.url.clone(),
+                row.node.clone().unwrap_or_else(|| "-".to_owned()),
+                row.last_seen.clone().unwrap_or_else(|| "-".to_owned()),
+                if row.ok {
+                    format!("\u{1b}[32m✓\u{1b}[0m ok ({}ms)", row.ms)
+                } else {
+                    format!(
+                        "\u{1b}[31m✗\u{1b}[0m {}",
+                        row.error
+                            .as_ref()
+                            .map_or("UNKNOWN", |err| err.code.as_str())
+                    )
+                },
+            ]
+        })
+        .collect();
+
+    let widths: Vec<usize> = header
+        .iter()
+        .enumerate()
+        .map(|(index, heading)| {
+            rows.iter()
+                .map(|row| ansi_stripped_len(&row[index]))
+                .max()
+                .unwrap_or(0)
+                .max(heading.len())
+        })
+        .collect();
+
+    let divider = widths
+        .iter()
+        .map(|width| "-".repeat(*width))
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format_probe_all_row(&header, &widths),
+        format_probe_all_row(&divider, &widths),
+    ];
+    lines.extend(rows.iter().map(|row| format_probe_all_row(row, &widths)));
+    lines.push(String::new());
+    lines.push(format!(
+        "{}/{} ok{}",
+        result.ok_count,
+        result.rows.len(),
+        if result.fail_count > 0 {
+            format!(", {} failed", result.fail_count)
+        } else {
+            String::new()
+        }
+    ));
+    lines.join("\n")
+}
+
+fn format_probe_all_row(cols: &[String], widths: &[usize]) -> String {
+    cols.iter()
+        .enumerate()
+        .map(|(index, col)| {
+            let padding = widths[index].saturating_sub(ansi_stripped_len(col));
+            format!("{col}{}", " ".repeat(padding))
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn ansi_stripped_len(value: &str) -> usize {
+    let mut len = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for code_ch in chars.by_ref() {
+                if code_ch == 'm' {
+                    break;
+                }
+            }
+        } else {
+            len += ch.len_utf8();
+        }
+    }
+    len
 }
