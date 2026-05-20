@@ -112,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "maw-bring",
  "maw-calver",
+ "maw-identity",
  "maw-matcher",
  "maw-peer",
  "maw-policy",

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 maw-bring = { path = "../maw-bring" }
 maw-calver = { path = "../maw-calver" }
+maw-identity = { path = "../maw-identity" }
 maw-matcher = { path = "../maw-matcher" }
 maw-peer = { path = "../maw-peer" }
 maw-policy = { path = "../maw-policy" }

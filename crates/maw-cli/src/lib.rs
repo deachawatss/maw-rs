@@ -5,6 +5,7 @@
 
 use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
+use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
     normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
     ResolveOptions, ResolveResult,
@@ -46,6 +47,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "--help" | "-h" | "help" => usage_ok(),
         "bring" | "b" => run_bring_plan(&argv[1..]),
         "resolve" => run_resolve_plan(&argv[1..]),
+        "identity" => run_identity_plan(&argv[1..]),
         "normalize" => run_normalize_plan(&argv[1..]),
         "calver" => run_calver_plan(&argv[1..]),
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
@@ -60,6 +62,153 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_identity_plan(argv: &[String]) -> CliOutput {
+    let (plan_json, action) = match parse_identity_plan_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return identity_usage_error(&message),
+    };
+    match action {
+        IdentityPlanAction::SessionName { oracle, slot } => {
+            let input = CanonicalSessionNameInput { oracle, slot };
+            match canonical_session_name(&input) {
+                Ok(canonical) => CliOutput {
+                    code: 0,
+                    stdout: if plan_json {
+                        render_identity_session_plan_json(&input, &canonical)
+                    } else {
+                        format!("{canonical}\n")
+                    },
+                    stderr: String::new(),
+                },
+                Err(error) => CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("identity: {error}\n"),
+                },
+            }
+        }
+        IdentityPlanAction::Node { host, user } => {
+            let canonical = canonical_node_identity(&host, user.as_deref());
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_identity_node_plan_json(&host, user.as_deref(), &canonical)
+                } else {
+                    format!("{canonical}\n")
+                },
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+fn parse_identity_plan_args(argv: &[String]) -> Result<(bool, IdentityPlanAction), String> {
+    let mut plan_json = false;
+    let mut action = None;
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "session-name" | "--session-name" => {
+                let Some(oracle) = argv.get(index + 1) else {
+                    return Err("identity: missing session-name oracle".to_owned());
+                };
+                action = Some(IdentityPlanAction::SessionName {
+                    oracle: oracle.to_owned(),
+                    slot: None,
+                });
+                index += 1;
+            }
+            "node" | "node-identity" | "--node-identity" => {
+                let Some(host) = argv.get(index + 1) else {
+                    return Err("identity: missing node host".to_owned());
+                };
+                action = Some(IdentityPlanAction::Node {
+                    host: host.to_owned(),
+                    user: None,
+                });
+                index += 1;
+            }
+            "--slot" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("identity: missing --slot value".to_owned());
+                };
+                let Ok(slot) = value.parse::<u32>() else {
+                    return Err("identity: --slot must be an integer".to_owned());
+                };
+                action = match action {
+                    Some(IdentityPlanAction::SessionName { oracle, .. }) => {
+                        Some(IdentityPlanAction::SessionName {
+                            oracle,
+                            slot: Some(slot),
+                        })
+                    }
+                    _ => return Err("identity: --slot requires session-name".to_owned()),
+                };
+                index += 1;
+            }
+            "--user" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("identity: missing --user value".to_owned());
+                };
+                action = match action {
+                    Some(IdentityPlanAction::Node { host, .. }) => Some(IdentityPlanAction::Node {
+                        host,
+                        user: Some(value.to_owned()),
+                    }),
+                    _ => return Err("identity: --user requires node-identity".to_owned()),
+                };
+                index += 1;
+            }
+            arg => return Err(format!("identity: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+    action.map_or_else(
+        || Err("identity: expected session-name or node-identity".to_owned()),
+        |action| Ok((plan_json, action)),
+    )
+}
+
+enum IdentityPlanAction {
+    SessionName { oracle: String, slot: Option<u32> },
+    Node { host: String, user: Option<String> },
+}
+
+fn identity_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs identity session-name <oracle> [--slot <0-99>] [--plan-json]\n       maw-rs identity node-identity <host> [--user <user>] [--plan-json]\n"
+        ),
+    }
+}
+
+fn render_identity_session_plan_json(input: &CanonicalSessionNameInput, canonical: &str) -> String {
+    let mut input_fields = vec![format!("\"oracle\":{}", json_string(&input.oracle))];
+    if let Some(slot) = input.slot {
+        input_fields.push(format!("\"slot\":{slot}"));
+    }
+    format!(
+        "{{\"command\":\"identity\",\"kind\":\"sessionName\",\"input\":{{{}}},\"canonical\":{}}}\n",
+        input_fields.join(","),
+        json_string(canonical)
+    )
+}
+
+fn render_identity_node_plan_json(host: &str, user: Option<&str>, canonical: &str) -> String {
+    let mut input_fields = vec![format!("\"host\":{}", json_string(host))];
+    if let Some(user) = user {
+        input_fields.push(format!("\"user\":{}", json_string(user)));
+    }
+    format!(
+        "{{\"command\":\"identity\",\"kind\":\"nodeIdentity\",\"input\":{{{}}},\"canonical\":{}}}\n",
+        input_fields.join(","),
+        json_string(canonical)
+    )
 }
 
 fn run_policy_plan(argv: &[String]) -> CliOutput {
@@ -1410,7 +1559,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  identity session-name <oracle> [--slot <0-99>] [--plan-json]\n  identity node-identity <host> [--user <user>] [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
