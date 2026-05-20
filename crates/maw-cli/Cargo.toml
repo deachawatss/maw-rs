@@ -15,6 +15,7 @@ maw-bring = { path = "../maw-bring" }
 maw-calver = { path = "../maw-calver" }
 maw-matcher = { path = "../maw-matcher" }
 maw-peer = { path = "../maw-peer" }
+maw-policy = { path = "../maw-policy" }
 maw-routing = { path = "../maw-routing" }
 maw-split = { path = "../maw-split" }
 maw-transport = { path = "../maw-transport" }

@@ -114,6 +114,7 @@ dependencies = [
  "maw-calver",
  "maw-matcher",
  "maw-peer",
+ "maw-policy",
  "maw-routing",
  "maw-split",
  "maw-transport",

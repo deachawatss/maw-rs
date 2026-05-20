@@ -13,6 +13,7 @@ use maw_peer::{
     resolve_peer_sources, DiscoveryResult, DiscoveryRow, NamedPeerConfig, PeerConfig,
     PeerSourceMode, PeerSourceResult,
 };
+use maw_policy::{default_active_group, weight_to_tier, DEFAULT_TIER, KNOWN_TIERS};
 use maw_routing::{
     resolve_target as resolve_route_target, MawConfig as RouteConfig, NamedPeer as RouteNamedPeer,
     ResolveResult as RouteResult, Session as RouteSession, Window as RouteWindow,
@@ -50,6 +51,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "worktree-window" => run_worktree_window_plan(&argv[1..]),
         "route" => run_route_plan(&argv[1..]),
         "peer-sources" => run_peer_sources_plan(&argv[1..]),
+        "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
         "split-policy" => run_split_policy_plan(&argv[1..]),
         "transport" => run_transport_plan(&argv[1..]),
         _ => CliOutput {
@@ -58,6 +60,173 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             stderr: format!("unknown command: {command}\n{}", usage_text()),
         },
     }
+}
+
+fn run_policy_plan(argv: &[String]) -> CliOutput {
+    let (plan_json, action) = match parse_policy_plan_args(argv) {
+        Ok(parsed) => parsed,
+        Err(message) => return policy_usage_error(&message),
+    };
+    render_policy_plan(action, plan_json)
+}
+
+fn parse_policy_plan_args(argv: &[String]) -> Result<(bool, PolicyPlanAction), String> {
+    let mut plan_json = false;
+    let mut action = PolicyPlanAction::Constants;
+
+    let mut index = 0;
+    while index < argv.len() {
+        match argv[index].as_str() {
+            "--plan-json" => plan_json = true,
+            "--constants" => action = PolicyPlanAction::Constants,
+            "--weight" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("policy: missing --weight value".to_owned());
+                };
+                let Ok(weight) = value.parse::<i32>() else {
+                    return Err("policy: --weight must be an integer".to_owned());
+                };
+                action = PolicyPlanAction::WeightToTier(weight);
+                index += 1;
+            }
+            "--default-active" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("policy: missing --default-active value".to_owned());
+                };
+                action = PolicyPlanAction::DefaultActiveGroup(value.to_owned());
+                index += 1;
+            }
+            "--includes" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err("policy: missing --includes value".to_owned());
+                };
+                action = match action {
+                    PolicyPlanAction::DefaultActiveGroup(key) => {
+                        PolicyPlanAction::DefaultActiveIncludes {
+                            key,
+                            plugin: value.to_owned(),
+                        }
+                    }
+                    _ => {
+                        return Err("policy: --includes requires --default-active <key>".to_owned())
+                    }
+                };
+                index += 1;
+            }
+            arg => return Err(format!("policy: unknown argument {arg}")),
+        }
+        index += 1;
+    }
+    Ok((plan_json, action))
+}
+
+fn render_policy_plan(action: PolicyPlanAction, plan_json: bool) -> CliOutput {
+    match action {
+        PolicyPlanAction::Constants => CliOutput {
+            code: 0,
+            stdout: if plan_json {
+                render_policy_constants_json()
+            } else {
+                format!(
+                    "policy constants default-tier={} known-tiers={}\n",
+                    DEFAULT_TIER.as_str(),
+                    KNOWN_TIERS
+                        .iter()
+                        .map(|tier| tier.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            },
+            stderr: String::new(),
+        },
+        PolicyPlanAction::WeightToTier(weight) => {
+            let tier = weight_to_tier(weight);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    format!(
+                        "{{\"command\":\"policy\",\"kind\":\"weightToTier\",\"weight\":{weight},\"tier\":{}}}\n",
+                        json_string(tier.as_str())
+                    )
+                } else {
+                    format!("policy weight {weight}: {}\n", tier.as_str())
+                },
+                stderr: String::new(),
+            }
+        }
+        PolicyPlanAction::DefaultActiveGroup(key) => {
+            let Some(group) = default_active_group(&key) else {
+                return policy_usage_error("policy: unknown --default-active key");
+            };
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    render_policy_default_active_json(&key, group)
+                } else {
+                    format!(
+                        "policy default-active {key}: migration={} plugins={}\n",
+                        group.migration,
+                        group.plugins.join(",")
+                    )
+                },
+                stderr: String::new(),
+            }
+        }
+        PolicyPlanAction::DefaultActiveIncludes { key, plugin } => {
+            let Some(group) = default_active_group(&key) else {
+                return policy_usage_error("policy: unknown --default-active key");
+            };
+            let included = (group.includes)(&plugin);
+            CliOutput {
+                code: 0,
+                stdout: if plan_json {
+                    format!(
+                        "{{\"command\":\"policy\",\"kind\":\"defaultActiveIncludes\",\"key\":{},\"plugin\":{},\"included\":{included}}}\n",
+                        json_string(&key),
+                        json_string(&plugin)
+                    )
+                } else {
+                    format!("policy default-active {key} includes {plugin}: {included}\n")
+                },
+                stderr: String::new(),
+            }
+        }
+    }
+}
+
+enum PolicyPlanAction {
+    Constants,
+    WeightToTier(i32),
+    DefaultActiveGroup(String),
+    DefaultActiveIncludes { key: String, plugin: String },
+}
+
+fn policy_usage_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "{message}\nusage: maw-rs policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n"
+        ),
+    }
+}
+
+fn render_policy_constants_json() -> String {
+    let tiers: Vec<&str> = KNOWN_TIERS.iter().map(|tier| tier.as_str()).collect();
+    format!(
+        "{{\"command\":\"policy\",\"kind\":\"constants\",\"knownTiers\":{},\"defaultTier\":{}}}\n",
+        json_str_array(&tiers),
+        json_string(DEFAULT_TIER.as_str())
+    )
+}
+
+fn render_policy_default_active_json(key: &str, group: maw_policy::DefaultActiveGroup) -> String {
+    format!(
+        "{{\"command\":\"policy\",\"kind\":\"defaultActiveGroup\",\"key\":{},\"migration\":{},\"plugins\":{}}}\n",
+        json_string(key),
+        json_string(group.migration),
+        json_str_array(group.plugins)
+    )
 }
 
 fn run_transport_plan(argv: &[String]) -> CliOutput {
@@ -1221,6 +1390,17 @@ fn json_string_array(values: &[String]) -> String {
     )
 }
 
+fn json_str_array(values: &[&str]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(|value| json_string(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 fn usage_ok() -> CliOutput {
     CliOutput {
         code: 0,
@@ -1230,7 +1410,7 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
+    "usage: maw-rs <command> [args]\ncommands:\n  bring|b <oracle> [--to <session[:window]>] [--plan-json]\n  resolve --mode <by-name|session|worktree> <target> <item...> [--plan-json]\n  normalize <target> [--plan-json]\n  calver --now <YYYY-M-DTHH:MM> [--stable|--alpha|--beta] [--package-version <version>] [--tag <tag>]... [--plan-json]\n  worktree-window --main-repo-name <repo> --wt-name <worktree> [--session <name>] [--window <index:name:active>]... [--plan-json]\n  route --query <target> [--node <name>] [--named-peer <name=url>] [--peer <url>] [--agent <agent=node>] [--session <name>] [--source <source>] [--window <index:name:active>]... [--plan-json]\n  peer-sources --mode <config|scout|both> [--peer <url>] [--named-peer <name=url>] [--discovery-ok|--discovery-error <error>] [--discovery-hint <hint>] [--discovered <node|host|oracle|locator[,locator]>]... [--plan-json]\n  policy [--constants|--weight <i32>|--default-active <key> [--includes <plugin>]] [--plan-json]\n  split-policy [--pane-current-command <cmd>] [--requested-policy <policy>] [--no-attach] [--force-split] [--plan-json]\n  transport --classify-error <error>|--classify-empty|--send [--transport <name[:connected][:canReach][:ok|false|throw=err]>]... [--plan-json]\n"
         .to_owned()
 }
 
