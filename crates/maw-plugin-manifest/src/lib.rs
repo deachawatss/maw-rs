@@ -909,6 +909,7 @@ pub struct DiscoverPackagesReport {
 }
 
 static DISCOVER_CACHE: OnceLock<Mutex<Option<Vec<LoadedPlugin>>>> = OnceLock::new();
+static MODULE_SYMBOL_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
 
 /// Parse and validate a `plugin.json` text.
 ///
@@ -1109,6 +1110,77 @@ pub fn reset_discover_cache() {
     if let Ok(mut cache) = discover_cache().lock() {
         *cache = None;
     }
+    if let Ok(mut cache) = module_symbol_cache().lock() {
+        cache.clear();
+    }
+}
+
+/// Import a whitelisted named symbol through an injected module loader.
+///
+/// This mirrors maw-js `importPluginSymbol` validation and caching, while leaving the
+/// language-specific runtime module import to the caller.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible errors for missing names, absent or disabled plugins,
+/// missing module surfaces, unallowlisted symbols, module paths that escape the plugin
+/// directory, loader failures, or runtime modules that omit the allowlisted export.
+pub fn import_plugin_symbol<F>(
+    plugin_name: &str,
+    symbol_name: &str,
+    plugins: &[LoadedPlugin],
+    load_module_symbols: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&Path) -> Result<BTreeMap<String, String>, String>,
+{
+    if plugin_name.is_empty() {
+        return Err("importPluginSymbol: pluginName is required".to_owned());
+    }
+    if symbol_name.is_empty() {
+        return Err("importPluginSymbol: symbolName is required".to_owned());
+    }
+
+    let plugin = plugins
+        .iter()
+        .find(|plugin| plugin.manifest.name == plugin_name)
+        .ok_or_else(|| format!("plugin '{plugin_name}' not found"))?;
+    if plugin.disabled {
+        return Err(format!("plugin '{plugin_name}' is disabled"));
+    }
+    let module_surface = plugin
+        .manifest
+        .module
+        .as_ref()
+        .ok_or_else(|| format!("plugin '{plugin_name}' does not declare a module surface"))?;
+    if !module_surface
+        .exports
+        .iter()
+        .any(|export| export == symbol_name)
+    {
+        return Err(format!(
+            "plugin '{plugin_name}' does not export '{symbol_name}'"
+        ));
+    }
+
+    let cache_key = format!("{}\0{plugin_name}\0{symbol_name}", plugin.dir.display());
+    if let Some(value) = module_symbol_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        return Ok(value);
+    }
+
+    let module_path = resolve_plugin_module_path(plugin)?;
+    let symbols = load_module_symbols(&module_path)?;
+    let value = symbols.get(symbol_name).cloned().ok_or_else(|| {
+        format!("plugin '{plugin_name}' module did not provide export '{symbol_name}'")
+    })?;
+    if let Ok(mut cache) = module_symbol_cache().lock() {
+        cache.insert(cache_key, value.clone());
+    }
+    Ok(value)
 }
 
 /// Default plugin scan roots.
@@ -1210,6 +1282,34 @@ fn resolve_dir_path(dir: &Path, path: &str) -> PathBuf {
 
 fn discover_cache() -> &'static Mutex<Option<Vec<LoadedPlugin>>> {
     DISCOVER_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn module_symbol_cache() -> &'static Mutex<BTreeMap<String, String>> {
+    MODULE_SYMBOL_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn resolve_plugin_module_path(plugin: &LoadedPlugin) -> Result<PathBuf, String> {
+    let module_path = plugin
+        .manifest
+        .module
+        .as_ref()
+        .map(|module| module.path.as_str())
+        .ok_or_else(|| {
+            format!(
+                "plugin '{}' does not declare module.path",
+                plugin.manifest.name
+            )
+        })?;
+    let resolved = plugin.dir.join(module_path);
+    let plugin_root = std::fs::canonicalize(&plugin.dir).map_err(|error| error.to_string())?;
+    let real_path = std::fs::canonicalize(&resolved).map_err(|error| error.to_string())?;
+    if real_path != plugin_root && !real_path.starts_with(&plugin_root) {
+        return Err(format!(
+            "plugin '{}' module.path escapes plugin dir: {module_path}",
+            plugin.manifest.name
+        ));
+    }
+    Ok(real_path)
 }
 
 fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
