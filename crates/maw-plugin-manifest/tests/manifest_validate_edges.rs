@@ -1,6 +1,6 @@
 use maw_plugin_manifest::{
-    parse_api, parse_cli, parse_cron, parse_hooks, parse_module, parse_transport, ApiMethod,
-    CliFlagKind, HookPolicy,
+    parse_api, parse_cli, parse_cron, parse_engine, parse_hooks, parse_module, parse_transport,
+    ApiMethod, CliFlagKind, HookPolicy,
 };
 use serde_json::json;
 
@@ -195,6 +195,70 @@ fn parse_cron_module_and_transport_reject_malformed_sections() {
     );
 }
 
+#[test]
+fn parse_engine_rejects_malformed_serve_process_metadata() {
+    assert_eq!(
+        parse_engine(&json!({})).expect("missing engine is valid"),
+        None
+    );
+    assert_eq!(
+        parse_engine(&json!({ "engine": {} }))
+            .expect("valid empty engine")
+            .expect("engine present")
+            .serve,
+        None
+    );
+
+    let engine = parse_engine(&json!({
+        "engine": {
+            "serve": {
+                "command": "bun run serve",
+                "prefix": "/api/demo",
+                "health": "/health",
+                "events": ["MessageSend"],
+                "eventPath": "/events"
+            }
+        }
+    }))
+    .expect("valid engine")
+    .expect("engine present");
+    let serve = engine.serve.expect("serve present");
+    assert_eq!(serve.command, Some("bun run serve".to_owned()));
+    assert_eq!(serve.prefix, Some("/api/demo".to_owned()));
+    assert_eq!(serve.health, Some("/health".to_owned()));
+    assert_eq!(serve.events, Some(vec!["MessageSend".to_owned()]));
+    assert_eq!(serve.event_path, Some("/events".to_owned()));
+
+    expect_engine_error(
+        &json!({ "engine": [] }),
+        "plugin.json: engine must be an object",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": [] } }),
+        "plugin.json: engine.serve must be an object",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "command": "" } } }),
+        "plugin.json: engine.serve.command must be a non-empty string",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "prefix": "/demo" } } }),
+        "plugin.json: engine.serve.prefix must start with /api/",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "health": "health" } } }),
+        "plugin.json: engine.serve.health must be an absolute path",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "eventPath": "events" } } }),
+        "plugin.json: engine.serve.eventPath must be an absolute path",
+    );
+    expect_engine_error(
+        &json!({ "engine": { "serve": { "events": [""] } } }),
+        "plugin.json: engine.serve.events must be an array of non-empty strings",
+    );
+}
+
 fn expect_error(input: &serde_json::Value, expected: &str) {
     let error = parse_cli(input).expect_err("expected parse_cli error");
     assert!(
@@ -237,6 +301,14 @@ fn expect_module_error(input: &serde_json::Value, expected: &str) {
 
 fn expect_transport_error(input: &serde_json::Value, expected: &str) {
     let error = parse_transport(input).expect_err("expected parse_transport error");
+    assert!(
+        error.contains(expected),
+        "{error:?} did not contain {expected:?}"
+    );
+}
+
+fn expect_engine_error(input: &serde_json::Value, expected: &str) {
+    let error = parse_engine(input).expect_err("expected parse_engine error");
     assert!(
         error.contains(expected),
         "{error:?} did not contain {expected:?}"

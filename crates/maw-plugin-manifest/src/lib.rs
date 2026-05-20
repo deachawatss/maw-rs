@@ -73,6 +73,20 @@ pub struct PluginTransport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginEngine {
+    pub serve: Option<PluginEngineServe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginEngineServe {
+    pub command: Option<String>,
+    pub prefix: Option<String>,
+    pub health: Option<String>,
+    pub events: Option<Vec<String>>,
+    pub event_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHooks {
     pub gate: Option<Vec<String>>,
     pub filter: Option<Vec<String>>,
@@ -316,6 +330,93 @@ pub fn parse_transport(manifest: &Value) -> Result<Option<PluginTransport>, Stri
     };
 
     Ok(Some(PluginTransport { peer }))
+}
+
+/// Parse the optional `engine` section.
+///
+/// # Errors
+///
+/// Returns maw-js-compatible validation messages for malformed engine serve metadata.
+pub fn parse_engine(manifest: &Value) -> Result<Option<PluginEngine>, String> {
+    let Some(engine) = manifest.get("engine") else {
+        return Ok(None);
+    };
+    let Some(engine) = engine.as_object() else {
+        return Err("plugin.json: engine must be an object".to_owned());
+    };
+    let Some(serve) = engine.get("serve") else {
+        return Ok(Some(PluginEngine { serve: None }));
+    };
+    let Some(serve) = serve.as_object() else {
+        return Err("plugin.json: engine.serve must be an object".to_owned());
+    };
+
+    let command = match serve.get("command") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|command| !command.is_empty())
+                .ok_or_else(|| {
+                    "plugin.json: engine.serve.command must be a non-empty string".to_owned()
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    let prefix = match serve.get("prefix") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|prefix| prefix.starts_with("/api/"))
+                .ok_or_else(|| "plugin.json: engine.serve.prefix must start with /api/".to_owned())?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    let health = match serve.get("health") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|health| health.starts_with('/'))
+                .ok_or_else(|| {
+                    "plugin.json: engine.serve.health must be an absolute path".to_owned()
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    let events = parse_optional_string_array(
+        serve,
+        "events",
+        "plugin.json: engine.serve.events must be an array of non-empty strings",
+        true,
+    )?;
+
+    let event_path = match serve.get("eventPath") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|event_path| event_path.starts_with('/'))
+                .ok_or_else(|| {
+                    "plugin.json: engine.serve.eventPath must be an absolute path".to_owned()
+                })?
+                .to_owned(),
+        ),
+        None => None,
+    };
+
+    Ok(Some(PluginEngine {
+        serve: Some(PluginEngineServe {
+            command,
+            prefix,
+            health,
+            events,
+            event_path,
+        }),
+    }))
 }
 
 /// Parse the optional `hooks` section.
