@@ -786,3 +786,132 @@ fn pair_api_accept_and_status_plans_match_maw_js_consumed_contract() {
     assert_eq!(pending.status, 200);
     assert_eq!(pending.consumed, Some(false));
 }
+
+// Ported from maw-js `test/pair-api-default.test.ts` auto-pair cases
+// and `src/api/pair.ts` hello freshness / add-result behavior.
+fn pair_api_test_config() -> maw_auth::PairApiConfig {
+    maw_auth::PairApiConfig {
+        node: "node-a".to_owned(),
+        oracle: "oracle-a".to_owned(),
+        port: 4567,
+        base_url: "http://localhost:4567".to_owned(),
+        federation_token: "token-a".to_owned(),
+        pubkey: "p".repeat(64),
+    }
+}
+
+fn auto_pair_input(zid: &str) -> maw_auth::AutoPairInput {
+    maw_auth::AutoPairInput {
+        node: "remote".to_owned(),
+        oracle: None,
+        url: "http://remote".to_owned(),
+        zid: zid.to_owned(),
+        pubkey: None,
+    }
+}
+
+#[test]
+fn pair_api_auto_plan_rejects_missing_stale_and_add_error_cases() {
+    use maw_auth::{pair_api_auto_plan, AutoPairAddOutcome, RecentHelloStore};
+
+    let config = pair_api_test_config();
+    let mut hellos = RecentHelloStore::default();
+
+    let missing_fields = pair_api_auto_plan(
+        &config,
+        &hellos,
+        None,
+        AutoPairAddOutcome::Ok { one_way: true },
+        70_001,
+    );
+    assert_eq!(missing_fields.status, 400);
+    assert_eq!(missing_fields.error.as_deref(), Some("missing_fields"));
+
+    let missing = pair_api_auto_plan(
+        &config,
+        &hellos,
+        Some(auto_pair_input("missing")),
+        AutoPairAddOutcome::Ok { one_way: true },
+        70_001,
+    );
+    assert_eq!(missing.status, 403);
+    assert_eq!(missing.error.as_deref(), Some("no_recent_hello"));
+
+    hellos.record("old", 0);
+    hellos.record("fresh", 70_001);
+    let stale = pair_api_auto_plan(
+        &config,
+        &hellos,
+        Some(auto_pair_input("old")),
+        AutoPairAddOutcome::Ok { one_way: true },
+        70_001,
+    );
+    assert_eq!(stale.status, 403);
+    assert_eq!(stale.error.as_deref(), Some("no_recent_hello"));
+
+    hellos.record("mismatch", 70_001);
+    let mismatch = pair_api_auto_plan(
+        &config,
+        &hellos,
+        Some(auto_pair_input("mismatch")),
+        AutoPairAddOutcome::PubkeyMismatch("key mismatch".to_owned()),
+        70_001,
+    );
+    assert_eq!(mismatch.status, 409);
+    assert_eq!(mismatch.error.as_deref(), Some("key mismatch"));
+
+    hellos.record("throws", 70_001);
+    let add_error = pair_api_auto_plan(
+        &config,
+        &hellos,
+        Some(auto_pair_input("throws")),
+        AutoPairAddOutcome::Error("bad peer".to_owned()),
+        70_001,
+    );
+    assert_eq!(add_error.status, 400);
+    assert_eq!(add_error.error.as_deref(), Some("bad peer"));
+}
+
+#[test]
+fn pair_api_auto_plan_returns_signed_identity_and_peer_add_plan() {
+    use maw_auth::{pair_api_auto_plan, AutoPairAddOutcome, AutoPairInput, RecentHelloStore};
+
+    let config = pair_api_test_config();
+    let mut hellos = RecentHelloStore::default();
+    hellos.record("success", 70_001);
+
+    let success = pair_api_auto_plan(
+        &config,
+        &hellos,
+        Some(AutoPairInput {
+            node: "remote".to_owned(),
+            oracle: Some("remote-oracle".to_owned()),
+            url: "http://remote".to_owned(),
+            zid: "success".to_owned(),
+            pubkey: Some("r".repeat(64)),
+        }),
+        AutoPairAddOutcome::Ok { one_way: false },
+        70_001,
+    );
+    assert_eq!(success.status, 200);
+    assert!(success.ok);
+    assert_eq!(success.node.as_deref(), Some("node-a"));
+    assert_eq!(success.oracle.as_deref(), Some("oracle-a"));
+    assert_eq!(success.url.as_deref(), Some("http://localhost:4567"));
+    assert_eq!(success.pubkey.as_deref(), Some(&"p".repeat(64)[..]));
+    assert_eq!(success.one_way, Some(false));
+    assert_eq!(success.add_alias.as_deref(), Some("remote"));
+    assert_eq!(success.add_url.as_deref(), Some("http://remote"));
+    assert_eq!(success.add_node.as_deref(), Some("remote"));
+    assert_eq!(success.add_pubkey.as_deref(), Some(&"r".repeat(64)[..]));
+    assert_eq!(
+        success.add_identity_oracle.as_deref(),
+        Some("remote-oracle")
+    );
+    assert_eq!(success.add_identity_node.as_deref(), Some("remote"));
+    assert!(success.mark_symmetric_check);
+    assert_eq!(
+        success.proof.as_deref(),
+        Some("95e63fc871ab14ce17c14e0046cd41b9dd305c086f1ed325fd2c5e62e6ee849f")
+    );
+}

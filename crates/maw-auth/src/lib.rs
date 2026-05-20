@@ -286,6 +286,61 @@ pub struct PairApiStatusResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoPairInput {
+    pub node: String,
+    pub oracle: Option<String>,
+    pub url: String,
+    pub zid: String,
+    pub pubkey: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoPairAddOutcome {
+    Ok { one_way: bool },
+    PubkeyMismatch(String),
+    Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairApiAutoResult {
+    pub status: u16,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub node: Option<String>,
+    pub oracle: Option<String>,
+    pub url: Option<String>,
+    pub pubkey: Option<String>,
+    pub proof: Option<String>,
+    pub one_way: Option<bool>,
+    pub add_alias: Option<String>,
+    pub add_url: Option<String>,
+    pub add_node: Option<String>,
+    pub add_pubkey: Option<String>,
+    pub add_identity_oracle: Option<String>,
+    pub add_identity_node: Option<String>,
+    pub mark_symmetric_check: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecentHelloStore {
+    seen_at: BTreeMap<String, u64>,
+}
+
+impl RecentHelloStore {
+    pub fn record(&mut self, zid: &str, now_ms: u64) {
+        self.seen_at.insert(zid.to_owned(), now_ms);
+    }
+
+    #[must_use]
+    pub fn is_recent(&self, zid: &str, now_ms: u64) -> bool {
+        const RECENT_HELLO_MS: u64 = 60_000;
+        self.seen_at
+            .get(zid)
+            .is_some_and(|seen_at| now_ms.saturating_sub(*seen_at) <= RECENT_HELLO_MS)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupResult {
     Live(PairEntry),
     NotFound,
@@ -690,6 +745,54 @@ pub fn pair_api_status_plan(store: &PairCodeStore, code: &str, now_ms: u64) -> P
         }
         LookupResult::NotFound => pair_api_status_error(404, "not_found"),
         LookupResult::Expired => pair_api_status_error(410, "expired"),
+    }
+}
+
+#[must_use]
+pub fn pair_api_auto_plan(
+    config: &PairApiConfig,
+    hellos: &RecentHelloStore,
+    input: Option<AutoPairInput>,
+    add_outcome: AutoPairAddOutcome,
+    now_ms: u64,
+) -> PairApiAutoResult {
+    let Some(input) = input
+        .filter(|input| !input.node.is_empty() && !input.url.is_empty() && !input.zid.is_empty())
+    else {
+        return pair_api_auto_error(400, "missing_fields");
+    };
+    if !hellos.is_recent(&input.zid, now_ms) {
+        return pair_api_auto_error(403, "no_recent_hello");
+    }
+    match add_outcome {
+        AutoPairAddOutcome::PubkeyMismatch(message) => pair_api_auto_error(409, &message),
+        AutoPairAddOutcome::Error(message) => pair_api_auto_error(400, &message),
+        AutoPairAddOutcome::Ok { one_way } => {
+            let identity = AutoPairIdentity {
+                node: config.node.clone(),
+                oracle: config.oracle.clone(),
+                url: config.base_url.clone(),
+                pubkey: config.pubkey.clone(),
+            };
+            PairApiAutoResult {
+                status: 200,
+                ok: true,
+                error: None,
+                node: Some(config.node.clone()),
+                oracle: Some(config.oracle.clone()),
+                url: Some(config.base_url.clone()),
+                pubkey: Some(config.pubkey.clone()),
+                proof: Some(sign_auto_pair_proof(&identity, &config.federation_token)),
+                one_way: Some(one_way),
+                add_alias: Some(input.node.clone()),
+                add_url: Some(input.url.clone()),
+                add_node: Some(input.node.clone()),
+                add_pubkey: input.pubkey.clone(),
+                add_identity_oracle: input.oracle,
+                add_identity_node: Some(input.node),
+                mark_symmetric_check: true,
+            }
+        }
     }
 }
 
@@ -1107,6 +1210,27 @@ fn pair_api_status_error(status: u16, error: &str) -> PairApiStatusResult {
         consumed: None,
         remote_node: None,
         remote_url: None,
+    }
+}
+
+fn pair_api_auto_error(status: u16, error: &str) -> PairApiAutoResult {
+    PairApiAutoResult {
+        status,
+        ok: false,
+        error: Some(error.to_owned()),
+        node: None,
+        oracle: None,
+        url: None,
+        pubkey: None,
+        proof: None,
+        one_way: None,
+        add_alias: None,
+        add_url: None,
+        add_node: None,
+        add_pubkey: None,
+        add_identity_oracle: None,
+        add_identity_node: None,
+        mark_symmetric_check: false,
     }
 }
 
