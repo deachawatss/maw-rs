@@ -6,6 +6,10 @@
 
 use std::{collections::BTreeSet, error::Error, ffi::OsString, fmt, process::Command};
 
+const DEFAULT_CAPTURE_LINES: u32 = 80;
+const DEFAULT_PTY_COLS_LIMIT: u32 = 500;
+const DEFAULT_PTY_ROWS_LIMIT: u32 = 200;
+
 /// Tmux window metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxWindow {
@@ -575,6 +579,99 @@ where
             .map(|_| ())
     }
 
+    /// Capture recent pane contents using `tmux capture-pane`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot capture the target.
+    pub fn capture(&mut self, target: &str, lines: Option<u32>) -> Result<String, TmuxError> {
+        let lines = lines.unwrap_or(DEFAULT_CAPTURE_LINES);
+        self.runner.run(
+            "capture-pane",
+            &[
+                "-t".to_owned(),
+                target.to_owned(),
+                "-e".to_owned(),
+                "-p".to_owned(),
+                "-S".to_owned(),
+                format!("-{lines}"),
+            ],
+        )
+    }
+
+    /// Resize a pane best-effort, clamping to maw-js default pty limits.
+    pub fn resize_pane(&mut self, target: &str, cols: u32, rows: u32) {
+        let cols = clamp_pty(cols, DEFAULT_PTY_COLS_LIMIT);
+        let rows = clamp_pty(rows, DEFAULT_PTY_ROWS_LIMIT);
+        self.try_run(
+            "resize-pane",
+            &[
+                "-t".to_owned(),
+                target.to_owned(),
+                "-x".to_owned(),
+                cols.to_string(),
+                "-y".to_owned(),
+                rows.to_string(),
+            ],
+        );
+    }
+
+    /// Resize a window best-effort, clamping to maw-js default pty limits.
+    pub fn resize_window(&mut self, target: &str, cols: u32, rows: u32) {
+        let cols = clamp_pty(cols, DEFAULT_PTY_COLS_LIMIT);
+        let rows = clamp_pty(rows, DEFAULT_PTY_ROWS_LIMIT);
+        self.try_run(
+            "resize-window",
+            &[
+                "-t".to_owned(),
+                target.to_owned(),
+                "-x".to_owned(),
+                cols.to_string(),
+                "-y".to_owned(),
+                rows.to_string(),
+            ],
+        );
+    }
+
+    /// Leave tmux copy-mode when the target reports `#{pane_in_mode} == 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns non-`not in a mode` cancellation errors from tmux. Probe failures return `Ok(false)`.
+    pub fn exit_mode_if_needed(&mut self, target: &str) -> Result<bool, TmuxError> {
+        let probe = self.runner.run(
+            "display-message",
+            &[
+                "-t".to_owned(),
+                target.to_owned(),
+                "-p".to_owned(),
+                "#{pane_in_mode}".to_owned(),
+            ],
+        );
+        if probe.is_ok_and(|raw| raw.trim() == "1") {
+            return match self.runner.run(
+                "send-keys",
+                &[
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "-X".to_owned(),
+                    "cancel".to_owned(),
+                ],
+            ) {
+                Ok(_) => Ok(true),
+                Err(error) if error.message.contains("not in a mode") => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
+        Ok(false)
+    }
+
+    /// Check whether captured pane text still appears to contain unsubmitted input.
+    pub fn pane_input_pending(&mut self, target: &str) -> bool {
+        self.capture(target, Some(5))
+            .is_ok_and(|content| pane_input_pending_from_capture(&content))
+    }
+
     /// Set a tmux environment variable.
     ///
     /// # Errors
@@ -628,6 +725,73 @@ where
     fn try_run(&mut self, subcommand: &str, args: &[String]) -> String {
         self.runner.run(subcommand, args).unwrap_or_default()
     }
+}
+
+fn clamp_pty(value: u32, max: u32) -> u32 {
+    value.clamp(1, max)
+}
+
+/// Strip common ANSI CSI sequences that tmux captures from pane output.
+#[must_use]
+pub fn strip_tmux_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b';') {
+                index += 1;
+            }
+            if index < bytes.len()
+                && matches!(
+                    bytes[index],
+                    b'm' | b'G' | b'K' | b'H' | b'F' | b'J' | b'A'..=b'Z'
+                )
+            {
+                index += 1;
+                continue;
+            }
+            out.push('\u{1b}');
+            out.push('[');
+            continue;
+        }
+        let Some(ch) = input[index..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// Return true when captured pane output appears to have pending prompt input.
+#[must_use]
+pub fn pane_input_pending_from_capture(content: &str) -> bool {
+    let Some(last) = content.lines().rfind(|line| !line.trim().is_empty()) else {
+        return false;
+    };
+    let clean = strip_tmux_ansi(last).replace('\r', "");
+    prompt_has_input(&clean)
+}
+
+fn prompt_has_input(line: &str) -> bool {
+    let chars = line.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().enumerate() {
+        if !matches!(ch, '#' | '$' | '%' | '>' | '❯' | '»') {
+            continue;
+        }
+        let mut next = index + 1;
+        let mut saw_space = false;
+        while next < chars.len() && chars[next].is_whitespace() {
+            saw_space = true;
+            next += 1;
+        }
+        if saw_space && next < chars.len() && !chars[next].is_whitespace() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Shell-quote one tmux command argument using the same safe-character policy as maw-js.
@@ -1006,6 +1170,44 @@ mod tests {
             client.runner.calls[5].1,
             vec!["-t", "%10", "-l", "hello | world"]
         );
+    }
+
+    #[test]
+    fn capture_resize_and_exit_mode_match_maw_js_runtime_helpers() {
+        let runner = FakeRunner::with_responses(vec![
+            Ok("captured"),
+            Err(TmuxError::new("ignored")),
+            Ok("1"),
+            Ok(""),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        assert_eq!(client.capture("%1", Some(5)).expect("capture"), "captured");
+        client.resize_pane("%1", 0, 999);
+        assert!(client.exit_mode_if_needed("%1").expect("exit mode"));
+
+        assert_eq!(client.runner.calls[0].0, "capture-pane");
+        assert_eq!(
+            client.runner.calls[0].1,
+            vec!["-t", "%1", "-e", "-p", "-S", "-5"]
+        );
+        assert_eq!(client.runner.calls[1].0, "resize-pane");
+        assert_eq!(
+            client.runner.calls[1].1,
+            vec!["-t", "%1", "-x", "1", "-y", "200"]
+        );
+        assert_eq!(client.runner.calls[2].0, "display-message");
+        assert_eq!(client.runner.calls[3].1, vec!["-t", "%1", "-X", "cancel"]);
+    }
+
+    #[test]
+    fn pending_input_detection_matches_maw_js_prompt_heuristic() {
+        assert!(pane_input_pending_from_capture("old\n$ maw hey oracle"));
+        assert!(pane_input_pending_from_capture(
+            "\u{1b}[32m❯\u{1b}[0m cargo test"
+        ));
+        assert!(!pane_input_pending_from_capture("old\n$ "));
+        assert!(!pane_input_pending_from_capture("command output only"));
+        assert_eq!(strip_tmux_ansi("a\u{1b}[31mred\u{1b}[0m"), "ared");
     }
 
     #[test]
