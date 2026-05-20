@@ -7,6 +7,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+maw-matcher = { path = "../maw-matcher" }
 maw-peer = { path = "../maw-peer" }
 
 [dev-dependencies]

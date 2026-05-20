@@ -13,6 +13,8 @@ use std::{
     process::{Command, Stdio},
 };
 
+use maw_matcher::{resolve_by_name, Named, ResolveOptions, ResolveResult};
+
 const DEFAULT_CAPTURE_LINES: u32 = 80;
 const DEFAULT_PTY_COLS_LIMIT: u32 = 500;
 const DEFAULT_PTY_ROWS_LIMIT: u32 = 200;
@@ -28,6 +30,10 @@ const VALID_LAYOUTS: [&str; 5] = [
     "main-vertical",
     "tiled",
 ];
+
+/// Tmux format used by maw-js pane target fallback resolution.
+pub const PANE_TARGET_FORMAT: &str =
+    "#{pane_id}|||#{session_name}:#{window_index}.#{pane_index}|||#{pane_title}|||#{@maw_tile_role}|||#{pane_current_path}";
 
 /// Tmux window metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +263,33 @@ pub enum TmuxAttachAction {
     SwitchClient { session: String },
     Attach { session: String },
     Recover { session: String },
+}
+
+/// Candidate name that can resolve to a live tmux pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTargetCandidate {
+    pub name: String,
+    pub resolved: String,
+    pub source: String,
+    pub target: String,
+}
+
+impl Named for PaneTargetCandidate {
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Resolution result for orphan pane kill fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneTargetResolution {
+    None,
+    Match {
+        candidate: PaneTargetCandidate,
+    },
+    Ambiguous {
+        candidates: Vec<PaneTargetCandidate>,
+    },
 }
 
 /// Error returned by an injected tmux runner.
@@ -1531,6 +1564,132 @@ pub fn decide_tmux_attach_action(
     }
 }
 
+fn basename(path: &str) -> &str {
+    path.split('/')
+        .rfind(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+fn worktree_names_from_cwd(cwd: &str) -> Vec<(String, String)> {
+    let base = basename(cwd);
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![(base.to_owned(), "worktree-dir".to_owned())];
+    let Some((repo, rest)) = base.split_once(".wt-") else {
+        return out;
+    };
+    let role = rest
+        .split_once('-')
+        .map(|(_, role)| role)
+        .unwrap_or_default()
+        .trim();
+    if !role.is_empty() {
+        out.push((role.to_owned(), "worktree-role".to_owned()));
+        if let Some(repo_stem) = repo.strip_suffix("-oracle") {
+            if !repo_stem.is_empty() {
+                out.push((format!("{repo_stem}-{role}"), "worktree-alias".to_owned()));
+            }
+        }
+    }
+    out
+}
+
+/// Parse `PANE_TARGET_FORMAT` rows into pane target resolution candidates.
+#[must_use]
+pub fn pane_target_candidates_from_list_panes_output(raw: &str) -> Vec<PaneTargetCandidate> {
+    let mut candidates = Vec::new();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split("|||").collect::<Vec<_>>();
+        let id = fields.first().copied().unwrap_or_default().trim();
+        let target = fields.get(1).copied().unwrap_or_default().trim();
+        let title = fields.get(2).copied().unwrap_or_default();
+        let tile_role = fields.get(3).copied().unwrap_or_default();
+        let cwd = fields.get(4).copied().unwrap_or_default();
+        let resolved = if id.is_empty() { target } else { id };
+        if resolved.is_empty() {
+            continue;
+        }
+        add_pane_target_candidate(&mut candidates, title, resolved, "pane-title", target);
+        add_pane_target_candidate(&mut candidates, tile_role, resolved, "tile-role", target);
+        for (name, source) in worktree_names_from_cwd(cwd) {
+            add_pane_target_candidate(&mut candidates, &name, resolved, &source, target);
+        }
+    }
+    candidates
+}
+
+fn add_pane_target_candidate(
+    candidates: &mut Vec<PaneTargetCandidate>,
+    name: &str,
+    resolved: &str,
+    source: &str,
+    target: &str,
+) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    candidates.push(PaneTargetCandidate {
+        name: name.to_owned(),
+        resolved: resolved.to_owned(),
+        source: source.to_owned(),
+        target: target.to_owned(),
+    });
+}
+
+fn unique_by_resolved(candidates: Vec<PaneTargetCandidate>) -> Vec<PaneTargetCandidate> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for candidate in candidates {
+        if seen.insert(candidate.resolved.clone()) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// Resolve a natural pane title, tile role, worktree dir, or worktree alias to a pane id.
+#[must_use]
+pub fn resolve_pane_target_from_candidates(
+    target: &str,
+    candidates: &[PaneTargetCandidate],
+) -> PaneTargetResolution {
+    let trimmed = target.trim().to_lowercase();
+    let exact = unique_by_resolved(
+        candidates
+            .iter()
+            .filter(|candidate| candidate.name.to_lowercase() == trimmed)
+            .cloned()
+            .collect(),
+    );
+    match exact.len() {
+        1 => {
+            return PaneTargetResolution::Match {
+                candidate: exact[0].clone(),
+            }
+        }
+        2.. => return PaneTargetResolution::Ambiguous { candidates: exact },
+        0 => {}
+    }
+
+    match resolve_by_name(target, candidates, ResolveOptions::default()) {
+        ResolveResult::Exact { matched } | ResolveResult::Fuzzy { matched } => {
+            PaneTargetResolution::Match { candidate: matched }
+        }
+        ResolveResult::Ambiguous { candidates } => PaneTargetResolution::Ambiguous {
+            candidates: unique_by_resolved(candidates),
+        },
+        ResolveResult::None { .. } => PaneTargetResolution::None,
+    }
+}
+
+/// Resolve a pane target directly from `PANE_TARGET_FORMAT` list-panes output.
+#[must_use]
+pub fn resolve_pane_target_from_list_panes_output(target: &str, raw: &str) -> PaneTargetResolution {
+    resolve_pane_target_from_candidates(target, &pane_target_candidates_from_list_panes_output(raw))
+}
+
 /// Parse `tmux list-sessions -F '#{session_name}\t#{session_created}'` style epoch rows.
 #[must_use]
 pub fn parse_session_epoch_list(raw: &str) -> BTreeMap<String, u64> {
@@ -2451,6 +2610,111 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pane_target_resolver_indexes_titles_roles_and_worktree_aliases() {
+        let raw = [
+            "%101|||47-mawjs:1.0|||codex-headless-demo-layout|||tile-1|||/opt/Code/github.com/Soul-Brews-Studio/mawjs-oracle.wt-7-codex-headless",
+            "%202|||47-mawjs:1.1|||notes|||researcher|||/opt/Code/github.com/Soul-Brews-Studio/notes-oracle.wt-2-researcher",
+        ]
+        .join("\n");
+
+        let names = pane_target_candidates_from_list_panes_output(&raw)
+            .into_iter()
+            .map(|candidate| {
+                format!(
+                    "{}:{}:{}",
+                    candidate.name, candidate.source, candidate.resolved
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"codex-headless-demo-layout:pane-title:%101".to_owned()));
+        assert!(names.contains(&"tile-1:tile-role:%101".to_owned()));
+        assert!(names.contains(&"codex-headless:worktree-role:%101".to_owned()));
+        assert!(names.contains(&"mawjs-codex-headless:worktree-alias:%101".to_owned()));
+
+        let hit = resolve_pane_target_from_list_panes_output("mawjs-codex-headless", &raw);
+        assert_eq!(
+            hit,
+            PaneTargetResolution::Match {
+                candidate: PaneTargetCandidate {
+                    name: "mawjs-codex-headless".to_owned(),
+                    resolved: "%101".to_owned(),
+                    source: "worktree-alias".to_owned(),
+                    target: "47-mawjs:1.0".to_owned(),
+                }
+            }
+        );
+
+        let hit = resolve_pane_target_from_list_panes_output("codex-headless-demo-layout", &raw);
+        assert_eq!(
+            hit,
+            PaneTargetResolution::Match {
+                candidate: PaneTargetCandidate {
+                    name: "codex-headless-demo-layout".to_owned(),
+                    resolved: "%101".to_owned(),
+                    source: "pane-title".to_owned(),
+                    target: "47-mawjs:1.0".to_owned(),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn pane_target_resolver_keeps_ambiguous_matches_safe() {
+        let raw = [
+            "%1|||47-mawjs:1.0|||codex-a|||worker|||/tmp/mawjs-oracle.wt-1-codex",
+            "%2|||47-mawjs:1.1|||codex-b|||worker|||/tmp/mawjs-oracle.wt-2-codex",
+        ]
+        .join("\n");
+        let hit = resolve_pane_target_from_list_panes_output("worker", &raw);
+        match hit {
+            PaneTargetResolution::Ambiguous { candidates } => {
+                assert_eq!(
+                    candidates
+                        .iter()
+                        .map(|candidate| candidate.resolved.clone())
+                        .collect::<Vec<_>>(),
+                    vec!["%1", "%2"]
+                );
+            }
+            other => panic!("expected ambiguous, got {other:?}"),
+        }
+
+        let candidates = vec![
+            PaneTargetCandidate {
+                name: "fleet-alpha".to_owned(),
+                resolved: "%1".to_owned(),
+                source: "pane-title".to_owned(),
+                target: "s:1.1".to_owned(),
+            },
+            PaneTargetCandidate {
+                name: "one-view".to_owned(),
+                resolved: "%2".to_owned(),
+                source: "pane-title".to_owned(),
+                target: "s:1.2".to_owned(),
+            },
+            PaneTargetCandidate {
+                name: "two-view".to_owned(),
+                resolved: "%3".to_owned(),
+                source: "pane-title".to_owned(),
+                target: "s:1.3".to_owned(),
+            },
+        ];
+        assert_eq!(
+            resolve_pane_target_from_candidates("alpha", &candidates),
+            PaneTargetResolution::Match {
+                candidate: candidates[0].clone()
+            }
+        );
+        assert_eq!(
+            resolve_pane_target_from_candidates("view", &candidates),
+            PaneTargetResolution::Ambiguous {
+                candidates: vec![candidates[1].clone(), candidates[2].clone()]
+            }
         );
     }
 
