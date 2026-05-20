@@ -4,11 +4,19 @@
 //! shell-safe command construction plus parsing of `list-windows` / `list-panes` output.
 //! Real process execution is intentionally injected through [`TmuxRunner`].
 
-use std::{collections::BTreeSet, error::Error, ffi::OsString, fmt, process::Command};
+use std::{
+    collections::BTreeSet,
+    error::Error,
+    ffi::OsString,
+    fmt,
+    io::Write,
+    process::{Command, Stdio},
+};
 
 const DEFAULT_CAPTURE_LINES: u32 = 80;
 const DEFAULT_PTY_COLS_LIMIT: u32 = 500;
 const DEFAULT_PTY_ROWS_LIMIT: u32 = 200;
+const MAX_SUBMIT_ATTEMPTS: u32 = 4;
 
 /// Tmux window metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +91,14 @@ pub struct SelectPaneOptions {
     pub title: Option<String>,
 }
 
+/// Outcome from maw-js-style smart text submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendTextReport {
+    pub used_buffer: bool,
+    pub enter_attempts: u32,
+    pub warned_pending: bool,
+}
+
 /// Error returned by an injected tmux runner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxError {
@@ -114,6 +130,20 @@ pub trait TmuxRunner {
     ///
     /// Returns [`TmuxError`] when tmux exits non-zero or the host command cannot be executed.
     fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, TmuxError>;
+
+    /// Run `tmux <subcommand> <args...>` with stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TmuxError`] when the runner does not support stdin or tmux execution fails.
+    fn run_with_stdin(
+        &mut self,
+        subcommand: &str,
+        args: &[String],
+        _stdin: &[u8],
+    ) -> Result<String, TmuxError> {
+        self.run(subcommand, args)
+    }
 }
 
 /// Concrete tmux runner backed by `std::process::Command`.
@@ -173,13 +203,56 @@ impl CommandTmuxRunner {
 
 impl TmuxRunner for CommandTmuxRunner {
     fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, TmuxError> {
+        self.run_command(subcommand, args, None)
+    }
+
+    fn run_with_stdin(
+        &mut self,
+        subcommand: &str,
+        args: &[String],
+        stdin: &[u8],
+    ) -> Result<String, TmuxError> {
+        self.run_command(subcommand, args, Some(stdin))
+    }
+}
+
+impl CommandTmuxRunner {
+    fn run_command(
+        &self,
+        subcommand: &str,
+        args: &[String],
+        stdin: Option<&[u8]>,
+    ) -> Result<String, TmuxError> {
         let command_line = self.argv(subcommand, args);
         let Some((program, rest)) = command_line.split_first() else {
             return Err(TmuxError::new("missing tmux program"));
         };
-        let output = Command::new(program).args(rest).output().map_err(|error| {
+        let mut command = Command::new(program);
+        command.args(rest);
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command.spawn().map_err(|error| {
             TmuxError::new(format!(
                 "failed to execute {}: {error}",
+                program.to_string_lossy()
+            ))
+        })?;
+        if let Some(stdin) = stdin {
+            let mut child_stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| TmuxError::new("failed to open tmux stdin"))?;
+            child_stdin.write_all(stdin).map_err(|error| {
+                TmuxError::new(format!(
+                    "failed to write stdin for {}: {error}",
+                    program.to_string_lossy()
+                ))
+            })?;
+        }
+        let output = child.wait_with_output().map_err(|error| {
+            TmuxError::new(format!(
+                "failed to collect {} output: {error}",
                 program.to_string_lossy()
             ))
         })?;
@@ -579,6 +652,51 @@ where
             .map(|_| ())
     }
 
+    /// Load text into tmux buffer via stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux rejects the buffer load.
+    pub fn load_buffer(&mut self, text: &str) -> Result<(), TmuxError> {
+        self.runner
+            .run_with_stdin("load-buffer", &["-".to_owned()], text.as_bytes())
+            .map(|_| ())
+    }
+
+    /// Smart text sending: buffer for multiline/long payloads, literal send otherwise, then submit-confirm.
+    ///
+    /// This is the synchronous maw-rs port of maw-js `sendText`; callers own any real-time settle delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
+    pub fn send_text(&mut self, target: &str, text: &str) -> Result<SendTextReport, TmuxError> {
+        self.exit_mode_if_needed(target)?;
+        let used_buffer = text.contains('\n') || text.len() > 500;
+        if used_buffer {
+            self.load_buffer(text)?;
+            self.paste_buffer(target)?;
+        } else {
+            self.send_keys_literal(target, text)?;
+        }
+        let (enter_attempts, warned_pending) = self.submit_with_confirm(target)?;
+        Ok(SendTextReport {
+            used_buffer,
+            enter_attempts,
+            warned_pending,
+        })
+    }
+
+    fn submit_with_confirm(&mut self, target: &str) -> Result<(u32, bool), TmuxError> {
+        for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
+            self.send_keys(target, &["Enter".to_owned()])?;
+            if !self.pane_input_pending(target) {
+                return Ok((attempt, false));
+            }
+        }
+        Ok((MAX_SUBMIT_ATTEMPTS, true))
+    }
+
     /// Capture recent pane contents using `tmux capture-pane`.
     ///
     /// # Errors
@@ -926,6 +1044,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRunner {
         calls: Vec<(String, Vec<String>)>,
+        stdin_calls: Vec<(String, Vec<String>, String)>,
         responses: Vec<Result<String, TmuxError>>,
     }
 
@@ -933,6 +1052,7 @@ mod tests {
         fn with_responses(responses: Vec<Result<&str, TmuxError>>) -> Self {
             Self {
                 calls: Vec::new(),
+                stdin_calls: Vec::new(),
                 responses: responses
                     .into_iter()
                     .map(|response| response.map(str::to_owned))
@@ -941,13 +1061,33 @@ mod tests {
         }
     }
 
-    impl TmuxRunner for FakeRunner {
-        fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, TmuxError> {
-            self.calls.push((subcommand.to_owned(), args.to_vec()));
+    impl FakeRunner {
+        fn next_response(&mut self) -> Result<String, TmuxError> {
             if self.responses.is_empty() {
                 return Err(TmuxError::new("no response"));
             }
             self.responses.remove(0)
+        }
+    }
+
+    impl TmuxRunner for FakeRunner {
+        fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, TmuxError> {
+            self.calls.push((subcommand.to_owned(), args.to_vec()));
+            self.next_response()
+        }
+
+        fn run_with_stdin(
+            &mut self,
+            subcommand: &str,
+            args: &[String],
+            stdin: &[u8],
+        ) -> Result<String, TmuxError> {
+            self.stdin_calls.push((
+                subcommand.to_owned(),
+                args.to_vec(),
+                String::from_utf8_lossy(stdin).into_owned(),
+            ));
+            self.next_response()
         }
     }
 
@@ -1169,6 +1309,99 @@ mod tests {
         assert_eq!(
             client.runner.calls[5].1,
             vec!["-t", "%10", "-l", "hello | world"]
+        );
+    }
+
+    #[test]
+    fn send_text_uses_literal_path_and_retries_until_capture_clears() {
+        let runner = FakeRunner::with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok("\u{1b}[32m❯\u{1b}[0m deploy now\r"),
+            Ok(""),
+            Ok("\u{1b}[32m❯\u{1b}[0m \r"),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        let report = client
+            .send_text("sess:oracle.0", "deploy now")
+            .expect("send text ok");
+        assert_eq!(
+            report,
+            SendTextReport {
+                used_buffer: false,
+                enter_attempts: 2,
+                warned_pending: false,
+            }
+        );
+        assert_eq!(client.runner.calls[0].0, "display-message");
+        assert_eq!(
+            client.runner.calls[1].1,
+            vec!["-t", "sess:oracle.0", "-l", "deploy now"]
+        );
+        assert_eq!(
+            client.runner.calls[2].1,
+            vec!["-t", "sess:oracle.0", "Enter"]
+        );
+        assert_eq!(client.runner.calls[3].0, "capture-pane");
+        assert_eq!(
+            client.runner.calls[4].1,
+            vec!["-t", "sess:oracle.0", "Enter"]
+        );
+        assert_eq!(client.runner.stdin_calls.len(), 0);
+    }
+
+    #[test]
+    fn send_text_uses_buffer_path_for_multiline_or_long_payloads() {
+        let long_text = "x".repeat(501);
+        let runner = FakeRunner::with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok(""), Ok("$ \r")]);
+        let mut client = TmuxClient::new(runner);
+        let report = client
+            .send_text("sess:oracle.0", &long_text)
+            .expect("send text ok");
+        assert!(report.used_buffer);
+        assert_eq!(report.enter_attempts, 1);
+        assert_eq!(
+            client.runner.stdin_calls,
+            vec![("load-buffer".to_owned(), vec!["-".to_owned()], long_text,)]
+        );
+        assert_eq!(client.runner.calls[1].0, "paste-buffer");
+    }
+
+    #[test]
+    fn send_text_reports_warning_after_max_pending_retries() {
+        let runner = FakeRunner::with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok("$ deploy"),
+            Ok(""),
+            Ok("$ deploy"),
+            Ok(""),
+            Ok("$ deploy"),
+            Ok(""),
+            Ok("$ deploy"),
+        ]);
+        let mut client = TmuxClient::new(runner);
+        let report = client
+            .send_text("sess:oracle.0", "deploy")
+            .expect("send text ok");
+        assert_eq!(report.enter_attempts, 4);
+        assert!(report.warned_pending);
+        assert_eq!(
+            client
+                .runner
+                .calls
+                .iter()
+                .filter(|(subcommand, args)| subcommand == "send-keys"
+                    && args
+                        == &vec![
+                            "-t".to_owned(),
+                            "sess:oracle.0".to_owned(),
+                            "Enter".to_owned()
+                        ])
+                .count(),
+            4
         );
     }
 
