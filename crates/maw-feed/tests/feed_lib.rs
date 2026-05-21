@@ -211,3 +211,78 @@ fn describe_activity_renders_lifecycle_notification_and_fallback_branches() {
         "PluginLoad"
     );
 }
+
+#[test]
+fn active_oracles_wrapper_uses_current_time_cutoff() {
+    let nowish = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_millis(),
+    )
+    .expect("current time should fit in i64 millis");
+    let active = event(|e| {
+        e.oracle = "now".to_owned();
+        e.ts = nowish;
+    });
+    let stale = event(|e| {
+        e.oracle = "old".to_owned();
+        e.ts = 1;
+    });
+
+    let active = maw_feed::active_oracles(&[stale, active], 60_000);
+    assert_eq!(active.keys().cloned().collect::<Vec<_>>(), vec!["now"]);
+}
+
+#[test]
+fn describe_activity_covers_empty_tool_status_fallback() {
+    assert_eq!(
+        describe_activity(&event(|e| {
+            e.event = "PostToolUse".to_owned();
+            e.message.clear();
+        })),
+        "✓ Tool done"
+    );
+    assert_eq!(
+        describe_activity(&event(|e| {
+            e.event = "PostToolUseFailure".to_owned();
+            e.message = "   ".to_owned();
+        })),
+        "✗ Tool failed"
+    );
+}
+
+#[test]
+fn parse_line_rejects_invalid_timestamp_shapes_and_ranges() {
+    for timestamp in [
+        "2026-05-18-extra 12:00:00",
+        "2026-05-18 12:00:00:01",
+        "2026-00-18 12:00:00",
+        "2026-13-18 12:00:00",
+        "2026-05-00 12:00:00",
+        "2026-05-32 12:00:00",
+        "2026-05-18 24:00:00",
+        "2026-05-18 12:60:00",
+        "2026-05-18 12:00:60",
+        "2026-02-30 12:00:00",
+        "2026-04-31 12:00:00",
+    ] {
+        let line = format!("{timestamp} | oracle | host | Notification | project | session");
+        assert_eq!(parse_line(&line), None, "{timestamp} should reject");
+    }
+}
+
+#[test]
+fn parse_line_accepts_month_lengths_and_leap_days() {
+    for timestamp in [
+        "2026-01-31 00:00:00",
+        "2026-04-30 00:00:00",
+        "2024-02-29 00:00:00",
+        "2026-02-28 00:00:00",
+    ] {
+        let line = format!("{timestamp} | oracle | host | Notification | project | session");
+        assert!(parse_line(&line).is_some(), "{timestamp} should parse");
+    }
+    let non_leap = "2026-02-29 00:00:00 | oracle | host | Notification | project | session";
+    assert_eq!(parse_line(non_leap), None);
+}

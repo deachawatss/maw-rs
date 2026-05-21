@@ -80,3 +80,28 @@ fn split_policy_fixtures_match_maw_js_portable_spec() {
         );
     }
 }
+
+#[test]
+fn split_policy_string_and_empty_edges_are_covered() {
+    assert_eq!(ClaudePanePolicy::Split.as_str(), "split");
+    assert_eq!(ClaudePanePolicy::BackgroundTab.as_str(), "background-tab");
+    assert_eq!(ClaudePanePolicy::LinkWindow.as_str(), "link-window");
+    assert_eq!(ClaudePanePolicy::Refuse.as_str(), "refuse");
+    assert_eq!(SplitPolicyReason::NotAttaching.as_str(), "not-attaching");
+    assert_eq!(SplitPolicyReason::ForceSplit.as_str(), "force-split");
+    assert_eq!(SplitPolicyReason::NotClaude.as_str(), "not-claude");
+    assert_eq!(SplitPolicyReason::ClaudePolicy.as_str(), "claude-policy");
+
+    assert_eq!(
+        decide_split_policy(&SplitPolicyInput {
+            pane_current_command: None,
+            requested_policy: Some(String::new()),
+            ..SplitPolicyInput::default()
+        })
+        .unwrap()
+        .reason,
+        SplitPolicyReason::NotClaude
+    );
+
+    assert!(!maw_split::is_claude_like_pane(Some("1.2.3.4")));
+}

@@ -65,6 +65,12 @@ fn validates_workspace_config_with_maw_js_reasons() {
         ),
         invalid("hubUrl not a valid URL")
     );
+    assert_eq!(
+        validate_workspace_config(
+            &json!({ "id": "ws", "hubUrl": "ws://bad host", "token": "t", "sharedAgents": [] })
+        ),
+        invalid("hubUrl not a valid URL")
+    );
 }
 
 #[test]

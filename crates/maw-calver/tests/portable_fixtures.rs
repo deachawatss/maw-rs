@@ -293,3 +293,21 @@ fn calver_fixtures_match_maw_js_portable_spec() {
         }
     }
 }
+
+#[test]
+fn calver_edge_branches_are_covered() {
+    assert_eq!(extract_base_from_version("26..18"), None);
+    assert_eq!(extract_base_from_version("26.5.x"), None);
+    assert_eq!(extract_base_from_version("26.5.18.1"), None);
+    assert!(!is_valid_calendar_date("26.0.1"));
+    assert!(!is_valid_calendar_date("26.13.1"));
+
+    let err = effective_base("26.5.18", "26.4.31").unwrap_err();
+    assert!(err.contains("day 31 doesn't exist in month 4"));
+
+    assert_eq!(max_n_from_package_json("26.5.18", Channel::Alpha, ""), -1);
+    assert_eq!(
+        max_n_from_package_json("26.5.18", Channel::Alpha, "26.5.18-alpha.x"),
+        -1
+    );
+}

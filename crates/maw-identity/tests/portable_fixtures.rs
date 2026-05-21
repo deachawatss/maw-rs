@@ -1,4 +1,7 @@
-use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
+use maw_identity::{
+    canonical_node_identity, canonical_session_name, canonical_session_stem,
+    CanonicalSessionNameInput,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -55,4 +58,21 @@ fn canonical_node_identity_fixtures_match_maw_js_portable_spec() {
         let actual = canonical_node_identity(&fixture.input.host, fixture.input.user.as_deref());
         assert_eq!(actual, fixture.expected, "{}", fixture.name);
     }
+}
+
+#[test]
+fn constructors_stem_and_slot_errors_are_covered() {
+    assert_eq!(
+        canonical_session_name(&CanonicalSessionNameInput::new("50-foo-oracle.git")).unwrap(),
+        "foo"
+    );
+    assert_eq!(
+        canonical_session_name(&CanonicalSessionNameInput::with_slot("foo-oracle", 7)).unwrap(),
+        "07-foo"
+    );
+    assert_eq!(canonical_session_stem("foo-oracle").unwrap(), "foo");
+    assert_eq!(
+        canonical_session_name(&CanonicalSessionNameInput::with_slot("foo", 100)).unwrap_err(),
+        "invalid fleet slot '100'"
+    );
 }

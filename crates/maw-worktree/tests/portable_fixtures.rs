@@ -92,3 +92,41 @@ fn worktree_window_fixtures_match_maw_js_portable_spec() {
         );
     }
 }
+
+#[test]
+fn exact_worktree_name_can_bind_across_all_windows_without_parent_session() {
+    let sessions = vec![Session {
+        name: "unrelated".to_owned(),
+        windows: vec![Window {
+            index: 0,
+            name: "123-feature".to_owned(),
+            active: false,
+        }],
+    }];
+
+    assert_eq!(
+        resolve_worktree_window("repo", "123-feature", &sessions),
+        WorktreeWindowResolution::Bound {
+            window: "123-feature".to_owned()
+        }
+    );
+}
+
+#[test]
+fn worktree_name_without_dash_falls_through_to_all_window_resolution() {
+    let sessions = vec![Session {
+        name: "unrelated".to_owned(),
+        windows: vec![Window {
+            index: 0,
+            name: "feature".to_owned(),
+            active: false,
+        }],
+    }];
+
+    assert_eq!(
+        resolve_worktree_window("repo", "feature", &sessions),
+        WorktreeWindowResolution::Bound {
+            window: "feature".to_owned()
+        }
+    );
+}
