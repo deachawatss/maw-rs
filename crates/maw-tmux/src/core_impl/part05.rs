@@ -148,12 +148,11 @@ fn tmux_pane_to_live_pane(pane: &TmuxPane, peers: &[maw_peer::PeerTarget]) -> Di
                 .iter()
                 .any(|signal| peer_signals.iter().any(|peer_signal| peer_signal == signal))
         })
-        .map(|peer| {
+        .filter_map(|peer| {
             peer.name
                 .clone()
                 .or_else(|| peer.node.clone())
                 .or_else(|| peer.oracle.clone())
-                .unwrap_or_else(|| peer.url.clone())
         })
         .collect();
     live
