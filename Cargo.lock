@@ -80,7 +80,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "maw-auth"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "hmac",
  "sha2",
@@ -88,15 +88,15 @@ dependencies = [
 
 [[package]]
 name = "maw-auto-wake"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "maw-bind"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "maw-bring"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "maw-calver"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "maw-cli"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "maw-auth",
  "maw-auto-wake",
@@ -140,15 +140,15 @@ dependencies = [
 
 [[package]]
 name = "maw-feed"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "maw-fuzzy"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "maw-hub"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -156,7 +156,7 @@ dependencies = [
 
 [[package]]
 name = "maw-identity"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "maw-matcher"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "maw-peer"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "maw-xdg",
  "serde",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "maw-plugin-manifest"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde_json",
  "sha2",
@@ -189,14 +189,14 @@ dependencies = [
 
 [[package]]
 name = "maw-plugin-scaffold"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "maw-policy"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "maw-routing"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "maw-split"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "maw-tmux"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "maw-matcher",
  "maw-peer",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "maw-transport"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "maw-worktree"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "maw-matcher",
  "serde",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "maw-xdg"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 
 [[package]]
 name = "memchr"
