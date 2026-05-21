@@ -145,15 +145,17 @@ fn plugin_manifest_text_rendering_and_parser_errors_are_stable() {
         ]),
         "ts alpha\n",
     );
-    assert_ok_text(
-        &run_cli(&[
-            "plugin-manifest".to_owned(),
-            "discover".to_owned(),
-            "--scan-dir".to_owned(),
-            plugins_dir.display().to_string(),
-        ]),
-        "wasm-plug\nalpha\n",
-    );
+    let discovered = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "discover".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.display().to_string(),
+    ]);
+    assert_eq!(discovered.code, 0, "{}", discovered.stderr);
+    let mut discovered_names = discovered.stdout.lines().collect::<Vec<_>>();
+    discovered_names.sort_unstable();
+    assert_eq!(discovered_names, ["alpha", "wasm-plug"]);
+    assert!(discovered.stderr.is_empty(), "{}", discovered.stderr);
     assert_ok_text(
         &run_cli(&[
             "plugin-manifest".to_owned(),
