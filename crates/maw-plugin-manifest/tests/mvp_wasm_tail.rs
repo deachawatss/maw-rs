@@ -74,6 +74,28 @@ fn wasm_parser_rejects_additional_truncated_sections() {
             "import-global-missing-mutability",
             wasm(&[(2, vector(vec![import_entry("env", "g", 0x03, vec![0x7f])]))]),
         ),
+        (
+            "import-global-missing-content-type",
+            wasm(&[(2, vector(vec![import_entry("env", "g", 0x03, vec![])]))]),
+        ),
+        (
+            "import-table-missing-min",
+            wasm(&[(
+                2,
+                vector(vec![import_entry("env", "table", 0x01, vec![0x00])]),
+            )]),
+        ),
+        (
+            "import-table-missing-max",
+            wasm(&[(
+                2,
+                vector(vec![import_entry("env", "table", 0x01, vec![0x01, 0x01])]),
+            )]),
+        ),
+        (
+            "import-name-bytes-truncated",
+            wasm(&[(2, vec![0x01, 0x03])]),
+        ),
     ];
 
     for (name, bytes) in cases {
@@ -108,6 +130,10 @@ fn wasm_parser_rejects_truncated_exports_and_code() {
         (
             "export-missing-index",
             wasm(&[(7, vector(vec![extend(wasm_name("memory"), &[0x02])]))]),
+        ),
+        (
+            "export-name-bytes-truncated",
+            wasm(&[(7, vec![0x01, 0x05])]),
         ),
         (
             "code-missing-count",
@@ -148,8 +174,20 @@ fn wasm_parser_rejects_truncated_exports_and_code() {
             valid_wasm_with_body(&[0x01, 0x01], vec![]),
         ),
         (
+            "const-local-missing-count",
+            valid_wasm_with_body(&[0x01], vec![]),
+        ),
+        (
+            "const-opcode-missing",
+            valid_wasm_with_body(&[0x00], vec![]),
+        ),
+        (
             "const-missing-i32-op",
             valid_wasm_with_body(&[0x00, 0x42, 0x00, 0x0b], vec![]),
+        ),
+        (
+            "const-end-missing",
+            valid_wasm_with_body(&[0x00, 0x41, 0x00], vec![]),
         ),
         (
             "const-missing-end",
@@ -176,6 +214,11 @@ fn wasm_parser_rejects_truncated_exports_and_code() {
 fn wasm_parser_rejects_truncated_data_sections() {
     let root = temp_dir("wasm-truncated-data");
     let cases = [
+        ("data-section-empty", wasm_with_raw_data_section(vec![])),
+        (
+            "data-missing-flag",
+            valid_wasm_with_body(&[0x00, 0x41, 0x00, 0x0b], data_section(vec![vec![]])),
+        ),
         (
             "data-non-i32-offset",
             valid_wasm_with_body(
@@ -195,6 +238,13 @@ fn wasm_parser_rejects_truncated_data_sections() {
             valid_wasm_with_body(
                 &[0x00, 0x41, 0x00, 0x0b],
                 data_section(vec![vec![0x00, 0x41, 0x00, 0x00]]),
+            ),
+        ),
+        (
+            "data-end-byte-missing",
+            valid_wasm_with_body(
+                &[0x00, 0x41, 0x00, 0x0b],
+                data_section(vec![vec![0x00, 0x41, 0x00]]),
             ),
         ),
         (
@@ -287,6 +337,22 @@ fn wasm_runtime_covers_large_data_offset_and_short_length_prefix() {
         ),
         InvokeResult::output("a")
     );
+
+    let payload_past_end = valid_wasm_with_body(
+        &const_i32_body(65_530),
+        data_section(vec![extend(
+            data_i32_offset_prefix(65_530),
+            &[6, 10, 0, 0, 0, b'a', b'b'],
+        )]),
+    );
+    assert_eq!(
+        invoke_plugin(
+            &write_wasm_plugin(&root, "payload-past-end", &payload_past_end),
+            &cli(&[]),
+            &mut MvpWasmInvokeRuntime,
+        ),
+        InvokeResult::output("\n")
+    );
     remove_dir_all(root).expect("cleanup");
 }
 
@@ -350,6 +416,17 @@ fn valid_wasm_with_body(body_bytes: &[u8], data: Vec<u8>) -> Vec<u8> {
         code(&[body(body_bytes)]),
         data,
     )
+}
+
+fn wasm_with_raw_data_section(data: Vec<u8>) -> Vec<u8> {
+    wasm(&[
+        (1, vec![0x01, 0x60, 0x00, 0x01, 0x7f]),
+        (5, vec![0x01, 0x00, 0x01]),
+        (3, section_indices(1)),
+        (7, exports(&[("memory", 0x02, 0), ("handle", 0x00, 0)])),
+        (10, code(&[body(&[0x00, 0x41, 0x00, 0x0b])])),
+        (11, data),
+    ])
 }
 
 fn wasm_module(
@@ -423,6 +500,20 @@ fn body(bytes: &[u8]) -> Vec<u8> {
 
 fn data_section(segments: Vec<Vec<u8>>) -> Vec<u8> {
     vector(segments)
+}
+
+fn data_i32_offset_prefix(offset: u32) -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x41];
+    bytes.extend(leb(offset));
+    bytes.push(0x0b);
+    bytes
+}
+
+fn const_i32_body(value: u32) -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x41];
+    bytes.extend(leb(value));
+    bytes.push(0x0b);
+    bytes
 }
 
 fn vector(items: Vec<Vec<u8>>) -> Vec<u8> {

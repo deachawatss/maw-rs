@@ -320,6 +320,22 @@
     }
 
     #[test]
+    fn command_runner_reports_broken_pipe_when_child_closes_stdin() {
+        let mut runner = CommandTmuxRunner::with_program("sh");
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+
+        let error = runner
+            .run_with_stdin("-c", &["exit 0".to_owned()], &payload)
+            .expect_err("closed child stdin should surface write failure");
+
+        assert!(
+            error.message.contains("write stdin for"),
+            "unexpected error: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn live_state_falls_back_for_non_standard_tmux_targets() {
         let result = resolve_tmux_live_state(
             &[],

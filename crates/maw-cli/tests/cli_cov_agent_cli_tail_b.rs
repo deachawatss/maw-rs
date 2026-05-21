@@ -316,3 +316,138 @@ fn ls_and_bring_tail_b_render_and_filter_edges_are_stable() {
     let minimal = assert_ok(&["bring", "neo"]);
     assert_eq!(minimal.stdout, "wake neo --split\n");
 }
+
+#[test]
+fn auth_tail_b_success_region_edges_are_stable() {
+    let sign_v1 = assert_json(&[
+        "auth",
+        "sign-v1",
+        "--token",
+        "peer-token",
+        "--method",
+        "POST",
+        "--path",
+        "/api/oracle",
+        "--now",
+        "1700000000",
+        "--body-hash",
+        "abc123",
+        "--plan-json",
+    ]);
+    assert_eq!(sign_v1["kind"], "sign-v1");
+    assert_eq!(sign_v1["method"], "POST");
+    assert_eq!(sign_v1["path"], "/api/oracle");
+    assert_eq!(sign_v1["bodyHash"], "abc123");
+
+    let headers = assert_json(&[
+        "auth",
+        "sign-headers",
+        "--token",
+        "peer-token",
+        "--method",
+        "PATCH",
+        "--path",
+        "/api/patch",
+        "--now",
+        "1700000001",
+        "--body",
+        "payload-body",
+        "--plan-json",
+    ]);
+    assert_eq!(headers["kind"], "sign-headers");
+    assert_eq!(headers["method"], "PATCH");
+    assert_eq!(headers["path"], "/api/patch");
+
+    let verify_v1 = assert_json(&[
+        "auth",
+        "verify-v1",
+        "--token",
+        "peer-token",
+        "--method",
+        "POST",
+        "--path",
+        "/api/oracle",
+        "--signature",
+        "bad-signature",
+        "--signed-at",
+        "1700000000",
+        "--now",
+        "1700000001",
+        "--plan-json",
+    ]);
+    assert_eq!(verify_v1["kind"], "verify-v1");
+    assert_eq!(verify_v1["valid"], false);
+
+    let payload = assert_json(&[
+        "auth",
+        "from-sign-payload",
+        "--from",
+        "mawjs:m5",
+        "--legacy",
+        "--signed-at",
+        "1700000000",
+        "--method",
+        "PUT",
+        "--path",
+        "/legacy",
+        "--body-hash",
+        "bodyhash",
+        "--plan-json",
+    ]);
+    assert_eq!(payload["kind"], "from-sign-payload");
+    assert_eq!(payload["version"], "legacy");
+}
+
+#[test]
+fn discover_ls_bring_tail_b_remaining_region_edges_are_stable() {
+    assert_usage(
+        &["discover", "--oracle", "bad"],
+        "discover: --oracle must use",
+    );
+    let discover = assert_json(&[
+        "discover",
+        "--named-peer",
+        "window-node=http://window-node:3456",
+        "--agent",
+        "agent-window=window-node",
+        "--fleet",
+        "fleet.toml|slot|workspace|101-mawjs|agent-window|Soul/workspace",
+        "--oracle",
+        "workspace|-|-|-|agent-window|Soul/workspace|-|false|true",
+        "--tree",
+        "--json",
+        "--plan-json",
+    ]);
+    assert_eq!(
+        discover["fleet"]["records"][0]["endpoint"],
+        "http://window-node:3456"
+    );
+    assert_eq!(discover["oracles"]["records"][0]["fleetMatched"], true);
+
+    let active_minutes = assert_json(&[
+        "ls",
+        "--active",
+        "2m",
+        "--json",
+        "--now",
+        "200",
+        "--pane",
+        "%1|bash|50-mawjs:1.0|minute-old|100|/repo|100",
+    ]);
+    assert_eq!(active_minutes["activeThresholdSec"], 120);
+    assert_eq!(active_minutes["sessions"][0]["status"], "idle");
+
+    let empty_days = assert_ok(&[
+        "ls",
+        "--active=1d",
+        "--now",
+        "200000",
+        "--pane",
+        "%9|bash|50-mawjs:1.0|too-old|100|/repo|1",
+    ]);
+    assert_eq!(empty_days.stdout, "No sessions active in the last 1d.\n");
+    assert_usage(
+        &["bring", "--engine", "codex"],
+        "bring: missing oracle name",
+    );
+}

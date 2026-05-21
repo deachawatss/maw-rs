@@ -422,7 +422,19 @@ mod tests {
 
     #[test]
     fn private_timestamp_and_hmac_edges_are_reachable() {
+        assert!(!verify_hmac_sig("s", "p", ""));
         assert!(!verify_hmac_sig("s", "p", "not-hex"));
+        assert!(!verify_hmac_sig("s", "p", "0"));
+        assert!(!verify_auto_pair_proof(
+            &AutoPairIdentity {
+                oracle: "o".to_owned(),
+                node: "n".to_owned(),
+                url: "u".to_owned(),
+                pubkey: "p".to_owned(),
+            },
+            "token",
+            "",
+        ));
         assert!(!verify_auto_pair_proof(
             &AutoPairIdentity {
                 oracle: "o".to_owned(),
@@ -434,6 +446,7 @@ mod tests {
             &"z".repeat(64),
         ));
 
+        assert_eq!(parse_iso_millis("2024-01-01T00:00:00"), Some(1_704_067_200_000));
         assert_eq!(parse_second_millis("07.1"), Some((7, 100)));
         assert_eq!(parse_second_millis("07.12"), Some((7, 120)));
         assert_eq!(parse_second_millis("07.1239"), Some((7, 123)));

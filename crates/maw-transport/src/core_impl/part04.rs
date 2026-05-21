@@ -137,12 +137,21 @@ mod coverage_gap_tests {
 
     #[test]
     fn classifier_recognizes_alternate_needles_and_rate_limit_shapes() {
+        assert_eq!(
+            classify_error(None),
+            ClassifiedError {
+                reason: TransportFailureReason::Unknown,
+                retryable: false,
+            }
+        );
         for (message, reason, retryable) in [
             ("ENETUNREACH while dialing", TransportFailureReason::Unreachable, true),
             ("too many requests", TransportFailureReason::RateLimit, true),
             ("rate window limit exceeded", TransportFailureReason::RateLimit, true),
+            ("403 forbidden", TransportFailureReason::Auth, false),
             ("permission denied", TransportFailureReason::Rejected, false),
             ("json syntax error", TransportFailureReason::ParseError, false),
+            ("socket evaporated mysteriously", TransportFailureReason::Unknown, false),
         ] {
             assert_eq!(
                 classify_error(Some(message)),
@@ -217,6 +226,131 @@ mod coverage_gap_tests {
             *sent.borrow(),
             vec!["soft-false", "retryable", "winner"]
         );
+    }
+
+    struct RemoteSessionIo;
+
+    impl HttpTransportIo for RemoteSessionIo {
+        fn list_local_sessions(&mut self) -> Result<Vec<TmuxTransportSession>, String> {
+            Ok(vec![TmuxTransportSession {
+                name: "local".to_owned(),
+                windows: Vec::new(),
+            }])
+        }
+
+        fn get_all_sessions(
+            &mut self,
+            _local_sessions: &[TmuxTransportSession],
+        ) -> Result<Vec<TransportSession>, String> {
+            Ok(vec![
+                TransportSession {
+                    name: "without-source".to_owned(),
+                    source: None,
+                    windows: vec![TmuxTransportWindow {
+                        index: 0,
+                        name: "mawjs".to_owned(),
+                        active: true,
+                    }],
+                },
+                TransportSession {
+                    name: "local-source".to_owned(),
+                    source: Some("local".to_owned()),
+                    windows: vec![TmuxTransportWindow {
+                        index: 1,
+                        name: "mawjs".to_owned(),
+                        active: false,
+                    }],
+                },
+                TransportSession {
+                    name: "remote-miss".to_owned(),
+                    source: Some("http://miss".to_owned()),
+                    windows: vec![TmuxTransportWindow {
+                        index: 2,
+                        name: "other".to_owned(),
+                        active: false,
+                    }],
+                },
+                TransportSession {
+                    name: "remote-hit".to_owned(),
+                    source: Some("http://hit".to_owned()),
+                    windows: vec![TmuxTransportWindow {
+                        index: 3,
+                        name: "MAWJS oracle".to_owned(),
+                        active: false,
+                    }],
+                },
+            ])
+        }
+
+        fn find_target_window(
+            &mut self,
+            sessions: &[TransportSession],
+            query: &str,
+        ) -> Option<String> {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(query, "mawjs");
+            Some(format!("{}:3", sessions[0].name))
+        }
+
+        fn send_peer_keys(
+            &mut self,
+            source: &str,
+            target: &str,
+            message: &str,
+        ) -> Result<bool, String> {
+            assert_eq!(source, "http://hit");
+            assert_eq!(target, "remote-hit:3");
+            assert_eq!(message, "hello");
+            Ok(true)
+        }
+
+        fn post_peer_feed(
+            &mut self,
+            _url: &str,
+            _method: &str,
+            _body: &str,
+            _timeout_ms: u64,
+        ) -> Result<HttpPostResult, String> {
+            Ok(HttpPostResult {
+                ok: true,
+                status: 200,
+            })
+        }
+
+        fn timeout_for(&self, _transport: &str) -> u64 {
+            250
+        }
+    }
+
+    #[test]
+    fn http_transport_lifecycle_and_remote_session_scan_edges_are_deterministic() {
+        let config = HttpTransportConfig {
+            peers: vec!["http://peer".to_owned()],
+            self_host: "local".to_owned(),
+        };
+        let mut transport = HttpFederationTransport::new(config, RemoteSessionIo);
+
+        assert!(!transport.connected());
+        transport.connect();
+        assert!(transport.connected());
+        assert_eq!(transport.name(), "http-federation");
+        assert!(transport.can_reach(&target("mawjs")));
+        assert!(!transport.can_reach(&TransportTarget {
+            oracle: "mawjs".to_owned(),
+            host: Some("localhost".to_owned()),
+            tmux_target: None,
+        }));
+        transport.on_message();
+        transport.on_presence();
+        transport.on_feed();
+        assert_eq!(transport.handler_counts(), (1, 1, 1));
+        transport.publish_presence();
+        assert_eq!(transport.io().timeout_for("http"), 250);
+        assert!(transport.publish_feed("{}").is_empty());
+
+        assert!(transport.send(&target("mawjs"), "hello"));
+        transport.disconnect();
+        assert!(!transport.connected());
     }
 
     #[test]
