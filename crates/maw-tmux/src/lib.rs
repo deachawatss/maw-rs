@@ -4072,6 +4072,12 @@ mod tests {
         assert!(error
             .message
             .contains("failed to execute /definitely/not/a/tmux"));
+
+        let mut quiet_failure_runner = CommandTmuxRunner::with_program("/bin/sh");
+        let error = quiet_failure_runner
+            .run("-c", &["exit 9".to_owned()])
+            .expect_err("empty stderr/stdout reports status only");
+        assert_eq!(error.message, "tmux exited with status 9");
     }
 
     #[test]
@@ -4182,12 +4188,21 @@ mod tests {
 
     #[test]
     fn pure_edge_cases_cover_malformed_ansi_targets_and_duration_inputs() {
+        assert_eq!(
+            strip_tmux_ansi("left\u{1b}[2Kright\u{1b}[1G!"),
+            "leftright!"
+        );
         assert_eq!(strip_tmux_ansi("left\u{1b}[?right"), "left\u{1b}[?right");
         assert_eq!(strip_tmux_ansi("wide λ"), "wide λ");
         assert!(!pane_input_pending_from_capture("\n \n\t"));
+        assert!(contains_word("please rm now", "rm"));
+        assert!(!contains_word("farmhouse", "rm"));
         assert!(!check_destructive("program").destructive);
+        assert!(!has_redirect("echo hi >", false));
+        assert!(!has_redirect("echo hi >>", true));
         assert!(!is_claude_like_pane(Some(".")));
         assert!(!is_claude_like_pane(Some("1.")));
+        assert!(!is_claude_like_pane(None));
         assert_eq!(tmux_window_target("session.window.1"), "session.window.1");
         assert_eq!(tmux_window_target("session:win.x"), "session:win.x");
         assert_eq!(
@@ -4201,6 +4216,18 @@ mod tests {
             active_duration_arg(&["--active".to_owned()], "--active"),
             None
         );
+        assert_eq!(
+            active_duration_arg(&["--active=15m".to_owned()], "--active"),
+            Some("15m".to_owned())
+        );
+        assert_eq!(
+            active_duration_arg(&["--active=0m".to_owned()], "--active"),
+            None
+        );
+        assert_eq!(
+            active_duration_arg(&["--active".to_owned(), "-v".to_owned()], "--active"),
+            None
+        );
         assert_eq!(format_session_created(Some(1)), "1970-01-01 00:00:01");
         assert_eq!(
             similar_oracle_candidates_from_repos("plain", &["plain-oracle".to_owned()]),
@@ -4209,6 +4236,285 @@ mod tests {
         assert_eq!(
             tmux_shell_command(Some(""), "list-panes", &[]),
             "tmux -S '' list-panes"
+        );
+        assert_eq!(
+            parse_pane_tag_options("@broken\nnot-meta value\n"),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            parse_pane_tag_options("@quoted \"value\\\\tail\\\\\""),
+            BTreeMap::from([("@quoted".to_owned(), "value\\tail\\".to_owned())])
+        );
+        assert_eq!(parse_list_all_windows("too|||short\n"), Vec::new());
+        assert!(pane_target_candidates_from_list_panes_output("||||||||||||").is_empty());
+        assert_eq!(basename("///"), "///");
+        assert!(worktree_names_from_cwd("").is_empty());
+        assert_eq!(
+            worktree_names_from_cwd("/tmp/project-oracle.wt-7-codex")
+                .into_iter()
+                .map(|(name, source)| format!("{source}:{name}"))
+                .collect::<Vec<_>>(),
+            vec![
+                "worktree-dir:project-oracle.wt-7-codex",
+                "worktree-role:codex",
+                "worktree-alias:project-codex",
+            ]
+        );
+        assert_eq!(parse_tmux_pane_target(":win.1"), None);
+        assert_eq!(parse_tmux_pane_target("session:.1"), None);
+        assert_eq!(parse_tmux_pane_target("session:win."), None);
+    }
+
+    #[test]
+    fn tmux_client_remaining_simple_queries_use_runner_outputs() {
+        let runner = FakeRunner::with_responses(vec![
+            Ok("1:main:1\n2:logs:0\n"),
+            Ok("bash\nzsh\n"),
+            Ok("vim\t/tmp/repo\n"),
+            Ok("pane title\n"),
+            Ok("@role worker\n@quoted \"hello\\\\ world\"\nwindow-option ignored\nmalformed\n"),
+        ]);
+        let mut client = TmuxClient::new(runner);
+
+        assert_eq!(
+            client.list_windows("demo").expect("windows parse"),
+            vec![
+                TmuxWindow {
+                    index: 1,
+                    name: "main".to_owned(),
+                    active: true,
+                    cwd: None,
+                },
+                TmuxWindow {
+                    index: 2,
+                    name: "logs".to_owned(),
+                    active: false,
+                    cwd: None,
+                },
+            ]
+        );
+        assert_eq!(client.get_pane_command("%1").expect("command"), "bash");
+        assert_eq!(
+            client.get_pane_info("%1").expect("pane info"),
+            ("vim".to_owned(), "/tmp/repo".to_owned())
+        );
+        assert_eq!(
+            client.read_pane_tags("%1").expect("tags"),
+            PaneTags {
+                title: "pane title".to_owned(),
+                meta: BTreeMap::from([
+                    ("@quoted".to_owned(), "hello\\ world".to_owned()),
+                    ("@role".to_owned(), "worker".to_owned()),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn tmux_client_tag_pane_writes_title_and_normalized_metadata() {
+        let runner = FakeRunner::with_responses(vec![Ok(""), Ok(""), Ok("")]);
+        let mut client = TmuxClient::new(runner);
+
+        client
+            .tag_pane(
+                "%2",
+                Some("worker"),
+                &[
+                    ("role".to_owned(), "executor".to_owned()),
+                    ("@node".to_owned(), "alpha".to_owned()),
+                ],
+            )
+            .expect("tag writes");
+
+        assert_eq!(
+            client.runner.calls,
+            vec![
+                (
+                    "select-pane".to_owned(),
+                    vec![
+                        "-t".to_owned(),
+                        "%2".to_owned(),
+                        "-T".to_owned(),
+                        "worker".to_owned(),
+                    ],
+                ),
+                (
+                    "set-option".to_owned(),
+                    vec![
+                        "-p".to_owned(),
+                        "-t".to_owned(),
+                        "%2".to_owned(),
+                        "@role".to_owned(),
+                        "executor".to_owned(),
+                    ],
+                ),
+                (
+                    "set-option".to_owned(),
+                    vec![
+                        "-p".to_owned(),
+                        "-t".to_owned(),
+                        "%2".to_owned(),
+                        "@node".to_owned(),
+                        "alpha".to_owned(),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tmux_client_simple_query_and_tag_errors_propagate_runner_context() {
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![Err(TmuxError::new(
+            "no windows",
+        ))]));
+        assert_eq!(
+            client.list_windows("demo").expect_err("list error").message,
+            "no windows"
+        );
+
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![Err(TmuxError::new(
+            "no command",
+        ))]));
+        assert_eq!(
+            client
+                .get_pane_command("%1")
+                .expect_err("command error")
+                .message,
+            "no command"
+        );
+
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![Err(TmuxError::new(
+            "no info",
+        ))]));
+        assert_eq!(
+            client.get_pane_info("%1").expect_err("info error").message,
+            "no info"
+        );
+
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![Err(TmuxError::new(
+            "title denied",
+        ))]));
+        assert_eq!(
+            client
+                .tag_pane("%1", Some("title"), &[])
+                .expect_err("title error")
+                .message,
+            "title denied"
+        );
+
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![
+            Ok(""),
+            Err(TmuxError::new("meta denied")),
+        ]));
+        assert_eq!(
+            client
+                .tag_pane(
+                    "%1",
+                    Some("title"),
+                    &[("role".to_owned(), "worker".to_owned())]
+                )
+                .expect_err("meta error")
+                .message,
+            "meta denied"
+        );
+
+        let mut client = TmuxClient::new(FakeRunner::with_responses(vec![Err(TmuxError::new(
+            "no title",
+        ))]));
+        assert_eq!(
+            client
+                .read_pane_tags("%1")
+                .expect_err("title read error")
+                .message,
+            "no title"
+        );
+    }
+
+    #[test]
+    fn fake_runner_no_response_and_resolution_none_paths_are_explicit() {
+        let mut client = TmuxClient::new(FakeRunner::default());
+        let error = client
+            .list_windows("missing")
+            .expect_err("empty fake runner reports no response");
+        assert_eq!(error.message, "no response");
+
+        let target = resolve_kill_target_with_pane_fallback(
+            "ghost",
+            "ghost",
+            "session-name",
+            false,
+            "%1|||demo:1.1|||worker|||role|||/tmp/repo.wt-1-codex\n",
+        )
+        .expect("no pane fallback preserves session target");
+        assert_eq!(
+            target,
+            TmuxKillTarget {
+                resolved: "ghost".to_owned(),
+                source: "session-name".to_owned(),
+            }
+        );
+
+        assert_eq!(
+            resolve_pane_target_from_candidates("ghost", &[]),
+            PaneTargetResolution::None
+        );
+        assert_eq!(
+            format_pane_ambiguity_error(
+                "worker",
+                &[
+                    PaneTargetCandidate {
+                        name: "worker".to_owned(),
+                        resolved: "%1".to_owned(),
+                        source: "pane-title".to_owned(),
+                        target: String::new(),
+                    },
+                    PaneTargetCandidate {
+                        name: "worker".to_owned(),
+                        resolved: "%2".to_owned(),
+                        source: "tile-role".to_owned(),
+                        target: "demo:1.2".to_owned(),
+                    },
+                ],
+            ),
+            "'worker' is ambiguous — matches 2 panes:\n    • worker → %1 [pane-title]\n    • worker → %2 (demo:1.2) [tile-role]\n  use the pane id or full session:window.pane target"
+        );
+        assert_eq!(unescape_tmux_quoted_value("tail\\"), "tail\\");
+    }
+
+    #[test]
+    fn attach_recovery_includes_fleet_window_clone_label_and_dedupes_repo_candidate() {
+        let fleet_entries = vec![AttachRecoveryFleetEntry {
+            session: "101-mawjs".to_owned(),
+            first_window_name: Some("pulse-oracle".to_owned()),
+            repo: Some("pulse-oracle".to_owned()),
+        }];
+        let cloned_repos = vec![
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-oracle".to_owned(),
+            "/opt/Code/github.com/Soul-Brews-Studio/pulse-helper-oracle".to_owned(),
+        ];
+
+        assert_eq!(
+            attach_recovery_candidates(
+                "pulse",
+                "101-mawjs",
+                "fleet-window (pulse)",
+                &fleet_entries,
+                &cloned_repos,
+            ),
+            vec![
+                AttachRecoveryCandidate {
+                    oracle: "pulse".to_owned(),
+                    label: "pulse-oracle (cloned)".to_owned(),
+                },
+                AttachRecoveryCandidate {
+                    oracle: "Soul-Brews-Studio/pulse-oracle".to_owned(),
+                    label: "Soul-Brews-Studio/pulse-oracle".to_owned(),
+                },
+                AttachRecoveryCandidate {
+                    oracle: "Soul-Brews-Studio/pulse-helper-oracle".to_owned(),
+                    label: "Soul-Brews-Studio/pulse-helper-oracle".to_owned(),
+                },
+            ]
         );
     }
 }

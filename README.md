@@ -1,5 +1,9 @@
 # maw-rs
 
+[![CI](https://github.com/Soul-Brews-Studio/maw-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Soul-Brews-Studio/maw-rs/actions/workflows/ci.yml)
+![version](https://img.shields.io/badge/version-v0.1.0--alpha.1-blue)
+![coverage](https://img.shields.io/badge/coverage-95.53%25-yellowgreen)
+
 Rust port of the maw-js portable core.
 
 `maw-rs` is intentionally starting with deterministic, side-effect-free crates.
