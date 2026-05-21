@@ -260,6 +260,33 @@
     }
 
     #[test]
+    fn list_all_parses_runner_output_in_coverage_gap_module() {
+        struct ListAllRunner;
+
+        impl TmuxRunner for ListAllRunner {
+            fn run(&mut self, subcommand: &str, _args: &[String]) -> Result<String, TmuxError> {
+                assert_eq!(subcommand, "list-windows");
+                Ok("demo|||1|||work|||1|||/tmp/demo\n".to_owned())
+            }
+        }
+
+        let mut client = TmuxClient::new(ListAllRunner);
+
+        assert_eq!(
+            client.list_all(),
+            vec![TmuxSession {
+                name: "demo".to_owned(),
+                windows: vec![TmuxWindow {
+                    index: 1,
+                    name: "work".to_owned(),
+                    active: true,
+                    cwd: Some("/tmp/demo".to_owned()),
+                }],
+            }]
+        );
+    }
+
+    #[test]
     fn command_runner_handles_success_stdin_and_failure_details() {
         let mut runner = CommandTmuxRunner::with_program("sh");
 
@@ -285,6 +312,11 @@
             .run("-c", &["exit 5".to_owned()])
             .expect_err("non-zero shell exit without output includes status");
         assert_eq!(empty_error.message, "tmux exited with status 5");
+
+        let signal_error = runner
+            .run("-c", &["kill -TERM $$".to_owned()])
+            .expect_err("terminated shell has no exit code");
+        assert_eq!(signal_error.message, "tmux exited with status signal");
     }
 
     #[test]

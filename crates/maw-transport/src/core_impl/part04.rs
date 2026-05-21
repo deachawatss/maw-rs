@@ -220,6 +220,32 @@ mod coverage_gap_tests {
     }
 
     #[test]
+    fn transport_result_constructors_accept_owned_via_values() {
+        assert_eq!(
+            TransportResult::success("tmux".to_owned()),
+            TransportResult {
+                ok: true,
+                via: "tmux".to_owned(),
+                reason: None,
+                retryable: false,
+            }
+        );
+        assert_eq!(
+            TransportResult::failure(
+                "http-federation".to_owned(),
+                TransportFailureReason::Rejected,
+                false
+            ),
+            TransportResult {
+                ok: false,
+                via: "http-federation".to_owned(),
+                reason: Some(TransportFailureReason::Rejected),
+                retryable: false,
+            }
+        );
+    }
+
+    #[test]
     fn tmux_session_conversion_preserves_windows_with_no_source() {
         let local = TmuxTransportSession {
             name: "mawjs".to_owned(),

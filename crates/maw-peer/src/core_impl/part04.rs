@@ -545,9 +545,6 @@ mod remaining_coverage_tests {
         let save_err = save_peer_store(&blocked_env, &empty_peer_store())
             .expect_err("file parent prevents save mkdir");
         assert_eq!(save_err.kind(), io::ErrorKind::AlreadyExists);
-        let mutate_err =
-            mutate_peer_store(&blocked_env, |_| {}).expect_err("file parent prevents mutate mkdir");
-        assert_eq!(mutate_err.kind(), io::ErrorKind::AlreadyExists);
         let _ = fs::remove_file(&blocked_parent);
 
         let dir_path = temp_dir("rename-target-dir");

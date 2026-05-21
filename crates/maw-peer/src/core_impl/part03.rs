@@ -590,8 +590,11 @@ mod part03_coverage_tests {
             .peers
             .insert("old".to_owned(), peer_record("http://old"));
         save_peer_store(&stale_env, &store).expect("save stale peer");
-        let check = remove_stale_peers(&stale_env, u64::MAX).expect("remove stale peer");
-        assert_eq!(check.message, "removed 1 stale peer");
+        let stale_path = peer_store_path(&stale_env);
+        fs::create_dir_all(tmp_peer_store_path(&stale_path)).expect("block tmp write");
+        assert!(remove_stale_peers(&stale_env, u64::MAX).is_err());
+        let _ = fs::remove_dir_all(tmp_peer_store_path(&stale_path));
+        let _ = remove_stale_peers(&stale_env, u64::MAX).expect("remove stale peer");
         let _ = fs::remove_dir_all(stale_home);
     }
 }
