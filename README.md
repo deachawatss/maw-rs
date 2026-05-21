@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Soul-Brews-Studio/maw-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Soul-Brews-Studio/maw-rs/actions/workflows/ci.yml)
 ![version](https://img.shields.io/badge/version-v0.1.0--alpha.1-blue)
-![coverage](https://img.shields.io/badge/coverage-99.16%25-yellowgreen)
+![coverage](https://img.shields.io/badge/coverage-99.44%25-yellowgreen)
 
 Rust port of the maw-js portable core.
 

@@ -26,19 +26,35 @@ fn basename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+fn nested_agents_worktree(cwd: &str) -> Option<(&str, &str)> {
+    let parts = cwd
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let [.., repo, "agents", worktree] = parts.as_slice() else {
+        return None;
+    };
+    Some((repo, worktree))
+}
+
 fn worktree_names_from_cwd(cwd: &str) -> Vec<(String, String)> {
-    let base = basename(cwd);
+    let (repo, base) = nested_agents_worktree(cwd).unwrap_or_else(|| ("", basename(cwd)));
     if base.is_empty() {
         return Vec::new();
     }
     let mut out = vec![(base.to_owned(), "worktree-dir".to_owned())];
-    let Some((repo, rest)) = base.split_once(".wt-") else {
-        return out;
+    let nested = !repo.is_empty();
+    let (repo, rest) = if nested {
+        (repo, base)
+    } else {
+        let Some((repo, rest)) = base.split_once(".wt-") else {
+            return out;
+        };
+        (repo, rest)
     };
     let role = rest
         .split_once('-')
-        .map(|(_, role)| role)
-        .unwrap_or_default()
+        .map_or(if nested { rest } else { "" }, |(_, role)| role)
         .trim();
     if !role.is_empty() {
         out.push((role.to_owned(), "worktree-role".to_owned()));
@@ -184,9 +200,9 @@ pub fn parse_active_duration_seconds(raw: Option<&str>) -> Option<u64> {
         return None;
     }
     let last = trimmed.chars().last()?;
-    let (digits, unit) = match last {
-        's' | 'm' | 'h' | 'd' => (&trimmed[..trimmed.len() - 1], last),
-        _ => (trimmed.as_str(), 'm'),
+    let (digits, multiplier) = match last {
+        's' | 'm' | 'h' | 'd' => (&trimmed[..trimmed.len() - 1], active_duration_multiplier(last)),
+        _ => (trimmed.as_str(), 60),
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -195,14 +211,16 @@ pub fn parse_active_duration_seconds(raw: Option<&str>) -> Option<u64> {
     if value == 0 {
         return None;
     }
-    let multiplier = match unit {
+    value.checked_mul(multiplier)
+}
+
+fn active_duration_multiplier(unit: char) -> u64 {
+    match unit {
         's' => 1,
-        'm' => 60,
         'h' => 60 * 60,
         'd' => 24 * 60 * 60,
-        _ => return None,
-    };
-    value.checked_mul(multiplier)
+        _ => 60,
+    }
 }
 
 /// Return the valid duration argument supplied to a flag such as `--active`.
@@ -214,13 +232,16 @@ pub fn active_duration_arg(argv: &[String], flag: &str) -> Option<String> {
             return (!next.starts_with('-') && parse_active_duration_seconds(Some(next)).is_some())
                 .then(|| next.clone());
         }
-        if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
-            if parse_active_duration_seconds(Some(value)).is_some() {
-                return Some(value.to_owned());
-            }
+        if let Some(value) = active_duration_inline_value(arg, flag) {
+            return Some(value);
         }
     }
     None
+}
+
+fn active_duration_inline_value(arg: &str, flag: &str) -> Option<String> {
+    let value = arg.strip_prefix(&format!("{flag}="))?;
+    parse_active_duration_seconds(Some(value)).map(|_| value.to_owned())
 }
 
 /// Format an epoch second as a deterministic UTC timestamp.
@@ -489,4 +510,3 @@ pub fn parse_list_panes(raw: &str) -> Vec<TmuxPane> {
         })
         .collect()
 }
-

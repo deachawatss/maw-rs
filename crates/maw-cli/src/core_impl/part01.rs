@@ -21,7 +21,7 @@ use maw_auth::{
 };
 use maw_auto_wake::{should_auto_wake, AutoWakeManifest, AutoWakeOptions, AutoWakeSite};
 use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
-use maw_bring::{parse_bring_args, BringAliasOptions, ParsedBringArgs};
+use maw_bring::{parse_bring_args, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};

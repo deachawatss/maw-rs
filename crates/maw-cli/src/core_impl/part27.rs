@@ -4,24 +4,17 @@ fn parse_ls_pane(value: &str) -> Result<TmuxPane, String> {
 
 fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
     let trimmed = raw.trim().to_lowercase();
-    let (digits, unit) = match trimmed.as_bytes().last().copied() {
-        Some(b's' | b'm' | b'h' | b'd') => (
-            &trimmed[..trimmed.len() - 1],
-            trimmed.as_bytes().last().copied(),
-        ),
-        _ => (trimmed.as_str(), None),
+    let (digits, multiplier) = match trimmed.as_bytes().last().copied() {
+        Some(b's') => (&trimmed[..trimmed.len() - 1], 1),
+        Some(b'm') => (&trimmed[..trimmed.len() - 1], 60),
+        Some(b'h') => (&trimmed[..trimmed.len() - 1], 60 * 60),
+        Some(b'd') => (&trimmed[..trimmed.len() - 1], 24 * 60 * 60),
+        _ => (trimmed.as_str(), 60),
     };
     let value = digits.parse::<u64>().ok()?;
     if value == 0 {
         return None;
     }
-    let multiplier = match unit {
-        Some(b's') => 1,
-        Some(b'm') | None => 60,
-        Some(b'h') => 60 * 60,
-        Some(b'd') => 24 * 60 * 60,
-        _ => return None,
-    };
     Some(value * multiplier)
 }
 
@@ -281,18 +274,15 @@ fn render_ls_sessions_json(panes: &[LsPanePlan], include_recent: bool) -> String
             if let Some(created) = panes.first().and_then(|pane| pane.session_created) {
                 fields.push(format!("\"created\":{created}"));
             }
-            if let Some(age) = panes
+            let youngest_active_age = panes
                 .iter()
                 .filter_map(|pane| pane.last_activity.map(|_| pane.age_sec))
-                .min()
-            {
-                if panes
-                    .first()
-                    .and_then(|pane| pane.session_created)
-                    .is_some()
-                {
-                    fields.push(format!("\"lastActivityAgeSec\":{age}"));
-                }
+                .min();
+            if let (Some(age), Some(_created)) = (
+                youngest_active_age,
+                panes.first().and_then(|pane| pane.session_created),
+            ) {
+                fields.push(format!("\"lastActivityAgeSec\":{age}"));
             }
             format!("{{{}}}", fields.join(","))
         })
@@ -525,5 +515,61 @@ fn json_string(value: &str) -> String {
     out
 }
 
-#[allow(dead_code)]
-const fn _assert_options_shape(_: &BringAliasOptions) {}
+
+
+#[cfg(test)]
+mod remaining_cli_private_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn private_pair_code_store_consumed_state_is_renderable() {
+        let result = PairCodeStorePlanResult::Lookup(LookupResult::Consumed);
+        assert_eq!(pair_code_store_result_state(&result), "consumed");
+        assert_eq!(pair_code_store_result_entry(&result), "null");
+    }
+
+    #[test]
+    fn private_route_error_without_hint_is_renderable() {
+        let result = RouteResult::Error {
+            reason: "missing".to_owned(),
+            detail: "no route".to_owned(),
+            hint: None,
+        };
+        assert_eq!(
+            render_route_plan_text("neo", &result),
+            "route neo: error missing no route\n"
+        );
+    }
+
+    #[test]
+    fn private_calver_and_ls_duration_error_edges_are_reachable() {
+        assert_eq!(
+            parse_i32_part(None, "hour"),
+            Err("calver: missing hour in --now".to_owned())
+        );
+        assert_eq!(parse_ls_duration_seconds("2m"), Some(120));
+        assert_eq!(parse_ls_duration_seconds("7w"), None);
+    }
+
+    #[test]
+    fn private_ls_unknown_status_and_json_age_without_created_are_reachable() {
+        let pane = LsPanePlan {
+            id: "%1".to_owned(),
+            target: "alpha:1.0".to_owned(),
+            session: "alpha".to_owned(),
+            command: "zsh".to_owned(),
+            title: String::new(),
+            source: None,
+            last_activity: Some(10),
+            session_created: None,
+            status: "mystery",
+            age_sec: 5,
+            agent: false,
+        };
+        assert_eq!(ls_best_status(&[&pane]), "unknown");
+        assert!(ls_status_dot("mystery").contains('◌'));
+        let rendered = render_ls_sessions_json(&[pane], true);
+        assert!(rendered.contains("\"status\":\"unknown\""));
+        assert!(!rendered.contains("lastActivityAgeSec"));
+    }
+}

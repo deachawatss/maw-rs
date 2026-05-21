@@ -48,6 +48,14 @@
                 ),
             ]
         );
+
+        let runner = FakeRunner::with_responses(vec![Ok("")]);
+        let mut client = TmuxClient::new(runner);
+        client
+            .tag_pane("%3", None, &[("role".to_owned(), "observer".to_owned())])
+            .expect("metadata-only tag writes");
+        assert_eq!(client.runner.calls.len(), 1);
+        assert_eq!(client.runner.calls[0].0, "set-option");
     }
 
     #[test]

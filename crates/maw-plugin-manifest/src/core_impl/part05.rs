@@ -460,6 +460,14 @@ mod tests {
     }
 
     #[test]
+    fn optional_code_section_without_handle_export_is_noop() {
+        let mut module = MvpWasmModule::default();
+        parse_optional_code_section(&[0x00], None, 0, 0, &mut module)
+            .expect("missing exported handle skips code parse");
+        assert_eq!(module.handle_result, 0);
+    }
+
+    #[test]
     fn discover_applies_weight_overrides() {
         let root = temp_dir("discover");
         let plugin_dir = root.join("demo");

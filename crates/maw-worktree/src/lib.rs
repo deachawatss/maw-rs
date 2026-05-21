@@ -138,4 +138,32 @@ mod tests {
         assert_eq!(strip_numeric_prefix("abc-feature"), "abc-feature");
         assert_eq!(strip_numeric_prefix("1-feature"), "feature");
     }
+
+    #[test]
+    fn later_duplicate_window_name_replaces_earlier_entry() {
+        let windows = dedupe_windows_by_name(&[Session {
+            name: "mawjs".to_owned(),
+            windows: vec![
+                Window {
+                    index: 0,
+                    name: "agent".to_owned(),
+                    active: false,
+                },
+                Window {
+                    index: 3,
+                    name: "agent".to_owned(),
+                    active: true,
+                },
+            ],
+        }]);
+
+        assert_eq!(
+            windows,
+            vec![Window {
+                index: 3,
+                name: "agent".to_owned(),
+                active: true,
+            }]
+        );
+    }
 }

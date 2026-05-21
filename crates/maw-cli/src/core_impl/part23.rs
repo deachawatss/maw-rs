@@ -146,6 +146,13 @@ fn build_discover_inventory(
     }
 }
 
+fn is_worktree_path(path: &str, parts: &[&str]) -> bool {
+    path.contains(".wt-")
+        || path.contains(".wt/")
+        || path.contains(".wt.")
+        || parts.windows(2).any(|window| window[0] == "agents" && !window[1].is_empty())
+}
+
 fn ghq_repo_record(path: &str) -> GhqRepoRecord {
     let parts = path
         .split('/')
@@ -161,7 +168,7 @@ fn ghq_repo_record(path: &str) -> GhqRepoRecord {
     GhqRepoRecord {
         path: path.to_owned(),
         oracle_like: is_oracle_like(&name),
-        worktree: path.contains(".wt-") || path.contains(".wt/") || path.contains(".wt."),
+        worktree: is_worktree_path(path, &parts),
         name,
         owner,
         host,

@@ -145,3 +145,45 @@
             "2023-11-14 22:13:20"
         );
     }
+
+    #[test]
+    fn nested_agents_worktree_cwd_names_match_legacy_aliases() {
+        assert_eq!(
+            worktree_names_from_cwd("/tmp/mawjs-oracle/agents/1-executor"),
+            vec![
+                ("1-executor".to_owned(), "worktree-dir".to_owned()),
+                ("executor".to_owned(), "worktree-role".to_owned()),
+                ("mawjs-executor".to_owned(), "worktree-alias".to_owned()),
+            ]
+        );
+        assert_eq!(
+            worktree_names_from_cwd("/tmp/mawjs-oracle/agents/codex"),
+            vec![
+                ("codex".to_owned(), "worktree-dir".to_owned()),
+                ("codex".to_owned(), "worktree-role".to_owned()),
+                ("mawjs-codex".to_owned(), "worktree-alias".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_pane_title_error_propagates_before_metadata() {
+        struct FailingTitleRunner;
+
+        impl TmuxRunner for FailingTitleRunner {
+            fn run(&mut self, subcommand: &str, _args: &[String]) -> Result<String, TmuxError> {
+                assert_eq!(subcommand, "select-pane");
+                Err(TmuxError::new("title failed"))
+            }
+        }
+
+        let mut client = TmuxClient::new(FailingTitleRunner);
+        let error = client
+            .tag_pane(
+                "%1",
+                Some("pulse"),
+                &[("role".to_owned(), "worker".to_owned())],
+            )
+            .expect_err("title failure should stop tagging");
+        assert_eq!(error.message, "title failed");
+    }

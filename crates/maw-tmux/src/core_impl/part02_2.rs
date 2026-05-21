@@ -70,17 +70,7 @@ where
         title: Option<&str>,
         meta: &[(String, String)],
     ) -> Result<(), TmuxError> {
-        if let Some(title) = title {
-            self.runner.run(
-                "select-pane",
-                &[
-                    "-t".to_owned(),
-                    target.to_owned(),
-                    "-T".to_owned(),
-                    title.to_owned(),
-                ],
-            )?;
-        }
+        write_pane_title(&mut self.runner, target, title)?;
         for (raw_key, value) in meta {
             let key = normalize_pane_tag_key(raw_key);
             self.runner.run(
@@ -372,3 +362,22 @@ where
     }
 }
 
+fn write_pane_title(
+    runner: &mut dyn TmuxRunner,
+    target: &str,
+    title: Option<&str>,
+) -> Result<(), TmuxError> {
+    let Some(title) = title else {
+        return Ok(());
+    };
+    runner.run(
+        "select-pane",
+        &[
+            "-t".to_owned(),
+            target.to_owned(),
+            "-T".to_owned(),
+            title.to_owned(),
+        ],
+    )?;
+    Ok(())
+}

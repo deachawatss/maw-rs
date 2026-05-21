@@ -218,6 +218,15 @@
                 .expect("printf succeeds"),
             "hello world"
         );
+        assert_eq!(
+            tmux_program_io_error(
+                "write stdin for",
+                std::ffi::OsStr::new("tmux"),
+                &std::io::Error::other("closed")
+            )
+            .message,
+            "failed to write stdin for tmux: closed"
+        );
 
         let mut cat_runner = CommandTmuxRunner::with_program("/bin/cat");
         assert_eq!(
@@ -477,4 +486,3 @@
             }
         );
     }
-

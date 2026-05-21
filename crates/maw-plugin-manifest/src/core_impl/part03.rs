@@ -195,10 +195,10 @@ where
         let Ok(entries) = std::fs::read_dir(base_dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
+        for (entry, file_type) in entries
+            .flatten()
+            .filter_map(|entry| entry.file_type().ok().map(|file_type| (entry, file_type)))
+        {
             if !file_type.is_dir() && !file_type.is_symlink() {
                 continue;
             }

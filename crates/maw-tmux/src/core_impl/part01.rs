@@ -480,9 +480,9 @@ impl CommandTmuxRunner {
         stdin: Option<&[u8]>,
     ) -> Result<String, TmuxError> {
         let command_line = self.argv(subcommand, args);
-        let Some((program, rest)) = command_line.split_first() else {
-            return Err(TmuxError::new("missing tmux program"));
-        };
+        let (program, rest) = command_line
+            .split_first()
+            .expect("tmux command line always includes a program");
         let mut command = Command::new(program);
         command.args(rest);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -500,19 +500,13 @@ impl CommandTmuxRunner {
                 .stdin
                 .take()
                 .ok_or_else(|| TmuxError::new("failed to open tmux stdin"))?;
-            child_stdin.write_all(stdin).map_err(|error| {
-                TmuxError::new(format!(
-                    "failed to write stdin for {}: {error}",
-                    program.to_string_lossy()
-                ))
-            })?;
+            child_stdin
+                .write_all(stdin)
+                .map_err(|error| tmux_program_io_error("write stdin for", program, &error))?;
         }
-        let output = child.wait_with_output().map_err(|error| {
-            TmuxError::new(format!(
-                "failed to collect {} output: {error}",
-                program.to_string_lossy()
-            ))
-        })?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| tmux_program_io_error("collect output from", program, &error))?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
@@ -533,3 +527,13 @@ impl CommandTmuxRunner {
     }
 }
 
+fn tmux_program_io_error(
+    action: &str,
+    program: &std::ffi::OsStr,
+    error: &std::io::Error,
+) -> TmuxError {
+    TmuxError::new(format!(
+        "failed to {action} {}: {error}",
+        program.to_string_lossy()
+    ))
+}

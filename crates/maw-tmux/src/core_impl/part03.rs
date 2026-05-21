@@ -15,10 +15,7 @@ pub fn strip_tmux_ansi(input: &str) -> String {
                 index += 1;
             }
             if index < bytes.len()
-                && matches!(
-                    bytes[index],
-                    b'm' | b'G' | b'K' | b'H' | b'F' | b'J' | b'A'..=b'Z'
-                )
+                && (bytes[index] == b'm' || bytes[index].is_ascii_uppercase())
             {
                 index += 1;
                 continue;
@@ -27,9 +24,7 @@ pub fn strip_tmux_ansi(input: &str) -> String {
             out.push('[');
             continue;
         }
-        let Some(ch) = input[index..].chars().next() else {
-            break;
-        };
+        let ch = input[index..].chars().next().unwrap_or_default();
         out.push(ch);
         index += ch.len_utf8();
     }
@@ -377,26 +372,10 @@ pub fn attach_recovery_candidates(
         || source.starts_with("fleet-window")
         || source.starts_with("live-session")
     {
-        if let Some(entry) = fleet_entries.iter().find(|entry| entry.session == session) {
-            if let Some(window) = &entry.first_window_name {
-                let oracle = window.strip_suffix("-oracle").unwrap_or(window).to_owned();
-                let cloned = entry
-                    .repo
-                    .as_deref()
-                    .and_then(|repo| {
-                        cloned_repos
-                            .iter()
-                            .find(|path| path.ends_with(&format!("/{repo}")))
-                    })
-                    .is_some();
-                candidates.push(AttachRecoveryCandidate {
-                    oracle,
-                    label: format!(
-                        "{window} ({})",
-                        if cloned { "cloned" } else { "not cloned" }
-                    ),
-                });
-            }
+        if let Some(candidate) =
+            fleet_recovery_candidate_for_session(session, fleet_entries, cloned_repos)
+        {
+            candidates.push(candidate);
         }
     }
 
@@ -413,6 +392,29 @@ pub fn attach_recovery_candidates(
         }
     }
     candidates
+}
+
+fn fleet_recovery_candidate_for_session(
+    session: &str,
+    fleet_entries: &[AttachRecoveryFleetEntry],
+    cloned_repos: &[String],
+) -> Option<AttachRecoveryCandidate> {
+    let entry = fleet_entries.iter().find(|entry| entry.session == session)?;
+    let window = entry.first_window_name.as_ref()?;
+    let oracle = window.strip_suffix("-oracle").unwrap_or(window).to_owned();
+    let cloned = entry
+        .repo
+        .as_deref()
+        .and_then(|repo| {
+            cloned_repos
+                .iter()
+                .find(|path| path.ends_with(&format!("/{repo}")))
+        })
+        .is_some();
+    Some(AttachRecoveryCandidate {
+        oracle,
+        label: format!("{window} ({})", if cloned { "cloned" } else { "not cloned" }),
+    })
 }
 
 /// Decide attach recovery behavior after candidates are known.
@@ -489,4 +491,3 @@ pub fn resolve_kill_target_with_pane_fallback(
         source: source.to_owned(),
     })
 }
-

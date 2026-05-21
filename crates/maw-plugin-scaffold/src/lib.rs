@@ -207,6 +207,10 @@ pub fn validate_plugin_name(name: &str) -> Option<String> {
 ///
 /// Underscores are normalized to hyphens for slug fields, while Rust wasm crate
 /// artifacts normalize hyphens to underscores like maw-js.
+///
+/// # Panics
+///
+/// Panics only if `serde_json` cannot serialize the statically constructed manifest.
 #[must_use]
 pub fn build_manifest_json(name: &str, lang: PluginLanguage) -> String {
     let slug = name.replace('_', "-");
@@ -241,10 +245,8 @@ pub fn build_manifest_json(name: &str, lang: PluginLanguage) -> String {
         json!({ "path": format!("/api/plugins/{slug}"), "methods": ["GET", "POST"] }),
     );
 
-    let text = match serde_json::to_string_pretty(&Value::Object(manifest)) {
-        Ok(text) => text,
-        Err(error) => format!(r#"{{"error":"manifest serialization failed: {error}"}}"#),
-    };
+    let text = serde_json::to_string_pretty(&Value::Object(manifest))
+        .expect("plugin manifest JSON serialization should be infallible");
     format!("{text}\n")
 }
 
@@ -258,11 +260,9 @@ fn rewrite_package_json_name(package: &str, name: &str) -> io::Result<String> {
     match &mut value {
         Value::Object(object) => {
             object.insert("name".to_owned(), Value::String(name.to_owned()));
-            serde_json::to_string_pretty(&value)
-                .map(|text| format!("{text}\n"))
-                .map_err(|error| {
-                    io::Error::other(format!("package.json serialization failed: {error}"))
-                })
+            let text = serde_json::to_string_pretty(&value)
+                .expect("package.json serialization should be infallible");
+            Ok(format!("{text}\n"))
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,

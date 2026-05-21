@@ -159,9 +159,9 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
     if endpoint == "constants" {
         return run_pair_api_constants_plan(&argv[1..]);
     }
-    if !matches!(endpoint, "generate" | "probe" | "accept" | "status") {
+    let Some(endpoint) = PairApiEndpoint::parse(endpoint) else {
         return pair_api_usage_error("pair-api: expected generate, probe, accept, or status");
-    }
+    };
 
     let mut plan_json = false;
     let mut node = None::<String>;
@@ -326,7 +326,7 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
     CliOutput {
         code: 0,
         stdout: match endpoint {
-            "generate" => {
+            PairApiEndpoint::Generate => {
                 let result =
                     pair_api_generate_plan(&mut store, &config, &code, expires_sec, ttl_ms, now_ms);
                 if plan_json {
@@ -338,7 +338,7 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
                     )
                 }
             }
-            "probe" => {
+            PairApiEndpoint::Probe => {
                 let result = pair_api_probe_plan(&store, &config, &code, now_ms);
                 if plan_json {
                     render_pair_api_probe_json(&result)
@@ -346,7 +346,7 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
                     format!("pair-api probe status={} ok={}\n", result.status, result.ok)
                 }
             }
-            "accept" => {
+            PairApiEndpoint::Accept => {
                 let input = remote_node.map(|node| PairAcceptInput {
                     node,
                     url: remote_url,
@@ -361,7 +361,7 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
                     )
                 }
             }
-            "status" => {
+            PairApiEndpoint::Status => {
                 let result = pair_api_status_plan(&store, &code, now_ms);
                 if plan_json {
                     render_pair_api_status_json(&result)
@@ -372,9 +372,28 @@ fn run_pair_api_plan(argv: &[String]) -> CliOutput {
                     )
                 }
             }
-            _ => unreachable!(),
         },
         stderr: String::new(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PairApiEndpoint {
+    Generate,
+    Probe,
+    Accept,
+    Status,
+}
+
+impl PairApiEndpoint {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "generate" => Some(Self::Generate),
+            "probe" => Some(Self::Probe),
+            "accept" => Some(Self::Accept),
+            "status" => Some(Self::Status),
+            _ => None,
+        }
     }
 }
 
@@ -405,4 +424,3 @@ fn parse_seed_pair_code(value: &str) -> Result<SeedPairCode, String> {
         created_at_ms: parse_u64_arg(created_at_ms, "pair-api: --seed-code created_at_ms")?,
     })
 }
-

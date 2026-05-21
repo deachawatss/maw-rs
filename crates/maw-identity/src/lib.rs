@@ -212,6 +212,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn numeric_fleet_slot_helper_leaves_non_numeric_prefixes_alone() {
+        assert_eq!("mawjs".strip_prefix_numeric_fleet_slot(), "mawjs");
+        assert_eq!("dev-mawjs".strip_prefix_numeric_fleet_slot(), "dev-mawjs");
+        assert_eq!("47-mawjs".strip_prefix_numeric_fleet_slot(), "mawjs");
+    }
+
+    #[test]
     fn trims_trailing_dash_dot_runs() {
         assert_eq!(sanitize_session_stem(" foo-- "), "foo");
         assert_eq!(sanitize_session_stem("...foo.."), "foo");

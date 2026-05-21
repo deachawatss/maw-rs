@@ -164,13 +164,15 @@ fn discover_plan_includes_registered_plugins_and_deduped_ghq_repos_in_json_tree(
         "/opt/Code/github.com/Soul-Brews-Studio/maw-js".to_owned(),
         "--ghq".to_owned(),
         "/opt/Code/github.com/Soul-Brews-Studio/maw-js.wt-features".to_owned(),
+        "--ghq".to_owned(),
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js/agents/2-nested".to_owned(),
         "--tree".to_owned(),
         "--json".to_owned(),
         "--plan-json".to_owned(),
     ]));
 
     assert_eq!(output["ok"], true);
-    assert_eq!(output["total"], 3);
+    assert_eq!(output["total"], 4);
     assert_eq!(output["plugins"]["total"], 1);
     assert_eq!(
         output["plugins"]["records"][0],
@@ -190,7 +192,7 @@ fn discover_plan_includes_registered_plugins_and_deduped_ghq_repos_in_json_tree(
             "dependencies": ["base"]
         })
     );
-    assert_eq!(output["ghq"]["total"], 2);
+    assert_eq!(output["ghq"]["total"], 3);
     assert_eq!(
         output["ghq"]["repos"][0],
         json!({
@@ -205,6 +207,7 @@ fn discover_plan_includes_registered_plugins_and_deduped_ghq_repos_in_json_tree(
         })
     );
     assert_eq!(output["ghq"]["repos"][1]["worktree"], true);
+    assert_eq!(output["ghq"]["repos"][2]["worktree"], true);
     assert_eq!(output["tree"]["plugins"][0]["name"], "buddy");
     assert_eq!(
         output["tree"]["ghq"][0]["path"],
@@ -213,6 +216,10 @@ fn discover_plan_includes_registered_plugins_and_deduped_ghq_repos_in_json_tree(
     assert_eq!(
         output["tree"]["ghq"][1]["path"],
         "/opt/Code/github.com/Soul-Brews-Studio/maw-js.wt-features"
+    );
+    assert_eq!(
+        output["tree"]["ghq"][2]["path"],
+        "/opt/Code/github.com/Soul-Brews-Studio/maw-js/agents/2-nested"
     );
 }
 

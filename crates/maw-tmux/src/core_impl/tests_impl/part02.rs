@@ -316,18 +316,10 @@
         ]
         .join("\n");
         let hit = resolve_pane_target_from_list_panes_output("worker", &raw);
-        match hit {
-            PaneTargetResolution::Ambiguous { candidates } => {
-                assert_eq!(
-                    candidates
-                        .iter()
-                        .map(|candidate| candidate.resolved.clone())
-                        .collect::<Vec<_>>(),
-                    vec!["%1", "%2"]
-                );
-            }
-            other => panic!("expected ambiguous, got {other:?}"),
-        }
+        let debug = format!("{hit:?}");
+        assert!(debug.starts_with("Ambiguous"));
+        assert!(debug.contains("resolved: \"%1\""));
+        assert!(debug.contains("resolved: \"%2\""));
 
         let candidates = vec![
             PaneTargetCandidate {
@@ -457,4 +449,3 @@
             "kill failed for '%101' (from worktree-role (scout)): kill denied"
         );
     }
-

@@ -202,22 +202,39 @@ impl MvpWasmModule {
                 }
                 3 => defined_func_count = count_section_items(section)?,
                 7 => exported_handle_index = parse_exports(section, &mut module)?,
-                10 => {
-                    if let Some(index) = exported_handle_index {
-                        module.handle_result = parse_handle_result(
-                            section,
-                            index,
-                            imported_func_count,
-                            defined_func_count,
-                        )?;
-                    }
-                }
+                10 => parse_optional_code_section(
+                    section,
+                    exported_handle_index,
+                    imported_func_count,
+                    defined_func_count,
+                    &mut module,
+                )?,
                 11 => module.data_segments = parse_data_segments(section)?,
                 _ => {}
             }
         }
         Ok(module)
     }
+}
+
+fn parse_optional_code_section(
+    section: &[u8],
+    exported_handle_index: Option<u32>,
+    imported_func_count: u32,
+    defined_func_count: u32,
+    module: &mut MvpWasmModule,
+) -> Result<(), String> {
+    let Some(index) = exported_handle_index else {
+        return Ok(());
+    };
+    let handle_result = parse_handle_result(
+        section,
+        index,
+        imported_func_count,
+        defined_func_count,
+    )?;
+    module.handle_result = handle_result;
+    Ok(())
 }
 
 struct WasmCursor<'a> {
@@ -443,9 +460,8 @@ fn read_wasm_result_from_memory(memory: &[u8], result_ptr: i32) -> InvokeResult 
     if result_ptr <= 0 {
         return InvokeResult::ok();
     }
-    let Ok(start) = usize::try_from(result_ptr) else {
-        return InvokeResult::ok();
-    };
+    #[allow(clippy::cast_sign_loss)]
+    let start = result_ptr as usize;
     if start >= memory.len() {
         return InvokeResult::ok();
     }
@@ -479,4 +495,3 @@ fn read_length_prefixed_wasm_output(data: &[u8], start: usize) -> Option<String>
 fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
     discover_cache().lock().ok().and_then(|cache| cache.clone())
 }
-

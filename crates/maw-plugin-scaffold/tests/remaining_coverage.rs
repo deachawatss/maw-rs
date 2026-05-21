@@ -72,3 +72,44 @@ fn empty_plugin_name_fails_validator() {
         Some("name is required".to_owned())
     );
 }
+
+#[test]
+fn scaffold_rust_reports_plugin_json_write_error() {
+    let root = temp_dir("rust-plugin-json-dir");
+    let template = root.join("template");
+    let dest = root.join("dest");
+    fs::create_dir_all(template.join("plugin.json")).expect("create plugin dir");
+    fs::write(
+        template.join("Cargo.toml"),
+        r#"[package]
+name = "template"
+[dependencies]
+maw-plugin-sdk = { path = "old" }
+"#,
+    )
+    .expect("write cargo template");
+
+    let error = scaffold_rust("hello-world", &dest, &template, "../sdk")
+        .expect_err("plugin.json directory should reject manifest write");
+    assert!(
+        error.to_string().contains("Is a directory")
+            || error.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn scaffold_as_reports_plugin_json_write_error() {
+    let root = temp_dir("as-plugin-json-dir");
+    let template = root.join("template");
+    let dest = root.join("dest");
+    fs::create_dir_all(template.join("plugin.json")).expect("create plugin dir");
+
+    let error = scaffold_as("hello-as", &dest, &template)
+        .expect_err("plugin.json directory should reject manifest write");
+    assert!(
+        error.to_string().contains("Is a directory")
+            || error.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    let _ = fs::remove_dir_all(root);
+}
