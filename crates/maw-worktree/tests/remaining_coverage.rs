@@ -38,3 +38,41 @@ fn suffixed_parent_session_can_scope_worktree_resolution() {
         }
     );
 }
+
+#[test]
+fn unscoped_task_part_can_fuzzy_bind_across_all_windows() {
+    let sessions = vec![Session {
+        name: "outside".to_owned(),
+        windows: vec![Window {
+            index: 0,
+            name: "feature-login".to_owned(),
+            active: false,
+        }],
+    }];
+
+    assert_eq!(
+        resolve_worktree_window("mawjs-oracle", "1-login", &sessions),
+        WorktreeWindowResolution::Bound {
+            window: "feature-login".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn unscoped_task_part_can_exact_bind_after_numeric_prefix_strip() {
+    let sessions = vec![Session {
+        name: "outside".to_owned(),
+        windows: vec![Window {
+            index: 0,
+            name: "login".to_owned(),
+            active: false,
+        }],
+    }];
+
+    assert_eq!(
+        resolve_worktree_window("mawjs-oracle", "1-login", &sessions),
+        WorktreeWindowResolution::Bound {
+            window: "login".to_owned(),
+        }
+    );
+}

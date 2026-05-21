@@ -201,6 +201,7 @@ mod http_transport_tests {
         queries: Vec<String>,
         find_result: Option<String>,
         fail_post_url: Option<String>,
+        peer_send_result: Option<Result<bool, String>>,
     }
 
     impl HttpTransportIo for FakeHttpIo {
@@ -234,7 +235,9 @@ mod http_transport_tests {
         ) -> Result<bool, String> {
             self.sent
                 .push((source.to_owned(), target.to_owned(), message.to_owned()));
-            Ok(true)
+            self.peer_send_result
+                .clone()
+                .unwrap_or(Ok(true))
         }
 
         fn post_peer_feed(
@@ -422,6 +425,39 @@ mod http_transport_tests {
     }
 
     #[test]
+    fn http_transport_returns_false_when_peer_send_declines_or_errors() {
+        for peer_send_result in [Ok(false), Err("peer refused".to_owned())] {
+            let io = FakeHttpIo {
+                all_sessions: vec![sourced_session(
+                    "remote",
+                    "target-oracle",
+                    Some("http://peer"),
+                )],
+                find_result: Some("remote:0".to_owned()),
+                peer_send_result: Some(peer_send_result),
+                ..FakeHttpIo::default()
+            };
+            let mut transport = HttpFederationTransport::new(
+                HttpTransportConfig {
+                    peers: vec!["http://peer".to_owned()],
+                    self_host: "local".to_owned(),
+                },
+                io,
+            );
+
+            assert!(!transport.send(
+                &TransportTarget {
+                    oracle: "target".to_owned(),
+                    host: Some("remote".to_owned()),
+                    tmux_target: None,
+                },
+                "hello",
+            ));
+            assert_eq!(transport.io().sent.len(), 1);
+        }
+    }
+
+    #[test]
     fn http_transport_publishes_feed_events_to_every_peer_and_warns_on_rejections() {
         let mut transport = HttpFederationTransport::new(
             HttpTransportConfig {
@@ -486,4 +522,3 @@ mod http_transport_tests {
         transport.publish_presence();
     }
 }
-

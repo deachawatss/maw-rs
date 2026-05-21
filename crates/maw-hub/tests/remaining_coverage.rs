@@ -30,3 +30,25 @@ fn valid_shape_with_non_string_agent_reports_deserialize_warning() {
     assert!(report.warnings[0].contains("failed to parse workspace config: bad.json"));
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn loader_surfaces_filesystem_errors_for_unusable_workspace_paths() {
+    let config_file = temp_dir("config-file");
+    fs::write(&config_file, "not a directory").expect("write config path as file");
+    let create_err = load_workspace_configs(&config_file).expect_err("file parent blocks mkdir");
+    assert!(matches!(
+        create_err.kind(),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists
+    ));
+    let _ = fs::remove_file(&config_file);
+
+    let dir = temp_dir("workspaces-file");
+    fs::create_dir_all(&dir).expect("create config dir");
+    fs::write(workspaces_dir(&dir), "not a directory").expect("write workspaces as file");
+    let read_err = load_workspace_configs(&dir).expect_err("workspaces file blocks read_dir");
+    assert!(matches!(
+        read_err.kind(),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput
+    ));
+    let _ = fs::remove_dir_all(dir);
+}

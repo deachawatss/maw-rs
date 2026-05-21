@@ -448,6 +448,14 @@ mod coverage_gap_tests {
     #[test]
     fn blank_alias_and_numeric_prefixed_candidates_are_defensive() {
         assert!(resolve_session_alias_window_target("   ", &[], RouteType::Local).is_none());
+        assert_eq!(fleet_window_candidate_names(""), Vec::<String>::new());
+        assert_eq!(
+            fleet_window_candidate_names("mawjs"),
+            vec!["mawjs", "mawjs-oracle"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             fleet_window_candidate_names("47-mawjs-oracle"),
             vec!["47-mawjs-oracle", "47-mawjs", "mawjs-oracle", "mawjs"]
@@ -503,6 +511,10 @@ mod coverage_gap_tests {
         assert_eq!(
             find_window(&session_match, "session"),
             Some("mawjs-session:4".to_owned())
+        );
+        assert_eq!(
+            find_window(&[session("empty-session", Vec::new())], "empty"),
+            None
         );
 
         let ambiguous = vec![

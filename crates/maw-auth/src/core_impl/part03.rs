@@ -404,7 +404,11 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{consent_status_str, constant_time_eq, ConsentStatus};
+    use super::{
+        consent_status_str, constant_time_eq, parse_iso_millis, parse_second_millis,
+        timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
+        ConsentStatus,
+    };
 
     #[test]
     fn private_helpers_cover_unreachable_public_edges() {
@@ -414,5 +418,49 @@ mod tests {
             super::iso_from_unix_millis(-62_167_219_200_001),
             "-001-12-31T23:59:59.999Z"
         );
+    }
+
+    #[test]
+    fn private_timestamp_and_hmac_edges_are_reachable() {
+        assert!(!verify_hmac_sig("s", "p", "not-hex"));
+        assert!(!verify_auto_pair_proof(
+            &AutoPairIdentity {
+                oracle: "o".to_owned(),
+                node: "n".to_owned(),
+                url: "u".to_owned(),
+                pubkey: "p".to_owned(),
+            },
+            "token",
+            &"z".repeat(64),
+        ));
+
+        assert_eq!(parse_second_millis("07.1"), Some((7, 100)));
+        assert_eq!(parse_second_millis("07.12"), Some((7, 120)));
+        assert_eq!(parse_second_millis("07.1239"), Some((7, 123)));
+        assert_eq!(parse_second_millis("07.x"), None);
+
+        for invalid in [
+            "",
+            "2024-01-01",
+            "bad-01-01T00:00:00Z",
+            "2024-bad-01T00:00:00Z",
+            "2024-01-badT00:00:00Z",
+            "2024-01-01Tbad:00:00Z",
+            "2024-01-01T00:bad:00Z",
+            "2024-01-01T00:00",
+            "2024-01-01T00:00:badZ",
+            "2024-01-01-extraT00:00:00Z",
+            "2024-01-01T00:00:00:extraZ",
+            "2024-01-01T24:00:00Z",
+            "2024-01-01T00:60:00Z",
+            "2024-01-01T00:00:60Z",
+            "2024-02-30T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso_millis(invalid), None, "{invalid}");
+        }
+
+        assert_eq!(timestamp_seconds(2000, 2, 29, 0, 0, 0), Some(951_782_400));
+        assert_eq!(timestamp_seconds(1900, 2, 29, 0, 0, 0), None);
+        assert_eq!(timestamp_seconds(2024, 13, 0, 0, 0, 0), None);
     }
 }

@@ -350,13 +350,15 @@ mod tests {
             resolve_numeric_fleet_stem_prefix("mawjs", &[session("114-mawjs-no2")]),
             ResolveResult::None { hints: None }
         );
-        assert!(matches!(
+        assert_eq!(
             resolve_numeric_fleet_stem_prefix(
                 "homeke",
-                &[session("20-homekeeper"), session("21-homekey")]
+                &[session("20-homekeeper"), session("21-homekey")],
             ),
-            ResolveResult::Ambiguous { .. }
-        ));
+            ResolveResult::Ambiguous {
+                candidates: vec![session("20-homekeeper"), session("21-homekey")]
+            }
+        );
     }
 
     #[test]
@@ -428,9 +430,11 @@ mod tests {
                 }],
             },
         ];
-        assert!(matches!(
+        assert_eq!(
             resolve_fleet_window_session_target("shared", &ambiguous),
-            ResolveResult::Ambiguous { candidates } if candidates.len() == 2
-        ));
+            ResolveResult::Ambiguous {
+                candidates: ambiguous
+            }
+        );
     }
 }

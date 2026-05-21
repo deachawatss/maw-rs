@@ -187,3 +187,86 @@
             .expect_err("title failure should stop tagging");
         assert_eq!(error.message, "title failed");
     }
+
+    #[test]
+    fn command_runner_handles_success_stdin_and_failure_details() {
+        let mut runner = CommandTmuxRunner::with_program("sh");
+
+        assert_eq!(
+            runner
+                .run("-c", &["printf ok".to_owned()])
+                .expect("shell printf succeeds"),
+            "ok"
+        );
+        assert_eq!(
+            runner
+                .run_with_stdin("-c", &["cat".to_owned()], b"stdin payload")
+                .expect("shell cat echoes stdin"),
+            "stdin payload"
+        );
+
+        let stderr_error = runner
+            .run("-c", &["printf boom >&2; exit 7".to_owned()])
+            .expect_err("non-zero shell exit includes stderr");
+        assert_eq!(stderr_error.message, "tmux exited with status 7: boom");
+
+        let empty_error = runner
+            .run("-c", &["exit 5".to_owned()])
+            .expect_err("non-zero shell exit without output includes status");
+        assert_eq!(empty_error.message, "tmux exited with status 5");
+    }
+
+    #[test]
+    fn live_state_falls_back_for_non_standard_tmux_targets() {
+        let result = resolve_tmux_live_state(
+            &[],
+            &[TmuxPane {
+                id: "%9".to_owned(),
+                command: "zsh".to_owned(),
+                target: "scratch-session:broken-target".to_owned(),
+                title: "scratch".to_owned(),
+                pid: None,
+                cwd: None,
+                last_activity: None,
+            }],
+        );
+
+        assert_eq!(result.live[0].session, "scratch-session");
+        assert_eq!(result.live[0].window, "");
+        assert_eq!(result.live[0].pane, "");
+        assert_eq!(fallback_target_parts("bare-session").session, "bare-session");
+    }
+
+    #[test]
+    fn live_state_match_labels_fall_back_to_node_and_oracle() {
+        let peers = vec![
+            maw_peer::PeerTarget {
+                name: None,
+                url: "http://node".to_owned(),
+                source: maw_peer::PeerSourceKind::Scout,
+                node: Some("scratch".to_owned()),
+                oracle: None,
+            },
+            maw_peer::PeerTarget {
+                name: None,
+                url: "http://oracle".to_owned(),
+                source: maw_peer::PeerSourceKind::Scout,
+                node: None,
+                oracle: Some("scratch".to_owned()),
+            },
+        ];
+        let result = resolve_tmux_live_state(
+            &peers,
+            &[TmuxPane {
+                id: "%10".to_owned(),
+                command: "zsh".to_owned(),
+                target: "demo:1.0".to_owned(),
+                title: "scratch".to_owned(),
+                pid: None,
+                cwd: None,
+                last_activity: None,
+            }],
+        );
+
+        assert_eq!(result.live[0].matches, vec!["scratch", "scratch"]);
+    }

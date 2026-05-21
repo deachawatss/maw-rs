@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod coverage_gap_tests {
     use super::*;
+    use std::{cell::RefCell, rc::Rc};
 
     struct FailingTmuxListIo;
 
@@ -131,6 +132,90 @@ mod coverage_gap_tests {
                 reason: TransportFailureReason::Unknown,
                 retryable: false,
             }
+        );
+    }
+
+    #[test]
+    fn classifier_recognizes_alternate_needles_and_rate_limit_shapes() {
+        for (message, reason, retryable) in [
+            ("ENETUNREACH while dialing", TransportFailureReason::Unreachable, true),
+            ("too many requests", TransportFailureReason::RateLimit, true),
+            ("rate window limit exceeded", TransportFailureReason::RateLimit, true),
+            ("permission denied", TransportFailureReason::Rejected, false),
+            ("json syntax error", TransportFailureReason::ParseError, false),
+        ] {
+            assert_eq!(
+                classify_error(Some(message)),
+                ClassifiedError { reason, retryable },
+                "{message}"
+            );
+        }
+    }
+
+    struct ScriptedTransport {
+        name: &'static str,
+        connected: bool,
+        reachable: bool,
+        result: Result<bool, &'static str>,
+        sent: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Transport for ScriptedTransport {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn connected(&self) -> bool {
+            self.connected
+        }
+
+        fn can_reach(&self, _target: &TransportTarget) -> bool {
+            self.reachable
+        }
+
+        fn send(
+            &mut self,
+            _target: &TransportTarget,
+            _message: &str,
+            _from: &str,
+        ) -> Result<bool, String> {
+            self.sent.borrow_mut().push(self.name);
+            self.result.map_err(str::to_owned)
+        }
+    }
+
+    fn scripted(
+        name: &'static str,
+        connected: bool,
+        reachable: bool,
+        result: Result<bool, &'static str>,
+        sent: &Rc<RefCell<Vec<&'static str>>>,
+    ) -> ScriptedTransport {
+        ScriptedTransport {
+            name,
+            connected,
+            reachable,
+            result,
+            sent: Rc::clone(sent),
+        }
+    }
+
+    #[test]
+    fn router_skips_unavailable_transports_and_fails_over_after_retryable_errors() {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut router = TransportRouter::new();
+        router.register(scripted("offline", false, true, Ok(true), &sent));
+        router.register(scripted("unreachable", true, false, Ok(true), &sent));
+        router.register(scripted("soft-false", true, true, Ok(false), &sent));
+        router.register(scripted("retryable", true, true, Err("timeout"), &sent));
+        router.register(scripted("winner", true, true, Ok(true), &sent));
+
+        let result = router.send(&target("mawjs"), "hello", "codex");
+
+        assert_eq!(result, TransportResult::success("winner"));
+        assert_eq!(
+            *sent.borrow(),
+            vec!["soft-false", "retryable", "winner"]
         );
     }
 
