@@ -495,3 +495,67 @@ fn read_length_prefixed_wasm_output(data: &[u8], start: usize) -> Option<String>
 fn cached_discover_plugins() -> Option<Vec<LoadedPlugin>> {
     discover_cache().lock().ok().and_then(|cache| cache.clone())
 }
+
+#[cfg(test)]
+mod part04_coverage_tests {
+    use super::*;
+
+    #[test]
+    fn wasm_cursor_reports_short_reads_and_overlong_leb_lengths() {
+        let mut empty = WasmCursor::new(&[]);
+        assert_eq!(
+            empty.read_u8().expect_err("empty read_u8"),
+            "failed to parse WebAssembly module"
+        );
+
+        let mut cursor = WasmCursor::new(&[0x7f, 0x02, b'a']);
+        assert_eq!(cursor.read_u8().expect("byte"), 0x7f);
+        assert_eq!(cursor.read_leb_usize().expect("usize leb"), 2);
+        assert_eq!(
+            cursor.read_bytes(2).expect_err("short payload"),
+            "failed to parse WebAssembly module"
+        );
+
+        let mut overlong = WasmCursor::new(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+        assert_eq!(
+            overlong.read_leb_usize().expect_err("overlong leb"),
+            "failed to parse WebAssembly module"
+        );
+    }
+
+    #[test]
+    fn parse_data_segments_rejects_negative_offsets_and_accepts_payload() {
+        assert_eq!(
+            parse_data_segments(&[0x01, 0x00, 0x41, 0x7f, 0x0b, 0x00])
+                .expect_err("negative offset"),
+            "failed to parse WebAssembly module"
+        );
+
+        let segments =
+            parse_data_segments(&[0x01, 0x00, 0x41, 0x02, 0x0b, 0x03, b'a', b'b', b'c'])
+                .expect("data segment");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].offset, 2);
+        assert_eq!(segments[0].bytes, b"abc");
+    }
+
+    #[test]
+    fn length_prefixed_wasm_output_handles_length_edges() {
+        assert_eq!(read_length_prefixed_wasm_output(&[1, 0, 0], 0), None);
+        assert_eq!(read_length_prefixed_wasm_output(&[0, 0, 0, 0], 0), None);
+        assert_eq!(
+            read_length_prefixed_wasm_output(&1_000_000_u32.to_le_bytes(), 0),
+            None
+        );
+        assert_eq!(
+            read_length_prefixed_wasm_output(&[3, 0, 0, 0, b'a'], 0),
+            None
+        );
+
+        let data = [0, 9, 9, 2, 0, 0, 0, b'o', b'k'];
+        assert_eq!(
+            read_length_prefixed_wasm_output(&data, 3),
+            Some("ok".to_owned())
+        );
+    }
+}

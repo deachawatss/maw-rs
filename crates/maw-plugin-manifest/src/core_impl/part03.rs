@@ -493,3 +493,60 @@ fn handle_universal_cli_flag(plugin: &LoadedPlugin, ctx: &InvokeContext) -> Opti
     None
 }
 
+#[cfg(test)]
+mod part03_coverage_tests {
+    use super::*;
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn reset_discover_cache_clears_discovery_and_symbol_caches() {
+        cache_discover_plugins(Vec::new());
+        module_symbol_cache()
+            .lock()
+            .expect("symbol cache lock")
+            .insert("dir\0plugin\0symbol".to_owned(), "cached".to_owned());
+
+        assert_eq!(cached_discover_plugins(), Some(Vec::new()));
+        assert!(!module_symbol_cache()
+            .lock()
+            .expect("symbol cache lock")
+            .is_empty());
+
+        reset_discover_cache();
+
+        assert_eq!(cached_discover_plugins(), None);
+        assert!(module_symbol_cache()
+            .lock()
+            .expect("symbol cache lock")
+            .is_empty());
+    }
+
+    #[test]
+    fn resolve_dir_path_handles_absolute_relative_and_missing_cwd_fallback() {
+        let _guard = CWD_LOCK.lock().expect("cwd lock");
+        let original = std::env::current_dir().expect("cwd");
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-resolve-dir-path-{}",
+            std::process::id()
+        ));
+        let vanished = root.join("vanished");
+        std::fs::create_dir_all(&vanished).expect("vanished dir");
+
+        let absolute = resolve_dir_path(&root, "plugin.wasm");
+        assert_eq!(absolute, root.join("plugin.wasm"));
+
+        std::env::set_current_dir(&root).expect("set cwd");
+        let cwd_root = std::env::current_dir().expect("canonical cwd");
+        let relative = resolve_dir_path(Path::new("plugins/helper"), "index.ts");
+        assert_eq!(relative, cwd_root.join("plugins/helper/index.ts"));
+
+        std::env::set_current_dir(&vanished).expect("set vanished cwd");
+        std::fs::remove_dir_all(&vanished).expect("remove cwd");
+        let fallback = resolve_dir_path(Path::new("plugins/helper"), "index.ts");
+        assert_eq!(fallback, PathBuf::from(".").join("plugins/helper/index.ts"));
+
+        std::env::set_current_dir(original).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

@@ -70,6 +70,42 @@ struct ExpectedTransportResult {
     retryable: bool,
 }
 
+#[derive(Default)]
+struct LocalIo {
+    list_error: bool,
+    resolve: Option<String>,
+    send_ok: bool,
+}
+
+impl maw_transport::TmuxTransportIo for LocalIo {
+    fn send_to_tmux(&mut self, _: &str, _: &str) -> Result<(), String> {
+        if self.send_ok {
+            Ok(())
+        } else {
+            Err("send failed".to_owned())
+        }
+    }
+
+    fn list_tmux_sessions(&mut self) -> Result<Vec<TmuxTransportSession>, String> {
+        if self.list_error {
+            Err("list failed".to_owned())
+        } else {
+            Ok(vec![TmuxTransportSession {
+                name: "local".to_owned(),
+                windows: vec![TmuxTransportWindow {
+                    index: 1,
+                    name: "mawjs".to_owned(),
+                    active: true,
+                }],
+            }])
+        }
+    }
+
+    fn find_tmux_window(&mut self, _: &[TmuxTransportSession], _: &str) -> Option<String> {
+        self.resolve.clone()
+    }
+}
+
 struct FixtureTransportRuntime {
     fixture: FixtureTransport,
     sent: Rc<RefCell<Vec<String>>>,
@@ -267,6 +303,57 @@ fn http_transport_continues_after_unresolved_remote_window() {
             oracle: "mawjs".to_owned(),
             host: Some("remote".to_owned()),
             tmux_target: None,
+        },
+        "hello"
+    ));
+}
+
+#[test]
+fn remaining_transport_edges_cover_unknown_and_local_failure_paths() {
+    assert_eq!(
+        classify_error(Some("opaque failure")),
+        ClassifiedError {
+            reason: TransportFailureReason::Unknown,
+            retryable: false,
+        }
+    );
+
+    let local_target = TransportTarget {
+        oracle: "mawjs".to_owned(),
+        host: Some("localhost".to_owned()),
+        tmux_target: None,
+    };
+    let remote_target = TransportTarget {
+        oracle: "mawjs".to_owned(),
+        host: Some("remote".to_owned()),
+        tmux_target: Some("s:1".to_owned()),
+    };
+
+    let mut list_error = maw_transport::TmuxLocalTransport::new(LocalIo {
+        list_error: true,
+        ..LocalIo::default()
+    });
+    assert!(!list_error.send(&local_target, "hello"));
+
+    let mut unresolved = maw_transport::TmuxLocalTransport::new(LocalIo::default());
+    assert!(!unresolved.send(&local_target, "hello"));
+
+    let mut send_error = maw_transport::TmuxLocalTransport::new(LocalIo {
+        resolve: Some("local:1".to_owned()),
+        send_ok: false,
+        ..LocalIo::default()
+    });
+    assert!(!send_error.send(&local_target, "hello"));
+    assert!(!send_error.send(&remote_target, "hello"));
+
+    let mut explicit = maw_transport::TmuxLocalTransport::new(LocalIo {
+        send_ok: true,
+        ..LocalIo::default()
+    });
+    assert!(explicit.send(
+        &TransportTarget {
+            tmux_target: Some("local:1".to_owned()),
+            ..local_target
         },
         "hello"
     ));

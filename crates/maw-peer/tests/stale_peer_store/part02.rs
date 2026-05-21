@@ -100,3 +100,29 @@ fn valid_iso_timestamps_drive_stale_age_save_and_removal_paths() {
     assert_eq!(removed.message, "removed 1 stale peer");
     assert!(load_peer_store(&env).peers.is_empty());
 }
+
+#[test]
+fn remove_stale_peers_reports_plural_removed_count() {
+    let tmp = TestDir::new("maw-rs-plural-stale-removal");
+    let file = tmp.path().join("peers.json");
+    let env = PeerStoreEnv::with_vars(
+        tmp.path(),
+        [
+            ("PEERS_FILE", file.to_string_lossy().into_owned()),
+            ("MAW_PEER_STALE_TTL_MS", DAY_MS.to_string()),
+        ],
+    );
+    save_peer_store(
+        &env,
+        &store_from([
+            ("alpha", "http://alpha.local", iso_days_ago(4), None),
+            ("bravo", "http://bravo.local", iso_days_ago(7), None),
+        ]),
+    )
+    .expect("save peer store through atomic JSON writer");
+
+    let removed = remove_stale_peers(&env, NOW_MS).expect("remove stale peers");
+
+    assert_eq!(removed.message, "removed 2 stale peers");
+    assert!(load_peer_store(&env).peers.is_empty());
+}

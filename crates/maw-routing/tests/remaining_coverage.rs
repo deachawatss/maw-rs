@@ -39,3 +39,39 @@ fn colon_numeric_window_falls_back_to_direct_target() {
         }
     );
 }
+
+#[test]
+fn numeric_oracle_session_aliases_resolve_to_first_window() {
+    let sessions = vec![session("101-mawjs-oracle", vec![window(2, "agent")])];
+
+    assert_eq!(
+        resolve_target("mawjs", &MawConfig::default(), &sessions),
+        ResolveResult::Local {
+            target: "101-mawjs-oracle:2".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn substring_window_match_requires_a_single_candidate() {
+    let sessions = vec![
+        session("alpha", vec![window(1, "homekeeper")]),
+        session("beta", vec![window(2, "homekeeper")]),
+    ];
+
+    assert!(matches!(
+        resolve_target("home", &MawConfig::default(), &sessions),
+        ResolveResult::Error { .. }
+    ));
+
+    assert_eq!(
+        resolve_target(
+            "keeper",
+            &MawConfig::default(),
+            &[session("solo", vec![window(3, "homekeeper")])]
+        ),
+        ResolveResult::Local {
+            target: "solo:3".to_owned(),
+        }
+    );
+}
