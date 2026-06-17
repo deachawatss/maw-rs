@@ -158,7 +158,14 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
 }
 
 fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
-    let report = discover_packages(&DiscoverPackagesOptions::default());
+    let mut options = DiscoverPackagesOptions::default();
+    options.runtime_version = "1.0.0".to_owned();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let default_dir = format!("{home}/.maw/plugins");
+    if std::path::Path::new(&default_dir).is_dir() {
+        options.scan_dirs = vec![default_dir.into()];
+    }
+    let report = discover_packages(&options);
     let (plugin, matched_args) = report
         .plugins
         .iter()
@@ -169,6 +176,37 @@ fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
         source: InvokeSource::Cli,
         args: matched_args.to_vec(),
     };
+
+    if plugin.entry_path.is_some() {
+        let cli_command = plugin.manifest.cli.as_ref().map(|c| c.command.as_str()).unwrap_or("");
+        let mut cmd_args: Vec<&str> = cli_command.split_whitespace().collect();
+        for arg in &ctx.args {
+            cmd_args.push(arg.as_str());
+        }
+        let output = std::process::Command::new("maw")
+            .args(&cmd_args)
+            .env("MAW_FROM_RS", "1")
+            .output();
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                return Some(CliOutput {
+                    code: out.status.code().unwrap_or(1),
+                    stdout,
+                    stderr,
+                });
+            }
+            Err(e) => {
+                return Some(CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("failed to run bun: {e}\n"),
+                });
+            }
+        }
+    }
+
     let mut runtime = MvpWasmInvokeRuntime;
     Some(render_cli_plugin_result(invoke_plugin(plugin, &ctx, &mut runtime)))
 }
