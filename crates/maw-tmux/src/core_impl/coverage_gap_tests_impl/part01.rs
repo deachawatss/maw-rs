@@ -417,6 +417,67 @@
     }
 
     #[test]
+    fn mark_peer_targets_live_reports_targets_sessions_and_cwd_matches() {
+        let peers = vec![maw_peer::PeerTarget {
+            name: Some("scratch".to_owned()),
+            url: "http://scratch".to_owned(),
+            source: maw_peer::PeerSourceKind::Config,
+            node: Some("node-a".to_owned()),
+            oracle: Some("oracle-a".to_owned()),
+        }];
+        let live = vec![
+            DiscoverLivePane {
+                source: "tmux".to_owned(),
+                id: "%1".to_owned(),
+                target: "05-scratch:1.0".to_owned(),
+                session: "05-scratch".to_owned(),
+                window: "main".to_owned(),
+                pane: "0".to_owned(),
+                command: Some("zsh".to_owned()),
+                title: None,
+                pid: None,
+                cwd: Some("/tmp/scratch".to_owned()),
+                last_activity: None,
+                awake: true,
+                matches: Vec::new(),
+            },
+            DiscoverLivePane {
+                source: "tmux".to_owned(),
+                id: "%2".to_owned(),
+                target: "other:1.0".to_owned(),
+                session: "other".to_owned(),
+                window: "scratch".to_owned(),
+                pane: "0".to_owned(),
+                command: Some("zsh".to_owned()),
+                title: None,
+                pid: None,
+                cwd: None,
+                last_activity: None,
+                awake: true,
+                matches: Vec::new(),
+            },
+        ];
+
+        let marked = mark_peer_targets_live(&peers, &live);
+
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].name, Some("scratch".to_owned()));
+        assert_eq!(marked[0].url, "http://scratch");
+        assert_eq!(marked[0].source, maw_peer::PeerSourceKind::Config);
+        assert_eq!(marked[0].node, Some("node-a".to_owned()));
+        assert_eq!(marked[0].oracle, Some("oracle-a".to_owned()));
+        assert!(marked[0].awake);
+        assert_eq!(
+            marked[0].live_targets,
+            vec!["05-scratch:1.0".to_owned(), "other:1.0".to_owned()]
+        );
+        assert_eq!(
+            marked[0].live_sessions,
+            vec!["05-scratch".to_owned(), "other".to_owned()]
+        );
+    }
+
+    #[test]
     fn io_error_formatter_includes_action_program_and_error() {
         let error = tmux_program_io_error(
             "collect output from",
