@@ -43,7 +43,7 @@ use maw_peer::{
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
     DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    PluginInvokeRuntime, PluginManifest,
+    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -148,12 +148,68 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
         "split-policy" => run_split_policy_plan(&argv[1..]),
         "transport" => run_transport_plan(&argv[1..]),
-        _ => CliOutput {
+        _ => dispatch_cli_plugin(argv).unwrap_or_else(|| CliOutput {
             code: 2,
             stdout: String::new(),
             stderr: format!("unknown command: {command}\n{}", usage_text()),
-        },
+        }),
     }
+}
+
+fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
+    let report = discover_packages(&DiscoverPackagesOptions::default());
+    let (plugin, matched_args) = report
+        .plugins
+        .iter()
+        .filter(|plugin| !plugin.disabled)
+        .find_map(|plugin| plugin_cli_args(plugin, argv).map(|args| (plugin, args)))?;
+
+    let ctx = InvokeContext {
+        source: InvokeSource::Cli,
+        args: matched_args.to_vec(),
+    };
+    let mut runtime = MvpWasmInvokeRuntime;
+    Some(render_cli_plugin_result(invoke_plugin(plugin, &ctx, &mut runtime)))
+}
+
+fn plugin_cli_args<'a>(plugin: &LoadedPlugin, argv: &'a [String]) -> Option<&'a [String]> {
+    let command = &plugin.manifest.cli.as_ref()?.command;
+    let command_parts = command.split_whitespace().collect::<Vec<_>>();
+    if command_parts.is_empty() || argv.len() < command_parts.len() {
+        return None;
+    }
+    argv.iter()
+        .map(String::as_str)
+        .zip(&command_parts)
+        .all(|(arg, command_part)| arg == *command_part)
+        .then_some(&argv[command_parts.len()..])
+}
+
+fn render_cli_plugin_result(result: InvokeResult) -> CliOutput {
+    if result.ok {
+        return CliOutput {
+            code: 0,
+            stdout: result.output.map_or_else(String::new, with_trailing_newline),
+            stderr: String::new(),
+        };
+    }
+
+    CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: with_trailing_newline(
+            result
+                .error
+                .unwrap_or_else(|| "plugin invocation failed".to_owned()),
+        ),
+    }
+}
+
+fn with_trailing_newline(mut value: String) -> String {
+    if !value.ends_with('\n') {
+        value.push('\n');
+    }
+    value
 }
 
 
