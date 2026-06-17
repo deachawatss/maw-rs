@@ -43,7 +43,7 @@ use maw_peer::{
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
     DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest,
+    LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -108,6 +108,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
         "auto-wake" => run_auto_wake_plan(&argv[1..]),
         "hub" => run_hub_plan(&argv[1..]),
         "xdg" => run_xdg_plan(&argv[1..]),
+        "plugin" => run_plugin_plan(&argv[1..]),
         "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
         "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
         "bind-host" => run_bind_host_plan(&argv[1..]),

@@ -338,6 +338,7 @@ fn usage_text() -> String {
         "ported commands:\n",
         "  a|attach <target> [--print] [--readonly|-r]   attach to a tmux session\n",
         "  ls [--compact|-c] [--verbose|-v] [--json]     list live local sessions\n",
+        "  plugin ls [-v|--verbose]                      list installed plugins\n",
         "  bring|b <oracle> [--to <session[:window]>]    plan a wake split target\n",
         "  feed active|parse-line|describe                inspect local activity feed data\n",
         "\n",
@@ -518,4 +519,3 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
 
     Ok(options)
 }
-
