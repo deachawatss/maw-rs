@@ -45,6 +45,7 @@ fn parse_plugin_args(argv: &[String]) -> Result<PluginAction, String> {
 
 fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
     let mut options = DiscoverPackagesOptions::default();
+    options.runtime_version = "1.0.0".to_owned();
     let mut scan_dirs = Vec::new();
     let mut verbose = false;
     let mut index = 0;
@@ -73,6 +74,12 @@ fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
     }
     if !scan_dirs.is_empty() {
         options.scan_dirs = scan_dirs;
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let default_dir = format!("{home}/.maw/plugins");
+        if std::path::Path::new(&default_dir).is_dir() {
+            options.scan_dirs = vec![default_dir.into()];
+        }
     }
 
     Ok(PluginAction::Ls { options, verbose })
