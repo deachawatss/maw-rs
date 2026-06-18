@@ -35,7 +35,7 @@ members:
   # Wave 1 — Leaf crates (no internal deps), 5 parallel coders
   - role: codex-1
     name: codex-1
-    engine: codex-1
+    engine: codex-t1
     branch: agents/codex-1
     prompt: |
       maw-rs codex builder. WAIT for task via maw hey.
@@ -48,7 +48,7 @@ members:
 
   - role: codex-2
     name: codex-2
-    engine: codex-2
+    engine: codex-t3
     branch: agents/codex-2
     prompt: |
       maw-rs codex builder. WAIT for task via maw hey.
@@ -61,7 +61,7 @@ members:
 
   - role: codex-3
     name: codex-3
-    engine: codex-3
+    engine: codex-t4
     branch: agents/codex-3
     prompt: |
       maw-rs codex builder. WAIT for task via maw hey.
@@ -74,7 +74,7 @@ members:
 
   - role: codex-4
     name: codex-4
-    engine: codex-4
+    engine: codex-t5
     branch: agents/codex-4
     prompt: |
       maw-rs codex builder. WAIT for task via maw hey.
@@ -87,7 +87,7 @@ members:
 
   - role: codex-5
     name: codex-5
-    engine: codex-5
+    engine: codex
     branch: agents/codex-5
     prompt: |
       maw-rs codex builder. WAIT for task via maw hey.
@@ -100,33 +100,6 @@ members:
 
 # Wave 2 coders (mid-level: maw-peer, maw-tmux, maw-worktree) — spawn after Wave 1 merges
 # Wave 3 coder (maw-cli — depends on everything) — spawn after Wave 2 merges
-
-headless:
-  mode: exec
-  model: gpt-5.5
-  reasoning_effort: low
-  callback: "maw hey ${session}:maw-rs"
-  engines:
-    codex-1: "CODEX_HOME=$HOME/.codex-team/1 codex exec --dangerously-bypass-approvals-and-sandbox -m ${model} -c model_reasoning_effort=${reasoning_effort}"
-    codex-2: "CODEX_HOME=$HOME/.codex-team/2 codex exec --dangerously-bypass-approvals-and-sandbox -m ${model} -c model_reasoning_effort=${reasoning_effort}"
-    codex-3: "CODEX_HOME=$HOME/.codex-team/3 codex exec --dangerously-bypass-approvals-and-sandbox -m ${model} -c model_reasoning_effort=${reasoning_effort}"
-    codex-4: "CODEX_HOME=$HOME/.codex-team/4 codex exec --dangerously-bypass-approvals-and-sandbox -m ${model} -c model_reasoning_effort=${reasoning_effort}"
-    codex-5: "CODEX_HOME=$HOME/.codex-team/5 codex exec --dangerously-bypass-approvals-and-sandbox -m ${model} -c model_reasoning_effort=${reasoning_effort}"
-  exec_template: >
-    CODEX_HOME=${codex_home} codex exec
-    --dangerously-bypass-approvals-and-sandbox
-    -m ${model}
-    -c model_reasoning_effort="${reasoning_effort}"
-    "${prompt}"
-    --json &
-  prompt_template: |
-    TASK: ${task}
-    PROTOCOL:
-      1. maw hey ${session}:maw-rs "codex-${n} starting — ${task_short}"
-      2. implement -> cargo build -> cargo test -> cargo clippy -> fix -> repeat
-      3. git add + commit + gh pr create --base alpha
-      4. maw hey ${session}:maw-rs "codex-${n} done — ${task_short} PR#N"
-      5. blocked: maw hey ${session}:maw-rs "codex-${n} blocked — <reason>"
 
 lifecycle:
   worktree: true
