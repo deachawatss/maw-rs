@@ -16,6 +16,198 @@ impl PluginInvokeRuntime for MvpWasmInvokeRuntime {
     }
 }
 
+const BUN_INVOKE_TIMEOUT: Duration = Duration::from_secs(5);
+const BUN_TS_INVOKE_DRIVER: &str = r#"
+import { realpathSync } from "fs";
+import { pathToFileURL } from "url";
+
+const entryPath = process.argv[1];
+
+async function readStdin() {
+  return await new Response(Bun.stdin.stream()).text();
+}
+
+function errorResult(error) {
+  const e = error instanceof Error ? error : new Error(String(error));
+  return { ok: false, error: e.stack || e.message };
+}
+
+try {
+  if (!entryPath) {
+    process.stdout.write(JSON.stringify({ ok: false, error: "TS plugin entry path is required" }));
+    process.exit(0);
+  }
+
+  const ctx = JSON.parse(await readStdin());
+  const logs = [];
+  ctx.writer ??= (...args) => logs.push(args.map(String).join(" "));
+
+  const mod = await import(pathToFileURL(realpathSync(entryPath)).href);
+  const handler = mod.default ?? mod.handler;
+  if (typeof handler !== "function") {
+    process.stdout.write(JSON.stringify({ ok: false, error: "TS plugin has no default export or handler" }));
+    process.exit(0);
+  }
+
+  const result = await handler(ctx);
+  const out = result && typeof result === "object" && "ok" in result ? result : { ok: true };
+  if (out.ok && out.output === undefined && logs.length > 0) out.output = logs.join("\n");
+  process.stdout.write(JSON.stringify(out));
+} catch (error) {
+  process.stdout.write(JSON.stringify(errorResult(error)));
+}
+"#;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BunInvokeRuntime {
+    timeout: Duration,
+}
+
+impl Default for BunInvokeRuntime {
+    fn default() -> Self {
+        Self {
+            timeout: BUN_INVOKE_TIMEOUT,
+        }
+    }
+}
+
+impl BunInvokeRuntime {
+    #[must_use]
+    pub const fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl PluginInvokeRuntime for BunInvokeRuntime {
+    fn invoke_ts(&mut self, plugin: &LoadedPlugin, ctx: &InvokeContext) -> InvokeResult {
+        invoke_ts_with_bun(plugin, ctx, self.timeout)
+    }
+
+    fn invoke_wasm(
+        &mut self,
+        _plugin: &LoadedPlugin,
+        ctx: &InvokeContext,
+        wasm_bytes: &[u8],
+    ) -> InvokeResult {
+        invoke_wasm_mvp(ctx, wasm_bytes)
+    }
+}
+
+fn invoke_ts_with_bun(plugin: &LoadedPlugin, ctx: &InvokeContext, timeout: Duration) -> InvokeResult {
+    let Some(entry_path) = plugin.entry_path.as_ref() else {
+        return InvokeResult::error("TS plugin has no entry path");
+    };
+
+    let context_json = invoke_context_json(ctx);
+    let mut child = match Command::new("bun")
+        .arg("-e")
+        .arg(BUN_TS_INVOKE_DRIVER)
+        .arg(entry_path)
+        .args(&ctx.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return InvokeResult::error(format!("failed to run bun: {error}")),
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(error) = stdin.write_all(context_json.as_bytes()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return InvokeResult::error(format!("failed to write invoke context to bun: {error}"));
+        }
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return collect_bun_invoke_output(child),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return InvokeResult::error(format!(
+                    "TS plugin timed out after {}ms",
+                    timeout.as_millis()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return InvokeResult::error(format!("failed to wait for bun: {error}"));
+            }
+        }
+    }
+}
+
+fn collect_bun_invoke_output(child: std::process::Child) -> InvokeResult {
+    match child.wait_with_output() {
+        Ok(output) => {
+            let parsed = parse_invoke_result_stdout(&output.stdout);
+            if output.status.success() {
+                return parsed.unwrap_or_else(InvokeResult::error);
+            }
+
+            if let Ok(result) = parsed {
+                if !result.ok {
+                    return result;
+                }
+            }
+
+            let code = output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = if stderr.trim().is_empty() {
+                format!("bun exited with status {code}")
+            } else {
+                format!("bun exited with status {code}: {}", stderr.trim())
+            };
+            InvokeResult::error(message)
+        }
+        Err(error) => InvokeResult::error(format!("failed to collect bun output: {error}")),
+    }
+}
+
+fn parse_invoke_result_stdout(stdout: &[u8]) -> Result<InvokeResult, String> {
+    let value: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("failed to parse bun InvokeResult JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "bun InvokeResult JSON must be an object".to_owned())?;
+    let ok = object
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "bun InvokeResult JSON must contain boolean ok".to_owned())?;
+    let output = optional_string_field(object, "output")?;
+    let error = optional_string_field(object, "error")?;
+    Ok(InvokeResult { ok, output, error })
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    object.get(field).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| format!("bun InvokeResult JSON field {field} must be a string"))
+    })
+}
+
+fn invoke_context_json(ctx: &InvokeContext) -> String {
+    serde_json::json!({
+        "source": ctx.source.as_str(),
+        "args": ctx.args,
+    })
+    .to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginNameAndTier {
     pub name: String,
