@@ -208,6 +208,7 @@ pub struct MawWasmHost {
     tmux_dry_run: bool,
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     http_timeout_ms: u64,
+    localserver_url: Option<String>,
 }
 
 impl MawWasmHost {
@@ -223,6 +224,7 @@ impl MawWasmHost {
             tmux_dry_run: false,
             audit: Arc::new(Mutex::new(Vec::new())),
             http_timeout_ms: 10_000,
+            localserver_url: None,
         }
     }
 
@@ -235,6 +237,12 @@ impl MawWasmHost {
     #[must_use]
     pub fn with_secret_ref(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.secret_store.insert(name.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_localserver_url(mut self, url: impl Into<String>) -> Self {
+        self.localserver_url = Some(url.into());
         self
     }
 
@@ -341,6 +349,7 @@ impl MawWasmHost {
             "maw.fs.list" => to_json(&self.fs_list(input)),
             "maw.fs.stat" => to_json(&self.fs_stat(input)),
             "maw.http.request" => to_json(&self.http_request(input)),
+            "maw.localserver.request" => to_json(&self.localserver_request(input)),
             "maw.http.peer_send" => to_json(&self.peer_send(input)),
             "maw.http.peer_wake" => to_json(&self.peer_wake(input)),
             "maw.tmux.list_sessions" => to_json(&self.tmux_list_sessions(input)),
@@ -865,6 +874,70 @@ impl MawWasmHost {
             Err(error) => HostResult::err(HostErrorCode::NetworkError, error),
         };
         self.audit("maw.http.request", &cap, &host, status_of(&result), start);
+        result
+    }
+
+
+    fn localserver_request(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<LocalserverArgs>(input) {
+            Ok(args) => args,
+            Err(err) => return err,
+        };
+        let cap = match self.caps.require("sdk", "localserver", None) {
+            Ok(cap) => cap,
+            Err(err) => return err,
+        };
+        let base = match self.resolve_localserver_url() {
+            Ok(base) => base,
+            Err(err) => return err,
+        };
+        let url = match pinned_localserver_url(&base, args.path.as_deref(), args.url.as_deref()) {
+            Ok(url) => url,
+            Err(err) => return err,
+        };
+        let headers = redact_headers(args.headers.unwrap_or_default());
+        let request = TransportHttpRequest {
+            method: args.method,
+            url: url.to_string(),
+            headers,
+            body: args.body,
+            timeout_ms: Some(
+                args.timeout_ms
+                    .unwrap_or(self.http_timeout_ms)
+                    .min(MAX_HTTP_TIMEOUT_MS),
+            ),
+            follow_redirects: false,
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(error) => {
+                return HostResult::err(
+                    HostErrorCode::NetworkError,
+                    format!("tokio runtime failed: {error}"),
+                )
+            }
+        };
+        let client = match ReqwestHttpTransportIo::new(request.timeout_ms.unwrap_or(self.http_timeout_ms)) {
+            Ok(client) => client,
+            Err(error) => return HostResult::err(HostErrorCode::NetworkError, error),
+        };
+        let result = match runtime.block_on(client.request(&request)) {
+            Ok(resp) => HostResult::ok(
+                json!({"status": resp.status, "headers": resp.headers, "body": resp.body, "url": resp.url}),
+            ),
+            Err(error) => HostResult::err(HostErrorCode::NetworkError, error),
+        };
+        self.audit(
+            "maw.localserver.request",
+            &cap,
+            base.as_str(),
+            status_of(&result),
+            start,
+        );
         result
     }
 
@@ -1426,6 +1499,26 @@ impl MawWasmHost {
         Ok(root.join("maw.config.json"))
     }
 
+    fn resolve_localserver_url(&self) -> Result<Url, HostResult<Value>> {
+        if let Some(url) = &self.localserver_url {
+            return parse_localserver_base_url(url);
+        }
+        if let Ok(url) = std::env::var("MAW_LOCALSERVER_URL") {
+            return parse_localserver_base_url(&url);
+        }
+        if let Ok(url) = std::env::var("MAW_ENGINE_URL") {
+            return parse_localserver_base_url(&url);
+        }
+        let config_path = self.config_file_path()?;
+        let config = read_config_json(&config_path).unwrap_or(Value::Null);
+        let port = config
+            .get("port")
+            .and_then(json_u16)
+            .or_else(|| std::env::var("MAW_PORT").ok().and_then(|value| value.parse::<u16>().ok()))
+            .unwrap_or(31_745);
+        parse_localserver_base_url(&format!("http://127.0.0.1:{port}"))
+    }
+
     fn consent_state_root(&self) -> Result<PathBuf, HostResult<Value>> {
         let root = self
             .fs_roots
@@ -1550,6 +1643,7 @@ pub const HOST_FN_NAMES: &[&str] = &[
     "maw.fs.list",
     "maw.fs.stat",
     "maw.http.request",
+    "maw.localserver.request",
     "maw.http.peer_send",
     "maw.http.peer_wake",
     "maw.tmux.list_sessions",
@@ -1676,6 +1770,16 @@ struct HttpArgs {
     body: Option<String>,
     timeout_ms: Option<u64>,
     follow_redirects: Option<bool>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalserverArgs {
+    method: String,
+    path: Option<String>,
+    url: Option<String>,
+    headers: Option<BTreeMap<String, String>>,
+    body: Option<String>,
+    timeout_ms: Option<u64>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2521,6 +2625,86 @@ fn redact(value: &str) -> String {
     }
     out
 }
+
+fn json_u16(value: &Value) -> Option<u16> {
+    if let Some(port) = value.as_u64() {
+        return u16::try_from(port).ok();
+    }
+    value.as_str()?.parse::<u16>().ok()
+}
+
+fn parse_localserver_base_url(raw: &str) -> Result<Url, HostResult<Value>> {
+    let mut url = Url::parse(raw.trim_end_matches('/')).map_err(|error| {
+        HostResult::err(
+            HostErrorCode::InvalidArgs,
+            format!("invalid localserver url: {error}"),
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(HostResult::err(
+            HostErrorCode::CapabilityDenied,
+            "localserver URL must be http/https",
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        HostResult::err(HostErrorCode::InvalidArgs, "localserver URL host is required")
+    })?;
+    if !is_localserver_host(host) {
+        return Err(HostResult::err(
+            HostErrorCode::CapabilityDenied,
+            "localserver URL must resolve to loopback",
+        ));
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn pinned_localserver_url(
+    base: &Url,
+    path: Option<&str>,
+    requested_url: Option<&str>,
+) -> Result<Url, HostResult<Value>> {
+    let url = if let Some(raw) = requested_url {
+        Url::parse(raw).map_err(|error| {
+            HostResult::err(HostErrorCode::InvalidArgs, format!("invalid url: {error}"))
+        })?
+    } else {
+        let path = path.unwrap_or("/");
+        if !path.starts_with('/') || path.starts_with("//") {
+            return Err(HostResult::err(
+                HostErrorCode::CapabilityDenied,
+                "localserver path must be absolute and hostless",
+            ));
+        }
+        base.join(path.trim_start_matches('/')).map_err(|error| {
+            HostResult::err(HostErrorCode::InvalidArgs, format!("invalid path: {error}"))
+        })?
+    };
+    if !same_origin(base, &url) {
+        return Err(HostResult::err(
+            HostErrorCode::CapabilityDenied,
+            "localserver request denied: URL is not the host-pinned maw server endpoint",
+        ));
+    }
+    Ok(url)
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn is_localserver_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
 fn is_discord_gateway(url: &Url) -> bool {
     url.host_str()
         .is_some_and(|host| host.contains("discord") && url.path().contains("gateway"))

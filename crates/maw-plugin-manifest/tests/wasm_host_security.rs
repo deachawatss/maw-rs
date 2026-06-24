@@ -1,6 +1,9 @@
 use std::fs::{create_dir_all, read_to_string, write};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_plugin_manifest::{parse_manifest, HostErrorCode, MawWasmHost, PluginManifest};
@@ -51,6 +54,25 @@ fn host(dir: &Path, caps: &[&str]) -> MawWasmHost {
 
 fn call(host: &MawWasmHost, name: &str, args: &Value) -> Value {
     serde_json::from_str(&host.handle_json(name, &args.to_string())).expect("host result json")
+}
+
+fn spawn_localserver_once(body: &'static str) -> String {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind localserver");
+    let addr = listener.local_addr().expect("localserver addr");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept localserver request");
+        let mut buf = [0_u8; 1024];
+        let _ = stream.read(&mut buf);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write localserver response");
+    });
+    format!("http://127.0.0.1:{}", addr.port())
 }
 
 #[test]
@@ -124,6 +146,74 @@ fn secret_bytes_are_redacted_from_audit_and_headers() {
         !audit.contains("Authorization"),
         "audit leaked header name/value: {audit}"
     );
+}
+
+#[test]
+fn localserver_request_is_host_pinned_and_capability_gated() {
+    let dir = temp("localserver-host-direct");
+    let base = spawn_localserver_once(r#"{"ok":true,"source":"maw-server"}"#);
+    let actual_url = format!("{base}/api/probe");
+    let wrong_port = if base.ends_with(":65535") {
+        "http://127.0.0.1:65534/api/probe".to_owned()
+    } else {
+        "http://127.0.0.1:65535/api/probe".to_owned()
+    };
+    let pinned = host(&dir, &["sdk:localserver"]).with_localserver_url(&base);
+
+    for denied_url in [
+        wrong_port.as_str(),
+        "http://127.0.0.2:31745/api/probe",
+        "http://[::1]:31745/api/probe",
+        "http://10.0.0.7:31745/api/probe",
+    ] {
+        let denied = call(
+            &pinned,
+            "maw.localserver.request",
+            &json!({"method": "GET", "url": denied_url}),
+        );
+        assert_eq!(denied["ok"], false, "{denied_url}: {denied}");
+        assert_eq!(
+            denied["code"], "capability_denied",
+            "{denied_url}: {denied}"
+        );
+    }
+
+    let no_cap = host(&dir, &[]).with_localserver_url(&base);
+    let cap_denied = call(
+        &no_cap,
+        "maw.localserver.request",
+        &json!({"method": "GET", "url": actual_url}),
+    );
+    assert_eq!(cap_denied["ok"], false);
+    assert_eq!(cap_denied["code"], "capability_denied");
+
+    let allowed = call(
+        &pinned,
+        "maw.localserver.request",
+        &json!({"method": "GET", "url": actual_url}),
+    );
+    assert_eq!(allowed["ok"], true, "{allowed}");
+    assert_eq!(allowed["value"]["status"], 200);
+    assert!(
+        allowed["value"]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("maw-server"),
+        "{allowed}"
+    );
+}
+
+#[test]
+fn general_http_loopback_deny_still_applies_with_localserver_cap() {
+    let dir = temp("localserver-does-not-weaken-http");
+    let host = host(&dir, &["sdk:localserver", "net:http:127.0.0.1"]);
+    let denied = call(
+        &host,
+        "maw.http.request",
+        &json!({"method": "GET", "url": "http://127.0.0.1:31745/api/probe"}),
+    );
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["code"], "capability_denied");
 }
 
 #[test]

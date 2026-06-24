@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
@@ -29,6 +29,7 @@ struct ServeState {
     cached_pubkey: Option<String>,
     ws_tx: broadcast::Sender<RelayFrame>,
     workspaces: Mutex<WorkspaceStore>,
+    requests: Mutex<RequestReplyStore>,
     #[cfg(test)]
     peer_addr_override: Option<SocketAddr>,
     #[cfg(test)]
@@ -83,6 +84,7 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         cached_pubkey: args.cached_pubkey.or_else(load_inbound_peer_pubkey),
         ws_tx: new_ws_relay(),
         workspaces: Mutex::new(WorkspaceStore::default()),
+        requests: Mutex::new(RequestReplyStore::default()),
         #[cfg(test)]
         peer_addr_override: None,
         #[cfg(test)]
@@ -195,6 +197,11 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/transport/status", get(api_transport_status))
         .route("/api/transport/send", post(api_transport_send))
         .route("/api/federation/status", get(api_federation_status))
+        .route("/api/health", get(api_health))
+        .route("/api/message-ledger", get(api_message_ledger))
+        .route("/api/requests", get(api_requests))
+        .route("/api/request", post(api_request_create))
+        .route("/api/reply/:correlation_id", post(api_reply))
         .route("/api/identity", get(api_identity))
         .route("/api/peers/discoveries", get(api_peers_discoveries))
         .route("/api/peers/discovered", get(api_peers_discoveries))
@@ -381,6 +388,43 @@ async fn api_transport_send(
 
 async fn api_federation_status() -> impl IntoResponse {
     Json(json!({"localUrl": null, "localReachable": true, "peers": [], "totalPeers": 0, "reachablePeers": 0, "clockHealth": "ok"}))
+}
+
+async fn api_health() -> impl IntoResponse {
+    Json(json!({"ok": true, "source": "maw-rs", "server": "local", "port": DEFAULT_SERVE_PORT}))
+}
+
+async fn api_message_ledger(Query(query): Query<MessageLedgerQuery>) -> impl IntoResponse {
+    let _ = (query.limit, query.from, query.to, query.direction, query.state, query.q, query.json);
+    Json(json!({"ok": true, "messages": [], "total": 0, "source": "maw-rs-native"}))
+}
+
+async fn api_requests(
+    State(state): State<Arc<ServeState>>,
+    Query(query): Query<RequestListQuery>,
+) -> impl IntoResponse {
+    let requests = with_request_store(&state, |store| store.list(query.oracle.as_deref(), query.status.as_deref()));
+    Json(json!({"requests": requests, "total": requests.len()}))
+}
+
+async fn api_request_create(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<RequestCreateBody>,
+) -> impl IntoResponse {
+    let entry = with_request_store(&state, |store| store.create(body));
+    Json(json!({"correlationId": entry.correlation_id, "status": entry.status, "oracle": entry.to}))
+}
+
+async fn api_reply(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(correlation_id): AxumPath<String>,
+    Json(body): Json<ReplyBody>,
+) -> impl IntoResponse {
+    with_request_store(&state, |store| match store.reply(&correlation_id, body.reply, body.data) {
+        ReplyResult::Ok => Json(json!({"ok": true, "correlationId": correlation_id})).into_response(),
+        ReplyResult::NotFound => (StatusCode::NOT_FOUND, Json(json!({"error": "request not found"}))).into_response(),
+        ReplyResult::AlreadyReplied => Json(json!({"error": "already replied", "correlationId": correlation_id})).into_response(),
+    })
 }
 
 async fn api_identity() -> impl IntoResponse {
@@ -807,6 +851,114 @@ enum RelayFrame {
 }
 
 #[derive(Default)]
+struct RequestReplyStore {
+    entries: HashMap<String, RequestEntry>,
+    next_id: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestEntry {
+    correlation_id: String,
+    from: String,
+    to: String,
+    target: String,
+    message: String,
+    status: String,
+    reply: Option<String>,
+    data: Option<Value>,
+}
+
+enum ReplyResult {
+    Ok,
+    NotFound,
+    AlreadyReplied,
+}
+
+impl RequestReplyStore {
+    fn create(&mut self, body: RequestCreateBody) -> RequestEntry {
+        self.next_id = self.next_id.saturating_add(1);
+        let correlation_id = format!("req-{}", self.next_id);
+        let to = body.to.split(':').next().unwrap_or(&body.to).to_owned();
+        let entry = RequestEntry {
+            correlation_id: correlation_id.clone(),
+            from: body.from.unwrap_or_else(|| "external".to_owned()),
+            to,
+            target: body.to,
+            message: body.message,
+            status: "delivered".to_owned(),
+            reply: None,
+            data: None,
+        };
+        self.entries.insert(correlation_id, entry.clone());
+        entry
+    }
+
+    fn list(&self, oracle: Option<&str>, status: Option<&str>) -> Vec<RequestEntry> {
+        let mut entries = self.entries.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.correlation_id.cmp(&b.correlation_id));
+        entries
+            .into_iter()
+            .filter(|entry| oracle.is_none_or(|oracle| entry.to == oracle))
+            .filter(|entry| status.is_none_or(|status| entry.status == status))
+            .collect()
+    }
+
+    fn reply(&mut self, correlation_id: &str, reply: String, data: Option<Value>) -> ReplyResult {
+        let Some(entry) = self.entries.get_mut(correlation_id) else {
+            return ReplyResult::NotFound;
+        };
+        if entry.status == "replied" {
+            return ReplyResult::AlreadyReplied;
+        }
+        "replied".clone_into(&mut entry.status);
+        entry.reply = Some(reply);
+        entry.data = data;
+        ReplyResult::Ok
+    }
+}
+
+fn with_request_store<T>(state: &ServeState, f: impl FnOnce(&mut RequestReplyStore) -> T) -> T {
+    match state.requests.lock() {
+        Ok(mut store) => f(&mut store),
+        Err(poisoned) => {
+            let mut store = poisoned.into_inner();
+            f(&mut store)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MessageLedgerQuery {
+    limit: Option<usize>,
+    from: Option<String>,
+    to: Option<String>,
+    direction: Option<String>,
+    state: Option<String>,
+    q: Option<String>,
+    json: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RequestListQuery {
+    oracle: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct RequestCreateBody {
+    to: String,
+    message: String,
+    from: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReplyBody {
+    reply: String,
+    data: Option<Value>,
+}
+
+#[derive(Default)]
 struct WorkspaceStore {
     workspaces: HashMap<String, Workspace>,
     join_codes: HashMap<String, String>,
@@ -914,6 +1066,7 @@ mod serve_tests {
             cached_pubkey: Some(KEY.to_owned()),
             ws_tx: new_ws_relay(),
             workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
         });

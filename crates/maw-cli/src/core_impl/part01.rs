@@ -65,7 +65,8 @@ use maw_transport::{
     classify_error, classify_symmetric_federation_status, FederationPeerStatus, FederationPeerView,
     FederationStatus, PairStatus, PeerFederationStatus, PeerFederationStatusResult,
     SymmetricFederationStatus, Transport, TransportFailureReason, TransportResult, TransportRouter,
-    PeerSendRequest, PeerWakeRequest, ReqwestHttpTransportIo, TransportTarget,
+    HttpRequest as TransportHttpRequest, PeerSendRequest, PeerWakeRequest, ReqwestHttpTransportIo,
+    TransportTarget,
 };
 use maw_worktree::{
     resolve_worktree_window, Session as WorktreeSession, Window as WorktreeWindow,
@@ -151,6 +152,10 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "send", handler: Handler::Async(run_send_async) },
     DispatcherEntry { command: "wake", handler: Handler::Async(run_wake_async) },
     DispatcherEntry { command: "serve", handler: Handler::Async(run_serve_async) },
+    DispatcherEntry { command: "health", handler: Handler::Async(run_health_async) },
+    DispatcherEntry { command: "messages", handler: Handler::Async(run_messages_async) },
+    DispatcherEntry { command: "reply", handler: Handler::Async(run_reply_async) },
+    DispatcherEntry { command: "rp", handler: Handler::Async(run_reply_async) },
     DispatcherEntry { command: "fuzzy", handler: Handler::Sync(run_fuzzy_plan) },
     DispatcherEntry { command: "resolve", handler: Handler::Sync(run_resolve_plan) },
     DispatcherEntry { command: "identity", handler: Handler::Sync(run_identity_plan) },
