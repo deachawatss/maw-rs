@@ -146,6 +146,8 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "split", handler: Handler::Sync(run_split_command) },
     DispatcherEntry { command: "attach", handler: Handler::Sync(run_attach_plan) },
     DispatcherEntry { command: "a", handler: Handler::Sync(run_attach_plan) },
+    DispatcherEntry { command: "attach-ssh", handler: Handler::Sync(run_attach_ssh_command) },
+    DispatcherEntry { command: "stream", handler: Handler::Sync(run_stream_command) },
     DispatcherEntry { command: "bring", handler: Handler::Sync(run_bring_plan) },
     DispatcherEntry { command: "b", handler: Handler::Sync(run_bring_plan) },
     DispatcherEntry { command: "ls", handler: Handler::Sync(run_ls_plan) },

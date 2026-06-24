@@ -171,3 +171,221 @@ fn init_interactive_wizard_uses_isolated_pty_when_script_is_available() {
     .expect("config json");
     assert_eq!(config["node"], "pty-node");
 }
+
+#[test]
+fn subset2_commands_are_native_not_bun_fallback() {
+    for command in ["stream", "attach-ssh"] {
+        assert_eq!(
+            dispatcher_status(command),
+            DispatchKind::Native,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn attach_ssh_dry_run_matches_committed_golden_without_ref_checkout() {
+    let root = temp_dir("attach-ssh-dry-run");
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node",
+            "peer-one",
+            "--session",
+            "50-mawjs",
+            "--ssh-alias",
+            "peer-one",
+            "--dry-run",
+        ],
+        &root,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-interactive/attach-ssh-dry-run.stdout")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+}
+
+#[test]
+fn attach_ssh_plan_json_matches_committed_golden_without_ref_checkout() {
+    let root = temp_dir("attach-ssh-plan-json");
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node=peer-one",
+            "--session=50-mawjs",
+            "--ssh-alias=peer-one",
+            "--plan-json",
+        ],
+        &root,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-interactive/attach-ssh-plan.json")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+}
+
+#[test]
+fn attach_ssh_refuses_unsafe_session_before_ssh() {
+    let root = temp_dir("attach-ssh-unsafe-session");
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node",
+            "peer-one",
+            "--session",
+            "bad;session",
+            "--ssh-alias",
+            "peer-one",
+            "--dry-run",
+        ],
+        &root,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("unsafe tmux session 'bad;session'"),
+        "{stderr}"
+    );
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}
+
+#[test]
+fn stream_unlink_dry_run_matches_committed_golden_without_ref_checkout() {
+    let root = temp_dir("stream-unlink-dry-run");
+    let output = run(&["stream", "--unlink", "view:oracle", "--dry-run"], &root);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-interactive/stream-unlink-dry-run.stdout")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+}
+
+#[test]
+fn stream_unlink_plan_json_matches_committed_golden_without_ref_checkout() {
+    let root = temp_dir("stream-unlink-plan-json");
+    let output = run(&["stream", "--unlink", "view:oracle", "--plan-json"], &root);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-interactive/stream-unlink-plan.json")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+}
+
+#[test]
+fn attach_remote_tier3_plan_json_matches_committed_golden_without_ref_checkout() {
+    let root = temp_dir("attach-remote-plan-json");
+    let output = run(
+        &[
+            "attach",
+            "peer-one:50-mawjs",
+            "--ssh-alias",
+            "peer-one",
+            "--yes",
+            "--plan-json",
+        ],
+        &root,
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/native-interactive/attach-remote-plan.json")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+}
+
+#[test]
+fn attach_ssh_refuses_option_injection_alias_before_ssh_spawn() {
+    let root = temp_dir("attach-ssh-option-alias");
+    let pwned = root.join("pwned");
+    let payload = format!("-oProxyCommand=touch+{}", pwned.display());
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node",
+            "peer-one",
+            "--session",
+            "foo",
+            "--ssh-alias",
+            &payload,
+        ],
+        &root,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("unsafe ssh alias '-oProxyCommand="),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("unreachable"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh exited"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(!pwned.exists(), "ssh ProxyCommand payload must not run");
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}
+
+#[test]
+fn attach_ssh_refuses_option_injection_node_before_ssh_spawn() {
+    let root = temp_dir("attach-ssh-option-node");
+    let output = run(
+        &[
+            "attach-ssh",
+            "--node=-oProxyCommand=touch+/tmp/pwned",
+            "--session",
+            "foo",
+            "--ssh-alias",
+            "peer-one",
+        ],
+        &root,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("unsafe node '-oProxyCommand="), "{stderr}");
+    assert!(
+        !stderr.contains("unreachable"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ssh exited"),
+        "validation must fail before ssh preflight: {stderr}"
+    );
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}

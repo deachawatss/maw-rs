@@ -1,0 +1,1 @@
+{"command":"attach-ssh","node":"peer-one","sessionName":"50-mawjs","sshAlias":"peer-one","probeArgs":["-o","ConnectTimeout=3","-o","BatchMode=yes","peer-one","true"],"sshArgs":["-tt","peer-one","tmux attach-session -t 50-mawjs"]}
