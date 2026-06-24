@@ -78,6 +78,8 @@ use maw_xdg::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,79 +105,117 @@ pub enum DispatchKind {
 }
 
 type NativeHandler = fn(&[String]) -> CliOutput;
+type AsyncHandler = fn(Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>>;
+
+#[derive(Clone, Copy)]
+enum Handler {
+    Sync(NativeHandler),
+    #[allow(dead_code)]
+    Async(AsyncHandler),
+}
 
 #[derive(Clone, Copy)]
 struct DispatcherEntry {
     command: &'static str,
-    handler: NativeHandler,
+    handler: Handler,
 }
 
 enum DispatchTarget {
     Native(NativeHandler),
+    AsyncNative(AsyncHandler),
     BunFallback,
 }
 
 const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
-    DispatcherEntry { command: "--help", handler: usage_handler },
-    DispatcherEntry { command: "-h", handler: usage_handler },
-    DispatcherEntry { command: "help", handler: usage_handler },
-    DispatcherEntry { command: "auth", handler: run_auth_plan },
-    DispatcherEntry { command: "auto-wake", handler: run_auto_wake_plan },
-    DispatcherEntry { command: "hub", handler: run_hub_plan },
-    DispatcherEntry { command: "xdg", handler: run_xdg_plan },
-    DispatcherEntry { command: "plugin", handler: run_plugin_plan },
-    DispatcherEntry { command: "plugin-scaffold", handler: run_plugin_scaffold_plan },
-    DispatcherEntry { command: "plugin-manifest", handler: run_plugin_manifest_plan },
-    DispatcherEntry { command: "bind-host", handler: run_bind_host_plan },
-    DispatcherEntry { command: "attach", handler: run_attach_plan },
-    DispatcherEntry { command: "a", handler: run_attach_plan },
-    DispatcherEntry { command: "bring", handler: run_bring_plan },
-    DispatcherEntry { command: "b", handler: run_bring_plan },
-    DispatcherEntry { command: "ls", handler: run_ls_plan },
-    DispatcherEntry { command: "run", handler: run_run_command },
-    DispatcherEntry { command: "send-enter", handler: run_send_enter_command },
-    DispatcherEntry { command: "feed", handler: run_feed_plan },
-    DispatcherEntry { command: "fuzzy", handler: run_fuzzy_plan },
-    DispatcherEntry { command: "resolve", handler: run_resolve_plan },
-    DispatcherEntry { command: "identity", handler: run_identity_plan },
-    DispatcherEntry { command: "normalize", handler: run_normalize_plan },
-    DispatcherEntry { command: "calver", handler: run_calver_plan },
-    DispatcherEntry { command: "worktree-window", handler: run_worktree_window_plan },
-    DispatcherEntry { command: "route", handler: run_route_plan },
-    DispatcherEntry { command: "discover", handler: run_discover_plan },
-    DispatcherEntry { command: "federation-identity", handler: run_federation_identity_plan },
-    DispatcherEntry { command: "federation-health", handler: run_federation_health_plan },
-    DispatcherEntry { command: "federation-sync", handler: run_federation_sync_plan },
-    DispatcherEntry { command: "auto-pair-proof", handler: run_auto_pair_proof_plan },
-    DispatcherEntry { command: "consent-constants", handler: run_consent_constants_plan },
-    DispatcherEntry { command: "consent-pin", handler: run_consent_pin_plan },
-    DispatcherEntry { command: "consent-request", handler: run_consent_request_plan },
-    DispatcherEntry { command: "consent-approval", handler: run_consent_approval_plan },
-    DispatcherEntry { command: "consent-store", handler: run_consent_store_plan },
-    DispatcherEntry { command: "consent-expiry", handler: run_consent_expiry_plan },
-    DispatcherEntry { command: "consent-cleanup", handler: run_consent_cleanup_plan },
-    DispatcherEntry { command: "consent-trust-revoke", handler: run_consent_trust_revoke_plan },
-    DispatcherEntry { command: "consent-trust-check", handler: run_consent_trust_check_plan },
-    DispatcherEntry { command: "consent-pending-read", handler: run_consent_pending_read_plan },
-    DispatcherEntry { command: "consent-pending-status", handler: run_consent_pending_status_plan },
-    DispatcherEntry { command: "recent-hello", handler: run_recent_hello_plan },
-    DispatcherEntry { command: "pair-code", handler: run_pair_code_plan },
-    DispatcherEntry { command: "pair-code-store", handler: run_pair_code_store_plan },
-    DispatcherEntry { command: "pair-api", handler: run_pair_api_plan },
-    DispatcherEntry { command: "pair-api-auto", handler: run_pair_api_auto_plan },
-    DispatcherEntry { command: "peer-sources", handler: run_peer_sources_plan },
-    DispatcherEntry { command: "peer-probe", handler: run_peer_probe_plan },
-    DispatcherEntry { command: "policy", handler: run_policy_plan },
-    DispatcherEntry { command: "plugin-policy", handler: run_policy_plan },
-    DispatcherEntry { command: "split-policy", handler: run_split_policy_plan },
-    DispatcherEntry { command: "transport", handler: run_transport_plan },
+    DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
+    DispatcherEntry { command: "auth", handler: Handler::Sync(run_auth_plan) },
+    DispatcherEntry { command: "auto-wake", handler: Handler::Sync(run_auto_wake_plan) },
+    DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },
+    DispatcherEntry { command: "xdg", handler: Handler::Sync(run_xdg_plan) },
+    DispatcherEntry { command: "plugin", handler: Handler::Sync(run_plugin_plan) },
+    DispatcherEntry { command: "plugin-scaffold", handler: Handler::Sync(run_plugin_scaffold_plan) },
+    DispatcherEntry { command: "plugin-manifest", handler: Handler::Sync(run_plugin_manifest_plan) },
+    DispatcherEntry { command: "bind-host", handler: Handler::Sync(run_bind_host_plan) },
+    DispatcherEntry { command: "attach", handler: Handler::Sync(run_attach_plan) },
+    DispatcherEntry { command: "a", handler: Handler::Sync(run_attach_plan) },
+    DispatcherEntry { command: "bring", handler: Handler::Sync(run_bring_plan) },
+    DispatcherEntry { command: "b", handler: Handler::Sync(run_bring_plan) },
+    DispatcherEntry { command: "ls", handler: Handler::Sync(run_ls_plan) },
+    DispatcherEntry { command: "run", handler: Handler::Sync(run_run_command) },
+    DispatcherEntry { command: "send-enter", handler: Handler::Sync(run_send_enter_command) },
+    DispatcherEntry { command: "feed", handler: Handler::Sync(run_feed_plan) },
+    DispatcherEntry { command: "fuzzy", handler: Handler::Sync(run_fuzzy_plan) },
+    DispatcherEntry { command: "resolve", handler: Handler::Sync(run_resolve_plan) },
+    DispatcherEntry { command: "identity", handler: Handler::Sync(run_identity_plan) },
+    DispatcherEntry { command: "normalize", handler: Handler::Sync(run_normalize_plan) },
+    DispatcherEntry { command: "calver", handler: Handler::Sync(run_calver_plan) },
+    DispatcherEntry { command: "worktree-window", handler: Handler::Sync(run_worktree_window_plan) },
+    DispatcherEntry { command: "route", handler: Handler::Sync(run_route_plan) },
+    DispatcherEntry { command: "discover", handler: Handler::Sync(run_discover_plan) },
+    DispatcherEntry { command: "federation-identity", handler: Handler::Sync(run_federation_identity_plan) },
+    DispatcherEntry { command: "federation-health", handler: Handler::Sync(run_federation_health_plan) },
+    DispatcherEntry { command: "federation-sync", handler: Handler::Sync(run_federation_sync_plan) },
+    DispatcherEntry { command: "auto-pair-proof", handler: Handler::Sync(run_auto_pair_proof_plan) },
+    DispatcherEntry { command: "consent-constants", handler: Handler::Sync(run_consent_constants_plan) },
+    DispatcherEntry { command: "consent-pin", handler: Handler::Sync(run_consent_pin_plan) },
+    DispatcherEntry { command: "consent-request", handler: Handler::Sync(run_consent_request_plan) },
+    DispatcherEntry { command: "consent-approval", handler: Handler::Sync(run_consent_approval_plan) },
+    DispatcherEntry { command: "consent-store", handler: Handler::Sync(run_consent_store_plan) },
+    DispatcherEntry { command: "consent-expiry", handler: Handler::Sync(run_consent_expiry_plan) },
+    DispatcherEntry { command: "consent-cleanup", handler: Handler::Sync(run_consent_cleanup_plan) },
+    DispatcherEntry { command: "consent-trust-revoke", handler: Handler::Sync(run_consent_trust_revoke_plan) },
+    DispatcherEntry { command: "consent-trust-check", handler: Handler::Sync(run_consent_trust_check_plan) },
+    DispatcherEntry { command: "consent-pending-read", handler: Handler::Sync(run_consent_pending_read_plan) },
+    DispatcherEntry { command: "consent-pending-status", handler: Handler::Sync(run_consent_pending_status_plan) },
+    DispatcherEntry { command: "recent-hello", handler: Handler::Sync(run_recent_hello_plan) },
+    DispatcherEntry { command: "pair-code", handler: Handler::Sync(run_pair_code_plan) },
+    DispatcherEntry { command: "pair-code-store", handler: Handler::Sync(run_pair_code_store_plan) },
+    DispatcherEntry { command: "pair-api", handler: Handler::Sync(run_pair_api_plan) },
+    DispatcherEntry { command: "pair-api-auto", handler: Handler::Sync(run_pair_api_auto_plan) },
+    DispatcherEntry { command: "peer-sources", handler: Handler::Sync(run_peer_sources_plan) },
+    DispatcherEntry { command: "peer-probe", handler: Handler::Sync(run_peer_probe_plan) },
+    DispatcherEntry { command: "policy", handler: Handler::Sync(run_policy_plan) },
+    DispatcherEntry { command: "plugin-policy", handler: Handler::Sync(run_policy_plan) },
+    DispatcherEntry { command: "split-policy", handler: Handler::Sync(run_split_policy_plan) },
+    DispatcherEntry { command: "transport", handler: Handler::Sync(run_transport_plan) },
+    #[cfg(test)]
+    DispatcherEntry { command: "__async-dispatch-test", handler: Handler::Async(run_async_dispatch_test) },
 ];
 
 #[must_use]
 pub fn dispatcher_status(command: &str) -> DispatchKind {
     match dispatcher_target(command) {
-        DispatchTarget::Native(_) => DispatchKind::Native,
+        DispatchTarget::Native(_) | DispatchTarget::AsyncNative(_) => DispatchKind::Native,
         DispatchTarget::BunFallback => DispatchKind::BunFallback,
+    }
+}
+
+#[cfg(test)]
+mod async_dispatch_tests {
+    use super::{run_cli_async, CliOutput, DispatchKind, dispatcher_status};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn async_dispatch_entry_runs_on_tokio_runtime() {
+        let output = run_cli_async(&args(&["__async-dispatch-test", "one", "two"])).await;
+
+        assert_eq!(
+            output,
+            CliOutput {
+                code: 0,
+                stdout: "async:one,two\n".to_owned(),
+                stderr: String::new(),
+            }
+        );
+        assert_eq!(
+            dispatcher_status("__async-dispatch-test"),
+            DispatchKind::Native
+        );
     }
 }
 
@@ -188,8 +228,9 @@ fn dispatcher_target(command: &str) -> DispatchTarget {
     DISPATCHER_ENTRIES
         .iter()
         .find(|entry| entry.command == command)
-        .map_or(DispatchTarget::BunFallback, |entry| {
-            DispatchTarget::Native(entry.handler)
+        .map_or(DispatchTarget::BunFallback, |entry| match entry.handler {
+            Handler::Sync(handler) => DispatchTarget::Native(handler),
+            Handler::Async(handler) => DispatchTarget::AsyncNative(handler),
         })
 }
 
@@ -206,6 +247,7 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
 
     match dispatcher_target(command) {
         DispatchTarget::Native(handler) => handler(&argv[1..]),
+        DispatchTarget::AsyncNative(handler) => run_async_handler_blocking(handler, &argv[1..]),
         DispatchTarget::BunFallback => dispatch_cli_plugin(argv).unwrap_or_else(|| {
             if has_partial_plugin_command_match(argv) {
                 unknown_command(command)
@@ -214,6 +256,58 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
             }
         }),
     }
+}
+
+/// Run CLI dispatch on the process tokio runtime.
+///
+/// Dispatcher entries deliberately separate `Handler::Sync` from
+/// `Handler::Async`: E3+ transport commands can register an async handler while
+/// the existing native command functions keep their synchronous signatures and
+/// byte-for-byte output contract.
+pub async fn run_cli_async(argv: &[String]) -> CliOutput {
+    let Some(command) = argv.first().map(String::as_str) else {
+        return usage_ok();
+    };
+
+    match dispatcher_target(command) {
+        DispatchTarget::Native(handler) => handler(&argv[1..]),
+        DispatchTarget::AsyncNative(handler) => handler(argv[1..].to_vec()).await,
+        DispatchTarget::BunFallback => dispatch_cli_plugin(argv).unwrap_or_else(|| {
+            if has_partial_plugin_command_match(argv) {
+                unknown_command(command)
+            } else {
+                dispatch_bun_fallback(argv, command)
+            }
+        }),
+    }
+}
+
+fn run_async_handler_blocking(handler: AsyncHandler, args: &[String]) -> CliOutput {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("failed to start tokio runtime: {error}\n"),
+            };
+        }
+    };
+    runtime.block_on(handler(args.to_vec()))
+}
+
+#[cfg(test)]
+fn run_async_dispatch_test(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move {
+        CliOutput {
+            code: 0,
+            stdout: format!("async:{}\n", args.join(",")),
+            stderr: String::new(),
+        }
+    })
 }
 
 

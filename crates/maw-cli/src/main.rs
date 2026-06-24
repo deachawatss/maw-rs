@@ -13,18 +13,33 @@ async fn main() {
 }
 
 async fn main_code_async(argv: &[String]) -> i32 {
-    std::future::ready(main_code(argv)).await
+    main_code_async_with(argv, maybe_exec_attach).await
 }
 
+#[cfg(test)]
 fn main_code(argv: &[String]) -> i32 {
     main_code_with(argv, maybe_exec_attach)
 }
 
+#[cfg(test)]
 fn main_code_with(argv: &[String], attach: impl FnOnce(&[String]) -> Option<i32>) -> i32 {
     if let Some(code) = attach(argv) {
         return code;
     }
     let output = maw_cli::run_cli(argv);
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    output.code
+}
+
+async fn main_code_async_with(
+    argv: &[String],
+    attach: impl FnOnce(&[String]) -> Option<i32>,
+) -> i32 {
+    if let Some(code) = attach(argv) {
+        return code;
+    }
+    let output = maw_cli::run_cli_async(argv).await;
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     output.code
@@ -129,7 +144,8 @@ fn attach_exec_tmux_args(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_exec_tmux_args, main_code, main_code_with, maybe_exec_attach_with, run_tmux_attach,
+        attach_exec_tmux_args, main_code, main_code_async_with, main_code_with,
+        maybe_exec_attach_with, run_tmux_attach,
     };
     use std::{
         env,
@@ -273,6 +289,14 @@ mod tests {
     #[test]
     fn main_code_with_returns_fast_attach_status_without_running_cli() {
         assert_eq!(main_code_with(&args(&["a", "50-mawjs"]), |_| Some(23)), 23);
+    }
+
+    #[tokio::test]
+    async fn main_code_async_with_returns_fast_attach_status_without_running_cli() {
+        assert_eq!(
+            main_code_async_with(&args(&["a", "50-mawjs"]), |_| Some(29)).await,
+            29
+        );
     }
 
     #[test]
