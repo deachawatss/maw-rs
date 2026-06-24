@@ -148,6 +148,7 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "send-enter", handler: Handler::Sync(run_send_enter_command) },
     DispatcherEntry { command: "feed", handler: Handler::Sync(run_feed_plan) },
     DispatcherEntry { command: "hey", handler: Handler::Async(run_hey_async) },
+    DispatcherEntry { command: "serve", handler: Handler::Async(run_serve_async) },
     DispatcherEntry { command: "fuzzy", handler: Handler::Sync(run_fuzzy_plan) },
     DispatcherEntry { command: "resolve", handler: Handler::Sync(run_resolve_plan) },
     DispatcherEntry { command: "identity", handler: Handler::Sync(run_identity_plan) },

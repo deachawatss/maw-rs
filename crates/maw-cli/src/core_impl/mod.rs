@@ -27,3 +27,4 @@ include!("part26.rs");
 include!("part28.rs");
 include!("part27.rs");
 include!("part29.rs");
+include!("part30.rs");
