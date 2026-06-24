@@ -340,6 +340,7 @@ fn workon_path_str(path: &std::path::Path) -> Result<&str, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::redundant_closure_for_method_calls)]
 mod workon_tests {
     use super::*;
 
@@ -373,6 +374,8 @@ mod workon_tests {
         let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
         let options = WorkonOptions { repo: "demo".to_owned(), task: None, layout: WorkonLayout::Nested };
         let mut runner = WorkonMockTmux { session: "50-mawjs\n".to_owned(), windows: "demo\n".to_owned(), ..Default::default() };
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
 
         let stdout = workon_cmd_with_runner(&options, &repo, &mut runner).expect("reuse");
@@ -387,6 +390,8 @@ mod workon_tests {
         let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
         let options = WorkonOptions { repo: "demo".to_owned(), task: None, layout: WorkonLayout::Nested };
         let mut runner = WorkonMockTmux { session: "-Sbad\n".to_owned(), windows: String::new(), ..Default::default() };
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
 
         let err = workon_cmd_with_runner(&options, &repo, &mut runner).expect_err("guard");

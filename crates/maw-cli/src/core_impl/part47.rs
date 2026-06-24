@@ -390,11 +390,11 @@ fn demo_dim() -> &'static str { "\x1b[90m" }
 fn demo_reset() -> &'static str { "\x1b[0m" }
 
 #[cfg(test)]
+#[allow(clippy::redundant_closure_for_method_calls)]
 mod demo_tests {
     use super::*;
     use std::collections::VecDeque;
     use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     #[derive(Debug, Default)]
     struct DemoMockTmuxRunner {
@@ -420,10 +420,6 @@ mod demo_tests {
         }
     }
 
-    fn demo_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct DemoEnvRestore {
         tmux: Option<OsString>,
@@ -460,7 +456,7 @@ mod demo_tests {
 
     #[test]
     fn demo_help_matches_maw_js_handler_text() {
-        let _guard = demo_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = DemoEnvRestore::capture();
         std::env::remove_var("TMUX");
         std::env::remove_var("TMUX_PANE");
@@ -470,7 +466,7 @@ mod demo_tests {
 
     #[test]
     fn demo_no_tmux_matches_maw_js_showcase_golden() {
-        let _guard = demo_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = DemoEnvRestore::capture();
         std::env::remove_var("TMUX");
         std::env::remove_var("TMUX_PANE");
@@ -479,7 +475,7 @@ mod demo_tests {
 
     #[test]
     fn demo_tmux_fast_orchestrates_panes_and_cleans_up() {
-        let _guard = demo_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = DemoEnvRestore::capture();
         std::env::set_var("TMUX", "/tmp/tmux-1000/default,1,0");
         std::env::set_var("TMUX_PANE", "%0");
@@ -510,7 +506,7 @@ mod demo_tests {
 
     #[test]
     fn demo_rejects_option_injection_caller_target() {
-        let _guard = demo_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _restore = DemoEnvRestore::capture();
         std::env::set_var("TMUX", "/tmp/tmux-1000/default,1,0");
         std::env::set_var("TMUX_PANE", "-tbad");

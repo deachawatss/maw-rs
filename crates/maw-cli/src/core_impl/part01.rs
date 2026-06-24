@@ -86,6 +86,39 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+fn env_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+struct EnvVarRestore {
+    key: &'static str,
+    value: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl EnvVarRestore {
+    fn capture(key: &'static str) -> Self {
+        Self {
+            key,
+            value: std::env::var_os(key),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            std::env::set_var(self.key, value);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct FederationSyncFlags {

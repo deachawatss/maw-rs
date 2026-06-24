@@ -540,9 +540,9 @@ fn locate_render_text(oracle: &str, info: &LocateResult) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::redundant_closure_for_method_calls)]
 mod locate_tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     const LOCATE_ENV_KEYS: &[&str] = &[
         "HOME",
@@ -635,10 +635,6 @@ mod locate_tests {
         }
     }
 
-    fn locate_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn locate_temp_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -676,7 +672,7 @@ mod locate_tests {
 
     #[test]
     fn locate_json_matches_committed_golden_and_ignores_missing_js_ref() {
-        let _guard = locate_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let env = LocateHermeticEnv::new("json");
         assert_eq!(std::env::var_os("TMUX"), None);
         assert_eq!(current_xdg_env().home_dir(), env.home.as_path());
@@ -718,7 +714,7 @@ mod locate_tests {
 
     #[test]
     fn locate_path_is_one_clean_line_from_temp_home() {
-        let _guard = locate_env_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let env = LocateHermeticEnv::new("path");
         assert_eq!(std::env::var_os("TMUX"), None);
         let repo = env.ghq.join("github.com/acme/pathfinder-oracle");

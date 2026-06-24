@@ -1048,6 +1048,7 @@ struct CaptureQuery {
 }
 
 #[cfg(test)]
+#[allow(clippy::redundant_closure_for_method_calls)]
 mod serve_tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
@@ -1146,9 +1147,10 @@ mod serve_tests {
 
     #[test]
     fn serve_default_bind_is_loopback_only() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvVarRestore::capture("MAW_HOST");
         std::env::set_var("MAW_HOST", "0.0.0.0");
         assert_eq!(default_bind_host(), "127.0.0.1");
-        std::env::remove_var("MAW_HOST");
     }
 
     #[tokio::test]
