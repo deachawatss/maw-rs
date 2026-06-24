@@ -43,7 +43,7 @@ use maw_peer::{
 use maw_plugin_manifest::{
     discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
     DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
+    LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -79,6 +79,7 @@ use maw_xdg::{
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 

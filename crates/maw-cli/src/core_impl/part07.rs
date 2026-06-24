@@ -11,15 +11,16 @@ fn plugin_scaffold_usage_error(message: &str) -> CliOutput {
 fn run_plugin_plan(argv: &[String]) -> CliOutput {
     let action = match parse_plugin_args(argv) {
         Ok(action) => action,
-        Err(message) => return plugin_usage_error(&message),
+        Err(PluginParseError::Usage(message)) => return plugin_usage_error(&message),
+        Err(PluginParseError::Help) => return plugin_ls_help(),
     };
 
     match action {
-        PluginAction::Ls { options, verbose } => {
+        PluginAction::Ls { options, ls_options } => {
             let report = discover_packages(&options);
             CliOutput {
                 code: 0,
-                stdout: render_plugin_ls(&report.plugins, &report.warnings, verbose),
+                stdout: render_plugin_ls(&report.plugins, &ls_options),
                 stderr: String::new(),
             }
         }
@@ -29,48 +30,75 @@ fn run_plugin_plan(argv: &[String]) -> CliOutput {
 enum PluginAction {
     Ls {
         options: DiscoverPackagesOptions,
-        verbose: bool,
+        ls_options: PluginLsOptions,
     },
 }
 
-fn parse_plugin_args(argv: &[String]) -> Result<PluginAction, String> {
+#[derive(Default)]
+struct PluginLsOptions {
+    verbose: bool,
+    tiers: Vec<PluginTier>,
+    api_only: bool,
+}
+
+enum PluginParseError {
+    Usage(String),
+    Help,
+}
+
+fn parse_plugin_args(argv: &[String]) -> Result<PluginAction, PluginParseError> {
     let Some(kind) = argv.first().map(String::as_str) else {
-        return Err("plugin: expected ls".to_owned());
+        return Err(PluginParseError::Usage("plugin: expected ls".to_owned()));
     };
     match kind {
         "ls" | "list" => parse_plugin_ls_args(&argv[1..]),
-        other => Err(format!("plugin: unknown subcommand {other}")),
+        other => Err(PluginParseError::Usage(format!(
+            "plugin: unknown subcommand {other}"
+        ))),
     }
 }
 
-fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
+fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, PluginParseError> {
     let mut options = DiscoverPackagesOptions {
         runtime_version: "1.0.0".to_owned(),
         ..DiscoverPackagesOptions::default()
     };
+    let mut ls_options = PluginLsOptions::default();
     let mut scan_dirs = Vec::new();
-    let mut verbose = false;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
-            "-v" | "--verbose" => verbose = true,
+            "-v" | "--verbose" => ls_options.verbose = true,
+            "--core" => ls_options.tiers.push(PluginTier::Core),
+            "--standard" => ls_options.tiers.push(PluginTier::Standard),
+            "--extra" => ls_options.tiers.push(PluginTier::Extra),
+            "--api" => ls_options.api_only = true,
+            "--help" | "-h" => return Err(PluginParseError::Help),
             "--scan-dir" => {
-                scan_dirs.push(take_plugin_manifest_path(argv, index, "--scan-dir")?);
+                scan_dirs.push(
+                    take_plugin_manifest_path(argv, index, "--scan-dir")
+                        .map_err(PluginParseError::Usage)?,
+                );
                 index += 1;
             }
             "--disabled" => {
-                options
-                    .disabled_plugins
-                    .push(take_plugin_manifest_value(argv, index, "--disabled")?);
+                options.disabled_plugins.push(
+                    take_plugin_manifest_value(argv, index, "--disabled")
+                        .map_err(PluginParseError::Usage)?,
+                );
                 index += 1;
             }
             "--runtime-version" => {
-                options.runtime_version =
-                    take_plugin_manifest_value(argv, index, "--runtime-version")?;
+                options.runtime_version = take_plugin_manifest_value(argv, index, "--runtime-version")
+                    .map_err(PluginParseError::Usage)?;
                 index += 1;
             }
             "--use-cache" => options.use_cache = true,
-            other => return Err(format!("plugin ls: unknown argument {other}")),
+            other => {
+                return Err(PluginParseError::Usage(format!(
+                    "plugin ls: unknown argument {other}"
+                )));
+            }
         }
         index += 1;
     }
@@ -78,7 +106,7 @@ fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, String> {
         options.scan_dirs = scan_dirs;
     }
 
-    Ok(PluginAction::Ls { options, verbose })
+    Ok(PluginAction::Ls { options, ls_options })
 }
 
 fn plugin_usage_error(message: &str) -> CliOutput {
@@ -86,16 +114,81 @@ fn plugin_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs plugin ls [-v|--verbose] [--scan-dir <dir>]... [--disabled <name>]... [--runtime-version <version>] [--use-cache]\n"
+            "{message}\nusage: maw-rs plugin ls [-v|--verbose] [--core] [--standard] [--extra] [--api] [--scan-dir <dir>]... [--disabled <name>]... [--runtime-version <version>] [--use-cache]\n"
         ),
     }
 }
 
-fn render_plugin_ls(plugins: &[LoadedPlugin], warnings: &[String], verbose: bool) -> String {
-    let mut rows = plugins.iter().map(PluginLsRow::new).collect::<Vec<_>>();
+fn plugin_ls_help() -> CliOutput {
+    CliOutput {
+        code: 0,
+        stdout: "usage: maw plugin <init|build|install|create|ls|info|remove|enable <name...>|disable> [args]\n  ls: compact by default; use -v for full table; filters: --core --standard --extra --api\n".to_owned(),
+        stderr: String::new(),
+    }
+}
+
+fn render_plugin_ls(plugins: &[LoadedPlugin], options: &PluginLsOptions) -> String {
+    let mut rows = plugins
+        .iter()
+        .map(PluginLsRow::new)
+        .filter(|row| options.tiers.is_empty() || options.tiers.contains(&row.tier))
+        .filter(|row| !options.api_only || row.api_path.is_some())
+        .collect::<Vec<_>>();
     rows.sort_by_key(|row| (plugin_tier_order(row.tier), row.name.to_owned()));
 
-    let widths = PluginLsWidths::new(&rows);
+    if rows.is_empty() {
+        return if plugins.is_empty() {
+            "no plugins installed\n".to_owned()
+        } else {
+            format!("no plugins{}.\n", plugin_ls_filter_label(options))
+        };
+    }
+
+    if !options.verbose {
+        return render_plugin_ls_compact(&rows, options);
+    }
+
+    render_plugin_ls_table(&rows)
+}
+
+fn render_plugin_ls_compact(rows: &[PluginLsRow<'_>], options: &PluginLsOptions) -> String {
+    let active = rows.iter().filter(|row| !row.disabled).count();
+    let disabled = rows.len() - active;
+    let core = rows
+        .iter()
+        .filter(|row| row.tier == PluginTier::Core)
+        .count();
+    let standard = rows
+        .iter()
+        .filter(|row| row.tier == PluginTier::Standard)
+        .count();
+    let extra = rows
+        .iter()
+        .filter(|row| row.tier == PluginTier::Extra)
+        .count();
+    let cli = rows.iter().filter(|row| row.has_cli).count();
+    let api = rows.iter().filter(|row| row.api_path.is_some()).count();
+    let missing = rows.iter().filter(|row| row.missing_executable).count();
+    let health = if missing == 0 {
+        "ok".to_owned()
+    } else {
+        format!(
+            "{missing} missing executable{}",
+            if missing == 1 { "" } else { "s" }
+        )
+    };
+
+    format!(
+        "{} plugin{} ({} active, {} disabled){}\n  core: {core} · standard: {standard} · extra: {extra}\n  cli: {cli} · api: {api} · health: {health}\n",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" },
+        active,
+        disabled,
+        plugin_ls_filter_label(options)
+    )
+}
+
+fn render_plugin_ls_table(rows: &[PluginLsRow<'_>]) -> String {
     let mut output = String::new();
     for tier in [PluginTier::Core, PluginTier::Standard, PluginTier::Extra] {
         let tier_rows = rows
@@ -105,66 +198,57 @@ fn render_plugin_ls(plugins: &[LoadedPlugin], warnings: &[String], verbose: bool
         if tier_rows.is_empty() {
             continue;
         }
+        let widths = PluginLsWidths::new(&tier_rows);
 
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        let _ = writeln!(output, "{} plugins", tier.as_str());
-        let _ = writeln!(
-            output,
-            "{:<name_width$}  {:<version_width$}  {:<tier_width$}  {:<surfaces_width$}  dir",
-            "name",
-            "version",
-            "tier",
-            "surfaces",
-            name_width = widths.name,
-            version_width = widths.version,
-            tier_width = widths.tier,
-            surfaces_width = widths.surfaces
+        let _ = writeln!(output, "\n\x1b[1m{}\x1b[0m ({})", tier.as_str(), tier_rows.len());
+        writeln_padded_row(
+            &mut output,
+            &["name", "version", "tier", "surfaces", "dir"],
+            &widths,
         );
+        writeln_separator(&mut output, &widths);
 
         for row in tier_rows {
-            let _ = writeln!(
-                output,
-                "{:<name_width$}  {:<version_width$}  {:<tier_width$}  {:<surfaces_width$}  {}",
-                row.name,
-                row.version,
-                row.tier.as_str(),
-                row.surfaces,
-                row.dir,
-                name_width = widths.name,
-                version_width = widths.version,
-                tier_width = widths.tier,
-                surfaces_width = widths.surfaces
+            let tier_label = format!(
+                "{} {}",
+                plugin_ls_tier_icon(row.tier, row.disabled),
+                if row.disabled { "disabled" } else { row.tier.as_str() }
             );
-            if verbose {
-                if let Some(description) = row.description {
-                    let _ = writeln!(output, "  description: {description}");
-                }
-                let _ = writeln!(output, "  kind: {}", row.kind);
-                let _ = writeln!(output, "  weight: {}", row.weight);
-                if let Some(command) = &row.cli_command {
-                    let _ = writeln!(output, "  cli: maw {command}");
-                }
-                if let Some(api_path) = row.api_path {
-                    let _ = writeln!(output, "  api: {api_path}");
-                }
-            }
+            writeln_padded_row(
+                &mut output,
+                &[row.name, row.version, &tier_label, &row.surfaces, &row.dir],
+                &widths,
+            );
         }
     }
 
-    if output.is_empty() {
-        output.push_str("no plugins found\n");
+    let active = rows.iter().filter(|row| !row.disabled).count();
+    let disabled = rows.len() - active;
+    if disabled > 0 {
+        let _ = writeln!(
+            output,
+            "\n{active} active. {disabled} disabled — use 'maw plugin ls --all' to see them."
+        );
+    } else {
+        let _ = writeln!(output, "\n{active} active");
     }
-    if verbose && !warnings.is_empty() {
-        output.push('\n');
-        output.push_str("warnings\n");
-        for warning in warnings {
-            let _ = writeln!(output, "  - {}", plugin_ls_warning_summary(warning));
-        }
-    }
-
     output
+}
+
+fn plugin_ls_filter_label(options: &PluginLsOptions) -> String {
+    let mut parts = options
+        .tiers
+        .iter()
+        .map(|tier| tier.as_str())
+        .collect::<Vec<_>>();
+    if options.api_only {
+        parts.push("api");
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" matching {}", parts.join("+"))
+    }
 }
 
 struct PluginLsRow<'a> {
@@ -173,10 +257,9 @@ struct PluginLsRow<'a> {
     tier: PluginTier,
     surfaces: String,
     dir: String,
-    kind: &'static str,
-    weight: u64,
-    description: Option<&'a str>,
-    cli_command: Option<String>,
+    disabled: bool,
+    has_cli: bool,
+    missing_executable: bool,
     api_path: Option<&'a str>,
 }
 
@@ -185,16 +268,19 @@ impl<'a> PluginLsRow<'a> {
         let manifest = &plugin.manifest;
         let cli_command = plugin_ls_cli_command(plugin);
         let api_path = manifest.api.as_ref().map(|api| api.path.as_str());
+        let executable_path = match plugin.kind {
+            LoadedPluginKind::Ts => plugin.entry_path.as_ref(),
+            LoadedPluginKind::Wasm => (!plugin.wasm_path.as_os_str().is_empty()).then_some(&plugin.wasm_path),
+        };
         Self {
             name: &manifest.name,
             version: &manifest.version,
-            tier: manifest.tier.unwrap_or(PluginTier::Core),
+            tier: plugin_ls_effective_tier(manifest),
             surfaces: plugin_ls_surfaces(cli_command.as_deref(), api_path),
-            dir: path_string(&plugin.dir),
-            kind: plugin.kind.as_str(),
-            weight: manifest.weight.unwrap_or(50),
-            description: manifest.description.as_deref(),
-            cli_command,
+            dir: shorten_home(&plugin.dir),
+            disabled: plugin.disabled,
+            has_cli: cli_command.is_some(),
+            missing_executable: executable_path.is_some_and(|path| !path.exists()),
             api_path,
         }
     }
@@ -205,66 +291,136 @@ struct PluginLsWidths {
     version: usize,
     tier: usize,
     surfaces: usize,
+    dir: usize,
 }
 
 impl PluginLsWidths {
-    fn new(rows: &[PluginLsRow<'_>]) -> Self {
+    fn new(rows: &[&PluginLsRow<'_>]) -> Self {
         let mut widths = Self {
-            name: "name".len(),
-            version: "version".len(),
-            tier: "tier".len(),
-            surfaces: "surfaces".len(),
+            name: "name".chars().count(),
+            version: "version".chars().count(),
+            tier: "tier".chars().count(),
+            surfaces: "surfaces".chars().count(),
+            dir: "dir".chars().count(),
         };
         for row in rows {
-            widths.name = widths.name.max(row.name.len());
-            widths.version = widths.version.max(row.version.len());
-            widths.tier = widths.tier.max(row.tier.as_str().len());
-            widths.surfaces = widths.surfaces.max(row.surfaces.len());
+            widths.name = widths.name.max(row.name.chars().count());
+            widths.version = widths.version.max(row.version.chars().count());
+            let tier_label = format!("{} {}", plugin_ls_tier_icon(row.tier, row.disabled), row.tier.as_str());
+            widths.tier = widths.tier.max(tier_label.chars().count());
+            widths.surfaces = widths.surfaces.max(row.surfaces.chars().count());
+            widths.dir = widths.dir.max(row.dir.chars().count());
         }
         widths
     }
 }
 
+fn writeln_padded_row(output: &mut String, cells: &[&str; 5], widths: &PluginLsWidths) {
+    let padded = [
+        pad_end_chars(cells[0], widths.name),
+        pad_end_chars(cells[1], widths.version),
+        pad_end_chars(cells[2], widths.tier),
+        pad_end_chars(cells[3], widths.surfaces),
+        pad_end_chars(cells[4], widths.dir),
+    ];
+    let _ = writeln!(
+        output,
+        "{}  {}  {}  {}  {}",
+        padded[0], padded[1], padded[2], padded[3], padded[4]
+    );
+}
+
+fn writeln_separator(output: &mut String, widths: &PluginLsWidths) {
+    let _ = writeln!(
+        output,
+        "{}  {}  {}  {}  {}",
+        "─".repeat(widths.name),
+        "─".repeat(widths.version),
+        "─".repeat(widths.tier),
+        "─".repeat(widths.surfaces),
+        "─".repeat(widths.dir)
+    );
+}
+
+fn pad_end_chars(value: &str, width: usize) -> String {
+    let len = value.chars().count();
+    if len >= width {
+        value.to_owned()
+    } else {
+        format!("{}{}", value, " ".repeat(width - len))
+    }
+}
+
 fn plugin_ls_surfaces(cli_command: Option<&str>, api_path: Option<&str>) -> String {
     let mut surfaces = Vec::new();
-    if cli_command.is_some() {
-        surfaces.push("cli");
+    if let Some(command) = cli_command {
+        surfaces.push(format!("cli:{command}"));
     }
-    if api_path.is_some() {
-        surfaces.push("api");
+    if let Some(api_path) = api_path {
+        surfaces.push(format!("api:{api_path}"));
     }
     if surfaces.is_empty() {
-        "-".to_owned()
+        "—".to_owned()
     } else {
-        surfaces.join(",")
+        surfaces.join(", ")
     }
 }
 
 fn plugin_ls_cli_command(plugin: &LoadedPlugin) -> Option<String> {
-    plugin
-        .manifest
-        .cli
-        .as_ref()
-        .map(|cli| cli.command.clone())
+    plugin.manifest.cli.as_ref().map_or_else(
+        || match plugin.kind {
+            LoadedPluginKind::Ts if plugin.entry_path.is_some() => Some(plugin.manifest.name.clone()),
+            LoadedPluginKind::Wasm if !plugin.wasm_path.as_os_str().is_empty() => {
+                Some(plugin.manifest.name.clone())
+            }
+            LoadedPluginKind::Ts | LoadedPluginKind::Wasm => None,
+        },
+        |cli| Some(cli.command.clone()),
+    )
 }
 
-fn plugin_ls_warning_summary(warning: &str) -> String {
-    warning
-        .lines()
-        .next()
-        .unwrap_or(warning)
-        .trim()
-        .trim_start_matches('✗')
-        .trim_start()
-        .replace("requires maw SDK", "requires sdk")
+fn plugin_ls_effective_tier(manifest: &PluginManifest) -> PluginTier {
+    manifest
+        .tier
+        .unwrap_or_else(|| plugin_ls_weight_to_tier(manifest.weight.unwrap_or(50)))
 }
 
-const fn plugin_tier_order(tier: PluginTier) -> u8 {
+fn plugin_ls_weight_to_tier(weight: u64) -> PluginTier {
+    if weight < 10 {
+        PluginTier::Core
+    } else if weight < 50 {
+        PluginTier::Standard
+    } else {
+        PluginTier::Extra
+    }
+}
+
+fn plugin_tier_order(tier: PluginTier) -> u8 {
     match tier {
         PluginTier::Core => 0,
         PluginTier::Standard => 1,
         PluginTier::Extra => 2,
     }
+}
+
+fn plugin_ls_tier_icon(tier: PluginTier, disabled: bool) -> &'static str {
+    if disabled {
+        "\x1b[90m○\x1b[0m"
+    } else {
+        match tier {
+            PluginTier::Core => "\x1b[32m●\x1b[0m",
+            PluginTier::Standard => "\x1b[36m●\x1b[0m",
+            PluginTier::Extra => "\x1b[33m●\x1b[0m",
+        }
+    }
+}
+
+fn shorten_home(path: &Path) -> String {
+    let raw = path_string(path);
+    std::env::var("HOME").map_or(raw.clone(), |home| {
+        raw.strip_prefix(&home)
+            .map_or(raw.clone(), |suffix| format!("~{suffix}"))
+    })
 }
 
 fn run_plugin_manifest_plan(argv: &[String]) -> CliOutput {

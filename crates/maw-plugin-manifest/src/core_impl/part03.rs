@@ -382,6 +382,7 @@ where
     let mut plugins = Vec::new();
     let mut warnings = Vec::new();
     let mut legacy_count = 0usize;
+    let mut seen_plugin_names = BTreeSet::new();
 
     for base_dir in &options.scan_dirs {
         let Ok(entries) = std::fs::read_dir(base_dir) else {
@@ -395,10 +396,16 @@ where
                 continue;
             }
             match discover_plugin_dir(&entry.path(), options) {
-                PluginDiscovery::Loaded(loaded) => plugins.push(loaded),
+                PluginDiscovery::Loaded(loaded) => {
+                    if seen_plugin_names.insert(loaded.manifest.name.clone()) {
+                        plugins.push(loaded);
+                    }
+                }
                 PluginDiscovery::Legacy(loaded) => {
-                    legacy_count += 1;
-                    plugins.push(loaded);
+                    if seen_plugin_names.insert(loaded.manifest.name.clone()) {
+                        legacy_count += 1;
+                        plugins.push(loaded);
+                    }
                 }
                 PluginDiscovery::Warning(warning) => warnings.push(warning),
                 PluginDiscovery::Skip => {}

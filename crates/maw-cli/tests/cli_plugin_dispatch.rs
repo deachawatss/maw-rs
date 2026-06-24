@@ -178,15 +178,9 @@ fn plugin_ls_scans_home_maw_plugins_by_default() {
 
     assert_eq!(output.code, 0, "{}", output.stderr);
     assert!(output.stderr.is_empty(), "{}", output.stderr);
-    assert!(
-        output.stdout.contains("core plugins\n"),
-        "{}",
-        output.stdout
-    );
-    assert!(
-        output.stdout.contains("home-weather  1.0.0    core  cli"),
-        "{}",
-        output.stdout
+    assert_eq!(
+        output.stdout,
+        "1 plugin (1 active, 0 disabled)\n  core: 0 · standard: 0 · extra: 1\n  cli: 1 · api: 0 · health: ok\n"
     );
 
     remove_dir_all(root).expect("cleanup");

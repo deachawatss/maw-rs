@@ -29,7 +29,7 @@ fn write_plugin(root: &Path, dir_name: &str, manifest: &str) {
 }
 
 #[test]
-fn plugin_ls_groups_discovered_plugins_by_tier() {
+fn plugin_ls_defaults_to_compact_summary_with_tier_and_surface_counts() {
     let root = temp_plugin_root("tiers");
     write_plugin(
         &root,
@@ -77,21 +77,14 @@ fn plugin_ls_groups_discovered_plugins_by_tier() {
     ]);
 
     assert_eq!(output.code, 0, "{}", output.stderr);
-    assert!(output.stdout.contains("core plugins\n"));
-    assert!(output.stdout.contains("standard plugins\n"));
-    assert!(output.stdout.contains("extra plugins\n"));
-    assert!(output
-        .stdout
-        .contains("name     version  tier      surfaces"));
-    assert!(output.stdout.contains("bravo    0.2.0    core      cli"));
-    assert!(output
-        .stdout
-        .contains("alpha    1.2.3    standard  cli,api"));
-    assert!(output.stdout.contains("charlie  0.3.0    extra     api"));
+    assert_eq!(
+        output.stdout,
+        "3 plugins (3 active, 0 disabled)\n  core: 1 · standard: 1 · extra: 1\n  cli: 3 · api: 2 · health: ok\n"
+    );
 }
 
 #[test]
-fn plugin_ls_verbose_includes_details_and_warnings() {
+fn plugin_ls_verbose_renders_maw_js_grouped_table_and_filters_refused_plugins() {
     let root = temp_plugin_root("verbose");
     write_plugin(
         &root,
@@ -130,16 +123,22 @@ fn plugin_ls_verbose_includes_details_and_warnings() {
     ]);
 
     assert_eq!(output.code, 0, "{}", output.stderr);
-    assert!(output.stdout.contains("delta  2.0.0    core  cli,api"));
-    assert!(output.stdout.contains("  description: Delta tools"));
-    assert!(output.stdout.contains("  kind: ts"));
-    assert!(output.stdout.contains("  weight: 7"));
-    assert!(output.stdout.contains("  cli: maw delta-tools"));
-    assert!(output.stdout.contains("  api: /api/plugins/delta"));
-    assert!(output.stdout.contains("warnings\n"));
-    assert!(output
-        .stdout
-        .contains("plugin 'future' requires sdk >99.0.0"));
+    assert!(
+        output.stdout.starts_with("\n\x1b[1mcore\x1b[0m (1)\n"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains(&format!(
+            "delta  2.0.0    \x1b[32m●\x1b[0m core  cli:delta-tools, api:/api/plugins/delta  {}/delta",
+            root.display()
+        )),
+        "{}",
+        output.stdout
+    );
+    assert!(!output.stdout.contains("future"), "{}", output.stdout);
+    assert!(!output.stdout.contains("description:"), "{}", output.stdout);
+    assert!(output.stdout.ends_with("\n1 active\n"), "{}", output.stdout);
 }
 
 #[test]
