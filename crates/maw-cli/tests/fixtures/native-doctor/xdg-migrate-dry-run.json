@@ -1,0 +1,13 @@
+{
+  "checks": [
+    {
+      "fix": [],
+      "message": "dry-run; copied=0; planned=0; exists=0; missing=18; errors=0",
+      "name": "xdg:migrate",
+      "ok": true,
+      "severity": "info"
+    }
+  ],
+  "comparison": [],
+  "ok": true
+}
