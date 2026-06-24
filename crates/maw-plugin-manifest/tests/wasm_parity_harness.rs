@@ -74,6 +74,43 @@ fn golden_parity_cross_team_queue_bun_and_wasm_outputs_match_in_isolated_maw_hom
 }
 
 #[test]
+fn golden_parity_project_bun_and_wasm_outputs_match_in_isolated_maw_home() {
+    for args in [
+        &[][..],
+        &["learn", "https://github.com/Soul-Brews-Studio/maw-js"][..],
+        &["incubate", "https://github.com/Soul-Brews-Studio/maw-rs"][..],
+        &["find", "oracle"][..],
+        &["search", "ψ"][..],
+        &["list"][..],
+        &["bogus"][..],
+        &["learn"][..],
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "project",
+            manifest_name: "project-parity",
+            args,
+            expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/project/index.ts",
+            ),
+        });
+    }
+}
+
+#[test]
+fn golden_parity_triggers_bun_and_wasm_outputs_match_in_isolated_maw_home() {
+    run_parity_case(ParityCase {
+        plugin: "triggers",
+        manifest_name: "triggers-parity",
+        args: &[],
+        expected_host_calls: Some(0),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "src/vendor/mpr-plugins/triggers/index.ts",
+        ),
+    });
+}
+
+#[test]
 #[ignore = "regenerates committed maw-js parity goldens; requires MAW_JS_REF_DIR"]
 fn generate_wasm_parity_goldens_from_real_maw_js() {
     for case in parity_cases() {
@@ -129,6 +166,37 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         args: &[],
         expected_host_calls: Some(0),
         real_maw_js_entry: RealMawJsEntry::CrossTeamQueueHandle,
+    });
+
+    for args in [
+        &[][..],
+        &["learn", "https://github.com/Soul-Brews-Studio/maw-js"][..],
+        &["incubate", "https://github.com/Soul-Brews-Studio/maw-rs"][..],
+        &["find", "oracle"][..],
+        &["search", "ψ"][..],
+        &["list"][..],
+        &["bogus"][..],
+        &["learn"][..],
+    ] {
+        cases.push(ParityCase {
+            plugin: "project",
+            manifest_name: "project-parity",
+            args,
+            expected_host_calls: Some(0),
+            real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+                "src/vendor/mpr-plugins/project/index.ts",
+            ),
+        });
+    }
+
+    cases.push(ParityCase {
+        plugin: "triggers",
+        manifest_name: "triggers-parity",
+        args: &[],
+        expected_host_calls: Some(0),
+        real_maw_js_entry: RealMawJsEntry::DefaultHandler(
+            "src/vendor/mpr-plugins/triggers/index.ts",
+        ),
     });
 
     cases
