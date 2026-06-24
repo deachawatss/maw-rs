@@ -1,0 +1,5 @@
+[36mAudit Trail[0m (last 2)
+
+  [90m24 Jun 02:03:04[0m  [33m⚠[0m [35mbad-input[0m  input={"target":"--oops"}
+  [90m24 Jun 03:04:05[0m  [33mwake[0m nova
+

@@ -1,0 +1,4 @@
+{"ts":"2026-06-24T01:02:03.000Z","cmd":"ls","args":["--json"],"user":"agent","pid":100,"result":"ok"}
+malformed
+{"ts":"2026-06-24T02:03:04.000Z","kind":"anomaly","event":"bad-input","input":{"target":"--oops"},"context":{"cmd":"wake"},"user":"agent","pid":101}
+{"ts":"2026-06-24T03:04:05.000Z","cmd":"wake","args":["nova"],"user":"agent","pid":102}
