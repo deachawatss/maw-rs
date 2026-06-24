@@ -119,7 +119,7 @@ enum Handler {
 }
 
 #[derive(Clone, Copy)]
-struct DispatcherEntry {
+pub(crate) struct DispatcherEntry {
     command: &'static str,
     handler: Handler,
 }
@@ -130,7 +130,7 @@ enum DispatchTarget {
     BunFallback,
 }
 
-const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
+const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
@@ -243,14 +243,118 @@ mod async_dispatch_tests {
     }
 }
 
+
+#[cfg(test)]
+mod dispatcher_fragment_tests {
+    use super::{dispatcher_entries, dispatcher_status, DispatchKind};
+    use std::collections::BTreeSet;
+
+    const KNOWN_COMMANDS: &[&str] = &[
+        "--help",
+        "-h",
+        "help",
+        "activity",
+        "auth",
+        "auto-wake",
+        "hub",
+        "xdg",
+        "plugin",
+        "plugin-scaffold",
+        "plugin-manifest",
+        "bind-host",
+        "init",
+        "tmux",
+        "view",
+        "split",
+        "attach",
+        "a",
+        "attach-ssh",
+        "stream",
+        "bring",
+        "b",
+        "ls",
+        "run",
+        "send-enter",
+        "feed",
+        "hey",
+        "send",
+        "wake",
+        "serve",
+        "health",
+        "messages",
+        "reply",
+        "rp",
+        "fuzzy",
+        "resolve",
+        "identity",
+        "normalize",
+        "calver",
+        "worktree-window",
+        "route",
+        "discover",
+        "discord",
+        "federation-identity",
+        "federation-health",
+        "federation-sync",
+        "auto-pair-proof",
+        "consent-constants",
+        "consent-pin",
+        "consent-request",
+        "consent-approval",
+        "consent-store",
+        "consent-expiry",
+        "consent-cleanup",
+        "consent-trust-revoke",
+        "consent-trust-check",
+        "consent-pending-read",
+        "consent-pending-status",
+        "recent-hello",
+        "pair-code",
+        "pair-code-store",
+        "pair-api",
+        "pair-api-auto",
+        "peer-sources",
+        "peer-probe",
+        "policy",
+        "plugin-policy",
+        "split-policy",
+        "transport",
+        "scope",
+        "find",
+        "token",
+        "tokens",
+        "__async-dispatch-test",
+    ];
+
+    #[test]
+    fn generated_dispatcher_fragments_preserve_original_commands() {
+        let commands: Vec<&str> = dispatcher_entries().map(|entry| entry.command).collect();
+
+        assert_eq!(commands.len(), 74);
+        assert_eq!(commands, KNOWN_COMMANDS);
+
+        let mut seen = BTreeSet::new();
+        for command in dispatcher_entries().map(|entry| entry.command) {
+            assert!(seen.insert(command), "duplicate dispatcher command: {command}");
+        }
+
+        for command in KNOWN_COMMANDS {
+            assert_eq!(dispatcher_status(command), DispatchKind::Native, "{command}");
+        }
+    }
+}
+
 #[must_use]
 pub fn native_dispatch_commands() -> Vec<&'static str> {
-    DISPATCHER_ENTRIES.iter().map(|entry| entry.command).collect()
+    dispatcher_entries().map(|entry| entry.command).collect()
+}
+
+fn dispatcher_entries() -> impl Iterator<Item = &'static DispatcherEntry> {
+    DISPATCHER_FRAGMENTS.iter().copied().flatten()
 }
 
 fn dispatcher_target(command: &str) -> DispatchTarget {
-    DISPATCHER_ENTRIES
-        .iter()
+    dispatcher_entries()
         .find(|entry| entry.command == command)
         .map_or(DispatchTarget::BunFallback, |entry| match entry.handler {
             Handler::Sync(handler) => DispatchTarget::Native(handler),
