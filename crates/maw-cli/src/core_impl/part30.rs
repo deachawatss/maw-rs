@@ -1,17 +1,23 @@
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo, Path as AxumPath, Query, State,
+    },
     http::{HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
+use tokio::sync::broadcast;
 
 const DEFAULT_SERVE_PORT: u16 = 31745;
 const DEFAULT_SERVE_BIND: &str = "127.0.0.1";
@@ -19,9 +25,10 @@ const DEFAULT_SERVE_BIND: &str = "127.0.0.1";
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 49_152);
 
-#[derive(Clone)]
 struct ServeState {
     cached_pubkey: Option<String>,
+    ws_tx: broadcast::Sender<RelayFrame>,
+    workspaces: Mutex<WorkspaceStore>,
     #[cfg(test)]
     peer_addr_override: Option<SocketAddr>,
     #[cfg(test)]
@@ -74,6 +81,8 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
     };
     let app = serve_router(ServeState {
         cached_pubkey: args.cached_pubkey.or_else(load_inbound_peer_pubkey),
+        ws_tx: new_ws_relay(),
+        workspaces: Mutex::new(WorkspaceStore::default()),
         #[cfg(test)]
         peer_addr_override: None,
         #[cfg(test)]
@@ -174,6 +183,8 @@ fn default_bind_host() -> String {
 fn serve_router(state: ServeState) -> Router {
     let state = Arc::new(state);
     Router::new()
+        .route("/ws", get(ws_relay))
+        .route("/ws/pty", get(ws_relay))
         .route("/api/send", post(api_send))
         .route("/api/feed", get(api_feed_get).post(api_feed_post))
         .route("/api/sessions", get(api_sessions))
@@ -187,8 +198,66 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/identity", get(api_identity))
         .route("/api/peers/discoveries", get(api_peers_discoveries))
         .route("/api/peers/discovered", get(api_peers_discoveries))
+        .route("/api/workspace/create", post(api_workspace_create))
+        .route("/api/workspace/join", post(api_workspace_join))
+        .route(
+            "/api/workspace/:id/agents",
+            get(api_workspace_agents_get).post(api_workspace_agents_post),
+        )
+        .route("/api/workspace/:id/status", get(api_workspace_status))
+        .route("/api/workspace/:id/feed", get(api_workspace_feed))
+        .route("/api/workspace/:id/message", post(api_workspace_message))
         .fallback(api_not_found)
         .with_state(state)
+}
+
+async fn ws_relay(State(state): State<Arc<ServeState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_relay(socket, state.ws_tx.clone()))
+}
+
+async fn handle_ws_relay(mut socket: WebSocket, tx: broadcast::Sender<RelayFrame>) {
+    let mut rx = tx.subscribe();
+    loop {
+        tokio::select! {
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(Message::Text(text))) => {
+                        let _ = tx.send(RelayFrame::Text(text));
+                    }
+                    Some(Ok(Message::Binary(bytes))) => {
+                        let _ = tx.send(RelayFrame::Binary(bytes));
+                    }
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if socket.send(Message::Pong(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        let _ = socket.send(Message::Close(frame)).await;
+                        break;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+            outbound = rx.recv() => {
+                match outbound {
+                    Ok(RelayFrame::Text(text)) => {
+                        if socket.send(Message::Text(text)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(RelayFrame::Binary(bytes)) => {
+                        if socket.send(Message::Binary(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 }
 
 async fn api_send(
@@ -323,6 +392,186 @@ async fn api_peers_discoveries() -> impl IntoResponse {
     Json(json!({"ok": true, "total": 0, "shown": 0, "filtered": 0, "peers": []}))
 }
 
+async fn api_workspace_create(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<WorkspaceCreateBody>,
+) -> impl IntoResponse {
+    let workspace = Workspace::new(body.name, body.node_id);
+    let response = json!({
+        "id": workspace.id,
+        "token": workspace.token,
+        "joinCode": workspace.join_code,
+        "joinCodeExpiresAt": workspace.join_code_expires_at,
+    });
+    with_workspace_store(&state, |store| {
+        store.join_codes.insert(workspace.join_code.clone(), workspace.id.clone());
+        store.workspaces.insert(workspace.id.clone(), workspace);
+    });
+    Json(response).into_response()
+}
+
+async fn api_workspace_join(
+    State(state): State<Arc<ServeState>>,
+    Json(body): Json<WorkspaceJoinBody>,
+) -> impl IntoResponse {
+    with_workspace_store(&state, |store| {
+        let Some(workspace_id) = store.join_codes.get(&body.code).cloned() else {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response();
+        };
+        let Some(workspace) = store.workspaces.get_mut(&workspace_id) else {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response();
+        };
+        workspace.nodes.insert(body.node_id);
+        Json(json!({
+            "workspaceId": workspace.id,
+            "token": workspace.token,
+            "name": workspace.name,
+        }))
+        .into_response()
+    })
+}
+
+async fn api_workspace_agents_post(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Some(response) = verify_workspace_request(&state, &id, &method, &uri, &headers) {
+        return response;
+    }
+    let agent = serde_json::from_slice::<WorkspaceAgentBody>(&body).unwrap_or_default();
+    with_workspace_store(&state, |store| {
+        let Some(workspace) = store.workspaces.get_mut(&id) else {
+            return workspace_not_found();
+        };
+        if !agent.node_id.is_empty() {
+            workspace.nodes.insert(agent.node_id.clone());
+        }
+        if !agent.name.is_empty() {
+            workspace.agents.insert(
+                agent_key(&agent.node_id, &agent.name),
+                WorkspaceAgent {
+                    name: agent.name,
+                    node_id: agent.node_id,
+                    status: agent.status,
+                    capabilities: agent.capabilities,
+                },
+            );
+        }
+        Json(json!({"ok": true, "agents": workspace.agents.len()})).into_response()
+    })
+}
+
+async fn api_workspace_agents_get(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = verify_workspace_request(&state, &id, &method, &uri, &headers) {
+        return response;
+    }
+    with_workspace_store(&state, |store| {
+        let Some(workspace) = store.workspaces.get(&id) else {
+            return workspace_not_found();
+        };
+        let agents = workspace
+            .agents
+            .values()
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "nodeId": agent.node_id,
+                    "status": agent.status,
+                    "capabilities": agent.capabilities,
+                })
+            })
+            .collect::<Vec<_>>();
+        Json(json!({"agents": agents, "total": workspace.agents.len()})).into_response()
+    })
+}
+
+async fn api_workspace_status(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = verify_workspace_request(&state, &id, &method, &uri, &headers) {
+        return response;
+    }
+    with_workspace_store(&state, |store| {
+        let Some(workspace) = store.workspaces.get(&id) else {
+            return workspace_not_found();
+        };
+        Json(json!({
+            "id": workspace.id,
+            "name": workspace.name,
+            "createdAt": workspace.created_at,
+            "nodes": workspace.nodes.iter().cloned().collect::<Vec<_>>(),
+            "nodeCount": workspace.nodes.len(),
+            "healthyNodes": workspace.nodes.len(),
+            "agents": workspace.agents.values().map(|agent| json!({"name": agent.name, "nodeId": agent.node_id, "status": agent.status, "capabilities": agent.capabilities})).collect::<Vec<_>>(),
+            "agentCount": workspace.agents.len(),
+            "feedCount": workspace.feed.len(),
+        }))
+        .into_response()
+    })
+}
+
+async fn api_workspace_feed(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<WorkspaceFeedQuery>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(response) = verify_workspace_request(&state, &id, &method, &uri, &headers) {
+        return response;
+    }
+    with_workspace_store(&state, |store| {
+        let Some(workspace) = store.workspaces.get(&id) else {
+            return workspace_not_found();
+        };
+        let limit = query.limit.unwrap_or(workspace.feed.len());
+        let start = workspace.feed.len().saturating_sub(limit);
+        Json(json!({"events": workspace.feed[start..].to_vec(), "total": workspace.feed.len()}))
+            .into_response()
+    })
+}
+
+async fn api_workspace_message(
+    State(state): State<Arc<ServeState>>,
+    AxumPath(id): AxumPath<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Some(response) = verify_workspace_request(&state, &id, &method, &uri, &headers) {
+        return response;
+    }
+    let message = serde_json::from_slice::<WorkspaceMessageBody>(&body).unwrap_or_default();
+    with_workspace_store(&state, |store| {
+        let Some(workspace) = store.workspaces.get_mut(&id) else {
+            return workspace_not_found();
+        };
+        workspace.feed.push(json!({
+            "from": message.from,
+            "text": message.text,
+            "to": message.to,
+            "timestamp": unix_seconds(),
+        }));
+        Json(json!({"ok": true})).into_response()
+    })
+}
+
 async fn api_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"})))
 }
@@ -419,6 +668,95 @@ fn path_and_query(uri: &Uri) -> String {
         .map_or_else(|| uri.path().to_owned(), ToString::to_string)
 }
 
+fn verify_workspace_request(
+    state: &ServeState,
+    id: &str,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Option<axum::response::Response> {
+    with_workspace_store(state, |store| {
+        let Some(workspace) = store.workspaces.get(id) else {
+            return Some(workspace_not_found());
+        };
+        let timestamp = header_to_string(headers, "x-maw-timestamp");
+        let signature = header_to_string(headers, "x-maw-signature");
+        let Some(signed_at) = parse_workspace_timestamp(&timestamp) else {
+            return Some(workspace_auth_failed());
+        };
+        let now = verify_now(state);
+        if (now - signed_at).abs() > 300 {
+            return Some(workspace_auth_failed());
+        }
+        let payload = format!("{}:{}:{}", method.as_str(), uri.path(), timestamp);
+        if maw_auth::verify_hmac_sig(&workspace.token, &payload, &signature) {
+            None
+        } else {
+            Some(workspace_auth_failed())
+        }
+    })
+}
+
+fn parse_workspace_timestamp(timestamp: &str) -> Option<i64> {
+    if timestamp.chars().all(|ch| ch.is_ascii_digit()) {
+        timestamp.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn workspace_auth_failed() -> axum::response::Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
+}
+
+fn workspace_not_found() -> axum::response::Response {
+    (StatusCode::NOT_FOUND, Json(json!({"error": "not_found"}))).into_response()
+}
+
+fn with_workspace_store<T>(state: &ServeState, op: impl FnOnce(&mut WorkspaceStore) -> T) -> T {
+    let mut guard = state
+        .workspaces
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    op(&mut guard)
+}
+
+fn new_ws_relay() -> broadcast::Sender<RelayFrame> {
+    let (tx, _rx) = broadcast::channel(128);
+    tx
+}
+
+fn random_hex(bytes: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut data = vec![0_u8; bytes];
+    rand::thread_rng().fill_bytes(&mut data);
+    let mut output = String::with_capacity(bytes * 2);
+    for byte in data {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn unix_seconds() -> i64 {
+    i64::try_from(current_epoch_seconds()).unwrap_or(i64::MAX)
+}
+
+fn unix_millis() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn agent_key(node_id: &str, name: &str) -> String {
+    format!("{node_id}:{name}")
+}
+
 fn load_inbound_peer_pubkey() -> Option<String> {
     if let Ok(value) = std::env::var("MAW_PEER_PUBKEY") {
         if !value.trim().is_empty() {
@@ -462,6 +800,91 @@ struct SendBody {
     text: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum RelayFrame {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+#[derive(Default)]
+struct WorkspaceStore {
+    workspaces: HashMap<String, Workspace>,
+    join_codes: HashMap<String, String>,
+}
+
+struct Workspace {
+    id: String,
+    name: String,
+    token: String,
+    join_code: String,
+    join_code_expires_at: u64,
+    created_at: u64,
+    nodes: HashSet<String>,
+    agents: HashMap<String, WorkspaceAgent>,
+    feed: Vec<Value>,
+}
+
+impl Workspace {
+    fn new(name: String, node_id: String) -> Self {
+        let created_at = unix_millis();
+        let mut nodes = HashSet::new();
+        nodes.insert(node_id);
+        Self {
+            id: format!("ws-{}", random_hex(8)),
+            name,
+            token: random_hex(32),
+            join_code: random_hex(3),
+            join_code_expires_at: created_at.saturating_add(15 * 60 * 1_000),
+            created_at,
+            nodes,
+            agents: HashMap::new(),
+            feed: Vec::new(),
+        }
+    }
+}
+
+struct WorkspaceAgent {
+    name: String,
+    node_id: String,
+    status: Option<String>,
+    capabilities: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCreateBody {
+    name: String,
+    node_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceJoinBody {
+    code: String,
+    node_id: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAgentBody {
+    name: String,
+    node_id: String,
+    status: Option<String>,
+    capabilities: Option<Value>,
+}
+
+#[derive(Default, Deserialize)]
+struct WorkspaceMessageBody {
+    from: String,
+    text: String,
+    to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceFeedQuery {
+    limit: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct SessionsQuery {
     local: Option<bool>,
@@ -475,6 +898,7 @@ struct CaptureQuery {
 #[cfg(test)]
 mod serve_tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
     use maw_auth::{build_legacy_from_sign_payload, hash_body, sign_headers_v3_at, sign_hmac_sig};
     use tokio::sync::oneshot;
 
@@ -488,6 +912,8 @@ mod serve_tests {
         let addr = listener.local_addr().expect("local addr");
         let app = serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
+            ws_tx: new_ws_relay(),
+            workspaces: Mutex::new(WorkspaceStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
         });
@@ -570,5 +996,78 @@ mod serve_tests {
         std::env::set_var("MAW_HOST", "0.0.0.0");
         assert_eq!(default_bind_host(), "127.0.0.1");
         std::env::remove_var("MAW_HOST");
+    }
+
+    #[tokio::test]
+    async fn serve_real_wire_websocket_relay_echoes_text_frame() {
+        let addr = spawn_test_server().await;
+        let url = format!("ws://{addr}/ws");
+        let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect websocket");
+
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            "relay-check".to_owned(),
+        ))
+        .await
+        .expect("send websocket text");
+
+        let received = ws
+            .next()
+            .await
+            .expect("websocket should yield a frame")
+            .expect("frame should be ok");
+        assert_eq!(
+            received,
+            tokio_tungstenite::tungstenite::Message::Text("relay-check".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_hub_signed_routes_accept_and_unsigned_rejects() {
+        let addr = spawn_test_server().await;
+        let client = reqwest::Client::builder().build().expect("client");
+        let create_url = format!("http://{addr}/api/workspace/create");
+        let create_response = client
+            .post(create_url)
+            .json(&json!({"name": "nova", "nodeId": "node-a"}))
+            .send()
+            .await
+            .expect("create workspace");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_payload = create_response.json::<Value>().await.expect("create json");
+        let workspace_id = create_payload["id"].as_str().expect("workspace id");
+        let token = create_payload["token"].as_str().expect("workspace token");
+        assert_eq!(token.len(), 64);
+
+        let agents_path = format!("/api/workspace/{workspace_id}/agents");
+        let agents_url = format!("http://{addr}{agents_path}");
+        let unsigned = client
+            .post(&agents_url)
+            .json(&json!({"name": "nova-codex-1", "nodeId": "node-a"}))
+            .send()
+            .await
+            .expect("unsigned agents request");
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+
+        let timestamp = "1782277200";
+        let signature = sign_hmac_sig(token, &format!("POST:{agents_path}:{timestamp}"));
+        let signed = client
+            .post(&agents_url)
+            .header("x-maw-timestamp", timestamp)
+            .header("x-maw-signature", signature)
+            .json(&json!({
+                "name": "nova-codex-1",
+                "nodeId": "node-a",
+                "status": "online",
+                "capabilities": ["relay"]
+            }))
+            .send()
+            .await
+            .expect("signed agents request");
+        assert_eq!(signed.status(), StatusCode::OK);
+        let signed_payload = signed.json::<Value>().await.expect("signed json");
+        assert_eq!(signed_payload["ok"], true);
+        assert_eq!(signed_payload["agents"], 1);
     }
 }
