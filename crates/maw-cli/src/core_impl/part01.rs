@@ -190,6 +190,10 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "plugin-policy", handler: Handler::Sync(run_policy_plan) },
     DispatcherEntry { command: "split-policy", handler: Handler::Sync(run_split_policy_plan) },
     DispatcherEntry { command: "transport", handler: Handler::Sync(run_transport_plan) },
+    DispatcherEntry { command: "scope", handler: Handler::Sync(run_scope_command) },
+    DispatcherEntry { command: "find", handler: Handler::Sync(run_find_command) },
+    DispatcherEntry { command: "token", handler: Handler::Sync(run_token_command) },
+    DispatcherEntry { command: "tokens", handler: Handler::Sync(run_tokens_alias_command) },
     #[cfg(test)]
     DispatcherEntry { command: "__async-dispatch-test", handler: Handler::Async(run_async_dispatch_test) },
 ];
