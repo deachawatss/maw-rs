@@ -134,6 +134,29 @@ const PARK_LS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.list", "fs:read:state", "/state/parked"),
     ExpectedHostCall::new("maw.fs.read", "fs:read:state", "/state/parked/codex-1.json"),
 ];
+
+const PING_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:alpha.example.test",
+        "alpha.example.test",
+    ),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:beta.example.test",
+        "beta.example.test",
+    ),
+];
+const PING_ALPHA_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:alpha.example.test",
+        "alpha.example.test",
+    ),
+];
+
 const CHECK_TOOLS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.exec.run", "proc:exec:bun", "bun"),
     ExpectedHostCall::new("maw.exec.run", "proc:exec:gh", "gh"),
@@ -482,8 +505,38 @@ fn golden_parity_check_exec_bun_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_ping_net_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&[][..], PING_TRANSCRIPT),
+        (&["alpha"][..], PING_ALPHA_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "ping",
+            manifest_name: "ping-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::PingReadOnlyWrapper,
+        });
+    }
+}
+
+#[test]
 fn batch3_wasm_declares_exact_net_exec_git_caps_only() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity");
+
+    let ping = load_wasm_fixture(&root.join("ping"), "ping-parity");
+    assert_eq!(
+        ping.manifest.capabilities.as_deref(),
+        Some(
+            &[
+                "sdk:config:read".to_owned(),
+                "net:https:alpha.example.test".to_owned(),
+                "net:https:beta.example.test".to_owned(),
+            ][..]
+        ),
+        "ping must declare exact peer hosts only; no wildcard network cap"
+    );
     let federation = load_wasm_fixture(&root.join("federation"), "federation-parity");
     assert_eq!(
         federation.manifest.capabilities.as_deref(),
@@ -797,6 +850,20 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         real_maw_js_entry: RealMawJsEntry::CheckReadOnlyWrapper,
     });
 
+    for (args, expected_host_transcript) in [
+        (&[][..], PING_TRANSCRIPT),
+        (&["alpha"][..], PING_ALPHA_TRANSCRIPT),
+    ] {
+        cases.push(ParityCase {
+            plugin: "ping",
+            manifest_name: "ping-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::PingReadOnlyWrapper,
+        });
+    }
+
     cases
 }
 
@@ -953,6 +1020,7 @@ enum RealMawJsEntry {
     FederationReadOnlyWrapper,
     ParkReadOnlyWrapper,
     CheckReadOnlyWrapper,
+    PingReadOnlyWrapper,
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
@@ -1184,6 +1252,7 @@ fn real_maw_js_entry_path(temp: &Path, maw_js_ref: &Path, entry: RealMawJsEntry)
         }
         RealMawJsEntry::ParkReadOnlyWrapper => write_park_real_wrapper(temp, maw_js_ref),
         RealMawJsEntry::CheckReadOnlyWrapper => write_check_real_wrapper(temp, maw_js_ref),
+        RealMawJsEntry::PingReadOnlyWrapper => write_ping_real_wrapper(temp, maw_js_ref),
     }
 }
 
@@ -1333,6 +1402,34 @@ export default async function handle(ctx) {{
     );
     let path = wrapper_dir.join("index.ts");
     std::fs::write(&path, wrapper).expect("park wrapper");
+    path
+}
+
+fn write_ping_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-ping");
+    create_dir_all(&wrapper_dir).expect("ping wrapper dir");
+    let ping_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/ping/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let ping = serde_json::to_string(&ping_path).expect("ping path json string");
+    let wrapper = format!(
+        r#"// Read-only golden wrapper: imports the real ping plugin for provenance but
+// replaces live peer HTTP/config discovery with deterministic seeded output.
+await import({ping});
+const rows = {{
+  alpha: "\x1b[32m✅\x1b[0m alpha \x1b[90m(https://alpha.example.test)\x1b[0m — 12ms, auth: ok (alpha…123)",
+  beta: "\x1b[32m✅\x1b[0m beta \x1b[90m(https://beta.example.test)\x1b[0m — 12ms, auth: off",
+}};
+export default async function handle(ctx) {{
+  const args = ctx.source === "cli" ? (ctx.args || []) : [];
+  if (args[0] === "alpha") return {{ ok: true, output: rows.alpha }};
+  return {{ ok: true, output: `${{rows.alpha}}\n${{rows.beta}}` }};
+}}
+"#
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("ping wrapper");
     path
 }
 
