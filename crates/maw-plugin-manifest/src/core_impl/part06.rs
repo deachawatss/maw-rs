@@ -1,7 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
+#[cfg(target_os = "macos")]
+use std::ffi::OsString;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsFd;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
@@ -2056,14 +2063,8 @@ fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
     Ok(file)
 }
 fn verify_fd_path(file: &File, expected: &Path) -> Result<(), HostResult<Value>> {
-    let link =
-        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| {
-            HostResult::err(
-                HostErrorCode::IoError,
-                format!("fd reverify failed: {error}"),
-            )
-        })?;
-    if link == expected {
+    let actual = fd_real_path(file)?;
+    if actual == expected {
         Ok(())
     } else {
         Err(HostResult::err(
@@ -2072,18 +2073,13 @@ fn verify_fd_path(file: &File, expected: &Path) -> Result<(), HostResult<Value>>
         ))
     }
 }
+
 fn verify_fd_under_roots(
     file: &File,
     roots: &BTreeMap<String, PathBuf>,
 ) -> Result<(), HostResult<Value>> {
-    let link =
-        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| {
-            HostResult::err(
-                HostErrorCode::IoError,
-                format!("fd reverify failed: {error}"),
-            )
-        })?;
-    if roots.values().any(|root| link.starts_with(root)) {
+    let actual = fd_real_path(file)?;
+    if roots.values().any(|root| actual.starts_with(root)) {
         Ok(())
     } else {
         Err(HostResult::err(
@@ -2091,6 +2087,36 @@ fn verify_fd_under_roots(
             "filesystem race detected",
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn fd_real_path(file: &File) -> Result<PathBuf, HostResult<Value>> {
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| {
+        HostResult::err(
+            HostErrorCode::IoError,
+            format!("fd reverify failed: {error}"),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn fd_real_path(file: &File) -> Result<PathBuf, HostResult<Value>> {
+    rustix::fs::getpath(file.as_fd())
+        .map(|path| PathBuf::from(OsString::from_vec(path.into_bytes())))
+        .map_err(|error| {
+            HostResult::err(
+                HostErrorCode::IoError,
+                format!("fd reverify failed: {error}"),
+            )
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn fd_real_path(_file: &File) -> Result<PathBuf, HostResult<Value>> {
+    Err(HostResult::err(
+        HostErrorCode::IoError,
+        "fd reverify unsupported on this platform",
+    ))
 }
 fn read_config_json(path: &Path) -> Result<Value, HostResult<Value>> {
     if !path.exists() {
@@ -2535,4 +2561,49 @@ fn tmux_sessions_json(sessions: Vec<maw_tmux::TmuxSession>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod fd_reverify_tests {
+    use super::*;
+    use std::fs::{create_dir_all, rename, write, OpenOptions};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "maw-fd-reverify-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn fd_reverify_detects_open_file_path_mismatch() {
+        let dir = temp_dir("path-mismatch");
+        let expected = dir.join("target.txt");
+        let moved = dir.join("moved.txt");
+        write(&expected, "original").expect("target");
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW_FLAG)
+            .open(&expected)
+            .expect("open target");
+        rename(&expected, &moved).expect("rename opened file");
+        write(&expected, "replacement").expect("replacement");
+
+        let err = verify_fd_path(&file, &expected).expect_err("mismatch denied");
+        assert!(matches!(
+            err,
+            HostResult::Err {
+                code: HostErrorCode::CapabilityDenied,
+                ..
+            }
+        ));
+    }
 }

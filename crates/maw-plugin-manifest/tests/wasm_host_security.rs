@@ -62,9 +62,6 @@ fn manifest_accepts_entry_object_wasm_form() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn fs_read_denies_symlink_escape_and_proc() {
     let dir = temp("symlink");
     write(dir.join("safe.txt"), "ok").expect("safe");
@@ -216,9 +213,6 @@ fn capability_denied_uses_error_envelope_and_private_net_hard_deny() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn config_set_writes_config_store_and_audits_key_before_mutate() {
     let dir = temp("config-set");
     let host = host(&dir, &["sdk:config:write", "sdk:config:read"]).with_fs_root("config", &dir);
@@ -310,9 +304,6 @@ fn config_set_secret_key_is_denied_by_host_even_without_guest_censor() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn config_set_benign_author_key_is_not_secret_denied() {
     let dir = temp("config-author-allow");
     let host = host(&dir, &["sdk:config:write"]).with_fs_root("config", &dir);
@@ -357,9 +348,6 @@ fn config_set_without_write_capability_is_denied_by_host() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn consent_read_uses_read_capability_and_never_exposes_pin_hash() {
     let dir = temp("consent-read");
     let state = dir.join("state");
@@ -622,8 +610,6 @@ fn tmux_send_host_allows_destructive_send_with_force_cap() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_under_roots); Linux-only until #39 portable fd-reverify.
-#[cfg(target_os = "linux")]
 fn fs_write_and_remove_hard_deny_protected_security_state_paths() {
     let dir = temp("protected-state");
     let state = dir.join("state");
@@ -726,9 +712,6 @@ fn fs_write_resolves_traversal_and_symlink_into_protected_state_before_deny() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn fs_remove_host_side_allows_only_declared_root_and_real_files() {
     let dir = temp("remove-allowed");
     let victim = dir.join("victim.txt");
@@ -806,9 +789,6 @@ fn fs_remove_denies_outside_root_traversal_symlink_and_glob() {
 }
 
 #[test]
-// /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
-// #37 ↔ #39: remove this cfg-gate when #39 lands.
-#[cfg(target_os = "linux")]
 fn fs_remove_recursive_is_confined_and_does_not_follow_symlink_escape() {
     let dir = temp("remove-recursive");
     let outside_dir = temp("remove-recursive-outside");
