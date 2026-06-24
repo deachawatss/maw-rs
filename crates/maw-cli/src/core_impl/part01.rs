@@ -24,6 +24,7 @@ use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
 use maw_bring::{parse_bring_args, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
+use maw_discord::run_discord_command;
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
 use maw_hub::{
     load_workspace_configs, validate_workspace_config, WorkspaceConfig, WorkspaceConfigValidation,
@@ -171,6 +172,7 @@ const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
     DispatcherEntry { command: "worktree-window", handler: Handler::Sync(run_worktree_window_plan) },
     DispatcherEntry { command: "route", handler: Handler::Sync(run_route_plan) },
     DispatcherEntry { command: "discover", handler: Handler::Sync(run_discover_plan) },
+    DispatcherEntry { command: "discord", handler: Handler::Async(run_discord_async) },
     DispatcherEntry { command: "federation-identity", handler: Handler::Sync(run_federation_identity_plan) },
     DispatcherEntry { command: "federation-health", handler: Handler::Sync(run_federation_health_plan) },
     DispatcherEntry { command: "federation-sync", handler: Handler::Sync(run_federation_sync_plan) },
@@ -326,6 +328,17 @@ fn run_async_handler_blocking(handler: AsyncHandler, args: &[String]) -> CliOutp
         }
     };
     runtime.block_on(handler(args.to_vec()))
+}
+
+fn run_discord_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move {
+        let output = run_discord_command(args).await;
+        CliOutput {
+            code: output.code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    })
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ maw-auth = { path = "../maw-auth" }
 maw-bring = { path = "../maw-bring" }
 maw-bind = { path = "../maw-bind" }
 maw-calver = { path = "../maw-calver" }
+maw-discord = { path = "../maw-discord" }
 maw-feed = { path = "../maw-feed" }
 maw-fuzzy = { path = "../maw-fuzzy" }
 maw-identity = { path = "../maw-identity" }

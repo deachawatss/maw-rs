@@ -1450,6 +1450,7 @@ dependencies = [
  "maw-bind",
  "maw-bring",
  "maw-calver",
+ "maw-discord",
  "maw-feed",
  "maw-fuzzy",
  "maw-hub",
@@ -1471,6 +1472,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "maw-discord"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
