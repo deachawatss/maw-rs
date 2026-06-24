@@ -41,8 +41,9 @@ use maw_peer::{
     ProbeFailureInput, ProbeLastError, ProbeMawHandshake,
 };
 use maw_plugin_manifest::{
-    discover_packages, import_plugin_symbol, invoke_plugin, load_manifest_from_dir, parse_manifest,
-    DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
+    build_js_plugin_dir, discover_packages, import_plugin_symbol, infer_plugin_capabilities,
+    init_js_plugin_dir, install_built_plugin_dir, invoke_plugin, load_manifest_from_dir,
+    parse_manifest, DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
     LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
