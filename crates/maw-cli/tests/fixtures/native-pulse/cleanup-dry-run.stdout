@@ -1,0 +1,8 @@
+
+[36mWorktree Cleanup[0m
+
+  [32m0 active[0m | [33m1 stale[0m | [31m0 orphan[0m
+
+[33mstale[0m  1-old (acme/widgets) [agents/1-old]
+
+[90m(dry run — use without --dry-run to clean)[0m
