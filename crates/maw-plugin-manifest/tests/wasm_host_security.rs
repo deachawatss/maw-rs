@@ -622,6 +622,110 @@ fn tmux_send_host_allows_destructive_send_with_force_cap() {
 }
 
 #[test]
+// /proc-dependent (verify_fd_under_roots); Linux-only until #39 portable fd-reverify.
+#[cfg(target_os = "linux")]
+fn fs_write_and_remove_hard_deny_protected_security_state_paths() {
+    let dir = temp("protected-state");
+    let state = dir.join("state");
+    create_dir_all(state.join("consent-pending")).expect("consent dir");
+    create_dir_all(state.join("normal")).expect("normal dir");
+    write(state.join("trust.json"), r#"{"version":1,"trust":{}}"#).expect("trust");
+    write(state.join("peer-key"), "peer-secret").expect("peer key");
+    write(state.join("audit.jsonl"), "{\"event\":\"host-only\"}\n").expect("audit");
+    let host = host(&dir, &["fs:write:state"]).with_fs_root("state", &state);
+
+    let trust = call(
+        &host,
+        "maw.fs.write",
+        &json!({"path": state.join("trust.json"), "content": "{\"trust\":{\"pwn\":true}}", "mode": "overwrite"}),
+    );
+    assert_eq!(trust["ok"], false, "{trust}");
+    assert_eq!(trust["code"], "capability_denied");
+    assert!(trust["error"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("protected security-state"));
+    assert_eq!(
+        read_to_string(state.join("trust.json")).expect("trust unchanged"),
+        r#"{"version":1,"trust":{}}"#
+    );
+
+    let remove_peer_key = call(
+        &host,
+        "maw.fs.remove",
+        &json!({"path": state.join("peer-key"), "recursive": false}),
+    );
+    assert_eq!(remove_peer_key["ok"], false, "{remove_peer_key}");
+    assert_eq!(remove_peer_key["code"], "capability_denied");
+    assert_eq!(
+        read_to_string(state.join("peer-key")).expect("peer key survives"),
+        "peer-secret"
+    );
+
+    let audit = call(
+        &host,
+        "maw.fs.write",
+        &json!({"path": state.join("audit.jsonl"), "content": "{\"event\":\"plugin\"}\n", "mode": "append"}),
+    );
+    assert_eq!(audit["ok"], false, "{audit}");
+    assert_eq!(audit["code"], "capability_denied");
+    assert_eq!(
+        read_to_string(state.join("audit.jsonl")).expect("audit unchanged"),
+        "{\"event\":\"host-only\"}\n"
+    );
+
+    let normal = call(
+        &host,
+        "maw.fs.write",
+        &json!({"path": state.join("plugin-cache.json"), "content": "{}", "mode": "create"}),
+    );
+    assert_eq!(normal["ok"], true, "{normal}");
+    assert_eq!(
+        read_to_string(state.join("plugin-cache.json")).expect("normal write"),
+        "{}"
+    );
+}
+
+#[test]
+fn fs_write_resolves_traversal_and_symlink_into_protected_state_before_deny() {
+    let dir = temp("protected-resolve");
+    let state = dir.join("state");
+    create_dir_all(state.join("consent-pending")).expect("consent dir");
+    create_dir_all(state.join("normal")).expect("normal dir");
+    write(state.join("trust.json"), r#"{"version":1,"trust":{}}"#).expect("trust");
+    let alias = dir.join("alias-consent");
+    symlink(state.join("consent-pending"), &alias).expect("protected dir symlink");
+    let host = host(&dir, &["fs:write:state"]).with_fs_root("state", &state);
+
+    let traversal = call(
+        &host,
+        "maw.fs.write",
+        &json!({"path": state.join("normal/../trust.json"), "content": "pwn", "mode": "overwrite"}),
+    );
+    assert_eq!(traversal["ok"], false, "{traversal}");
+    assert_eq!(traversal["code"], "capability_denied");
+    assert_eq!(
+        read_to_string(state.join("trust.json")).expect("trust unchanged"),
+        r#"{"version":1,"trust":{}}"#
+    );
+
+    let symlink_into_protected = call(
+        &host,
+        "maw.fs.write",
+        &json!({"path": alias.join("req-evil.json"), "content": "{}", "mode": "create"}),
+    );
+    assert_eq!(
+        symlink_into_protected["ok"], false,
+        "{symlink_into_protected}"
+    );
+    assert_eq!(symlink_into_protected["code"], "capability_denied");
+    assert!(
+        !state.join("consent-pending/req-evil.json").exists(),
+        "protected consent dir must not be written through symlink"
+    );
+}
+
+#[test]
 // /proc-dependent (verify_fd_path); Linux-only until #39 portable fd-reverify (fcntl F_GETPATH on macOS)
 // #37 ↔ #39: remove this cfg-gate when #39 lands.
 #[cfg(target_os = "linux")]
