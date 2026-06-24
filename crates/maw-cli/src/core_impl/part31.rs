@@ -508,9 +508,20 @@ fn active_config_dir() -> std::path::PathBuf {
 
 fn current_xdg_env() -> MawXdgEnv {
     let home = std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-    let vars = ["MAW_HOME", "MAW_CONFIG_DIR", "MAW_XDG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "MAW_STATE_DIR", "XDG_DATA_HOME", "MAW_DATA_DIR"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)));
+    let vars = [
+        "MAW_HOME",
+        "MAW_CONFIG_DIR",
+        "MAW_XDG",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "MAW_STATE_DIR",
+        "XDG_DATA_HOME",
+        "MAW_DATA_DIR",
+        "XDG_CACHE_HOME",
+        "MAW_CACHE_DIR",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)));
     MawXdgEnv::with_vars(home, vars)
 }
 
