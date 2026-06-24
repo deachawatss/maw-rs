@@ -71,6 +71,11 @@ const SERVE_PEER_STARTUP_WARNINGS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/maw.config.json"),
     ExpectedHostCall::new("maw.fs.read", "fs:read:state", "/state/peers.json"),
 ];
+const SEND_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.tmux.send_keys",
+    "tmux:send",
+    "mawjs:codex-5.pane",
+)];
 
 #[test]
 fn golden_parity_trivial_bun_and_wasm_outputs_match_in_isolated_maw_home() {
@@ -321,6 +326,29 @@ fn golden_parity_serve_peer_startup_warnings_bun_and_wasm_outputs_match_seeded_h
 }
 
 #[test]
+fn golden_parity_send_bun_and_wasm_outputs_match_seeded_host() {
+    run_parity_case(ParityCase {
+        plugin: "send",
+        manifest_name: "send-parity",
+        args: &["mawjs:codex-5.pane", "hello", "world"],
+        expected_host_calls: Some(SEND_TRANSCRIPT.len()),
+        expected_host_transcript: Some(SEND_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::SendReadOnlyWrapper,
+    });
+}
+
+#[test]
+fn send_wasm_declares_plain_send_only_for_non_destructive_fixture() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/send");
+    let wasm_plugin = load_wasm_fixture(&fixture, "send-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["tmux:send".to_owned()][..]),
+        "non-destructive send fixture must not over-grant tmux:send:force"
+    );
+}
+
+#[test]
 #[ignore = "regenerates committed maw-js parity goldens; requires MAW_JS_REF_DIR"]
 fn generate_wasm_parity_goldens_from_real_maw_js() {
     for case in parity_cases() {
@@ -506,6 +534,15 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         ),
     });
 
+    cases.push(ParityCase {
+        plugin: "send",
+        manifest_name: "send-parity",
+        args: &["mawjs:codex-5.pane", "hello", "world"],
+        expected_host_calls: Some(SEND_TRANSCRIPT.len()),
+        expected_host_transcript: Some(SEND_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::SendReadOnlyWrapper,
+    });
+
     cases
 }
 
@@ -657,6 +694,7 @@ struct ParityCase<'a> {
 enum RealMawJsEntry {
     DefaultHandler(&'static str),
     CrossTeamQueueHandle,
+    SendReadOnlyWrapper,
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
@@ -881,6 +919,7 @@ fn real_maw_js_entry_path(temp: &Path, maw_js_ref: &Path, entry: RealMawJsEntry)
         RealMawJsEntry::CrossTeamQueueHandle => {
             write_cross_team_queue_real_wrapper(temp, maw_js_ref)
         }
+        RealMawJsEntry::SendReadOnlyWrapper => write_send_real_wrapper(temp, maw_js_ref),
     }
 }
 
@@ -897,6 +936,40 @@ fn write_cross_team_queue_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBu
     );
     let path = wrapper_dir.join("index.ts");
     std::fs::write(&path, wrapper).expect("cross-team-queue wrapper");
+    path
+}
+
+fn write_send_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-send");
+    create_dir_all(&wrapper_dir).expect("send wrapper dir");
+    let sdk_path = maw_js_ref
+        .join("src/sdk/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let send_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/send/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let sdk = serde_json::to_string(&sdk_path).expect("sdk path json string");
+    let send = serde_json::to_string(&send_path).expect("send path json string");
+    let wrapper = format!(
+        r#"import {{ mock }} from "bun:test";
+const realSdk = await import({sdk});
+class MockTmux {{ async sendKeysLiteral(_target, _text) {{}} }}
+mock.module("maw-js/sdk", () => ({{
+  ...realSdk,
+  loadConfig: () => ({{ node: {{ name: "local" }} }}),
+  listSessions: async () => [{{ name: "mawjs", windows: [{{ name: "codex-5" }}] }}],
+  resolveTarget: () => ({{ type: "local", target: "mawjs:codex-5" }}),
+  resolveOraclePane: async (_target) => "mawjs:codex-5.pane",
+  Tmux: MockTmux,
+}}));
+const real = await import({send});
+export default real.default;
+"#
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("send wrapper");
     path
 }
 

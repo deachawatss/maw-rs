@@ -98,8 +98,17 @@ pub fn check_destructive(command: &str) -> DestructiveCheck {
     if contains_word(&lower, "gh") && contains_word(&lower, "delete") {
         reasons.push("gh delete — removes GitHub resource".to_owned());
     }
-    if lower.contains("kill -9") {
-        reasons.push("kill -9 — force-terminate process".to_owned());
+    if contains_word(&lower, "clear") {
+        reasons.push("clear — clears pane context".to_owned());
+    }
+    if contains_word(&lower, "exit") {
+        reasons.push("exit — exits the foreground process".to_owned());
+    }
+    if contains_word(&lower, "kill") {
+        reasons.push("kill — terminates process".to_owned());
+    }
+    if lower.split_whitespace().any(|token| matches!(token, "c-c" | "c-d")) {
+        reasons.push("control key — may interrupt or close a session".to_owned());
     }
     if lower.contains("drop table") {
         reasons.push("DROP TABLE — removes database table".to_owned());

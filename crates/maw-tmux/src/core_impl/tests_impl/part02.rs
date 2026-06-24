@@ -242,7 +242,7 @@
                 "C-c",
                 &TmuxSendCommandOptions {
                     literal: true,
-                    allow_destructive: false,
+                    allow_destructive: true,
                     force: true,
                 },
                 4_000,

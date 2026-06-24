@@ -127,6 +127,8 @@ pub struct MawWasmHost {
     fs_roots: BTreeMap<String, PathBuf>,
     secret_store: BTreeMap<String, String>,
     fake_responses: BTreeMap<(String, String), FakeHostResponse>,
+    tmux_pane_commands: BTreeMap<String, String>,
+    tmux_dry_run: bool,
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     http_timeout_ms: u64,
 }
@@ -140,6 +142,8 @@ impl MawWasmHost {
             fs_roots: BTreeMap::new(),
             secret_store: BTreeMap::new(),
             fake_responses: BTreeMap::new(),
+            tmux_pane_commands: BTreeMap::new(),
+            tmux_dry_run: false,
             audit: Arc::new(Mutex::new(Vec::new())),
             http_timeout_ms: 10_000,
         }
@@ -181,6 +185,19 @@ impl MawWasmHost {
             (name.into(), input.into()),
             FakeHostResponse { output: output.into(), capability, resource, status },
         );
+        self
+    }
+
+
+    #[must_use]
+    pub fn with_tmux_pane_command(mut self, target: impl Into<String>, command: impl Into<String>) -> Self {
+        self.tmux_pane_commands.insert(target.into(), command.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_tmux_dry_run(mut self) -> Self {
+        self.tmux_dry_run = true;
         self
     }
 
@@ -241,6 +258,18 @@ impl MawWasmHost {
             "maw.ssh.tmux_send_keys" => to_json(&self.ssh_tmux_send_keys(input)),
             _ => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, format!("unsupported host function: {name}"))),
         }
+    }
+
+
+    fn has_exact_cap(&self, capability: &str) -> bool {
+        self.caps.caps.contains(capability)
+    }
+
+    fn tmux_current_command(&self, target: &str, client: &mut TmuxClient<CommandTmuxRunner>) -> Result<String, HostResult<Value>> {
+        if let Some(command) = self.tmux_pane_commands.get(target) {
+            return Ok(command.clone());
+        }
+        client.display_pane_current_command(target).map_err(|error| HostResult::err(HostErrorCode::IoError, error.message))
     }
 
     fn audit(&self, name: &str, capability: &str, resource: &str, status: &str, start: Instant) {
@@ -454,21 +483,40 @@ impl MawWasmHost {
     }
 
     fn tmux_send_keys(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
         let args = match parse_args::<TmuxSendArgs>(input) { Ok(args) => args, Err(err) => return err };
-        if !self.caps.contains("tmux", "send", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send capability denied"); }
-        if (args.force.unwrap_or(false) || args.allow_destructive.unwrap_or(false)) && !self.caps.contains("tmux", "send", Some("force")) { return HostResult::err(HostErrorCode::CapabilityDenied, "force/destructive tmux send denied"); }
         let text = args.keys.join(" ");
-        if maw_tmux::check_destructive(&text).destructive && !args.allow_destructive.unwrap_or(false) { return HostResult::err(HostErrorCode::CapabilityDenied, "destructive tmux send denied"); }
+        let destructive = maw_tmux::check_destructive(&text);
+        let needs_force = destructive.destructive || args.force.unwrap_or(false) || args.allow_destructive.unwrap_or(false);
+        let has_force_cap = self.has_exact_cap("tmux:send:force") || self.has_exact_cap("tmux:send:*");
+        let cap = if needs_force {
+            if !has_force_cap {
+                return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send force capability denied");
+            }
+            "tmux:send:force"
+        } else if self.caps.contains("tmux", "send", None) {
+            "tmux:send"
+        } else {
+            return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send capability denied");
+        };
         let mut client = TmuxClient::new(CommandTmuxRunner::new());
-        let send = if args.literal.unwrap_or(false) { client.send_keys_literal(&args.target, &text) } else { client.send_keys(&args.target, &args.keys) };
-        if let Err(error) = send { return HostResult::err(HostErrorCode::IoError, error.message); }
-        if args.enter.unwrap_or(false) { if let Err(error) = client.send_enter(&args.target) { return HostResult::err(HostErrorCode::IoError, error.message); } }
-        HostResult::ok(json!({"target": args.target, "sent": true}))
+        let pane_command = match self.tmux_current_command(&args.target, &mut client) { Ok(command) => command, Err(err) => return err };
+        if maw_tmux::is_claude_like_pane(Some(&pane_command)) && !has_force_cap && !args.allow_ai_pane.unwrap_or(false) {
+            return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send into AI-agent pane denied");
+        }
+        if !self.tmux_dry_run {
+            let send = if args.literal.unwrap_or(false) { client.send_keys_literal(&args.target, &text) } else { client.send_keys(&args.target, &args.keys) };
+            if let Err(error) = send { return HostResult::err(HostErrorCode::IoError, error.message); }
+            if args.enter.unwrap_or(false) { if let Err(error) = client.send_enter(&args.target) { return HostResult::err(HostErrorCode::IoError, error.message); } }
+        }
+        let result = HostResult::ok(json!({"target": args.target, "sent": true, "destructive": destructive.destructive}));
+        self.audit("maw.tmux.send_keys", cap, &args.target, status_of(&result), start);
+        result
     }
 
     fn tmux_run(&self, input: &str) -> HostResult<Value> {
         let args = match parse_args::<TmuxRunArgs>(input) { Ok(args) => args, Err(err) => return err };
-        self.tmux_send_keys(&serde_json::to_string(&TmuxSendArgs { target: args.target.clone(), keys: vec![args.text], literal: Some(true), enter: Some(true), allow_destructive: Some(false), force: Some(false) }).unwrap_or_default())
+        self.tmux_send_keys(&serde_json::to_string(&TmuxSendArgs { target: args.target.clone(), keys: vec![args.text], literal: Some(true), enter: Some(true), allow_destructive: Some(false), force: Some(false), allow_ai_pane: Some(false) }).unwrap_or_default())
     }
 
     fn tmux_send_enter(&self, input: &str) -> HostResult<Value> {
@@ -677,7 +725,7 @@ struct PeerWakeArgs { peer_url: String, target: String, task: Option<String>, fr
 struct TmuxCaptureArgs { target: String, lines: Option<u32>, strip_ansi: Option<bool> }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TmuxSendArgs { target: String, keys: Vec<String>, literal: Option<bool>, enter: Option<bool>, allow_destructive: Option<bool>, force: Option<bool> }
+struct TmuxSendArgs { target: String, keys: Vec<String>, literal: Option<bool>, enter: Option<bool>, allow_destructive: Option<bool>, force: Option<bool>, allow_ai_pane: Option<bool> }
 #[derive(Debug, Deserialize)]
 struct TmuxRunArgs { target: String, text: String }
 #[derive(Debug, Deserialize)]
