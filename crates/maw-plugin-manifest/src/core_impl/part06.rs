@@ -1,0 +1,676 @@
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Arc;
+
+use base64::Engine as _;
+use extism::{CurrentPlugin, Manifest as ExtismManifest, PluginBuilder, UserData, Val, ValType, Wasm};
+use maw_tmux::{CommandTmuxRunner, TmuxClient};
+use maw_transport::{HttpRequest as TransportHttpRequest, PeerSendRequest, PeerWakeRequest, ReqwestHttpTransportIo};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use url::Url;
+
+const MAX_HTTP_TIMEOUT_MS: u64 = 30_000;
+const MAX_EXEC_TIMEOUT_MS: u64 = 30_000;
+const MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
+const O_NOFOLLOW_FLAG: i32 = libc::O_NOFOLLOW;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostResult<T> {
+    Ok { value: T, warnings: Vec<String> },
+    Err { error: String, code: HostErrorCode, detail: Option<Value> },
+}
+
+impl<T: Serialize> Serialize for HostResult<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Ok { value, warnings } => {
+                let mut map = serializer.serialize_map(Some(if warnings.is_empty() { 2 } else { 3 }))?;
+                map.serialize_entry("ok", &true)?;
+                map.serialize_entry("value", value)?;
+                if !warnings.is_empty() {
+                    map.serialize_entry("warnings", warnings)?;
+                }
+                map.end()
+            }
+            Self::Err { error, code, detail } => {
+                let mut map = serializer.serialize_map(Some(if detail.is_some() { 4 } else { 3 }))?;
+                map.serialize_entry("ok", &false)?;
+                map.serialize_entry("error", error)?;
+                map.serialize_entry("code", code)?;
+                if let Some(detail) = detail {
+                    map.serialize_entry("detail", detail)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostErrorCode {
+    CapabilityDenied,
+    InvalidArgs,
+    NotFound,
+    Timeout,
+    IoError,
+    ProcessFailed,
+    NetworkError,
+    Unsupported,
+}
+
+impl<T> HostResult<T> {
+    fn ok(value: T) -> Self { Self::Ok { value, warnings: Vec::new() } }
+    fn err(code: HostErrorCode, error: impl Into<String>) -> Self { Self::Err { error: error.into(), code, detail: None } }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilitySet { caps: BTreeSet<String> }
+
+impl CapabilitySet {
+    #[must_use]
+    pub fn from_manifest(manifest: &PluginManifest) -> Self {
+        Self { caps: manifest.capabilities.clone().unwrap_or_default().into_iter().collect() }
+    }
+
+    #[must_use]
+    pub fn contains(&self, namespace: &str, verb: &str, scope: Option<&str>) -> bool {
+        let exact = scope.map_or_else(|| format!("{namespace}:{verb}"), |scope| format!("{namespace}:{verb}:{scope}"));
+        self.caps.contains(&exact) || self.caps.contains(&format!("{namespace}:{verb}:*")) || self.caps.contains(&format!("{namespace}:{verb}"))
+    }
+
+    fn require(&self, namespace: &str, verb: &str, scope: Option<&str>) -> Result<String, HostResult<Value>> {
+        if self.contains(namespace, verb, scope) {
+            Ok(scope.map_or_else(|| format!("{namespace}:{verb}"), |scope| format!("{namespace}:{verb}:{scope}")))
+        } else {
+            Err(HostResult::err(HostErrorCode::CapabilityDenied, format!("capability denied: {namespace}:{verb}{}", scope.map_or(String::new(), |s| format!(":{s}")))))
+        }
+    }
+
+    fn scopes_for(&self, namespace: &str, verb: &str) -> Vec<String> {
+        let prefix = format!("{namespace}:{verb}:");
+        self.caps.iter().filter_map(|cap| cap.strip_prefix(&prefix).map(str::to_owned)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub plugin: String,
+    pub host_fn: String,
+    pub capability: String,
+    pub resource: String,
+    pub status: String,
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+pub struct MawWasmHost {
+    plugin_name: String,
+    caps: CapabilitySet,
+    fs_roots: BTreeMap<String, PathBuf>,
+    secret_store: BTreeMap<String, String>,
+    audit: Arc<Mutex<Vec<AuditEvent>>>,
+    http_timeout_ms: u64,
+}
+
+impl MawWasmHost {
+    #[must_use]
+    pub fn new(plugin: &LoadedPlugin) -> Self {
+        Self {
+            plugin_name: plugin.manifest.name.clone(),
+            caps: CapabilitySet::from_manifest(&plugin.manifest),
+            fs_roots: BTreeMap::new(),
+            secret_store: BTreeMap::new(),
+            audit: Arc::new(Mutex::new(Vec::new())),
+            http_timeout_ms: 10_000,
+        }
+    }
+
+    #[must_use]
+    pub fn with_fs_root(mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        self.fs_roots.insert(name.into(), path.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_secret_ref(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.secret_store.insert(name.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn audit_json_lines(&self) -> String {
+        self.audit.lock().map_or_else(|_| String::new(), |events| {
+            events.iter().map(|event| serde_json::to_string(event).unwrap_or_default()).collect::<Vec<_>>().join("\n")
+        })
+    }
+
+    #[must_use]
+    pub fn handle_json(&self, name: &str, input: &str) -> String {
+        match name {
+            "maw.exec.run" => to_json(&self.exec_run(input)),
+            "maw.exec.spawn" => to_json(&self.exec_spawn(input)),
+            "maw.fs.read" => to_json(&self.fs_read(input)),
+            "maw.fs.write" => to_json(&self.fs_write(input)),
+            "maw.fs.list" => to_json(&self.fs_list(input)),
+            "maw.fs.stat" => to_json(&self.fs_stat(input)),
+            "maw.http.request" => to_json(&self.http_request(input)),
+            "maw.http.peer_send" => to_json(&self.peer_send(input)),
+            "maw.http.peer_wake" => to_json(&self.peer_wake(input)),
+            "maw.tmux.list_sessions" => to_json(&self.tmux_list_sessions(input)),
+            "maw.tmux.capture" => to_json(&self.tmux_capture(input)),
+            "maw.tmux.send_keys" => to_json(&self.tmux_send_keys(input)),
+            "maw.tmux.run" => to_json(&self.tmux_run(input)),
+            "maw.tmux.send_enter" => to_json(&self.tmux_send_enter(input)),
+            "maw.tmux.tags_read" => to_json(&self.tmux_tags_read(input)),
+            "maw.tmux.tags_write" => to_json(&self.tmux_tags_write(input)),
+            "maw.ssh.exec" => to_json(&self.ssh_exec(input)),
+            "maw.ssh.tmux_capture" => to_json(&self.ssh_tmux_capture(input)),
+            "maw.ssh.tmux_send_keys" => to_json(&self.ssh_tmux_send_keys(input)),
+            _ => to_json(&HostResult::<Value>::err(HostErrorCode::Unsupported, format!("unsupported host function: {name}"))),
+        }
+    }
+
+    fn audit(&self, name: &str, capability: &str, resource: &str, status: &str, start: Instant) {
+        if let Ok(mut events) = self.audit.lock() {
+            events.push(AuditEvent { plugin: redact(&self.plugin_name), host_fn: name.to_owned(), capability: capability.to_owned(), resource: redact(resource), status: status.to_owned(), duration_ms: start.elapsed().as_millis() });
+        }
+    }
+
+    fn exec_run(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<ExecRunArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let base = executable_basename(&args.cmd);
+        if is_hard_denied_exec(&args.cmd, &args.args) { return HostResult::err(HostErrorCode::CapabilityDenied, "hard-denied executable or interactive/privileged option"); }
+        let cap = match self.caps.require("proc", "exec", Some(&base)).or_else(|_| self.caps.require("shell", "exec", Some(&base))) { Ok(cap) => cap, Err(err) => return err };
+        if let Some(cwd) = &args.cwd { if let Err(err) = self.check_cwd(cwd) { return err; } }
+        let env = match sanitize_env(args.env.as_ref()) { Ok(env) => env, Err(err) => return err };
+        let mut cmd = Command::new(&args.cmd);
+        cmd.args(&args.args).env_clear().envs(env).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(cwd) = &args.cwd { cmd.current_dir(cwd); }
+        let output = run_child(cmd, args.stdin.as_deref(), args.timeout_ms.unwrap_or(10_000).min(MAX_EXEC_TIMEOUT_MS));
+        let result = match output {
+            Ok(output) => {
+                let status = output.status.code().unwrap_or(-1);
+                if status != 0 && !args.allow_non_zero { HostResult::err(HostErrorCode::ProcessFailed, format!("process exited with status {status}")) } else { HostResult::ok(json!({"status": status, "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr), "durationMs": start.elapsed().as_millis()})) }
+            }
+            Err(code) => HostResult::err(code, "process execution failed"),
+        };
+        self.audit("maw.exec.run", &cap, &args.cmd, status_of(&result), start);
+        result
+    }
+
+    fn exec_spawn(&self, input: &str) -> HostResult<Value> {
+        let mut args = match parse_args::<ExecRunArgs>(input) { Ok(args) => args, Err(err) => return err };
+        args.allow_non_zero = true;
+        self.exec_run(&serde_json::to_string(&args).unwrap_or_default())
+    }
+
+    fn fs_read(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<FsReadArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let (cap, real) = match self.secure_path(&args.path, "read") { Ok(value) => value, Err(err) => return err };
+        let max = args.max_bytes.unwrap_or(MAX_READ_BYTES).min(MAX_READ_BYTES);
+        let file = match open_nofollow_existing(&real) { Ok(file) => file, Err(err) => return err };
+        if let Err(err) = verify_fd_path(&file, &real) { return err; }
+        let mut bytes = Vec::new();
+        if let Err(error) = file.take(max + 1).read_to_end(&mut bytes) { return HostResult::err(HostErrorCode::IoError, format!("read failed: {error}")); }
+        if bytes.len() as u64 > max { return HostResult::err(HostErrorCode::IoError, "read exceeds maxBytes"); }
+        let content = if args.encoding.as_deref() == Some("base64") { base64::engine::general_purpose::STANDARD.encode(&bytes) } else { match String::from_utf8(bytes.clone()) { Ok(text) => text, Err(_) => return HostResult::err(HostErrorCode::InvalidArgs, "file is not valid utf8") } };
+        let result = HostResult::ok(json!({"path": real.display().to_string(), "bytes": bytes.len(), "content": content}));
+        self.audit("maw.fs.read", &cap, &real.display().to_string(), status_of(&result), start);
+        result
+    }
+
+    fn fs_write(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<FsWriteArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let (cap, path) = match self.secure_write_path(&args.path) { Ok(value) => value, Err(err) => return err };
+        if args.mkdirp.unwrap_or(false) { if let Some(parent) = path.parent() { if let Err(error) = std::fs::create_dir_all(parent) { return HostResult::err(HostErrorCode::IoError, format!("mkdirp failed: {error}")); } } }
+        let bytes = if args.encoding.as_deref() == Some("base64") { match base64::engine::general_purpose::STANDARD.decode(&args.content) { Ok(bytes) => bytes, Err(error) => return HostResult::err(HostErrorCode::InvalidArgs, format!("base64 decode failed: {error}")) } } else { args.content.into_bytes() };
+        let mut opts = OpenOptions::new();
+        opts.write(true).custom_flags(O_NOFOLLOW_FLAG);
+        match args.mode.as_deref().unwrap_or("create") { "create" => { opts.create_new(true); }, "overwrite" => { opts.create(true).truncate(true); }, "append" => { opts.create(true).append(true); }, _ => return HostResult::err(HostErrorCode::InvalidArgs, "mode must be create, overwrite, or append") }
+        let mut file = match opts.open(&path) { Ok(file) => file, Err(error) => return HostResult::err(HostErrorCode::IoError, format!("open failed: {error}")) };
+        if let Err(err) = verify_fd_under_roots(&file, &self.roots_for("write")) { return err; }
+        if let Err(error) = file.write_all(&bytes) { return HostResult::err(HostErrorCode::IoError, format!("write failed: {error}")); }
+        let result = HostResult::ok(json!({"path": path.display().to_string(), "bytes": bytes.len()}));
+        self.audit("maw.fs.write", &cap, &path.display().to_string(), status_of(&result), start);
+        result
+    }
+
+    fn fs_list(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<FsListArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let (_cap, real) = match self.secure_path(&args.path, "read") { Ok(value) => value, Err(err) => return err };
+        let mut entries = Vec::new();
+        let max = args.max_entries.unwrap_or(200).min(1000);
+        list_dir(&real, args.recursive.unwrap_or(false), args.include_dirs.unwrap_or(true), max, &mut entries);
+        HostResult::ok(json!({"entries": entries}))
+    }
+
+    fn fs_stat(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<FsPathArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let Ok((_cap, real)) = self.secure_path(&args.path, "read") else {
+            return HostResult::ok(json!({"exists": false}));
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&real) else {
+            return HostResult::ok(json!({"exists": false}));
+        };
+        HostResult::ok(json!({"exists": true, "kind": file_kind(meta.file_type()), "bytes": meta.len()}))
+    }
+
+    fn http_request(&self, input: &str) -> HostResult<Value> {
+        let start = Instant::now();
+        let args = match parse_args::<HttpArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let url = match Url::parse(&args.url) { Ok(url) => url, Err(error) => return HostResult::err(HostErrorCode::InvalidArgs, format!("invalid url: {error}")) };
+        if is_discord_gateway(&url) { return HostResult::err(HostErrorCode::CapabilityDenied, "Discord gateway is hard-denied from WASM host functions"); }
+        let scheme = url.scheme();
+        if !matches!(scheme, "http" | "https") { return HostResult::err(HostErrorCode::CapabilityDenied, "only http/https URLs are supported"); }
+        let host = match url.host_str() { Some(host) => host.to_owned(), None => return HostResult::err(HostErrorCode::InvalidArgs, "url host is required") };
+        if is_private_host(&host) && !self.caps.contains("net", "private", Some(&host)) { return HostResult::err(HostErrorCode::CapabilityDenied, "private network access denied"); }
+        let cap = match self.caps.require("net", scheme, Some(&host)) { Ok(cap) => cap, Err(err) => return err };
+        let headers = redact_headers(args.headers.unwrap_or_default());
+        let request = TransportHttpRequest { method: args.method, url: args.url, headers, body: args.body, timeout_ms: Some(args.timeout_ms.unwrap_or(self.http_timeout_ms).min(MAX_HTTP_TIMEOUT_MS)), follow_redirects: args.follow_redirects.unwrap_or(false) };
+        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() { Ok(rt) => rt, Err(error) => return HostResult::err(HostErrorCode::NetworkError, format!("tokio runtime failed: {error}")) };
+        let client = match ReqwestHttpTransportIo::new(request.timeout_ms.unwrap_or(self.http_timeout_ms)) { Ok(client) => client, Err(error) => return HostResult::err(HostErrorCode::NetworkError, error) };
+        let result = match runtime.block_on(client.request(&request)) { Ok(resp) => HostResult::ok(json!({"status": resp.status, "headers": resp.headers, "body": resp.body, "url": resp.url})), Err(error) => HostResult::err(HostErrorCode::NetworkError, error) };
+        self.audit("maw.http.request", &cap, &host, status_of(&result), start);
+        result
+    }
+
+    fn peer_send(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<PeerSendArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let key = match self.secret_ref(args.peer_key_ref.as_deref()) { Ok(key) => key, Err(err) => return err };
+        let url = match Url::parse(&args.peer_url) { Ok(url) => url, Err(error) => return HostResult::err(HostErrorCode::InvalidArgs, format!("invalid peerUrl: {error}")) };
+        let host = url.host_str().unwrap_or_default();
+        if let Err(err) = self.caps.require("peer", "send", None).and_then(|_| self.caps.require(url.scheme(), "", Some(host))) { let _ = err; }
+        if !self.caps.contains("peer", "send", None) || !self.caps.contains("net", url.scheme(), Some(host)) { return HostResult::err(HostErrorCode::CapabilityDenied, "peer send capability denied"); }
+        let req = PeerSendRequest { peer_url: args.peer_url, target: args.target, text: args.text, inbox: args.inbox, from: args.from, peer_key: key, timestamp: args.timestamp.unwrap_or(0) };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ()).ok();
+        let Some(rt) = rt else { return HostResult::err(HostErrorCode::NetworkError, "tokio runtime failed"); };
+        let client = match ReqwestHttpTransportIo::new(self.http_timeout_ms) { Ok(client) => client, Err(error) => return HostResult::err(HostErrorCode::NetworkError, error) };
+        match rt.block_on(client.send_peer(&req)) { Ok(resp) => HostResult::ok(json!({"ok": resp.ok, "status": resp.status, "state": resp.state, "target": resp.target, "lastLine": resp.last_line, "error": resp.error})), Err(error) => HostResult::err(HostErrorCode::NetworkError, error) }
+    }
+
+    fn peer_wake(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<PeerWakeArgs>(input) { Ok(args) => args, Err(err) => return err };
+        let key = match self.secret_ref(args.peer_key_ref.as_deref()) { Ok(key) => key, Err(err) => return err };
+        let url = Url::parse(&args.peer_url).map_err(|_| ()).ok();
+        let Some(url) = url else { return HostResult::err(HostErrorCode::InvalidArgs, "invalid peerUrl"); };
+        let host = url.host_str().unwrap_or_default();
+        if !self.caps.contains("peer", "wake", None) || !self.caps.contains("net", url.scheme(), Some(host)) { return HostResult::err(HostErrorCode::CapabilityDenied, "peer wake capability denied"); }
+        let req = PeerWakeRequest { peer_url: args.peer_url, target: args.target, task: args.task, from: args.from, peer_key: key, timestamp: args.timestamp.unwrap_or(0) };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_| ()).ok();
+        let Some(rt) = rt else { return HostResult::err(HostErrorCode::NetworkError, "tokio runtime failed"); };
+        let client = match ReqwestHttpTransportIo::new(self.http_timeout_ms) { Ok(client) => client, Err(error) => return HostResult::err(HostErrorCode::NetworkError, error) };
+        match rt.block_on(client.wake_peer(&req)) { Ok(resp) => HostResult::ok(json!({"ok": resp.ok, "status": resp.status, "target": resp.target, "error": resp.error})), Err(error) => HostResult::err(HostErrorCode::NetworkError, error) }
+    }
+
+    fn tmux_list_sessions(&self, _input: &str) -> HostResult<Value> {
+        if let Err(err) = self.caps.require("tmux", "read", None) { return err; }
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        HostResult::ok(json!({"sessions": tmux_sessions_json(client.list_all())}))
+    }
+
+    fn tmux_capture(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<TmuxCaptureArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("tmux", "capture", None) && !self.caps.contains("tmux", "read", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux capture capability denied"); }
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        match client.capture(&args.target, args.lines) { Ok(mut content) => { if args.strip_ansi.unwrap_or(false) { content = maw_tmux::strip_tmux_ansi(&content); } HostResult::ok(json!({"target": args.target, "content": content, "lines": args.lines.unwrap_or(80)})) }, Err(error) => HostResult::err(HostErrorCode::IoError, error.message) }
+    }
+
+    fn tmux_send_keys(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<TmuxSendArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("tmux", "send", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send capability denied"); }
+        if (args.force.unwrap_or(false) || args.allow_destructive.unwrap_or(false)) && !self.caps.contains("tmux", "send", Some("force")) { return HostResult::err(HostErrorCode::CapabilityDenied, "force/destructive tmux send denied"); }
+        let text = args.keys.join(" ");
+        if maw_tmux::check_destructive(&text).destructive && !args.allow_destructive.unwrap_or(false) { return HostResult::err(HostErrorCode::CapabilityDenied, "destructive tmux send denied"); }
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        let send = if args.literal.unwrap_or(false) { client.send_keys_literal(&args.target, &text) } else { client.send_keys(&args.target, &args.keys) };
+        if let Err(error) = send { return HostResult::err(HostErrorCode::IoError, error.message); }
+        if args.enter.unwrap_or(false) { if let Err(error) = client.send_enter(&args.target) { return HostResult::err(HostErrorCode::IoError, error.message); } }
+        HostResult::ok(json!({"target": args.target, "sent": true}))
+    }
+
+    fn tmux_run(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<TmuxRunArgs>(input) { Ok(args) => args, Err(err) => return err };
+        self.tmux_send_keys(&serde_json::to_string(&TmuxSendArgs { target: args.target.clone(), keys: vec![args.text], literal: Some(true), enter: Some(true), allow_destructive: Some(false), force: Some(false) }).unwrap_or_default())
+    }
+
+    fn tmux_send_enter(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<TmuxEnterArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("tmux", "send", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux send capability denied"); }
+        let count = args.count.unwrap_or(1).min(5);
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        for _ in 0..count { if let Err(error) = client.send_enter(&args.target) { return HostResult::err(HostErrorCode::IoError, error.message); } }
+        HostResult::ok(json!({"target": args.target, "count": count}))
+    }
+
+    fn tmux_tags_read(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<FsPathArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("tmux", "read", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux read capability denied"); }
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        match client.read_pane_tags(&args.path) { Ok(tags) => HostResult::ok(json!({"title": tags.title, "meta": tags.meta})), Err(error) => HostResult::err(HostErrorCode::IoError, error.message) }
+    }
+
+    fn tmux_tags_write(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<TmuxTagsWriteArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("tmux", "write-tags", None) { return HostResult::err(HostErrorCode::CapabilityDenied, "tmux write-tags capability denied"); }
+        let meta = args.meta.unwrap_or_default();
+        if meta.keys().any(|key| !key.starts_with("@maw-") && !key.starts_with("maw-")) { return HostResult::err(HostErrorCode::CapabilityDenied, "tag keys must use @maw-* namespace"); }
+        let pairs = meta.into_iter().collect::<Vec<_>>();
+        let mut client = TmuxClient::new(CommandTmuxRunner::new());
+        match client.tag_pane(&args.target, args.title.as_deref(), &pairs) { Ok(()) => HostResult::ok(json!({"target": args.target})), Err(error) => HostResult::err(HostErrorCode::IoError, error.message) }
+    }
+
+    fn ssh_exec(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<SshExecArgs>(input) { Ok(args) => args, Err(err) => return err };
+        if !self.caps.contains("shell", "ssh", Some(&args.host)) || !self.caps.contains("proc", "exec", Some("ssh")) { return HostResult::err(HostErrorCode::CapabilityDenied, "ssh exec capability denied"); }
+        if args.args.iter().any(|arg| matches!(arg.as_str(), "-A" | "-L" | "-R" | "-D" | "-tt" | "-t")) { return HostResult::err(HostErrorCode::CapabilityDenied, "interactive/forwarding ssh options denied"); }
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-T").arg(&args.host).arg(&args.cmd).args(&args.args).env_clear().stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::piped());
+        let output = run_child(cmd, args.stdin.as_deref(), args.timeout_ms.unwrap_or(10_000).min(MAX_EXEC_TIMEOUT_MS));
+        match output { Ok(output) => HostResult::ok(json!({"transport": "ssh", "host": args.host, "status": output.status.code().unwrap_or(-1), "stdout": String::from_utf8_lossy(&output.stdout), "stderr": String::from_utf8_lossy(&output.stderr)})), Err(code) => HostResult::err(code, "ssh execution failed") }
+    }
+
+    fn ssh_tmux_capture(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<SshTmuxCaptureArgs>(input) { Ok(args) => args, Err(err) => return err };
+        self.ssh_exec(&serde_json::to_string(&SshExecArgs { host: args.host, cmd: "tmux".to_owned(), args: vec!["capture-pane".to_owned(), "-p".to_owned(), "-t".to_owned(), args.target, "-S".to_owned(), format!("-{}", args.lines.unwrap_or(80))], stdin: None, timeout_ms: None }).unwrap_or_default())
+    }
+
+    fn ssh_tmux_send_keys(&self, input: &str) -> HostResult<Value> {
+        let args = match parse_args::<SshTmuxSendArgs>(input) { Ok(args) => args, Err(err) => return err };
+        self.ssh_exec(&serde_json::to_string(&SshExecArgs { host: args.host, cmd: "tmux".to_owned(), args: [vec!["send-keys".to_owned(), "-t".to_owned(), args.target], args.keys].concat(), stdin: None, timeout_ms: None }).unwrap_or_default())
+    }
+
+    fn secure_path(&self, requested: &str, verb: &str) -> Result<(String, PathBuf), HostResult<Value>> {
+        let path = canonicalize_checked(requested)?;
+        if deny_special_path(&path) { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special filesystem path denied")); }
+        let roots = self.roots_for(verb);
+        let (scope, _) = roots.iter().find(|(_, root)| path.starts_with(root)).ok_or_else(|| HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared roots"))?;
+        let cap = self.caps.require("fs", verb, Some(scope))?;
+        Ok((cap, path))
+    }
+
+    fn secure_write_path(&self, requested: &str) -> Result<(String, PathBuf), HostResult<Value>> {
+        let raw = PathBuf::from(requested);
+        let parent = raw.parent().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "write path requires parent"))?;
+        let parent = canonicalize_checked_path(parent)?;
+        if deny_special_path(&parent) { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "special filesystem path denied")); }
+        let file_name = raw.file_name().ok_or_else(|| HostResult::err(HostErrorCode::InvalidArgs, "write path requires file name"))?;
+        let path = parent.join(file_name);
+        let roots = self.roots_for("write");
+        let (scope, _) = roots.iter().find(|(_, root)| path.starts_with(root)).ok_or_else(|| HostResult::err(HostErrorCode::CapabilityDenied, "filesystem path outside declared write roots"))?;
+        let cap = self.caps.require("fs", "write", Some(scope))?;
+        Ok((cap, path))
+    }
+
+    fn roots_for(&self, verb: &str) -> BTreeMap<String, PathBuf> {
+        self.caps.scopes_for("fs", verb).into_iter().filter_map(|scope| self.fs_roots.get(&scope).and_then(|root| canonicalize_checked_path(root).ok()).map(|root| (scope, root))).collect()
+    }
+
+    fn check_cwd(&self, cwd: &str) -> Result<(), HostResult<Value>> {
+        let cwd = canonicalize_checked(cwd)?;
+        let roots = self.roots_for("read").into_values().chain(self.roots_for("write").into_values()).collect::<Vec<_>>();
+        if roots.iter().any(|root| cwd.starts_with(root)) { Ok(()) } else { Err(HostResult::err(HostErrorCode::CapabilityDenied, "cwd outside declared filesystem roots")) }
+    }
+
+    fn secret_ref(&self, key: Option<&str>) -> Result<String, HostResult<Value>> {
+        let Some(key) = key else { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "peerKeyRef is required")); };
+        self.secret_store.get(key).cloned().ok_or_else(|| HostResult::err(HostErrorCode::CapabilityDenied, "secret ref not available to plugin"))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExtismWasmInvokeRuntime {
+    host_overrides: BTreeMap<String, MawWasmHost>,
+}
+
+impl ExtismWasmInvokeRuntime {
+    #[must_use]
+    pub fn with_host(mut self, plugin_name: impl Into<String>, host: MawWasmHost) -> Self { self.host_overrides.insert(plugin_name.into(), host); self }
+}
+
+impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
+    fn invoke_ts(&mut self, _plugin: &LoadedPlugin, _ctx: &InvokeContext) -> InvokeResult { InvokeResult::error("TS plugin runtime is not available in Extism runtime") }
+
+    fn invoke_wasm(&mut self, plugin: &LoadedPlugin, ctx: &InvokeContext, wasm_bytes: &[u8]) -> InvokeResult {
+        let host = self.host_overrides.remove(&plugin.manifest.name).unwrap_or_else(|| MawWasmHost::new(plugin));
+        let manifest = ExtismManifest::new([Wasm::data(wasm_bytes.to_vec())]).with_allowed_hosts(host.caps.scopes_for("net", "https").into_iter());
+        let mut builder = PluginBuilder::new(manifest).with_wasi(false);
+        for name in HOST_FN_NAMES {
+            let fn_name = (*name).to_owned();
+            let data = UserData::new(host.clone());
+            builder = builder.with_function(*name, [ValType::I64], [ValType::I64], data, move |plugin, inputs, outputs, user_data| {
+                extism_host_call_named(plugin, inputs, outputs, &user_data, &fn_name)
+            });
+        }
+        let mut runtime = match builder.build() { Ok(plugin) => plugin, Err(error) => return InvokeResult::error(format!("wasm instantiation failed: {error}")) };
+        let input = invoke_context_json(ctx);
+        match runtime.call::<&str, String>("handle", &input) { Ok(output) => parse_invoke_result_stdout(output.as_bytes()).unwrap_or_else(InvokeResult::error), Err(error) => InvokeResult::error(format!("wasm call failed: {error}")) }
+    }
+}
+
+const HOST_FN_NAMES: &[&str] = &[
+    "maw.exec.run", "maw.exec.spawn", "maw.fs.read", "maw.fs.write", "maw.fs.list", "maw.fs.stat", "maw.http.request", "maw.http.peer_send", "maw.http.peer_wake", "maw.tmux.list_sessions", "maw.tmux.capture", "maw.tmux.send_keys", "maw.tmux.run", "maw.tmux.send_enter", "maw.tmux.tags_read", "maw.tmux.tags_write", "maw.ssh.exec", "maw.ssh.tmux_capture", "maw.ssh.tmux_send_keys",
+];
+
+fn extism_host_call_named(
+    plugin: &mut CurrentPlugin,
+    inputs: &[Val],
+    outputs: &mut [Val],
+    host: &UserData<MawWasmHost>,
+    name: &str,
+) -> Result<(), extism::Error> {
+    let input: String = plugin.memory_get_val(&inputs[0])?;
+    let host = host.get()?;
+    let host = host.lock().map_err(|_| extism::Error::msg("host lock failed"))?;
+    let output = host.handle_json(name, &input);
+    plugin.memory_set_val(&mut outputs[0], output)?;
+    Ok(())
+}
+
+fn parse_args<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, HostResult<Value>> {
+    serde_json::from_str(input).map_err(|error| HostResult::err(HostErrorCode::InvalidArgs, format!("invalid JSON args: {error}")))
+}
+
+fn to_json<T: Serialize>(value: &T) -> String { serde_json::to_string(value).unwrap_or_else(|_| r#"{"ok":false,"error":"serialize failed","code":"io_error"}"#.to_owned()) }
+
+fn status_of<T>(result: &HostResult<T>) -> &'static str { match result { HostResult::Ok { .. } => "ok", HostResult::Err { .. } => "error" } }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExecRunArgs { cmd: String, #[serde(default)] args: Vec<String>, cwd: Option<String>, env: Option<BTreeMap<String, String>>, stdin: Option<String>, timeout_ms: Option<u64>, #[serde(default)] allow_non_zero: bool }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsReadArgs { path: String, encoding: Option<String>, max_bytes: Option<u64> }
+#[derive(Debug, Deserialize)]
+struct FsPathArgs { #[serde(alias = "target")] path: String }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsWriteArgs { path: String, content: String, encoding: Option<String>, mode: Option<String>, mkdirp: Option<bool> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FsListArgs { path: String, recursive: Option<bool>, max_entries: Option<usize>, include_dirs: Option<bool> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpArgs { method: String, url: String, headers: Option<BTreeMap<String, String>>, body: Option<String>, timeout_ms: Option<u64>, follow_redirects: Option<bool> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerSendArgs { peer_url: String, target: String, text: String, inbox: Option<bool>, from: String, peer_key_ref: Option<String>, timestamp: Option<i64> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PeerWakeArgs { peer_url: String, target: String, task: Option<String>, from: String, peer_key_ref: Option<String>, timestamp: Option<i64> }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TmuxCaptureArgs { target: String, lines: Option<u32>, strip_ansi: Option<bool> }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TmuxSendArgs { target: String, keys: Vec<String>, literal: Option<bool>, enter: Option<bool>, allow_destructive: Option<bool>, force: Option<bool> }
+#[derive(Debug, Deserialize)]
+struct TmuxRunArgs { target: String, text: String }
+#[derive(Debug, Deserialize)]
+struct TmuxEnterArgs { target: String, count: Option<u32> }
+#[derive(Debug, Deserialize)]
+struct TmuxTagsWriteArgs { target: String, title: Option<String>, meta: Option<BTreeMap<String, String>> }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SshExecArgs { host: String, cmd: String, #[serde(default)] args: Vec<String>, stdin: Option<String>, timeout_ms: Option<u64> }
+#[derive(Debug, Deserialize)]
+struct SshTmuxCaptureArgs { host: String, target: String, lines: Option<u32> }
+#[derive(Debug, Deserialize)]
+struct SshTmuxSendArgs { host: String, target: String, keys: Vec<String> }
+
+fn executable_basename(cmd: &str) -> String { Path::new(cmd).file_name().and_then(|s| s.to_str()).unwrap_or(cmd).to_owned() }
+fn is_hard_denied_exec(cmd: &str, args: &[String]) -> bool {
+    matches!(executable_basename(cmd).as_str(), "sudo" | "su" | "doas" | "pkexec")
+        || args.iter().any(|arg| matches!(arg.as_str(), "--pty" | "--ffi"))
+}
+fn sanitize_env(
+    env: Option<&BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>, HostResult<Value>> {
+    let mut clean = BTreeMap::new();
+    clean.insert("PATH".to_owned(), "/usr/bin:/bin".to_owned());
+    if let Some(env) = env {
+        for (key, value) in env {
+            let lower = key.to_lowercase();
+            if lower.contains("secret") || lower.contains("token") || lower.contains("peerkey") {
+                return Err(HostResult::err(
+                    HostErrorCode::CapabilityDenied,
+                    "secret-like env keys are denied",
+                ));
+            }
+            if key.starts_with("MAW_") {
+                clean.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    Ok(clean)
+}
+
+fn run_child(mut cmd: Command, stdin: Option<&str>, timeout_ms: u64) -> Result<std::process::Output, HostErrorCode> {
+    let mut child = cmd.spawn().map_err(|_| HostErrorCode::ProcessFailed)?;
+    if let Some(input) = stdin { if let Some(mut pipe) = child.stdin.take() { pipe.write_all(input.as_bytes()).map_err(|_| HostErrorCode::IoError)?; } }
+    let deadline = Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop { match child.try_wait() { Ok(Some(_)) => return child.wait_with_output().map_err(|_| HostErrorCode::IoError), Ok(None) if Instant::now() >= deadline => { let _ = child.kill(); let _ = child.wait(); return Err(HostErrorCode::Timeout); }, Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)), Err(_) => return Err(HostErrorCode::ProcessFailed) } }
+}
+
+fn canonicalize_checked(path: &str) -> Result<PathBuf, HostResult<Value>> { canonicalize_checked_path(Path::new(path)) }
+fn canonicalize_checked_path(path: &Path) -> Result<PathBuf, HostResult<Value>> { std::fs::canonicalize(path).map_err(|error| HostResult::err(if error.kind() == std::io::ErrorKind::NotFound { HostErrorCode::NotFound } else { HostErrorCode::IoError }, format!("canonicalize failed: {error}"))) }
+fn deny_special_path(path: &Path) -> bool { path.starts_with("/proc") || path.starts_with("/dev") || path.starts_with("/sys") || path.starts_with("/root") }
+fn open_nofollow_existing(path: &Path) -> Result<File, HostResult<Value>> {
+    let file = OpenOptions::new().read(true).custom_flags(O_NOFOLLOW_FLAG).open(path).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("open failed: {error}")))?;
+    let meta = file.metadata().map_err(|error| HostResult::err(HostErrorCode::IoError, format!("metadata failed: {error}")))?;
+    if !meta.file_type().is_file() { return Err(HostResult::err(HostErrorCode::CapabilityDenied, "device/special file denied")); }
+    Ok(file)
+}
+fn verify_fd_path(file: &File, expected: &Path) -> Result<(), HostResult<Value>> { let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("fd reverify failed: {error}")))?; if link == expected { Ok(()) } else { Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem race detected")) } }
+fn verify_fd_under_roots(file: &File, roots: &BTreeMap<String, PathBuf>) -> Result<(), HostResult<Value>> { let link = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|error| HostResult::err(HostErrorCode::IoError, format!("fd reverify failed: {error}")))?; if roots.values().any(|root| link.starts_with(root)) { Ok(()) } else { Err(HostResult::err(HostErrorCode::CapabilityDenied, "filesystem race detected")) } }
+fn file_kind(file_type: std::fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        "dir"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "file"
+    }
+}
+
+fn list_dir(path: &Path, recursive: bool, include_dirs: bool, max: usize, out: &mut Vec<Value>) {
+    if out.len() >= max {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max {
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let kind = file_kind(meta.file_type());
+        if include_dirs || kind != "dir" {
+            out.push(json!({
+                "path": entry.path().display().to_string(),
+                "kind": kind,
+                "bytes": meta.len()
+            }));
+        }
+        if recursive && kind == "dir" {
+            list_dir(&entry.path(), true, include_dirs, max, out);
+        }
+    }
+}
+fn redact_headers(headers: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    headers
+        .into_iter()
+        .map(|(key, value)| {
+            let lower = key.to_lowercase();
+            if ["authorization", "token", "secret", "peerkey", "cookie", "api-key", "x-api-key", "bearer"]
+                .iter()
+                .any(|marker| lower.contains(marker))
+            {
+                (key, "[REDACTED]".to_owned())
+            } else {
+                (key, value)
+            }
+        })
+        .collect()
+}
+fn redact(value: &str) -> String {
+    let mut out = value.to_owned();
+    for marker in ["peerKey", "token", "secret", "authorization"] {
+        if out.to_lowercase().contains(&marker.to_lowercase()) {
+            "[REDACTED]".clone_into(&mut out);
+        }
+    }
+    out
+}
+fn is_discord_gateway(url: &Url) -> bool { url.host_str().is_some_and(|host| host.contains("discord") && url.path().contains("gateway")) }
+fn is_private_host(host: &str) -> bool {
+    if host == "localhost" || host.to_lowercase().ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return private_ip(ip);
+    }
+    format!("{host}:80")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| private_ip(addr.ip()))
+}
+
+fn private_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    }
+}
+
+fn tmux_sessions_json(sessions: Vec<maw_tmux::TmuxSession>) -> Vec<Value> {
+    sessions
+        .into_iter()
+        .map(|session| {
+            json!({
+                "name": session.name,
+                "windows": session.windows.into_iter().map(|window| json!({
+                    "index": window.index,
+                    "name": window.name,
+                    "active": window.active,
+                    "cwd": window.cwd,
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect()
+}

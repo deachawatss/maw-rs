@@ -7,8 +7,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+base64 = "0.22"
+extism = "1.30.0"
+maw-tmux = { path = "../maw-tmux" }
+maw-transport = { path = "../maw-transport" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tokio.workspace = true
+url = "2"
+libc = "0.2"
 
 [lints]
 workspace = true

@@ -64,7 +64,7 @@ impl PeerSendResponse {
 /// Concrete reqwest/rustls HTTP adapter for maw federation endpoints.
 #[derive(Clone)]
 pub struct ReqwestHttpTransportIo {
-    client: reqwest::Client,
+    pub(crate) client: reqwest::Client,
     timeout_ms: u64,
 }
 

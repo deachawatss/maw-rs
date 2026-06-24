@@ -200,11 +200,28 @@ fn parse_declared_manifest_file(
     key: &str,
     dir: &Path,
 ) -> Result<Option<String>, String> {
-    let Some(path) = object
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-    else {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let path = if key == "entry" {
+        if let Some(path) = value.as_str().filter(|path| !path.is_empty()) {
+            path
+        } else if let Some(entry) = value.as_object() {
+            let kind = entry.get("kind").and_then(Value::as_str);
+            if kind != Some("wasm") {
+                return Err("plugin.json: entry.kind must be \"wasm\" when entry is an object".to_owned());
+            }
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "plugin.json: entry.path must be a non-empty string".to_owned())?
+        } else {
+            return Err("plugin.json: entry must be a string or wasm entry object".to_owned());
+        }
+    } else if let Some(path) = value.as_str().filter(|path| !path.is_empty()) {
+        path
+    } else {
         return Ok(None);
     };
     let declared_path = dir.join(path);
