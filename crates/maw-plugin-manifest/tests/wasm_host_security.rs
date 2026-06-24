@@ -130,6 +130,38 @@ fn secret_bytes_are_redacted_from_audit_and_headers() {
 }
 
 #[test]
+fn batch3_host_direct_denies_ssrf_undeclared_exec_and_privileged_exec() {
+    let dir = temp("batch3-host-direct");
+
+    let ssrf_host = host(&dir, &["net:http:127.0.0.1"]);
+    let ssrf = call(
+        &ssrf_host,
+        "maw.http.request",
+        &json!({"method": "GET", "url": "http://127.0.0.1:3456/api/identity"}),
+    );
+    assert_eq!(ssrf["ok"], false);
+    assert_eq!(ssrf["code"], "capability_denied");
+
+    let exec_host = host(&dir, &["proc:exec:git", "fs:read:sandbox"]);
+    let undeclared = call(
+        &exec_host,
+        "maw.exec.run",
+        &json!({"cmd": "sh", "args": ["-c", "echo pwned"], "cwd": dir, "allowNonZero": true}),
+    );
+    assert_eq!(undeclared["ok"], false);
+    assert_eq!(undeclared["code"], "capability_denied");
+
+    let privileged_host = host(&dir, &["proc:exec:sudo", "fs:read:sandbox"]);
+    let privileged = call(
+        &privileged_host,
+        "maw.exec.run",
+        &json!({"cmd": "sudo", "args": ["git", "status"], "cwd": dir, "allowNonZero": true}),
+    );
+    assert_eq!(privileged["ok"], false);
+    assert_eq!(privileged["code"], "capability_denied");
+}
+
+#[test]
 fn exec_enforces_capability_and_env_allowlist() {
     let dir = temp("exec");
     let host = host(&dir, &["proc:exec:env", "fs:read:sandbox"]);

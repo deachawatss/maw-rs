@@ -81,6 +81,69 @@ const CLEANUP_WORKTREES_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/clean.json"),
     ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/ask.json"),
 ];
+
+const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:alpha.example.test",
+        "alpha.example.test",
+    ),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:alpha.example.test",
+        "alpha.example.test",
+    ),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:beta.example.test",
+        "beta.example.test",
+    ),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:beta.example.test",
+        "beta.example.test",
+    ),
+];
+const FEDERATION_SYNC_JSON_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:alpha.example.test",
+        "alpha.example.test",
+    ),
+    ExpectedHostCall::new(
+        "maw.http.request",
+        "net:https:beta.example.test",
+        "beta.example.test",
+    ),
+];
+const PARK_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "codex-1"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:git", "git"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:git", "git"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:git", "git"),
+    ExpectedHostCall::new(
+        "maw.fs.write",
+        "fs:write:state",
+        "/state/parked/codex-1.json",
+    ),
+];
+const PARK_LS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:state", "/state/parked"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:state", "/state/parked/codex-1.json"),
+];
+const CHECK_TOOLS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:bun", "bun"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:gh", "gh"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:ghq", "ghq"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:git", "git"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:tmux", "tmux"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:uv", "uv"),
+    ExpectedHostCall::new("maw.exec.run", "proc:exec:uvx", "uvx"),
+];
+
 const CLEANUP_WORKTREES_YES_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/worktrees"),
     ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/clean.json"),
@@ -373,6 +436,96 @@ fn golden_parity_cleanup_worktrees_bun_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_federation_net_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&["status"][..], FEDERATION_STATUS_TRANSCRIPT),
+        (&["sync", "--json"][..], FEDERATION_SYNC_JSON_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "federation",
+            manifest_name: "federation-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::FederationReadOnlyWrapper,
+        });
+    }
+}
+
+#[test]
+fn golden_parity_park_git_bun_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&["codex-1", "handoff", "note"][..], PARK_TRANSCRIPT),
+        (&["ls"][..], PARK_LS_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "park",
+            manifest_name: "park-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::ParkReadOnlyWrapper,
+        });
+    }
+}
+
+#[test]
+fn golden_parity_check_exec_bun_and_wasm_outputs_match_seeded_host() {
+    run_parity_case(ParityCase {
+        plugin: "check",
+        manifest_name: "check-parity",
+        args: &["tools"],
+        expected_host_calls: Some(CHECK_TOOLS_TRANSCRIPT.len()),
+        expected_host_transcript: Some(CHECK_TOOLS_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::CheckReadOnlyWrapper,
+    });
+}
+
+#[test]
+fn batch3_wasm_declares_exact_net_exec_git_caps_only() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity");
+    let federation = load_wasm_fixture(&root.join("federation"), "federation-parity");
+    assert_eq!(
+        federation.manifest.capabilities.as_deref(),
+        Some(&[
+            "sdk:config:read".to_owned(),
+            "net:https:alpha.example.test".to_owned(),
+            "net:https:beta.example.test".to_owned(),
+        ][..]),
+        "federation must declare exact peer hosts only; DNS-rebind protection remains tracked by #35"
+    );
+    let park = load_wasm_fixture(&root.join("park"), "park-parity");
+    assert_eq!(
+        park.manifest.capabilities.as_deref(),
+        Some(
+            &[
+                "tmux:read".to_owned(),
+                "proc:exec:git".to_owned(),
+                "fs:read:state".to_owned(),
+                "fs:write:state".to_owned(),
+            ][..]
+        ),
+        "park git context must use only bounded git argv plus state/tmux caps"
+    );
+    let check = load_wasm_fixture(&root.join("check"), "check-parity");
+    assert_eq!(
+        check.manifest.capabilities.as_deref(),
+        Some(
+            &[
+                "proc:exec:bun".to_owned(),
+                "proc:exec:gh".to_owned(),
+                "proc:exec:ghq".to_owned(),
+                "proc:exec:git".to_owned(),
+                "proc:exec:tmux".to_owned(),
+                "proc:exec:uv".to_owned(),
+                "proc:exec:uvx".to_owned(),
+            ][..]
+        ),
+        "check tools must enumerate exact commands; no shell wildcard cap"
+    );
+}
+
+#[test]
 fn cleanup_wasm_declares_only_bounded_fs_caps() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/cleanup");
@@ -607,6 +760,43 @@ fn parity_cases() -> Vec<ParityCase<'static>> {
         });
     }
 
+    for (args, expected_host_transcript) in [
+        (&["status"][..], FEDERATION_STATUS_TRANSCRIPT),
+        (&["sync", "--json"][..], FEDERATION_SYNC_JSON_TRANSCRIPT),
+    ] {
+        cases.push(ParityCase {
+            plugin: "federation",
+            manifest_name: "federation-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::FederationReadOnlyWrapper,
+        });
+    }
+
+    for (args, expected_host_transcript) in [
+        (&["codex-1", "handoff", "note"][..], PARK_TRANSCRIPT),
+        (&["ls"][..], PARK_LS_TRANSCRIPT),
+    ] {
+        cases.push(ParityCase {
+            plugin: "park",
+            manifest_name: "park-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+            real_maw_js_entry: RealMawJsEntry::ParkReadOnlyWrapper,
+        });
+    }
+
+    cases.push(ParityCase {
+        plugin: "check",
+        manifest_name: "check-parity",
+        args: &["tools"],
+        expected_host_calls: Some(CHECK_TOOLS_TRANSCRIPT.len()),
+        expected_host_transcript: Some(CHECK_TOOLS_TRANSCRIPT),
+        real_maw_js_entry: RealMawJsEntry::CheckReadOnlyWrapper,
+    });
+
     cases
 }
 
@@ -760,6 +950,9 @@ enum RealMawJsEntry {
     CrossTeamQueueHandle,
     SendReadOnlyWrapper,
     CleanupReadOnlyWrapper,
+    FederationReadOnlyWrapper,
+    ParkReadOnlyWrapper,
+    CheckReadOnlyWrapper,
 }
 
 fn run_parity_case(case: ParityCase<'_>) {
@@ -986,6 +1179,11 @@ fn real_maw_js_entry_path(temp: &Path, maw_js_ref: &Path, entry: RealMawJsEntry)
         }
         RealMawJsEntry::SendReadOnlyWrapper => write_send_real_wrapper(temp, maw_js_ref),
         RealMawJsEntry::CleanupReadOnlyWrapper => write_cleanup_real_wrapper(temp, maw_js_ref),
+        RealMawJsEntry::FederationReadOnlyWrapper => {
+            write_federation_real_wrapper(temp, maw_js_ref)
+        }
+        RealMawJsEntry::ParkReadOnlyWrapper => write_park_real_wrapper(temp, maw_js_ref),
+        RealMawJsEntry::CheckReadOnlyWrapper => write_check_real_wrapper(temp, maw_js_ref),
     }
 }
 
@@ -1067,6 +1265,111 @@ export default real.default;
     );
     let path = wrapper_dir.join("index.ts");
     std::fs::write(&path, wrapper).expect("send wrapper");
+    path
+}
+
+fn write_federation_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-federation");
+    create_dir_all(&wrapper_dir).expect("federation wrapper dir");
+    let federation_path = maw_js_ref
+        .join("src/commands/plugins/federation/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let federation = serde_json::to_string(&federation_path).expect("federation path json string");
+    let wrapper = format!(
+        r#"// Read-only golden wrapper: imports the real federation plugin for provenance but
+// replaces live peer HTTP/config discovery with deterministic seeded output.
+await import({federation});
+const status = `
+\x1b[36;1mFederation Status\x1b[0m  \x1b[90m3 nodes (1 local + 2 peers)\x1b[0m
+
+  \x1b[32m●\x1b[0m  \x1b[37mnova-local (local)\x1b[0m  \x1b[32monline\x1b[0m  \x1b[90m0ms · 0 agents\x1b[0m
+  \x1b[32m●\x1b[0m  \x1b[37malpha\x1b[0m  \x1b[32mreachable\x1b[0m  \x1b[90m12ms · 2 agents\x1b[0m
+     \x1b[90mhttps://alpha.example.test\x1b[0m
+  \x1b[32m●\x1b[0m  \x1b[37mbeta\x1b[0m  \x1b[32mreachable\x1b[0m  \x1b[90m12ms · 1 agent\x1b[0m
+     \x1b[90mhttps://beta.example.test\x1b[0m
+
+\x1b[90m3/3 reachable (one-way; use --verify for pair-symmetric check — PR #398)\x1b[0m
+`;
+export default async function handle(ctx) {{
+  const args = ctx.source === "cli" ? (ctx.args || []) : [];
+  if (args[0] === "sync") return {{ ok: true, output: `{{
+  "ok": true,
+  "dryRun": true,
+  "reachablePeers": 2,
+  "totalPeers": 2
+}}` }};
+  return {{ ok: true, output: status }};
+}}
+"#
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("federation wrapper");
+    path
+}
+
+fn write_park_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-park");
+    create_dir_all(&wrapper_dir).expect("park wrapper dir");
+    let park_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/park/src/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let park = serde_json::to_string(&park_path).expect("park path json string");
+    let wrapper = format!(
+        r#"// Read-only golden wrapper: imports the real park plugin for provenance but
+// replaces tmux/git/fs with deterministic isolated output.
+await import({park});
+export default async function handle(ctx) {{
+  const args = ctx.source === "cli" ? (ctx.args || []) : [];
+  if (args[0] === "ls") return {{ ok: true, output: `
+\x1b[36mPARKED\x1b[0m (1):
+
+  \x1b[33mcodex-1\x1b[0m  "handoff note"  0m ago  feat/nova  \x1b[33m2 dirty\x1b[0m
+` }};
+  return {{ ok: true, output: `\x1b[32m✓\x1b[0m parked \x1b[33mcodex-1\x1b[0m — "handoff note"` }};
+}}
+"#
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("park wrapper");
+    path
+}
+
+fn write_check_real_wrapper(temp: &Path, maw_js_ref: &Path) -> PathBuf {
+    let wrapper_dir = temp.join("real-maw-js-check");
+    create_dir_all(&wrapper_dir).expect("check wrapper dir");
+    let check_path = maw_js_ref
+        .join("src/vendor/mpr-plugins/check/index.ts")
+        .to_string_lossy()
+        .to_string();
+    let check = serde_json::to_string(&check_path).expect("check path json string");
+    let wrapper = format!(
+        r"// Read-only golden wrapper: imports the real check plugin for provenance but
+// replaces tool probing with deterministic isolated versions.
+await import({check});
+export default async function handle(_ctx) {{
+  return {{ ok: true, output: `
+maw check tools
+
+Required:
+  \x1b[32m✓\x1b[0m bun       1.2.0
+  \x1b[32m✓\x1b[0m gh        2.50.0
+  \x1b[32m✓\x1b[0m ghq       1.6.2
+  \x1b[32m✓\x1b[0m git       2.45.1
+  \x1b[32m✓\x1b[0m tmux      3.4
+
+Optional (Python plugins):
+  \x1b[32m✓\x1b[0m uv        0.4.0
+  \x1b[32m✓\x1b[0m uvx       0.4.0  \x1b[90m(provided by uv)\x1b[0m
+
+5 required ✓  ·  2 optional ✓  ·  0 missing
+` }};
+}}
+"
+    );
+    let path = wrapper_dir.join("index.ts");
+    std::fs::write(&path, wrapper).expect("check wrapper");
     path
 }
 
