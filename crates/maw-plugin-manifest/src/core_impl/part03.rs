@@ -739,7 +739,7 @@ mod part03_coverage_tests {
 
     #[test]
     fn resolve_dir_path_handles_absolute_relative_and_missing_cwd_fallback() {
-        let _guard = CWD_LOCK.lock().expect("cwd lock");
+        let _guard = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original = std::env::current_dir().expect("cwd");
         let root = std::env::temp_dir().join(format!(
             "maw-rs-resolve-dir-path-{}",

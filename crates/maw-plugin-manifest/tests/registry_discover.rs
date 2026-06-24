@@ -42,7 +42,9 @@ fn semver_satisfies_matches_maw_js_registry_helper_shapes() {
 #[test]
 fn scan_dirs_prefers_explicit_plugins_dir_then_maw_home_then_home() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original_plugins = std::env::var_os("MAW_PLUGINS_DIR");
     let original_maw_home = std::env::var_os("MAW_HOME");
     let original_home = std::env::var_os("HOME");

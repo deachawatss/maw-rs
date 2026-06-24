@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const [wasmPath, metadataPath] = process.argv.slice(2);
 if (!wasmPath || !metadataPath) {
@@ -7,11 +7,14 @@ if (!wasmPath || !metadataPath) {
 }
 const bytes = readFileSync(wasmPath);
 const sha256 = createHash('sha256').update(bytes).digest('hex');
+const existing = existsSync(metadataPath) ? JSON.parse(readFileSync(metadataPath, 'utf8')) : {};
 const metadata = {
   assemblyscript: '0.27.31',
+  export: 'handle',
   extismAsPdk: '1.0.0',
-  wasmSha256: `sha256:${sha256}`,
+  ...(existing.mawJsCommit ? { mawJsCommit: existing.mawJsCommit } : {}),
+  ...(existing.mawJsVersion ? { mawJsVersion: existing.mawJsVersion } : {}),
   wasmBytes: bytes.length,
-  export: 'handle'
+  wasmSha256: `sha256:${sha256}`
 };
 writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`);

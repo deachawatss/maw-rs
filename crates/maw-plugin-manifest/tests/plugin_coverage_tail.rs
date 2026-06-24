@@ -30,7 +30,9 @@ fn optional_manifest_error_tails_cover_direct_parsers() {
 #[test]
 fn relative_manifest_paths_and_symbol_cache_tail_are_exercised() {
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = CWD_LOCK.lock().expect("cwd lock");
+    let _guard = CWD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reset_discover_cache();
     let original = std::env::current_dir().expect("cwd");
     let root = temp_dir("relative-cache");

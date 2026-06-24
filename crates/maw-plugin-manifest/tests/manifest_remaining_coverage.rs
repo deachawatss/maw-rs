@@ -32,7 +32,9 @@ fn optional_manifest_sections_cover_absent_and_missing_member_edges() {
 #[test]
 fn relative_manifest_dir_resolves_against_current_dir() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original = std::env::current_dir().expect("cwd");
     let root = make_temp_dir("relative-dir");
     let plugin_dir = root.join("plugins/relative-plugin");

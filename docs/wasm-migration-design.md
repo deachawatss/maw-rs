@@ -334,6 +334,14 @@ Harness stages:
 | Compare | Compare normalized result envelope and raw output bytes. | `stdout`, `stderr`, `InvokeResult.output`, and error text byte-match unless fixture marks an approved intentional delta. |
 | Native integration | For selected plugins, run against real maw-rs native services in dry-run/temp roots. | No live fleet mutation; fmt/clippy/test still green. |
 
+Golden outputs are captured once and committed. Tests must not invoke the live `maw-js` checkout; they read `golden.<argscase>.json` from `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/<plugin>/`. To refresh after intentionally bumping the maw-js reference, run this on a maintainer machine where the real maw-js clone exists:
+
+```bash
+MAW_JS_REF_DIR=/path/to/Soul-Brews-Studio/maw-js scripts/refresh-wasm-parity-goldens.sh
+```
+
+The refresh command runs the ignored Rust fixture-generation test in an isolated temporary `MAW_HOME`, writes each committed golden, and stamps `metadata.json` with `mawJsVersion` and `mawJsCommit` so every captured output is traceable to the source checkout. CI does not need `MAW_JS_REF_DIR`; setting it to a nonexistent path must not affect normal parity tests.
+
 ### Host fake contract
 
 Fake host-fns must be deterministic and record calls:
