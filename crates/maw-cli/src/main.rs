@@ -6,9 +6,14 @@ use std::{
 
 use maw_tmux::{resolve_tmux_attach_session, TmuxAttachSessionResolution, TmuxClient};
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    std::process::exit(main_code(&argv));
+    std::process::exit(main_code_async(&argv).await);
+}
+
+async fn main_code_async(argv: &[String]) -> i32 {
+    std::future::ready(main_code(argv)).await
 }
 
 fn main_code(argv: &[String]) -> i32 {

@@ -1,4 +1,4 @@
-use maw_cli::{run_cli, CliOutput};
+use maw_cli::{dispatcher_status, run_cli, CliOutput, DispatchKind};
 
 fn run(args: &[&str]) -> CliOutput {
     run_cli(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
@@ -55,10 +55,9 @@ fn top_level_help_shows_only_live_ported_surfaces() {
         .stdout
         .contains("pair-api <generate|probe|accept|status>"));
 
-    assert_usage_error(
-        &["not-a-real-command"],
-        "unknown command: not-a-real-command",
-        "usage: maw-rs <command> [args]",
+    assert_eq!(
+        dispatcher_status("not-a-real-command"),
+        DispatchKind::BunFallback
     );
 }
 

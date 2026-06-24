@@ -96,67 +96,178 @@ pub struct CliOutput {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchKind {
+    Native,
+    BunFallback,
+}
+
+type NativeHandler = fn(&[String]) -> CliOutput;
+
+#[derive(Clone, Copy)]
+struct DispatcherEntry {
+    command: &'static str,
+    handler: NativeHandler,
+}
+
+enum DispatchTarget {
+    Native(NativeHandler),
+    BunFallback,
+}
+
+const DISPATCHER_ENTRIES: &[DispatcherEntry] = &[
+    DispatcherEntry { command: "--help", handler: usage_handler },
+    DispatcherEntry { command: "-h", handler: usage_handler },
+    DispatcherEntry { command: "help", handler: usage_handler },
+    DispatcherEntry { command: "auth", handler: run_auth_plan },
+    DispatcherEntry { command: "auto-wake", handler: run_auto_wake_plan },
+    DispatcherEntry { command: "hub", handler: run_hub_plan },
+    DispatcherEntry { command: "xdg", handler: run_xdg_plan },
+    DispatcherEntry { command: "plugin", handler: run_plugin_plan },
+    DispatcherEntry { command: "plugin-scaffold", handler: run_plugin_scaffold_plan },
+    DispatcherEntry { command: "plugin-manifest", handler: run_plugin_manifest_plan },
+    DispatcherEntry { command: "bind-host", handler: run_bind_host_plan },
+    DispatcherEntry { command: "attach", handler: run_attach_plan },
+    DispatcherEntry { command: "a", handler: run_attach_plan },
+    DispatcherEntry { command: "bring", handler: run_bring_plan },
+    DispatcherEntry { command: "b", handler: run_bring_plan },
+    DispatcherEntry { command: "ls", handler: run_ls_plan },
+    DispatcherEntry { command: "run", handler: run_run_command },
+    DispatcherEntry { command: "send-enter", handler: run_send_enter_command },
+    DispatcherEntry { command: "feed", handler: run_feed_plan },
+    DispatcherEntry { command: "fuzzy", handler: run_fuzzy_plan },
+    DispatcherEntry { command: "resolve", handler: run_resolve_plan },
+    DispatcherEntry { command: "identity", handler: run_identity_plan },
+    DispatcherEntry { command: "normalize", handler: run_normalize_plan },
+    DispatcherEntry { command: "calver", handler: run_calver_plan },
+    DispatcherEntry { command: "worktree-window", handler: run_worktree_window_plan },
+    DispatcherEntry { command: "route", handler: run_route_plan },
+    DispatcherEntry { command: "discover", handler: run_discover_plan },
+    DispatcherEntry { command: "federation-identity", handler: run_federation_identity_plan },
+    DispatcherEntry { command: "federation-health", handler: run_federation_health_plan },
+    DispatcherEntry { command: "federation-sync", handler: run_federation_sync_plan },
+    DispatcherEntry { command: "auto-pair-proof", handler: run_auto_pair_proof_plan },
+    DispatcherEntry { command: "consent-constants", handler: run_consent_constants_plan },
+    DispatcherEntry { command: "consent-pin", handler: run_consent_pin_plan },
+    DispatcherEntry { command: "consent-request", handler: run_consent_request_plan },
+    DispatcherEntry { command: "consent-approval", handler: run_consent_approval_plan },
+    DispatcherEntry { command: "consent-store", handler: run_consent_store_plan },
+    DispatcherEntry { command: "consent-expiry", handler: run_consent_expiry_plan },
+    DispatcherEntry { command: "consent-cleanup", handler: run_consent_cleanup_plan },
+    DispatcherEntry { command: "consent-trust-revoke", handler: run_consent_trust_revoke_plan },
+    DispatcherEntry { command: "consent-trust-check", handler: run_consent_trust_check_plan },
+    DispatcherEntry { command: "consent-pending-read", handler: run_consent_pending_read_plan },
+    DispatcherEntry { command: "consent-pending-status", handler: run_consent_pending_status_plan },
+    DispatcherEntry { command: "recent-hello", handler: run_recent_hello_plan },
+    DispatcherEntry { command: "pair-code", handler: run_pair_code_plan },
+    DispatcherEntry { command: "pair-code-store", handler: run_pair_code_store_plan },
+    DispatcherEntry { command: "pair-api", handler: run_pair_api_plan },
+    DispatcherEntry { command: "pair-api-auto", handler: run_pair_api_auto_plan },
+    DispatcherEntry { command: "peer-sources", handler: run_peer_sources_plan },
+    DispatcherEntry { command: "peer-probe", handler: run_peer_probe_plan },
+    DispatcherEntry { command: "policy", handler: run_policy_plan },
+    DispatcherEntry { command: "plugin-policy", handler: run_policy_plan },
+    DispatcherEntry { command: "split-policy", handler: run_split_policy_plan },
+    DispatcherEntry { command: "transport", handler: run_transport_plan },
+];
+
+#[must_use]
+pub fn dispatcher_status(command: &str) -> DispatchKind {
+    match dispatcher_target(command) {
+        DispatchTarget::Native(_) => DispatchKind::Native,
+        DispatchTarget::BunFallback => DispatchKind::BunFallback,
+    }
+}
+
+#[must_use]
+pub fn native_dispatch_commands() -> Vec<&'static str> {
+    DISPATCHER_ENTRIES.iter().map(|entry| entry.command).collect()
+}
+
+fn dispatcher_target(command: &str) -> DispatchTarget {
+    DISPATCHER_ENTRIES
+        .iter()
+        .find(|entry| entry.command == command)
+        .map_or(DispatchTarget::BunFallback, |entry| {
+            DispatchTarget::Native(entry.handler)
+        })
+}
+
+fn usage_handler(_: &[String]) -> CliOutput {
+    usage_ok()
+}
+
 /// Run the current maw-rs CLI parser/renderer over argv without process exit.
 #[must_use]
 pub fn run_cli(argv: &[String]) -> CliOutput {
     let Some(command) = argv.first().map(String::as_str) else {
         return usage_ok();
     };
-    match command {
-        "--help" | "-h" | "help" => usage_ok(),
-        "auth" => run_auth_plan(&argv[1..]),
-        "auto-wake" => run_auto_wake_plan(&argv[1..]),
-        "hub" => run_hub_plan(&argv[1..]),
-        "xdg" => run_xdg_plan(&argv[1..]),
-        "plugin" => run_plugin_plan(&argv[1..]),
-        "plugin-scaffold" => run_plugin_scaffold_plan(&argv[1..]),
-        "plugin-manifest" => run_plugin_manifest_plan(&argv[1..]),
-        "bind-host" => run_bind_host_plan(&argv[1..]),
-        "attach" | "a" => run_attach_plan(&argv[1..]),
-        "bring" | "b" => run_bring_plan(&argv[1..]),
-        "ls" => run_ls_plan(&argv[1..]),
-        "run" => run_run_command(&argv[1..]),
-        "send-enter" => run_send_enter_command(&argv[1..]),
-        "feed" => run_feed_plan(&argv[1..]),
-        "fuzzy" => run_fuzzy_plan(&argv[1..]),
-        "resolve" => run_resolve_plan(&argv[1..]),
-        "identity" => run_identity_plan(&argv[1..]),
-        "normalize" => run_normalize_plan(&argv[1..]),
-        "calver" => run_calver_plan(&argv[1..]),
-        "worktree-window" => run_worktree_window_plan(&argv[1..]),
-        "route" => run_route_plan(&argv[1..]),
-        "discover" => run_discover_plan(&argv[1..]),
-        "federation-identity" => run_federation_identity_plan(&argv[1..]),
-        "federation-health" => run_federation_health_plan(&argv[1..]),
-        "federation-sync" => run_federation_sync_plan(&argv[1..]),
-        "auto-pair-proof" => run_auto_pair_proof_plan(&argv[1..]),
-        "consent-constants" => run_consent_constants_plan(&argv[1..]),
-        "consent-pin" => run_consent_pin_plan(&argv[1..]),
-        "consent-request" => run_consent_request_plan(&argv[1..]),
-        "consent-approval" => run_consent_approval_plan(&argv[1..]),
-        "consent-store" => run_consent_store_plan(&argv[1..]),
-        "consent-expiry" => run_consent_expiry_plan(&argv[1..]),
-        "consent-cleanup" => run_consent_cleanup_plan(&argv[1..]),
-        "consent-trust-revoke" => run_consent_trust_revoke_plan(&argv[1..]),
-        "consent-trust-check" => run_consent_trust_check_plan(&argv[1..]),
-        "consent-pending-read" => run_consent_pending_read_plan(&argv[1..]),
-        "consent-pending-status" => run_consent_pending_status_plan(&argv[1..]),
-        "recent-hello" => run_recent_hello_plan(&argv[1..]),
-        "pair-code" => run_pair_code_plan(&argv[1..]),
-        "pair-code-store" => run_pair_code_store_plan(&argv[1..]),
-        "pair-api" => run_pair_api_plan(&argv[1..]),
-        "pair-api-auto" => run_pair_api_auto_plan(&argv[1..]),
-        "peer-sources" => run_peer_sources_plan(&argv[1..]),
-        "peer-probe" => run_peer_probe_plan(&argv[1..]),
-        "policy" | "plugin-policy" => run_policy_plan(&argv[1..]),
-        "split-policy" => run_split_policy_plan(&argv[1..]),
-        "transport" => run_transport_plan(&argv[1..]),
-        _ => dispatch_cli_plugin(argv).unwrap_or_else(|| CliOutput {
-            code: 2,
-            stdout: String::new(),
-            stderr: format!("unknown command: {command}\n{}", usage_text()),
+
+    match dispatcher_target(command) {
+        DispatchTarget::Native(handler) => handler(&argv[1..]),
+        DispatchTarget::BunFallback => dispatch_cli_plugin(argv).unwrap_or_else(|| {
+            if has_partial_plugin_command_match(argv) {
+                unknown_command(command)
+            } else {
+                dispatch_bun_fallback(argv, command)
+            }
         }),
     }
+}
+
+
+fn dispatch_bun_fallback(argv: &[String], command: &str) -> CliOutput {
+    if std::env::var_os("MAW_FROM_RS").is_some() {
+        return unknown_command(command);
+    }
+
+    match std::process::Command::new("maw")
+        .args(argv)
+        .env("MAW_FROM_RS", "1")
+        .output()
+    {
+        Ok(out) => CliOutput {
+            code: out.status.code().unwrap_or(1),
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        },
+        Err(error) => CliOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: format!("failed to run maw fallback: {error}\n"),
+        },
+    }
+}
+
+fn unknown_command(command: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("unknown command: {command}\n{}", usage_text()),
+    }
+}
+
+fn has_partial_plugin_command_match(argv: &[String]) -> bool {
+    let options = DiscoverPackagesOptions {
+        runtime_version: "1.0.0".to_owned(),
+        ..DiscoverPackagesOptions::default()
+    };
+    discover_packages(&options)
+        .plugins
+        .iter()
+        .filter(|plugin| !plugin.disabled)
+        .any(|plugin| plugin_cli_command_starts_with(plugin, argv))
+}
+
+fn plugin_cli_command_starts_with(plugin: &LoadedPlugin, argv: &[String]) -> bool {
+    let Some(command) = plugin.manifest.cli.as_ref().map(|cli| cli.command.as_str()) else {
+        return false;
+    };
+    let Some(first_command_part) = command.split_whitespace().next() else {
+        return false;
+    };
+    argv.first().is_some_and(|arg| arg == first_command_part)
 }
 
 fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {

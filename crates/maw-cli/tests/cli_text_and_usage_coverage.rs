@@ -1,4 +1,4 @@
-use maw_cli::{run_cli, CliOutput};
+use maw_cli::{dispatcher_status, run_cli, CliOutput, DispatchKind};
 
 fn run(args: &[&str]) -> CliOutput {
     run_cli(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
@@ -35,7 +35,10 @@ fn top_level_help_and_unknown_command_branches_are_covered() {
     assert_ok_text(&["help"], "usage: maw-rs");
     assert_ok_text(&["--help"], "usage: maw-rs");
     assert_ok_text(&["-h"], "usage: maw-rs");
-    assert_usage_error(&["definitely-not-a-command"], "unknown command");
+    assert_eq!(
+        dispatcher_status("definitely-not-a-command"),
+        DispatchKind::BunFallback
+    );
 }
 
 #[test]
