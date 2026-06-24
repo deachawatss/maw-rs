@@ -192,7 +192,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "feed", handler: Handler::Sync(run_feed_plan) },
     DispatcherEntry { command: "hey", handler: Handler::Async(run_hey_async) },
     DispatcherEntry { command: "send", handler: Handler::Async(run_send_async) },
-    DispatcherEntry { command: "wake", handler: Handler::Async(run_wake_async) },
     DispatcherEntry { command: "serve", handler: Handler::Async(run_serve_async) },
     DispatcherEntry { command: "health", handler: Handler::Async(run_health_async) },
     DispatcherEntry { command: "messages", handler: Handler::Async(run_messages_async) },
