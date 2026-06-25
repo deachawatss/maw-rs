@@ -454,22 +454,6 @@ fn config_set_secret_key_is_denied_by_host_even_without_guest_censor() {
         assert_eq!(denied["ok"], false, "{key}");
         assert_eq!(denied["code"], "capability_denied", "{key}");
     }
-
-    let nested_secret = call(
-        &host,
-        "maw.config.set",
-        &json!({"key": "env", "value": {"token": "must-not-write"}}),
-    );
-    assert_eq!(nested_secret["ok"], false);
-    assert_eq!(nested_secret["code"], "capability_denied");
-
-    let nested_password = call(
-        &host,
-        "maw.config.set",
-        &json!({"key": "db", "value": {"password": "must-not-write"}}),
-    );
-    assert_eq!(nested_password["ok"], false);
-    assert_eq!(nested_password["code"], "capability_denied");
     assert!(
         !dir.join("maw.config.json").exists(),
         "denied secret writes must not create config"
@@ -477,29 +461,51 @@ fn config_set_secret_key_is_denied_by_host_even_without_guest_censor() {
 }
 
 #[test]
-fn config_set_benign_author_key_is_not_secret_denied() {
-    let dir = temp("config-author-allow");
+fn config_set_unknown_non_secret_key_is_denied_by_default() {
+    let dir = temp("config-unknown-deny");
     let host = host(&dir, &["sdk:config:write"]).with_fs_root("config", &dir);
 
     for (key, value) in [
-        ("author", "Ada"),
-        ("authorName", "Ada Lovelace"),
-        ("editor", "vim"),
+        ("author", json!("Ada")),
+        ("authorName", json!("Ada Lovelace")),
+        ("editor", json!("vim")),
+        ("display.theme", json!("dark")),
     ] {
-        let allowed = call(
+        let denied = call(
             &host,
             "maw.config.set",
             &json!({"key": key, "value": value}),
         );
-        assert_eq!(allowed["ok"], true, "{key}: {allowed}");
+        assert_eq!(denied["ok"], false, "{key}: {denied}");
+        assert_eq!(denied["code"], "capability_denied", "{key}");
     }
+    assert!(
+        !dir.join("maw.config.json").exists(),
+        "deny-by-default writes must not create config"
+    );
+}
 
-    let stored: Value =
-        serde_json::from_str(&read_to_string(dir.join("maw.config.json")).expect("written config"))
-            .expect("config json");
-    assert_eq!(stored["author"], "Ada");
-    assert_eq!(stored["authorName"], "Ada Lovelace");
-    assert_eq!(stored["editor"], "vim");
+#[test]
+fn config_set_allowlisted_key_still_denies_nested_secret_values() {
+    let dir = temp("config-nested-secret-deny");
+    let host = host(&dir, &["sdk:config:write"]).with_fs_root("config", &dir);
+
+    for value in [
+        json!({"token": "must-not-write"}),
+        json!({"auth": {"password": "nope"}}),
+    ] {
+        let denied = call(
+            &host,
+            "maw.config.set",
+            &json!({"key": "node", "value": value}),
+        );
+        assert_eq!(denied["ok"], false, "{denied}");
+        assert_eq!(denied["code"], "capability_denied");
+    }
+    assert!(
+        !dir.join("maw.config.json").exists(),
+        "nested secret writes must not create config"
+    );
 }
 
 #[test]

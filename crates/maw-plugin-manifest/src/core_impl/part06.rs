@@ -537,12 +537,12 @@ impl MawWasmHost {
         if args.key.trim().is_empty() {
             return HostResult::err(HostErrorCode::InvalidArgs, "config key is required");
         }
-        if is_secret_config_key_path(&args.key)
+        if !is_plugin_writable_config_key_path(&args.key)
             || value_contains_secret_config_key_path(&args.key, &args.value)
         {
             return HostResult::err(
                 HostErrorCode::CapabilityDenied,
-                "secret-like config keys are host-gated and cannot be written from WASM",
+                "config key is not in the host allowlist for WASM writes",
             );
         }
         let path = match self.config_file_path() {
@@ -2606,7 +2606,35 @@ fn set_json_path(
     object.insert((*last).to_owned(), value);
     Ok(())
 }
-fn is_secret_config_key_path(key: &str) -> bool {
+const PLUGIN_WRITABLE_CONFIG_KEYS: &[&str] = &[
+    // Keep this host-side allowlist intentionally small: sandboxed plugins may
+    // only write config keys that are already parity-backed as safe user-facing
+    // `maw config set` targets. Everything else is denied by default.
+    "node",
+    "port",
+];
+
+fn is_plugin_writable_config_key_path(key: &str) -> bool {
+    normalized_config_key_path(key).is_some_and(|key| {
+        PLUGIN_WRITABLE_CONFIG_KEYS
+            .iter()
+            .any(|allowed| key == *allowed)
+    })
+}
+
+fn normalized_config_key_path(key: &str) -> Option<String> {
+    let parts = key
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("."))
+    }
+}
+
+fn is_secret_like_config_key_path(key: &str) -> bool {
     let lower = key.to_lowercase();
     [
         "password",
@@ -2648,7 +2676,7 @@ fn value_contains_secret_config_key_path(prefix: &str, value: &Value) -> bool {
             } else {
                 format!("{prefix}.{key}")
             };
-            is_secret_config_key_path(&path) || value_contains_secret_config_key_path(&path, value)
+            is_secret_like_config_key_path(&path) || value_contains_secret_config_key_path(&path, value)
         }),
         Value::Array(values) => values
             .iter()
