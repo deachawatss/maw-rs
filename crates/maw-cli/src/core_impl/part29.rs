@@ -726,6 +726,7 @@ async fn localserver_request(request: LocalserverCliRequest) -> Result<maw_trans
         body: request.body,
         timeout_ms: Some(5_000),
         follow_redirects: false,
+        pinned_addr: None,
     }).await
 }
 

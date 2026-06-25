@@ -326,6 +326,7 @@ fn pair_http_json(method: &str, url: &str, body: Option<String>) -> Result<maw_t
         body,
         timeout_ms: Some(5_000),
         follow_redirects: false,
+        pinned_addr: None,
     }))
 }
 

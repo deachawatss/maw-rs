@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 #[cfg(target_os = "macos")]
 use std::ffi::OsString;
 #[cfg(target_os = "macos")]
@@ -209,6 +209,7 @@ pub struct MawWasmHost {
     audit: Arc<Mutex<Vec<AuditEvent>>>,
     http_timeout_ms: u64,
     localserver_url: Option<String>,
+    http_resolver_overrides: BTreeMap<String, Vec<IpAddr>>,
 }
 
 impl MawWasmHost {
@@ -225,6 +226,7 @@ impl MawWasmHost {
             audit: Arc::new(Mutex::new(Vec::new())),
             http_timeout_ms: 10_000,
             localserver_url: None,
+            http_resolver_overrides: BTreeMap::new(),
         }
     }
 
@@ -243,6 +245,17 @@ impl MawWasmHost {
     #[must_use]
     pub fn with_localserver_url(mut self, url: impl Into<String>) -> Self {
         self.localserver_url = Some(url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_http_resolver_override(
+        mut self,
+        host: impl Into<String>,
+        addrs: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        self.http_resolver_overrides
+            .insert(host.into(), addrs.into_iter().collect());
         self
     }
 
@@ -827,7 +840,11 @@ impl MawWasmHost {
             Some(host) => host.to_owned(),
             None => return HostResult::err(HostErrorCode::InvalidArgs, "url host is required"),
         };
-        if is_private_host(&host) && !self.caps.contains("net", "private", Some(&host)) {
+        let pinned_addr = match self.resolve_http_pinned_addr(&url, &host) {
+            Ok(addr) => addr,
+            Err(err) => return err,
+        };
+        if private_ip(pinned_addr.ip()) && !self.caps.contains("net", "private", Some(&host)) {
             return HostResult::err(
                 HostErrorCode::CapabilityDenied,
                 "private network access denied",
@@ -849,6 +866,7 @@ impl MawWasmHost {
                     .min(MAX_HTTP_TIMEOUT_MS),
             ),
             follow_redirects: args.follow_redirects.unwrap_or(false),
+            pinned_addr: Some(pinned_addr),
         };
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -875,6 +893,52 @@ impl MawWasmHost {
         };
         self.audit("maw.http.request", &cap, &host, status_of(&result), start);
         result
+    }
+
+
+    fn resolve_http_pinned_addr(&self, url: &Url, host: &str) -> Result<SocketAddr, HostResult<Value>> {
+        let Some(port) = url.port_or_known_default() else {
+            return Err(HostResult::err(
+                HostErrorCode::InvalidArgs,
+                "url port is required",
+            ));
+        };
+        if private_host_name(host) && !self.caps.contains("net", "private", Some(host)) {
+            return Err(HostResult::err(
+                HostErrorCode::CapabilityDenied,
+                "private network access denied",
+            ));
+        }
+        let addrs = match self.resolve_http_host_once(host, port) {
+            Ok(addrs) => addrs,
+            Err(error) => return Err(HostResult::err(HostErrorCode::NetworkError, error)),
+        };
+        if addrs.iter().any(|addr| private_ip(*addr))
+            && !self.caps.contains("net", "private", Some(host))
+        {
+            return Err(HostResult::err(
+                HostErrorCode::CapabilityDenied,
+                "private network access denied",
+            ));
+        }
+        addrs
+            .first()
+            .map(|ip| SocketAddr::new(*ip, port))
+            .ok_or_else(|| HostResult::err(HostErrorCode::NetworkError, "host resolved no addresses"))
+    }
+
+    fn resolve_http_host_once(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        if let Some(addrs) = self.http_resolver_overrides.get(host) {
+            return Ok(addrs.clone());
+        }
+        let literal_host = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = literal_host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        (host, port)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect::<Vec<_>>())
+            .map_err(|error| format!("failed to resolve {host}: {error}"))
     }
 
 
@@ -908,6 +972,7 @@ impl MawWasmHost {
                     .min(MAX_HTTP_TIMEOUT_MS),
             ),
             follow_redirects: false,
+            pinned_addr: None,
         };
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2746,24 +2811,21 @@ fn is_discord_gateway(url: &Url) -> bool {
     url.host_str()
         .is_some_and(|host| host.contains("discord") && url.path().contains("gateway"))
 }
-fn is_private_host(host: &str) -> bool {
-    if host == "localhost" || host.to_lowercase().ends_with(".local") {
-        return true;
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return private_ip(ip);
-    }
-    format!("{host}:80")
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
-        .is_some_and(|addr| private_ip(addr.ip()))
+fn private_host_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host.to_lowercase().ends_with(".local")
 }
 
 fn private_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
-        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+        IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_unspecified()
+        }
     }
 }
 

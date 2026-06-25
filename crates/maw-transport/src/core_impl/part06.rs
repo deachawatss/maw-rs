@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 /// Generic bounded HTTP request used by the WASM host-function layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +9,7 @@ pub struct HttpRequest {
     pub body: Option<String>,
     pub timeout_ms: Option<u64>,
     pub follow_redirects: bool,
+    pub pinned_addr: Option<SocketAddr>,
 }
 
 /// Generic HTTP response returned to WASM plugins.
@@ -30,14 +31,20 @@ impl ReqwestHttpTransportIo {
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|error| format!("invalid HTTP method: {error}"))?;
         let timeout = request.timeout_ms.unwrap_or(self.timeout_ms());
-        let client = if request.follow_redirects {
-            self.client.clone()
-        } else {
-            reqwest::Client::builder()
-                .timeout(std::time::Duration::from_millis(timeout))
-                .redirect(reqwest::redirect::Policy::none())
+        let client = if request.pinned_addr.is_some() || !request.follow_redirects {
+            let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_millis(timeout));
+            if !request.follow_redirects {
+                builder = builder.redirect(reqwest::redirect::Policy::none());
+            }
+            if let Some(addr) = request.pinned_addr {
+                let host = url_host(&request.url)?;
+                builder = builder.resolve(&host, addr);
+            }
+            builder
                 .build()
                 .map_err(|error| format!("http client build failed: {error}"))?
+        } else {
+            self.client.clone()
         };
         let mut builder = client
             .request(method, &request.url)
@@ -75,4 +82,12 @@ impl ReqwestHttpTransportIo {
             url,
         })
     }
+}
+
+fn url_host(url: &str) -> Result<String, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| format!("invalid url: {error}"))?;
+    parsed
+        .host_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "url host is required".to_owned())
 }
