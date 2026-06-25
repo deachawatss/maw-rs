@@ -1,9 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, Path as AxumPath, Query, State,
-    },
+    extract::{ConnectInfo, Path as AxumPath, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
@@ -17,7 +14,6 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast;
 
 const DEFAULT_SERVE_PORT: u16 = 31745;
 const DEFAULT_SERVE_BIND: &str = "127.0.0.1";
@@ -27,7 +23,6 @@ const NON_LOOPBACK_TEST_PEER: SocketAddr =
 
 struct ServeState {
     cached_pubkey: Option<String>,
-    ws_tx: broadcast::Sender<RelayFrame>,
     workspaces: Mutex<WorkspaceStore>,
     requests: Mutex<RequestReplyStore>,
     #[cfg(test)]
@@ -84,7 +79,6 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
     };
     let app = serve_router(ServeState {
         cached_pubkey: args.cached_pubkey.or_else(load_inbound_peer_pubkey),
-        ws_tx: new_ws_relay(),
         workspaces: Mutex::new(WorkspaceStore::default()),
         requests: Mutex::new(RequestReplyStore::default()),
         #[cfg(test)]
@@ -202,10 +196,9 @@ fn serve_router(state: ServeState) -> Router {
     let state = Arc::new(state);
     let router = Router::new();
     let router = crate::serve_core::servecore_mount_core_routes(router);
+    let router = crate::serve_core::servecore_mount_ws_routes(router);
     let router = crate::serve_core::modules::servecore_mount_modules(router, &[]);
     let router = router
-        .route("/ws", get(ws_relay))
-        .route("/ws/pty", get(ws_relay))
         .route("/api/send", post(api_send))
         .route("/api/feed", get(api_feed_get).post(api_feed_post))
         .route("/api/sessions", get(api_sessions))
@@ -234,55 +227,6 @@ fn serve_router(state: ServeState) -> Router {
     crate::serve_core::servecore_apply_pipeline(router)
         .fallback(api_not_found)
         .with_state(state)
-}
-
-async fn ws_relay(State(state): State<Arc<ServeState>>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_relay(socket, state.ws_tx.clone()))
-}
-
-async fn handle_ws_relay(mut socket: WebSocket, tx: broadcast::Sender<RelayFrame>) {
-    let mut rx = tx.subscribe();
-    loop {
-        tokio::select! {
-            inbound = socket.recv() => {
-                match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        let _ = tx.send(RelayFrame::Text(text));
-                    }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        let _ = tx.send(RelayFrame::Binary(bytes));
-                    }
-                    Some(Ok(Message::Ping(bytes))) => {
-                        if socket.send(Message::Pong(bytes)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        let _ = socket.send(Message::Close(frame)).await;
-                        break;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Err(_)) | None => break,
-                }
-            }
-            outbound = rx.recv() => {
-                match outbound {
-                    Ok(RelayFrame::Text(text)) => {
-                        if socket.send(Message::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(RelayFrame::Binary(bytes)) => {
-                        if socket.send(Message::Binary(bytes)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
 }
 
 async fn api_send(
@@ -779,11 +723,6 @@ fn with_workspace_store<T>(state: &ServeState, op: impl FnOnce(&mut WorkspaceSto
     op(&mut guard)
 }
 
-fn new_ws_relay() -> broadcast::Sender<RelayFrame> {
-    let (tx, _rx) = broadcast::channel(128);
-    tx
-}
-
 fn random_hex(bytes: usize) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut data = vec![0_u8; bytes];
@@ -852,12 +791,6 @@ fn find_first_pubkey(value: &Value) -> Option<String> {
 struct SendBody {
     target: Option<String>,
     text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-enum RelayFrame {
-    Text(String),
-    Binary(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -1075,7 +1008,6 @@ mod serve_tests {
         let addr = listener.local_addr().expect("local addr");
         let app = serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
-            ws_tx: new_ws_relay(),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
@@ -1207,7 +1139,6 @@ mod serve_tests {
             }]);
         let app = serve_router(ServeState {
             cached_pubkey: Some(KEY.to_owned()),
-            ws_tx: new_ws_relay(),
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),

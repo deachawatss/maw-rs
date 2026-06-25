@@ -16,6 +16,7 @@ pub mod triggers;
 pub mod triggers_mutate;
 pub mod views;
 pub mod worktrees;
+pub mod ws;
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
 use axum::Router;
 
@@ -58,6 +59,7 @@ where
         triggers_mutate::triggersmutate_registration(),
         views::views_registration(),
         worktrees::worktrees_registration(),
+        ws::ws_registration(),
     ]
 }
 
