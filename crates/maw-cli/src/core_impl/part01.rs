@@ -167,7 +167,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "--help", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "-h", handler: Handler::Sync(usage_handler) },
     DispatcherEntry { command: "help", handler: Handler::Sync(usage_handler) },
-    DispatcherEntry { command: "activity", handler: Handler::Sync(run_activity_command) },
     DispatcherEntry { command: "auto-wake", handler: Handler::Sync(run_auto_wake_plan) },
     DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },
     DispatcherEntry { command: "xdg", handler: Handler::Sync(run_xdg_plan) },

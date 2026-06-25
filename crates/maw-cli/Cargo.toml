@@ -33,6 +33,7 @@ maw-transport = { path = "../maw-transport" }
 maw-worktree = { path = "../maw-worktree" }
 maw-xdg = { path = "../maw-xdg" }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+futures-util = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,7 +43,6 @@ tower-http = { version = "0.6", features = ["fs"] }
 tokio.workspace = true
 
 [dev-dependencies]
-futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
