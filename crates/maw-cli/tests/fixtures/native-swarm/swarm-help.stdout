@@ -1,0 +1,9 @@
+usage: maw swarm [agents...] [--tiled] [--count N] [--parent-session-id <id>] [--session-id <id>]
+
+  maw swarm                         3 claude agents (default)
+  maw swarm claude codex opencode    one of each
+  maw swarm codex codex codex        3 codex agents
+  maw swarm --count 5                5 claude agents
+  maw swarm --tiled                  equal layout
+
+Supported: claude, codex, opencode, aider, or any command
