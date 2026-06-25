@@ -213,7 +213,6 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/requests", get(api_requests))
         .route("/api/request", post(api_request_create))
         .route("/api/reply/:correlation_id", post(api_reply))
-        .route("/api/identity", get(api_identity))
         .route("/api/workspace/create", post(api_workspace_create))
         .route("/api/workspace/join", post(api_workspace_join))
         .route(
@@ -383,11 +382,6 @@ async fn api_reply(
         ReplyResult::NotFound => (StatusCode::NOT_FOUND, Json(json!({"error": "request not found"}))).into_response(),
         ReplyResult::AlreadyReplied => Json(json!({"error": "already replied", "correlationId": correlation_id})).into_response(),
     })
-}
-
-async fn api_identity() -> impl IntoResponse {
-    let config = load_hey_config();
-    Json(json!({"ok": true, "node": config.node, "oracle": config.oracle, "agents": []}))
 }
 
 async fn api_workspace_create(
@@ -1113,7 +1107,7 @@ mod serve_tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
         }
         let public = client
-            .get(format!("http://{addr}/api/identity"))
+            .get(format!("http://{addr}/api/agents"))
             .send()
             .await
             .expect("public request");

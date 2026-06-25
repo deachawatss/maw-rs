@@ -42,8 +42,8 @@ fn serveidentity_command(root: &Path) -> Command {
 }
 
 #[test]
-fn serveidentity_native_reports_stub_without_touching_identity_material() {
-    let root = serveidentity_temp("stub");
+fn serveidentity_native_reports_mounted_route_without_touching_identity_material() {
+    let root = serveidentity_temp("mounted");
     serveidentity_write(
         &root.join("xdg-config/maw/maw.config.json"),
         r#"{"node":"white","oracle":"gm-bo","port":4567,"agents":{"nova":"local"}}"#,
@@ -60,7 +60,9 @@ fn serveidentity_native_reports_stub_without_touching_identity_material() {
     let stdout = String::from_utf8(output.stdout).expect("stdout");
     let stderr = String::from_utf8(output.stderr).expect("stderr");
     assert!(stdout.contains("registers GET /api/identity"), "{stdout}");
-    assert!(stderr.contains("TODO(#89)"), "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(!stdout.contains("stub"), "{stdout}");
+    assert!(!stdout.contains("TODO(#89)"), "{stdout}");
     assert_eq!(dispatcher_status("serve-identity"), DispatchKind::Native);
     assert!(!root.join("xdg-state/maw/peer-key").exists());
     assert!(!root.join("home/.maw/state/peer-key").exists());

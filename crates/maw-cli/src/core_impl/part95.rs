@@ -59,7 +59,7 @@ fn serveidentity_command(argv: &[String]) -> CliOutput {
         Ok(()) => CliOutput {
             code: 0,
             stdout: "serve-identity registers GET /api/identity from the maw serve lifecycle hook\n".to_owned(),
-            stderr: serveidentity_stub_warning(),
+            stderr: String::new(),
         },
         Err(message) => serveidentity_usage_error(&message),
     }
@@ -75,13 +75,45 @@ fn serveidentity_parse_args(argv: &[String]) -> Result<(), String> {
     }
 }
 
-fn serveidentity_stub_warning() -> String {
-    "warn: serve-identity native HTTP route registration is stubbed pending native serve-daemon design; TODO(#89)\n".to_owned()
-}
-
 fn serveidentity_usage_error(message: &str) -> CliOutput {
     let prefix = if message.is_empty() { String::new() } else { format!("{message}\n") };
     CliOutput { code: 2, stdout: String::new(), stderr: format!("{prefix}{SERVEIDENTITY_USAGE}\n") }
+}
+
+
+pub(crate) fn serveidentity_http_payload_read_only() -> Result<serde_json::Value, String> {
+    let config = serveidentity_load_config();
+    let deps = serveidentity_default_read_only_deps()?;
+    Ok(serveidentity_identity_payload(&config, &deps))
+}
+
+fn serveidentity_default_read_only_deps() -> Result<ServeidentityDeps, String> {
+    Ok(ServeidentityDeps {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        uptime_seconds: current_epoch_seconds().saturating_sub(serveidentity_process_started_at()),
+        clock_utc: serveidentity_now_utc(),
+        peer_key: serveidentity_read_peer_key()?,
+        env_node_user: std::env::var("MAW_NODE_USER").ok(),
+        env_service_user: std::env::var("MAW_SERVICE_USER").ok(),
+        process_user: std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()),
+    })
+}
+
+fn serveidentity_read_peer_key() -> Result<String, String> {
+    if let Ok(value) = std::env::var("MAW_PEER_KEY") {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    let env = real_xdg_env();
+    let path = maw_state_path(&env, &["peer-key"]);
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read peer-key for identity: {error}"))?;
+    let key = raw.trim().to_owned();
+    if key.is_empty() {
+        return Err("failed to read peer-key for identity: empty peer-key".to_owned());
+    }
+    Ok(key)
 }
 
 #[allow(dead_code)]
@@ -174,19 +206,6 @@ fn serveidentity_load_config() -> ServeidentityConfig {
         service_user: serveidentity_json_string(&value, "serviceUser"),
         agents: serveidentity_json_agents(&value),
     }
-}
-
-#[allow(dead_code)]
-fn serveidentity_default_deps() -> Result<ServeidentityDeps, String> {
-    Ok(ServeidentityDeps {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        uptime_seconds: current_epoch_seconds().saturating_sub(serveidentity_process_started_at()),
-        clock_utc: serveidentity_now_utc(),
-        peer_key: load_peer_key()?,
-        env_node_user: std::env::var("MAW_NODE_USER").ok(),
-        env_service_user: std::env::var("MAW_SERVICE_USER").ok(),
-        process_user: std::env::var("USER").ok().or_else(|| std::env::var("LOGNAME").ok()),
-    })
 }
 
 #[allow(dead_code)]
@@ -287,11 +306,11 @@ mod serveidentity_tests {
     }
 
     #[test]
-    fn serveidentity_command_is_stubbed_until_daemon_design_exists() {
+    fn serveidentity_command_reports_mounted_identity_route_without_stub_warning() {
         let output = serveidentity_command(&[]);
         assert_eq!(output.code, 0);
         assert!(output.stdout.contains("registers GET /api/identity"));
-        assert!(output.stderr.contains("TODO(#89)"));
+        assert!(output.stderr.is_empty());
     }
 
     #[test]
@@ -336,6 +355,39 @@ mod serveidentity_tests {
         let resolved = serveidentity_resolve_node(&config, &serveidentity_deps());
         assert_eq!(resolved.node, "white");
         assert_eq!(resolved.user, None);
+    }
+
+    #[test]
+    fn serveidentity_http_provider_reads_peer_key_without_creating_one() {
+        let _guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_home = EnvVarRestore::capture("HOME");
+        let _restore_maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _restore_maw_state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _restore_maw_config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _restore_peer = EnvVarRestore::capture("MAW_PEER_KEY");
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-serveidentity-{}",
+            current_epoch_seconds()
+        ));
+        let state = root.join("state");
+        let config = root.join("config");
+        std::fs::create_dir_all(&state).expect("state");
+        std::fs::create_dir_all(&config).expect("config");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("MAW_STATE_DIR", &state);
+        std::env::set_var("MAW_CONFIG_DIR", &config);
+        std::env::remove_var("MAW_HOME");
+        std::env::remove_var("MAW_PEER_KEY");
+
+        let missing = serveidentity_http_payload_read_only().expect_err("missing key");
+        assert!(missing.contains("failed to read peer-key"));
+        assert!(!state.join("peer-key").exists());
+
+        std::fs::write(state.join("peer-key"), "pub-from-file\n").expect("peer-key");
+        let payload = serveidentity_http_payload_read_only().expect("payload");
+        assert_eq!(payload["pubkey"], "pub-from-file");
     }
 
     #[test]
