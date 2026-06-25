@@ -9,6 +9,7 @@
 //! 5. Never mount after `servecore_apply_pipeline`; all module routers must pass through default-deny.
 
 pub mod agents;
+pub mod triggers;
 
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
 use axum::Router;
@@ -44,7 +45,10 @@ fn servecore_module_registry<S>() -> Vec<ServecoreModuleRegistration<S>>
 where
     S: Clone + Send + Sync + 'static,
 {
-    vec![agents::agents_registration()]
+    vec![
+        agents::agents_registration(),
+        triggers::triggers_registration(),
+    ]
 }
 
 #[cfg(test)]
