@@ -171,7 +171,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "auto-wake", handler: Handler::Sync(run_auto_wake_plan) },
     DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },
     DispatcherEntry { command: "xdg", handler: Handler::Sync(run_xdg_plan) },
-    DispatcherEntry { command: "plugin", handler: Handler::Sync(run_plugin_plan) },
     DispatcherEntry { command: "plugin-scaffold", handler: Handler::Sync(run_plugin_scaffold_plan) },
     DispatcherEntry { command: "plugin-manifest", handler: Handler::Sync(run_plugin_manifest_plan) },
     DispatcherEntry { command: "bind-host", handler: Handler::Sync(run_bind_host_plan) },
