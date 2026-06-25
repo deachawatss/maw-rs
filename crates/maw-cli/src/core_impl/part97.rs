@@ -29,6 +29,20 @@ struct PairAcceptPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct PairGenerateLive {
+    code_pretty: String,
+    status_polled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PairAcceptLive {
+    remote_node: String,
+    remote_url: String,
+    token_received: bool,
+    peers_written: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PairConfig {
     node: String,
     port: u16,
@@ -36,6 +50,8 @@ struct PairConfig {
 
 trait PairHost {
     fn pair_config(&mut self) -> PairConfig;
+    fn pair_generate_live(&mut self, plan: &PairGeneratePlan) -> Result<PairGenerateLive, String>;
+    fn pair_accept_live(&mut self, plan: &PairAcceptPlan, config: &PairConfig) -> Result<PairAcceptLive, String>;
 }
 
 struct PairSystemHost;
@@ -47,6 +63,14 @@ impl PairHost for PairSystemHost {
             node: config.node.unwrap_or_else(|| "local".to_owned()),
             port: 3456,
         }
+    }
+
+    fn pair_generate_live(&mut self, plan: &PairGeneratePlan) -> Result<PairGenerateLive, String> {
+        pair_system_generate_live(plan)
+    }
+
+    fn pair_accept_live(&mut self, plan: &PairAcceptPlan, config: &PairConfig) -> Result<PairAcceptLive, String> {
+        pair_system_accept_live(plan, config)
     }
 }
 
@@ -66,8 +90,15 @@ fn pair_run(argv: &[String], host: &mut impl PairHost) -> Result<String, String>
     pair_validate_argv(argv)?;
     match pair_parse(argv, host)? {
         PairAction::Help => Ok(pair_help()),
-        PairAction::Generate(plan) => Ok(pair_render_generate(&plan)),
-        PairAction::Accept(plan) => Ok(pair_render_accept(&plan, &host.pair_config())),
+        PairAction::Generate(plan) => {
+            let live = host.pair_generate_live(&plan)?;
+            Ok(pair_render_generate(&plan, &live))
+        }
+        PairAction::Accept(plan) => {
+            let config = host.pair_config();
+            let live = host.pair_accept_live(&plan, &config)?;
+            Ok(pair_render_accept(&plan, &config, &live))
+        }
     }
 }
 
@@ -229,26 +260,121 @@ fn pair_positional_summary(argv: &[String]) -> String {
     argv.iter().filter(|arg| !arg.starts_with("--")).cloned().collect::<Vec<_>>().join(" ")
 }
 
-fn pair_render_generate(plan: &PairGeneratePlan) -> String {
+fn pair_render_generate(plan: &PairGeneratePlan, live: &PairGenerateLive) -> String {
     let ttl_ms = plan.expires_sec * 1000;
     format!(
-        "🤝 pair generate plan (build-only)\n   local server: {}\n   request: POST {}/api/pair/generate {{\"ttlMs\":{ttl_ms}}}\n   waits for explicit remote accept; no auto-approve surface is exposed\n   TODO(secret): runtime code minting/status polling remains delegated to maw serve; native pair does not generate/store/echo tokens yet.\n",
-        plan.local_url, plan.local_url
+        "🤝 pair generate live\n   local server: {}\n   code: {}\n   ttlMs: {ttl_ms}\n   status poll: {}\n   waits for explicit remote accept; no auto-approve surface is exposed\n   token: <redacted>\n",
+        plan.local_url,
+        live.code_pretty,
+        if live.status_polled { "ok" } else { "skipped" }
     )
 }
 
-fn pair_render_accept(plan: &PairAcceptPlan, config: &PairConfig) -> String {
+fn pair_render_accept(plan: &PairAcceptPlan, config: &PairConfig, live: &PairAcceptLive) -> String {
     let warning = pair_plain_http_warning(&plan.remote_url);
     let local_url = format!("http://localhost:{}", config.port);
     format!(
-        "🤝 pair accept plan (build-only)\n   remote: {}/api/pair/{}\n   code: {}\n   body: {{\"node\":{},\"url\":{}}}\n{}   human consent required; no auto-approve surface is exposed\n   TODO(secret): handshake POST, federation token receipt, and peers.json write are intentionally stubbed for Bigboy+TK gate.\n",
+        "🤝 pair accept live\n   remote: {}/api/pair/{}\n   code: {}\n   body: {{\"node\":{},\"url\":{}}}\n{}   peer: {} {}\n   federation token: {}\n   peers.json: {}\n   human consent required; no auto-approve surface is exposed\n",
         plan.remote_url,
         plan.code_normalized,
         pair_pretty_code(&plan.code_normalized),
         json_string(&config.node),
         json_string(&local_url),
-        warning
+        warning,
+        live.remote_node,
+        live.remote_url,
+        if live.token_received { "received (redacted)" } else { "missing" },
+        if live.peers_written { "atomic write ok" } else { "not written" }
     )
+}
+
+fn pair_system_generate_live(plan: &PairGeneratePlan) -> Result<PairGenerateLive, String> {
+    let body = serde_json::json!({ "ttlMs": plan.expires_sec.saturating_mul(1_000) }).to_string();
+    let response = pair_http_json("POST", &format!("{}/api/pair/generate", plan.local_url), Some(body))?;
+    if !(200..300).contains(&response.status) { return Err(format!("pair generate failed: HTTP {}", response.status)); }
+    let value = pair_parse_json(&response.body, "pair generate")?;
+    let code = pair_json_string(&value, "code").ok_or_else(|| "pair generate: missing code".to_owned())?;
+    let normalized = pair_normalize_code(&code);
+    if !pair_is_valid_code(&normalized) { return Err("pair generate: invalid code returned".to_owned()); }
+    let status_url = format!("{}/api/pair/status/{}", plan.local_url, normalized);
+    let status_polled = pair_http_json("GET", &status_url, None).is_ok();
+    Ok(PairGenerateLive { code_pretty: pair_pretty_code(&normalized), status_polled })
+}
+
+fn pair_system_accept_live(plan: &PairAcceptPlan, config: &PairConfig) -> Result<PairAcceptLive, String> {
+    let local_url = format!("http://localhost:{}", config.port);
+    let body = serde_json::json!({ "node": config.node, "url": local_url }).to_string();
+    let url = format!("{}/api/pair/{}", plan.remote_url, plan.code_normalized);
+    let response = pair_http_json("POST", &url, Some(body))?;
+    if !(200..300).contains(&response.status) { return Err(format!("pair accept failed: HTTP {}", response.status)); }
+    let value = pair_parse_json(&response.body, "pair accept")?;
+    let remote_node = pair_json_string(&value, "node").ok_or_else(|| "pair accept: missing node".to_owned())?;
+    let remote_url = pair_json_string(&value, "url").ok_or_else(|| "pair accept: missing url".to_owned())?;
+    let token_received = pair_json_string(&value, "federationToken").is_some();
+    pair_validate_peer_identity(&remote_node, &remote_url)?;
+    pair_write_peer(&remote_node, &remote_url)?;
+    Ok(PairAcceptLive { remote_node, remote_url, token_received, peers_written: true })
+}
+
+fn pair_http_json(method: &str, url: &str, body: Option<String>) -> Result<maw_transport::HttpResponse, String> {
+    let io = ReqwestHttpTransportIo::new(5_000)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("pair http runtime failed: {error}"))?;
+    runtime.block_on(io.request(&TransportHttpRequest {
+        method: method.to_owned(),
+        url: url.to_owned(),
+        headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+        body,
+        timeout_ms: Some(5_000),
+        follow_redirects: false,
+    }))
+}
+
+fn pair_parse_json(raw: &str, label: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(raw).map_err(|error| format!("{label}: invalid json: {error}"))
+}
+
+fn pair_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(serde_json::Value::as_str).filter(|value| !value.is_empty()).map(ToOwned::to_owned)
+}
+
+fn pair_validate_peer_identity(node: &str, url: &str) -> Result<(), String> {
+    if let Some(message) = maw_peer::validate_peer_alias(node) { return Err(message); }
+    if let Some(message) = maw_peer::validate_peer_url(url) { return Err(message); }
+    Ok(())
+}
+
+fn pair_write_peer(node: &str, url: &str) -> Result<(), String> {
+    let env = pair_peer_store_env();
+    pair_write_peer_to_env(&env, node, url)
+}
+
+fn pair_write_peer_to_env(env: &maw_peer::PeerStoreEnv, node: &str, url: &str) -> Result<(), String> {
+    let now = now_iso_utc();
+    maw_peer::mutate_peer_store(env, |store| {
+        store.peers.insert(node.to_owned(), maw_peer::PeerRecord {
+            url: url.to_owned(),
+            node: Some(node.to_owned()),
+            added_at: now.clone(),
+            last_seen: Some(now.clone()),
+            last_error: None,
+            nickname: None,
+            pubkey: None,
+            pubkey_first_seen: None,
+            identity: Some(maw_peer::PeerIdentity { oracle: "mawjs".to_owned(), node: node.to_owned() }),
+            one_way: Some(false),
+            last_symmetric_check: Some(now.clone()),
+        });
+    }).map_err(|error| format!("pair peers.json write failed: {error}"))?;
+    Ok(())
+}
+
+fn pair_peer_store_env() -> maw_peer::PeerStoreEnv {
+    let home = std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
+    let vars = ["PEERS_FILE", "MAW_HOME", "MAW_XDG", "XDG_STATE_HOME"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.to_owned(), value)))
+        .collect::<Vec<_>>();
+    maw_peer::PeerStoreEnv::with_vars(home, vars)
 }
 
 fn pair_plain_http_warning(url: &str) -> String {
@@ -263,7 +389,7 @@ fn pair_help() -> String {
         "",
         "example: B: `maw pair generate` → prints W4K-7F3; A: `maw pair http://b:5002 W4K-7F3`",
         "human consent is required; no auto approval or token-writing surface is exposed.",
-        "build-only native port: token minting/handshake/storage are stubbed pending Bigboy+TK secret gate.",
+        "live native pair: generate mints via serve, accept handshakes and atomically updates peers.json.",
     ].join("\n") + "\n"
 }
 
@@ -274,10 +400,27 @@ mod pair_tests {
     struct PairFakeHost;
 
     impl PairHost for PairFakeHost {
-        fn pair_config(&mut self) -> PairConfig { PairConfig { node: "fake-node".to_owned(), port: 5002 } }
+        fn pair_config(&mut self) -> PairConfig {
+            PairConfig { node: "fake-node".to_owned(), port: 5002 }
+        }
+
+        fn pair_generate_live(&mut self, _plan: &PairGeneratePlan) -> Result<PairGenerateLive, String> {
+            Ok(PairGenerateLive { code_pretty: "W4K-7F3".to_owned(), status_polled: true })
+        }
+
+        fn pair_accept_live(&mut self, _plan: &PairAcceptPlan, _config: &PairConfig) -> Result<PairAcceptLive, String> {
+            Ok(PairAcceptLive {
+                remote_node: "peer-node".to_owned(),
+                remote_url: "https://peer.example".to_owned(),
+                token_received: true,
+                peers_written: true,
+            })
+        }
     }
 
-    fn pair_args(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
+    fn pair_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
 
     fn pair_output(values: &[&str]) -> CliOutput {
         let mut host = PairFakeHost;
@@ -292,24 +435,26 @@ mod pair_tests {
     }
 
     #[test]
-    fn pair_generate_is_plan_only_and_does_not_echo_fake_token() {
+    fn pair_generate_is_live_and_does_not_echo_fake_token() {
         let output = pair_output(&["generate", "--expires", "60", "--at", "http://localhost:5002", "--token", "fake-test-token"]);
         assert_eq!(output.code, 0, "{}", output.stderr);
-        assert!(output.stdout.contains("pair generate plan"));
-        assert!(output.stdout.contains("ttlMs\":60000"));
-        assert!(output.stdout.contains("TODO(secret)"));
+        assert!(output.stdout.contains("pair generate live"));
+        assert!(output.stdout.contains("ttlMs: 60000"));
+        assert!(output.stdout.contains("status poll: ok"));
+        assert!(output.stdout.contains("token: <redacted>"));
         assert!(!output.stdout.contains("fake-test-token"));
         assert!(!output.stderr.contains("fake-test-token"));
     }
 
     #[test]
-    fn pair_accept_url_code_is_plan_only_and_redacts_flow() {
+    fn pair_accept_url_code_is_live_and_redacts_flow() {
         let output = pair_output(&["http://peer.example:5002", "W4K-7F3"]);
         assert_eq!(output.code, 0, "{}", output.stderr);
-        assert!(output.stdout.contains("pair accept plan"));
+        assert!(output.stdout.contains("pair accept live"));
         assert!(output.stdout.contains("W4K7F3"));
         assert!(output.stdout.contains("fake-node"));
         assert!(output.stdout.contains("plain HTTP"));
+        assert!(output.stdout.contains("federation token: received (redacted)"));
     }
 
     #[test]
@@ -345,6 +490,26 @@ mod pair_tests {
         assert!(pair_output(&["generate", "--expires", "4"]).stderr.contains("5..3600"));
         assert!(pair_output(&["generate", "--at", "ftp://peer"]).stderr.contains("must be http"));
         assert!(pair_output(&["https://peer", "BAD000"]).stderr.contains("invalid code shape"));
+    }
+
+
+    #[test]
+    fn pair_write_peer_uses_atomic_peer_store_path() {
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-pair-live-{}",
+            std::process::id()
+        ));
+        let peers = root.join("state").join("peers.json");
+        let env = maw_peer::PeerStoreEnv::with_vars(
+            root.clone(),
+            [("PEERS_FILE", peers.to_string_lossy().to_string())],
+        );
+        pair_write_peer_to_env(&env, "peer-node", "https://peer.example").expect("write peer");
+        let raw = std::fs::read_to_string(&peers).expect("read peers");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(value["peers"]["peer-node"]["url"], "https://peer.example");
+        assert!(!peers.with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

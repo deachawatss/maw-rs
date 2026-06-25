@@ -13,6 +13,7 @@ pub mod agents;
 pub mod debug;
 pub mod federation;
 pub mod identity;
+pub mod pair;
 pub mod triggers;
 pub mod triggers_mutate;
 pub mod views;
@@ -57,6 +58,7 @@ where
         debug::debug_registration(),
         federation::federation_registration(),
         identity::identity_registration(),
+        pair::pair_registration(),
         triggers::triggers_registration(),
         triggers_mutate::triggersmutate_registration(),
         views::views_registration(),
