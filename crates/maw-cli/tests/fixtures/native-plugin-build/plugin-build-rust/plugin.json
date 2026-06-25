@@ -1,0 +1,10 @@
+{
+  "name": "route-probe",
+  "version": "0.1.0",
+  "sdk": "^1.0.0",
+  "wasm": "./target/wasm32-unknown-unknown/release/route_probe.wasm",
+  "cli": {
+    "command": "route-probe",
+    "help": "Invoke route-probe"
+  }
+}
