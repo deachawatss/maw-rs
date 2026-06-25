@@ -87,6 +87,21 @@ struct ChannelAccessConfig {
     pending: serde_json::Value,
 }
 
+
+#[derive(Debug, Clone)]
+struct ChannelMigrateArgs {
+    targets: Vec<String>,
+    dry_run: bool,
+    remove_global: bool,
+}
+
+#[derive(Debug, Default)]
+struct ChannelMigrateCounts {
+    migrated: usize,
+    skipped: usize,
+    failed: usize,
+}
+
 fn channel_run_command(argv: &[String]) -> CliOutput {
     match channel_run(argv) {
         Ok(stdout) | Err((0, stdout)) => CliOutput { code: 0, stdout, stderr: String::new() },
@@ -104,7 +119,7 @@ fn channel_run(argv: &[String]) -> Result<String, (i32, String)> {
         Some("add") => channel_add(&argv[1..]),
         Some("rm" | "remove") => channel_rm(&argv[1..]),
         Some("setup") => channel_setup(&argv[1..]),
-        Some("migrate") => Err((1, format!("channel: subcommand '{}' is not part of this native slice", sub.unwrap_or_default()))),
+        Some("migrate") => channel_migrate(&argv[1..]),
         Some(_) => Ok(channel_short_usage()),
     }
 }
@@ -315,6 +330,128 @@ fn channel_validate_repo_path(value: &str) -> Result<std::path::PathBuf, (i32, S
     }
 }
 
+
+
+fn channel_migrate(input: &[String]) -> Result<String, (i32, String)> {
+    use std::fmt::Write as _;
+
+    let migrate_args = channel_parse_migrate(input)?;
+    let stems = if migrate_args.targets.is_empty() {
+        channel_list_all_configs().into_iter().map(|(oracle, _)| oracle).collect::<Vec<_>>()
+    } else {
+        migrate_args.targets.clone()
+    };
+    if stems.is_empty() { return Ok("  no oracles with global channel config to migrate\n".to_owned()); }
+
+    let mut counts = ChannelMigrateCounts::default();
+    let mut stdout = String::new();
+    for stem in stems {
+        channel_migrate_one(&stem, &migrate_args, &mut counts, &mut stdout)?;
+    }
+    let _ = writeln!(stdout, "\n  {} migrated, {} skipped, {} failed", counts.migrated, counts.skipped, counts.failed);
+    if counts.migrated > 0 && !migrate_args.remove_global && !migrate_args.dry_run {
+        stdout.push_str("  tip: re-run with --remove-global to delete the global config copies.\n");
+    }
+    Ok(stdout)
+}
+
+fn channel_parse_migrate(argv: &[String]) -> Result<ChannelMigrateArgs, (i32, String)> {
+    let mut to_repo = false;
+    let mut dry_run = false;
+    let mut remove_global = false;
+    let mut targets = Vec::new();
+    for arg in argv {
+        match arg.as_str() {
+            "--to-repo" => to_repo = true,
+            "--dry-run" => dry_run = true,
+            "--remove-global" => remove_global = true,
+            "--" => return Err((2, "channel: -- separator is not supported".to_owned())),
+            value if value.starts_with('-') => return Err((2, format!("channel migrate: unknown flag {value}"))),
+            value => targets.push(channel_validate_name("oracle", value)?),
+        }
+    }
+    if !to_repo { return Err((1, channel_migrate_usage())); }
+    Ok(ChannelMigrateArgs { targets, dry_run, remove_global })
+}
+
+fn channel_migrate_usage() -> String {
+    "usage: maw channel migrate --to-repo [oracle...] [--dry-run] [--remove-global]\n  copies global ~/.claude/channels/<oracle>/config.json into\n  <repo>/.claude/channel.json so config travels with the repo (#1195).\n\n  no [oracle...] args = migrate every oracle with global config.\n  --dry-run            = show what would happen, no writes.\n  --remove-global      = delete the global config after a successful copy.".to_owned()
+}
+
+fn channel_migrate_one(stem: &str, args: &ChannelMigrateArgs, counts: &mut ChannelMigrateCounts, stdout: &mut String) -> Result<(), (i32, String)> {
+    use std::fmt::Write as _;
+
+    let Some(global) = channel_load_oracle_config(stem) else {
+        let _ = writeln!(stdout, "  \x1b[90m·\x1b[0m {stem}: no global config — skip");
+        counts.skipped += 1;
+        return Ok(());
+    };
+    let Some(repo_path) = channel_resolve_repo_for_stem(stem) else {
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {stem}: no local repo (tried ghq for '{stem}' and '-oracle' variants) — skip");
+        counts.failed += 1;
+        return Ok(());
+    };
+    let repo_config = channel_repo_config_path(&repo_path);
+    if channel_load_config_at(&repo_config).is_some() {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m {stem}: {}/.claude/channel.json already exists — skip (delete it first)", repo_path.display());
+        counts.skipped += 1;
+        return Ok(());
+    }
+    if args.dry_run {
+        let _ = writeln!(stdout, "  \x1b[36m·\x1b[0m DRY-RUN {stem}: would write {}/.claude/channel.json ({} plugin(s))", repo_path.display(), global.plugins.len());
+        counts.migrated += 1;
+        return Ok(());
+    }
+
+    channel_save_config_at(&repo_config, &global)?;
+    channel_save_repo_gitignore(&repo_path)?;
+    let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {stem}: → {}/.claude/channel.json", repo_path.display());
+    if args.remove_global { channel_remove_global_after_copy(stem, stdout)?; }
+    counts.migrated += 1;
+    Ok(())
+}
+
+fn channel_resolve_repo_for_stem(stem: &str) -> Option<std::path::PathBuf> {
+    let candidates = channel_repo_candidates(stem);
+    if let Some(root) = std::env::var_os("MAW_RS_CHANNEL_FAKE_GHQ_ROOT") {
+        let root = std::path::PathBuf::from(root);
+        return candidates.into_iter().map(|candidate| root.join(candidate)).find(|path| path.exists());
+    }
+    let output = std::process::Command::new("ghq").arg("list").arg("--full-path").output().ok()?;
+    if !output.status.success() { return None; }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    candidates.into_iter().find_map(|candidate| channel_match_repo_listing(&listing, &candidate))
+}
+
+fn channel_repo_candidates(stem: &str) -> Vec<String> {
+    let alternate = stem.strip_suffix("-oracle").map_or_else(|| format!("{stem}-oracle"), str::to_owned);
+    vec![stem.to_owned(), alternate]
+}
+
+fn channel_match_repo_listing(listing: &str, candidate: &str) -> Option<std::path::PathBuf> {
+    let suffix = format!("/{candidate}");
+    listing.lines().map(str::trim).filter(|line| !line.is_empty()).find_map(|line| {
+        if line.ends_with(&suffix) || line.ends_with(candidate) { Some(std::path::PathBuf::from(line)) } else { None }
+    })
+}
+
+fn channel_remove_global_after_copy(stem: &str, stdout: &mut String) -> Result<(), (i32, String)> {
+    use std::fmt::Write as _;
+
+    let config_path = channel_oracle_config_path(stem);
+    channel_archive_existing_config(&config_path)?;
+    match std::fs::remove_file(&config_path) {
+        Ok(()) => {
+            let dir = channel_state_dir(stem);
+            let _ = std::fs::remove_dir(&dir);
+            stdout.push_str("    \x1b[90m✓ removed global config\x1b[0m\n");
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "    \x1b[33m⚠ failed to remove global: {error}\x1b[0m");
+        }
+    }
+    Ok(())
+}
 
 fn channel_setup(input: &[String]) -> Result<String, (i32, String)> {
     let setup_args = channel_parse_setup(input)?;

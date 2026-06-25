@@ -73,6 +73,45 @@ fn channel_install_official_plugins(root: &Path) {
     }
 }
 
+fn channel_seed_global_config(root: &Path, oracle: &str, plugin: &str) -> PathBuf {
+    let dir = root.join("home/.claude/channels").join(oracle);
+    fs::create_dir_all(&dir).expect("channel dir");
+    fs::write(dir.join("state.txt"), "keep-state").expect("state");
+    fs::write(
+        dir.join("access.json"),
+        r#"{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["111111111111111111"],
+  "groups": {},
+  "pending": {}
+}
+"#,
+    )
+    .expect("access");
+    fs::write(
+        dir.join("config.json"),
+        format!(
+            r#"{{
+  "plugins": [
+    {{
+      "id": "plugin:{plugin}@claude-plugins-official"
+    }}
+  ],
+  "token_source": "pass:{plugin}/{oracle}-token"
+}}
+"#
+        ),
+    )
+    .expect("config");
+    dir
+}
+
+fn channel_seed_fake_repo(root: &Path, name: &str) -> PathBuf {
+    let repo = root.join("repo/ghq").join(name);
+    fs::create_dir_all(&repo).expect("fake repo");
+    repo
+}
+
 fn channel_command(root: &Path, cwd: &Path, args: &[&str]) -> Output {
     fs::create_dir_all(root.join("maw-home")).expect("maw home");
     fs::create_dir_all(root.join("maw-plugins")).expect("maw plugins");
@@ -505,6 +544,191 @@ fn channel_setup_secret_and_snowflake_guards_fail_before_io() {
 }
 
 #[test]
+fn channel_migrate_missing_to_repo_matches_usage_golden() {
+    let root = channel_temp_dir("migrate-usage");
+    let repo = channel_empty_repo(&root);
+    let output = channel_command(&root, &repo, &["channel", "migrate"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stderr).expect("stderr"),
+        include_str!("fixtures/native-channel/channel-migrate-usage.stderr")
+    );
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+}
+
+#[test]
+fn channel_migrate_dry_run_all_is_zero_write_even_with_remove_global() {
+    let root = channel_temp_dir("migrate-dry-run");
+    let cwd = channel_empty_repo(&root);
+    let state = channel_seed_global_config(&root, "hermes-discord", "discord");
+    let repo = channel_seed_fake_repo(&root, "hermes-discord");
+    let before = fs::read_to_string(state.join("config.json")).expect("before config");
+
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &[
+            "channel",
+            "migrate",
+            "--to-repo",
+            "--dry-run",
+            "--remove-global",
+        ],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-dry-run.stdout"),
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("config.json")).expect("after config"),
+        before
+    );
+    assert!(!state.join("archive").exists(), "dry-run must not archive");
+    assert!(
+        !repo.join(".claude/channel.json").exists(),
+        "dry-run must not copy"
+    );
+}
+
+#[test]
+fn channel_migrate_one_copies_repo_config_and_prints_tip_without_delete() {
+    let root = channel_temp_dir("migrate-one");
+    let cwd = channel_empty_repo(&root);
+    let state = channel_seed_global_config(&root, "hermes-discord", "discord");
+    let repo = channel_seed_fake_repo(&root, "hermes-discord");
+
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &["channel", "migrate", "--to-repo", "hermes-discord"],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-one.stdout"),
+    );
+    assert!(state.join("config.json").exists());
+    assert!(repo.join(".claude/channel.json").exists());
+    assert!(fs::read_to_string(repo.join(".gitignore"))
+        .expect("gitignore")
+        .contains(".claude/.env"));
+}
+
+#[test]
+fn channel_migrate_remove_global_archives_before_delete_and_preserves_state_files() {
+    let root = channel_temp_dir("migrate-remove-global");
+    let cwd = channel_empty_repo(&root);
+    let state = channel_seed_global_config(&root, "hermes-discord", "discord");
+    let repo = channel_seed_fake_repo(&root, "hermes-discord");
+
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &[
+            "channel",
+            "migrate",
+            "--to-repo",
+            "hermes-discord",
+            "--remove-global",
+        ],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-remove-global.stdout"),
+    );
+    assert!(
+        repo.join(".claude/channel.json").exists(),
+        "copy succeeded first"
+    );
+    assert!(
+        !state.join("config.json").exists(),
+        "global config removed after copy"
+    );
+    assert!(
+        state.join("state.txt").exists(),
+        "non-config state survives"
+    );
+    assert!(state.join("access.json").exists(), "access survives");
+    assert!(
+        fs::read_dir(state.join("archive"))
+            .expect("archive")
+            .count()
+            >= 1
+    );
+}
+
+#[test]
+fn channel_migrate_copy_fail_never_deletes_global_config() {
+    let root = channel_temp_dir("migrate-copy-fail");
+    let cwd = channel_empty_repo(&root);
+    let state = channel_seed_global_config(&root, "hermes-discord", "discord");
+
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &[
+            "channel",
+            "migrate",
+            "--to-repo",
+            "hermes-discord",
+            "--remove-global",
+        ],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-no-repo.stdout"),
+    );
+    assert!(
+        state.join("config.json").exists(),
+        "no repo means no delete"
+    );
+    assert!(!state.join("archive").exists(), "no copy means no archive");
+}
+
+#[test]
+fn channel_migrate_skips_existing_repo_config_without_overwrite() {
+    let root = channel_temp_dir("migrate-existing");
+    let cwd = channel_empty_repo(&root);
+    channel_seed_global_config(&root, "hermes-discord", "discord");
+    let repo = channel_seed_fake_repo(&root, "hermes-discord");
+    fs::create_dir_all(repo.join(".claude")).expect("repo claude");
+    fs::write(
+        repo.join(".claude/channel.json"),
+        r#"{
+  "plugins": []
+}
+"#,
+    )
+    .expect("existing");
+
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &["channel", "migrate", "--to-repo", "hermes-discord"],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-existing.stdout"),
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join(".claude/channel.json")).expect("existing after"),
+        r#"{
+  "plugins": []
+}
+"#
+    );
+}
+
+#[test]
+fn channel_migrate_missing_global_skip_and_empty_all_match_goldens() {
+    let root = channel_temp_dir("migrate-missing-empty");
+    let cwd = channel_empty_repo(&root);
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &["channel", "migrate", "--to-repo", "ghost"],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-no-global.stdout"),
+    );
+    channel_assert_golden_with_env(
+        &root,
+        &cwd,
+        &["channel", "migrate", "--to-repo"],
+        &[("MAW_RS_CHANNEL_FAKE_GHQ_ROOT", "ghq")],
+        include_str!("fixtures/native-channel/channel-migrate-empty.stdout"),
+    );
+}
+
+#[test]
 fn channel_number_67_guards_reject_traversal_and_flag_values_before_io() {
     let root = channel_temp_dir("guards");
     let repo = channel_seed(&root);
@@ -526,6 +750,9 @@ fn channel_number_67_guards_reject_traversal_and_flag_values_before_io() {
         ]
         .as_slice(),
         ["channel", "rm", "hermes/discord"].as_slice(),
+        ["channel", "migrate", "--to-repo", "../secret"].as_slice(),
+        ["channel", "migrate", "--to-repo", "-bad"].as_slice(),
+        ["channel", "migrate", "--to-repo", "hermes/discord"].as_slice(),
     ] {
         let output = channel_command(&root, &repo, args);
         assert!(!output.status.success(), "args={args:?}");
