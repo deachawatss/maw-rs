@@ -226,6 +226,132 @@ fn verify_request_accepts_legacy_from_signing_and_identifies_refusals() {
     }));
 }
 
+
+#[test]
+fn verify_request_accepts_loopback_real_ip_and_rejects_xff_spoof() {
+    use maw_auth::{RequestAuthDecision, RequestAuthParts};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let loopback = maw_auth::verify_request(&RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: Headers::new([] as [(&str, &str); 0]),
+        body: None,
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        workspace_key: None,
+        cached_pubkey: None,
+        now: NOW,
+    });
+    assert_eq!(
+        loopback,
+        RequestAuthDecision::Accept {
+            who: "loopback".to_owned()
+        }
+    );
+
+    let spoof = maw_auth::verify_request(&RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: Headers::new([("x-forwarded-for", "127.0.0.1")]),
+        body: None,
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        workspace_key: None,
+        cached_pubkey: None,
+        now: NOW,
+    });
+    assert_eq!(spoof.reason(), Some("missing-credentials"));
+}
+
+#[test]
+fn verify_request_hmac_v3_accepts_byte_exact_cross_oracle_vector_and_rejects_replay() {
+    use maw_auth::{hash_body, RequestAuthParts};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let body = b"{\"event\":\"agent-idle\"}";
+    assert_eq!(
+        hash_body(Some(body)),
+        "98e31c8f0c5f043066b34e52684d8c0a9bbc61e0393e4dbba1d644b04abb8878"
+    );
+    let headers = Headers::new([
+        ("x-maw-from", FROM),
+        (
+            "x-maw-signature-v3",
+            "754ff65d7f146fdf18680b484539ffa79e83e2203b393f36c5790ddaf2c03bda",
+        ),
+        ("x-maw-timestamp", &NOW.to_string()),
+        ("x-maw-auth-version", "v3"),
+    ]);
+    let base = RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: headers.clone(),
+        body: Some(body.to_vec()),
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        workspace_key: Some(PEER_KEY.to_owned()),
+        cached_pubkey: None,
+        now: NOW,
+    };
+    let accepted = maw_auth::verify_request(&base);
+    assert!(accepted.is_accept(), "{accepted:?}");
+
+    let mut stale = base.clone();
+    stale.now = NOW + 301;
+    assert_eq!(
+        maw_auth::verify_request(&stale).reason(),
+        Some("timestamp-out-of-window")
+    );
+
+    let mut future_headers = headers.to_btree_map();
+    future_headers.insert("x-maw-timestamp".to_owned(), (NOW + 301).to_string());
+    let mut future = base.clone();
+    future.headers = Headers::new(future_headers);
+    assert_eq!(
+        maw_auth::verify_request(&future).reason(),
+        Some("timestamp-out-of-window")
+    );
+
+    let mut unpinned = base.clone();
+    unpinned.workspace_key = None;
+    assert_eq!(maw_auth::verify_request(&unpinned).reason(), Some("pin-missing"));
+
+    let mut mismatch = unpinned.clone();
+    mismatch.cached_pubkey = Some("different-pinned-key".to_owned());
+    assert_eq!(maw_auth::verify_request(&mismatch).reason(), Some("pin-mismatch"));
+
+    let mut bad = base;
+    bad.headers = Headers::new([
+        ("x-maw-from", FROM),
+        ("x-maw-signature-v3", &"0".repeat(64)),
+        ("x-maw-timestamp", &NOW.to_string()),
+    ]);
+    assert_eq!(maw_auth::verify_request(&bad).reason(), Some("signature-invalid"));
+}
+
+#[test]
+fn verify_request_ed25519_headers_fail_closed_until_native_verifier_lands() {
+    use maw_auth::RequestAuthParts;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let decision = maw_auth::verify_request(&RequestAuthParts {
+        method: "POST".to_owned(),
+        path: "/triggers/fire".to_owned(),
+        headers: Headers::new([
+            ("x-maw-from", FROM),
+            ("x-maw-ed25519-signature", "base64-ed25519-placeholder"),
+            ("x-maw-timestamp", &NOW.to_string()),
+        ]),
+        body: None,
+        peer_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))),
+        workspace_key: Some(PEER_KEY.to_owned()),
+        cached_pubkey: Some(PEER_KEY.to_owned()),
+        now: NOW,
+    });
+    assert_eq!(
+        decision.reason(),
+        Some("ed25519-verify-not-yet-native")
+    );
+}
+
 // Ported from maw-js `test/scout-pair-proof.test.ts` and
 // `src/transports/scout-pair-proof.ts`.
 #[test]

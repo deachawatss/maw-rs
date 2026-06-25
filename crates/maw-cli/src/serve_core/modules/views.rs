@@ -342,7 +342,7 @@ mod tests {
             .text()
             .await
             .expect("protected body")
-            .contains("auth-pending-default-deny"));
+            .contains("missing-credentials"));
 
         let pipeline = client
             .get(format!("http://{addr}/api/serve-core/pipeline"))

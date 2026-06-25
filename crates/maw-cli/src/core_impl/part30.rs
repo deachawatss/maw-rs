@@ -189,6 +189,7 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
     }
     crate::serve_core::ServecoreSharedState::default()
         .servecore_with_agents_node(load_hey_config().node)
+        .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone())
 }
 
 fn serve_router(state: ServeState) -> Router {
@@ -1091,20 +1092,23 @@ mod serve_tests {
     }
 
     #[tokio::test]
-    async fn serve_core_default_denies_protected_paths_on_real_router() {
+    async fn serve_core_real_router_allows_loopback_protected_paths() {
         let addr = spawn_test_server().await;
         let client = reqwest::Client::builder().build().expect("client");
-        for path in [
-            "/api/triggers/fire",
-            "/api/worktrees/cleanup",
-            "/api/plugins/reload",
-        ] {
+        let trigger = client
+            .post(format!("http://{addr}/api/triggers/fire"))
+            .json(&json!({"event":"agent-idle","context":{"repo":"maw-rs"}}))
+            .send()
+            .await
+            .expect("protected request");
+        assert_eq!(trigger.status(), StatusCode::OK, "/api/triggers/fire");
+        for path in ["/api/worktrees/cleanup", "/api/plugins/reload"] {
             let response = client
                 .post(format!("http://{addr}{path}"))
                 .send()
                 .await
                 .expect("protected request");
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
         let public = client
             .get(format!("http://{addr}/api/agents"))
@@ -1166,10 +1170,11 @@ mod serve_tests {
 
         let protected = client
             .post(format!("http://{addr}/api/triggers/fire"))
+            .json(&json!({"event":"agent-idle","context":{"repo":"maw-rs"}}))
             .send()
             .await
             .expect("protected");
-        assert_eq!(protected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(protected.status(), StatusCode::OK);
     }
 
     #[tokio::test]

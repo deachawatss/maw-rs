@@ -97,8 +97,17 @@ fn signed_at_seconds(signed: &SignedInput) -> Option<i64> {
     }
 }
 
-#[must_use]
-pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
+fn ed25519_signature_header(headers: &Headers) -> Option<&str> {
+    [
+        "x-maw-ed25519-signature",
+        "x-maw-signature-ed25519",
+        "x-maw-from-signature-ed25519",
+    ]
+    .into_iter()
+    .find_map(|name| headers.get(name).map(str::trim).filter(|value| !value.is_empty()))
+}
+
+fn verify_from_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     let signed = signed_input(&args.headers);
     let cached = args
         .cached_pubkey
@@ -173,6 +182,115 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     FromVerifyDecision::AcceptVerified {
         reason: "cache-sig-valid".to_owned(),
         from: signed.from,
+    }
+}
+
+
+impl VerifyRequestInput for VerifyRequestArgs {
+    type Decision = FromVerifyDecision;
+
+    fn verify_request_input(&self) -> Self::Decision {
+        verify_from_request(self)
+    }
+}
+
+impl VerifyRequestInput for RequestAuthParts {
+    type Decision = RequestAuthDecision;
+
+    fn verify_request_input(&self) -> Self::Decision {
+        verify_serve_request(self)
+    }
+}
+
+#[must_use]
+pub fn verify_request<T: VerifyRequestInput + ?Sized>(input: &T) -> T::Decision {
+    input.verify_request_input()
+}
+
+fn verify_serve_request(parts: &RequestAuthParts) -> RequestAuthDecision {
+    if parts.peer_ip.is_some_and(|ip| ip.is_loopback()) {
+        return RequestAuthDecision::Accept {
+            who: "loopback".to_owned(),
+        };
+    }
+
+    let signed = signed_input(&parts.headers);
+    if !signed.has_v3_sig {
+        if !signed.from.is_empty() && ed25519_signature_header(&parts.headers).is_some() {
+            // TODO(#248): wire native ed25519 from-sign verification here.
+            return RequestAuthDecision::Reject {
+                reason: "ed25519-verify-not-yet-native".to_owned(),
+            };
+        }
+        return RequestAuthDecision::Reject {
+            reason: if signed.signed {
+                "unsupported-signature".to_owned()
+            } else {
+                "missing-credentials".to_owned()
+            },
+        };
+    }
+    if signed.from.is_empty() {
+        return RequestAuthDecision::Reject {
+            reason: "missing-from".to_owned(),
+        };
+    }
+    let Some(signed_at_sec) = signed_at_seconds(&signed) else {
+        return RequestAuthDecision::Reject {
+            reason: "invalid-timestamp".to_owned(),
+        };
+    };
+    let delta = (parts.now - signed_at_sec).abs();
+    if delta > WINDOW_SEC {
+        return RequestAuthDecision::Reject {
+            reason: "timestamp-out-of-window".to_owned(),
+        };
+    }
+
+    let body_hash = hash_body(parts.body.as_deref());
+    let payload = build_from_sign_payload(
+        &signed.from,
+        signed_at_sec,
+        &parts.method,
+        &parts.path,
+        &body_hash,
+    );
+
+    let mut had_hmac_key = false;
+    if let Some(workspace_key) = parts
+        .workspace_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        had_hmac_key = true;
+        if verify_hmac_sig(workspace_key, &payload, &signed.v3_sig) {
+            return RequestAuthDecision::Accept {
+                who: format!("hmac-v3:{}", signed.from),
+            };
+        }
+    }
+
+    if let Some(cached) = parts
+        .cached_pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
+            return RequestAuthDecision::Accept {
+                who: format!("from-sign:{}", signed.from),
+            };
+        }
+        return RequestAuthDecision::Reject {
+            reason: "pin-mismatch".to_owned(),
+        };
+    }
+
+    RequestAuthDecision::Reject {
+        reason: if had_hmac_key {
+            "signature-invalid".to_owned()
+        } else {
+            "pin-missing".to_owned()
+        },
     }
 }
 

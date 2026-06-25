@@ -2,7 +2,7 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::IpAddr};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -439,6 +439,46 @@ impl FromVerifyDecision {
             Self::RefuseMalformed { .. } => "refuse-malformed",
         }
     }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestAuthDecision {
+    Accept { who: String },
+    Reject { reason: String },
+}
+
+impl RequestAuthDecision {
+    #[must_use]
+    pub fn is_accept(&self) -> bool {
+        matches!(self, Self::Accept { .. })
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Accept { .. } => None,
+            Self::Reject { reason } => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestAuthParts {
+    pub method: String,
+    pub path: String,
+    pub headers: Headers,
+    pub body: Option<Vec<u8>>,
+    pub peer_ip: Option<IpAddr>,
+    pub workspace_key: Option<String>,
+    pub cached_pubkey: Option<String>,
+    pub now: i64,
+}
+
+pub trait VerifyRequestInput {
+    type Decision;
+
+    fn verify_request_input(&self) -> Self::Decision;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

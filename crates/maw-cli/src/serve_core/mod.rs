@@ -1,8 +1,11 @@
 pub mod modules;
 
 use axum::{
-    body::Body,
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    body::{to_bytes, Body},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        ConnectInfo,
+    },
     http::{Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -14,11 +17,12 @@ use maw_tmux::{TmuxClient, TmuxPane};
 use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const SERVECORE_PIPELINE_ORDER: &[&str] = &[
@@ -87,6 +91,9 @@ pub struct ServecoreSharedState {
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
+    pub auth_workspace_key: Option<String>,
+    pub auth_cached_pubkey: Option<String>,
+    pub auth_now_override: Option<i64>,
 }
 
 impl Default for ServecoreSharedState {
@@ -98,6 +105,9 @@ impl Default for ServecoreSharedState {
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
             agents_snapshot: None,
+            auth_workspace_key: None,
+            auth_cached_pubkey: None,
+            auth_now_override: None,
         }
     }
 }
@@ -131,6 +141,24 @@ impl ServecoreSharedState {
             .into_iter()
             .map(ServecoreAgentPane::from)
             .collect()
+    }
+
+    #[must_use]
+    pub fn servecore_with_auth(
+        mut self,
+        workspace_key: Option<String>,
+        cached_pubkey: Option<String>,
+    ) -> Self {
+        self.auth_workspace_key = workspace_key;
+        self.auth_cached_pubkey = cached_pubkey;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn servecore_with_auth_now(mut self, now: i64) -> Self {
+        self.auth_now_override = Some(now);
+        self
     }
 }
 
@@ -454,15 +482,97 @@ async fn servecore_engine_proxy(req: Request<Body>, next: Next) -> Response {
 async fn servecore_auth_default_deny(req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let path = servecore_api_auth_path(req.uri().path());
-    if maw_auth::is_protected(&path, method.as_str()) {
-        // TODO(D2): auth logic pending Bigboy+TK; protected paths fail closed meanwhile.
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error":"forbidden","reason":"auth-pending-default-deny"})),
-        )
-            .into_response();
+    if !maw_auth::is_protected(&path, method.as_str()) {
+        return next.run(req).await;
     }
-    next.run(req).await
+
+    let peer_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    let state = req.extensions().get::<Arc<ServecoreSharedState>>().cloned();
+    let (parts, body) = req.into_parts();
+    let Ok(body_bytes) = to_bytes(body, 64 * 1024).await else {
+        return servecore_forbidden("bad-body");
+    };
+    let headers = servecore_auth_headers(&parts.headers);
+    let uri_path = servecore_api_auth_path(parts.uri.path());
+    let request_parts = maw_auth::RequestAuthParts {
+        method: method.as_str().to_owned(),
+        path: uri_path,
+        headers,
+        body: Some(body_bytes.to_vec()),
+        peer_ip: peer_addr.map(|addr| addr.ip()),
+        workspace_key: state
+            .as_ref()
+            .and_then(|state| state.auth_workspace_key.clone()),
+        cached_pubkey: state
+            .as_ref()
+            .and_then(|state| state.auth_cached_pubkey.clone()),
+        now: state
+            .as_ref()
+            .and_then(|state| state.auth_now_override)
+            .unwrap_or_else(servecore_auth_now),
+    };
+    match maw_auth::verify_request(&request_parts) {
+        maw_auth::RequestAuthDecision::Accept { .. } => {
+            next.run(Request::from_parts(parts, Body::from(body_bytes)))
+                .await
+        }
+        maw_auth::RequestAuthDecision::Reject { reason } => servecore_forbidden(&reason),
+    }
+}
+
+fn servecore_auth_headers(headers: &axum::http::HeaderMap) -> maw_auth::Headers {
+    maw_auth::Headers::new([
+        (
+            "x-maw-from",
+            servecore_header_to_string(headers, "x-maw-from"),
+        ),
+        (
+            "x-maw-signature-v3",
+            servecore_header_to_string(headers, "x-maw-signature-v3"),
+        ),
+        (
+            "x-maw-timestamp",
+            servecore_header_to_string(headers, "x-maw-timestamp"),
+        ),
+        (
+            "x-maw-auth-version",
+            servecore_header_to_string(headers, "x-maw-auth-version"),
+        ),
+        (
+            "x-maw-ed25519-signature",
+            servecore_header_to_string(headers, "x-maw-ed25519-signature"),
+        ),
+        (
+            "x-maw-signature-ed25519",
+            servecore_header_to_string(headers, "x-maw-signature-ed25519"),
+        ),
+    ])
+}
+
+fn servecore_header_to_string(headers: &axum::http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn servecore_auth_now() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn servecore_forbidden(reason: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({"error":"forbidden","reason": reason})),
+    )
+        .into_response()
 }
 
 fn servecore_api_auth_path(path: &str) -> String {
@@ -666,6 +776,7 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::sync::oneshot;
+    use tower::ServiceExt;
 
     async fn servecore_spawn_test_server() -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -675,7 +786,11 @@ mod tests {
         let app = servecore_apply_pipeline(servecore_mount_core_routes(Router::new()));
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
                 let _ = rx.await;
             });
             server.await.expect("server");
@@ -705,7 +820,11 @@ mod tests {
         );
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
                 let _ = rx.await;
             });
             server.await.expect("server");
@@ -835,7 +954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn servecore_default_denies_protected_paths_and_allows_public() {
+    async fn servecore_loopback_allows_protected_paths_and_public_still_passes() {
         let addr = servecore_spawn_test_server().await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -846,19 +965,19 @@ mod tests {
             .send()
             .await
             .expect("protected");
-        assert_eq!(protected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(protected.status(), StatusCode::OK);
         let plugins = client
             .post(format!("http://{addr}/api/plugins/reload"))
             .send()
             .await
             .expect("plugins");
-        assert_eq!(plugins.status(), StatusCode::FORBIDDEN);
+        assert_eq!(plugins.status(), StatusCode::OK);
         let cleanup = client
             .post(format!("http://{addr}/api/worktrees/cleanup"))
             .send()
             .await
             .expect("cleanup");
-        assert_eq!(cleanup.status(), StatusCode::FORBIDDEN);
+        assert_eq!(cleanup.status(), StatusCode::OK);
         let public = client
             .get(format!("http://{addr}/api/serve-core/pipeline"))
             .send()
@@ -867,8 +986,74 @@ mod tests {
         assert_eq!(public.status(), StatusCode::OK);
     }
 
+    fn servecore_auth_test_app(state: ServecoreSharedState) -> Router {
+        let router = servecore_mount_core_routes(Router::new());
+        let router = servecore_with_shared_state(router, state);
+        servecore_apply_pipeline(router)
+    }
+
+    async fn servecore_auth_request(
+        state: ServecoreSharedState,
+        mut request: Request<Body>,
+        peer: SocketAddr,
+    ) -> Response {
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request.extensions_mut().insert(Arc::new(state.clone()));
+        servecore_auth_test_app(state)
+            .oneshot(request)
+            .await
+            .expect("auth request")
+    }
+
     #[tokio::test]
-    async fn servecore_ws_uses_engine_hook_and_keeps_default_deny() {
+    async fn servecore_nonloopback_no_credentials_and_xff_spoof_fail_closed() {
+        let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/triggers/fire")
+            .body(Body::empty())
+            .expect("request");
+        let response = servecore_auth_request(ServecoreSharedState::default(), request, peer).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/triggers/fire")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(Body::empty())
+            .expect("request");
+        let response = servecore_auth_request(ServecoreSharedState::default(), request, peer).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn servecore_hmac_v3_allows_nonloopback_protected_request() {
+        let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
+        let body = br#"{"event":"agent-idle"}"#;
+        let state = ServecoreSharedState::default()
+            .servecore_with_auth(
+                Some("feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface".to_owned()),
+                None,
+            )
+            .servecore_with_auth_now(1_700_000_000);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/triggers/fire")
+            .header("x-maw-from", "mawjs:m5")
+            .header(
+                "x-maw-signature-v3",
+                "754ff65d7f146fdf18680b484539ffa79e83e2203b393f36c5790ddaf2c03bda",
+            )
+            .header("x-maw-timestamp", "1700000000")
+            .header("x-maw-auth-version", "v3")
+            .body(Body::from(body.as_slice().to_vec()))
+            .expect("request");
+        let response = servecore_auth_request(state, request, peer).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn servecore_ws_uses_engine_hook_and_loopback_auth() {
         let engine = Arc::new(TestEngine::default());
         let state = ServecoreSharedState::default().servecore_with_engine(engine.clone());
         let addr = servecore_spawn_ws_test_server(state, modules::ws::WsConfig::default()).await;
@@ -905,7 +1090,7 @@ mod tests {
             .send()
             .await
             .expect("protected");
-        assert_eq!(protected.status(), StatusCode::FORBIDDEN);
+        assert_eq!(protected.status(), StatusCode::OK);
     }
 
     #[tokio::test]
