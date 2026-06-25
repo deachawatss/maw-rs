@@ -1504,6 +1504,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "ed25519-dalek",
  "hmac",
+ "serde_json",
  "sha2",
 ]
 

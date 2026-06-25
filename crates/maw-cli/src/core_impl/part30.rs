@@ -192,6 +192,8 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
     let core = crate::serve_core::ServecoreSharedState::default()
         .servecore_with_agents_node(load_hey_config().node)
         .servecore_with_auth(state.cached_pubkey.clone(), state.cached_pubkey.clone());
+    #[cfg(not(test))]
+    let core = core.servecore_with_process_auth_pins();
     #[cfg(test)]
     let core = if let Some(now) = state.now_override {
         core.servecore_with_auth_now(now)

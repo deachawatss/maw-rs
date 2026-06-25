@@ -181,6 +181,18 @@ impl ServecoreSharedState {
         self
     }
 
+    #[must_use]
+    pub fn servecore_with_auth_pins(mut self, pins: maw_auth::Ed25519TofuPins) -> Self {
+        self.auth_ed25519_pins = pins;
+        self
+    }
+
+    #[must_use]
+    pub fn servecore_with_process_auth_pins(self) -> Self {
+        let store = maw_auth::Ed25519TofuStore::file_backed(servecore_ed25519_tofu_path());
+        self.servecore_with_auth_pins(Arc::new(Mutex::new(store)))
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn servecore_with_auth_now(mut self, now: i64) -> Self {
@@ -524,6 +536,21 @@ impl Default for ServecoreThreadStore {
     fn default() -> Self {
         Self::servecore_default()
     }
+}
+
+fn servecore_ed25519_tofu_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let vars = [
+        "MAW_HOME",
+        "MAW_DATA_DIR",
+        "MAW_XDG",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)));
+    let env = maw_xdg::MawXdgEnv::with_vars(home, vars);
+    maw_xdg::maw_data_path(&env, &["auth", "ed25519-tofu-pins.json"])
 }
 
 impl ServecoreThreadStore {

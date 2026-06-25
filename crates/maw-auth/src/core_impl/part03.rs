@@ -330,8 +330,8 @@ fn verify_ed25519_serve_request(
     if !verify_ed25519_signature(&key_hex, payload.as_bytes(), signature_hex) {
         return auth_reject("ed25519-signature-invalid");
     }
-    if !ed25519_pin_verified_key(parts, &signed.from, &key_hex) {
-        return auth_reject("ed25519-pin-mismatch");
+    if let Err(reason) = ed25519_pin_verified_key(parts, &signed.from, &key_hex) {
+        return auth_reject(reason);
     }
     RequestAuthDecision::Accept {
         who: format!("ed25519:{}", signed.from),
@@ -342,6 +342,9 @@ fn ed25519_select_pubkey(parts: &RequestAuthParts, from: &str) -> Result<String,
     let observed = ed25519_pubkey_header(&parts.headers).map(str::to_owned);
     if let Some(pins) = &parts.ed25519_pins {
         let guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_poisoned() {
+            return Err("tofu-store-corrupt");
+        }
         if let Some(pinned) = guard.pinned(from) {
             if observed.as_deref().is_some_and(|key| key != pinned) {
                 return Err("ed25519-pin-mismatch");
@@ -358,14 +361,28 @@ fn ed25519_select_pubkey(parts: &RequestAuthParts, from: &str) -> Result<String,
         .ok_or("ed25519-pin-missing")
 }
 
-fn ed25519_pin_verified_key(parts: &RequestAuthParts, from: &str, key_hex: &str) -> bool {
+fn ed25519_pin_verified_key(
+    parts: &RequestAuthParts,
+    from: &str,
+    key_hex: &str,
+) -> Result<(), &'static str> {
     let Some(pins) = &parts.ed25519_pins else {
-        return true;
+        return Ok(());
     };
     let mut guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    match guard.pinned(from) {
-        Some(pinned) => pinned == key_hex,
-        None => guard.pin_first_contact(from, key_hex),
+    if guard.is_poisoned() {
+        return Err("tofu-store-corrupt");
+    }
+    if let Some(pinned) = guard.pinned(from) {
+        if pinned == key_hex {
+            return Ok(());
+        }
+        return Err("ed25519-pin-mismatch");
+    }
+    if guard.pin_first_contact(from, key_hex) {
+        Ok(())
+    } else {
+        Err("ed25519-pin-mismatch")
     }
 }
 
