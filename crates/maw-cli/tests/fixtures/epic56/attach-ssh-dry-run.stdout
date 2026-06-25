@@ -1,0 +1,2 @@
+ssh -o ConnectTimeout=3 -o BatchMode=yes peer-one true
+ssh -tt peer-one tmux attach-session -t 50-mawjs

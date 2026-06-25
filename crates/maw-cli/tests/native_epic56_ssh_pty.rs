@@ -67,3 +67,26 @@ fn epic56_attach_view_split_committed_golden_without_js_ref() {
         include_str!("fixtures/epic56/split-dry-run.stdout"),
     );
 }
+
+#[test]
+fn epic56_stream_attach_ssh_committed_golden_without_js_ref() {
+    assert_stdout_golden(
+        "stream-unlink-dry-run",
+        &["stream", "--unlink", "view:oracle", "--dry-run"],
+        include_str!("fixtures/epic56/stream-unlink-dry-run.stdout"),
+    );
+    assert_stdout_golden(
+        "attach-ssh-dry-run",
+        &[
+            "attach-ssh",
+            "--node",
+            "peer-one",
+            "--session",
+            "50-mawjs",
+            "--ssh-alias",
+            "peer-one",
+            "--dry-run",
+        ],
+        include_str!("fixtures/epic56/attach-ssh-dry-run.stdout"),
+    );
+}
