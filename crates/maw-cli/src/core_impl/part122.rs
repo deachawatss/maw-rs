@@ -3,7 +3,7 @@ const DISPATCH_122: &[DispatcherEntry] = &[
     DispatcherEntry { command: "t", handler: Handler::Sync(team_run_command) },
 ];
 
-const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|liveness|down>";
+const TEAM_USAGE: &str = "usage: maw team <create|new|list|ls|status|tasks|oracle-members|members|lives|history|plan|preflight|check|load|send|msg|broadcast|inbox|up|bring|apply|liveness|down|remove>";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +83,7 @@ struct TeamCharterMember122 {
     engine: Option<String>,
     target: Option<String>,
     prompt: Option<String>,
+    worktree: Option<String>,
 }
 
 fn team_run_command(argv: &[String]) -> CliOutput {
@@ -116,6 +117,7 @@ fn team_run(argv: &[String]) -> Result<String, String> {
         "apply" => team_t5b_apply(argv),
         "liveness" | "live-check" => team_t3_liveness(argv),
         "down" => team_down(argv),
+        "remove" => team_remove(argv),
         other if other.starts_with('-') => Err(format!("team: unknown argument {other}")),
         _ => Err(TEAM_USAGE.to_owned()),
     }
@@ -437,7 +439,7 @@ fn team_parse_json_charter(text: &str) -> Result<TeamCharter122, String> {
 }
 
 fn team_member_from_json(value: &serde_json::Value) -> TeamCharterMember122 {
-    TeamCharterMember122 { role: value["role"].as_str().unwrap_or("").to_owned(), name: value["name"].as_str().map(str::to_owned), model: value["model"].as_str().map(str::to_owned), cwd: value["cwd"].as_str().map(str::to_owned), engine: value["engine"].as_str().map(str::to_owned), target: value["target"].as_str().map(str::to_owned), prompt: value["prompt"].as_str().map(str::to_owned) }
+    TeamCharterMember122 { role: value["role"].as_str().unwrap_or("").to_owned(), name: value["name"].as_str().map(str::to_owned), model: value["model"].as_str().map(str::to_owned), cwd: value["cwd"].as_str().map(str::to_owned), engine: value["engine"].as_str().map(str::to_owned), target: value["target"].as_str().map(str::to_owned), prompt: value["prompt"].as_str().map(str::to_owned), worktree: value["worktree"].as_str().map(str::to_owned).or_else(|| value["worktree"].as_bool().map(|v| v.to_string())) }
 }
 
 fn team_parse_yaml_charter(text: &str) -> Result<TeamCharter122, String> {
@@ -463,7 +465,7 @@ fn team_yaml_line(line: &str, charter: &mut TeamCharter122, current: &mut Option
 }
 
 fn team_yaml_member_line(line: &str, member: &mut TeamCharterMember122) {
-    for (key, slot) in [("name:", &mut member.name), ("model:", &mut member.model), ("cwd:", &mut member.cwd), ("engine:", &mut member.engine), ("target:", &mut member.target), ("prompt:", &mut member.prompt)] {
+    for (key, slot) in [("name:", &mut member.name), ("model:", &mut member.model), ("cwd:", &mut member.cwd), ("engine:", &mut member.engine), ("target:", &mut member.target), ("prompt:", &mut member.prompt), ("worktree:", &mut member.worktree)] {
         if let Some(rest) = line.trim_start().strip_prefix(key) { *slot = Some(team_unquote(rest)); }
     }
 }
@@ -505,6 +507,7 @@ fn team_member_bits(member: &TeamCharterMember122) -> String {
     if let Some(name) = &member.name { bits.push(format!("name={name}")); }
     if let Some(model) = &member.model { bits.push(format!("model={model}")); }
     if let Some(cwd) = &member.cwd { bits.push(format!("cwd={cwd}")); }
+    if let Some(worktree) = &member.worktree { bits.push(format!("worktree={worktree}")); }
     if let Some(engine) = &member.engine { bits.push(format!("engine={engine}")); }
     bits.join(", ")
 }
