@@ -1,0 +1,3 @@
+maw init [--non-interactive --node <name> --token <t> --federate --peer <url> --peer-name <name> --federation-token <hex> --force]
+
+Interactive 3-question wizard. Writes ~/.config/maw/maw.config.json.

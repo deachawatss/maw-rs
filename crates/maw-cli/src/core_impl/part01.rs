@@ -174,7 +174,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "plugin-scaffold", handler: Handler::Sync(run_plugin_scaffold_plan) },
     DispatcherEntry { command: "plugin-manifest", handler: Handler::Sync(run_plugin_manifest_plan) },
     DispatcherEntry { command: "bind-host", handler: Handler::Sync(run_bind_host_plan) },
-    DispatcherEntry { command: "init", handler: Handler::Sync(run_init_command) },
     DispatcherEntry { command: "tmux", handler: Handler::Sync(run_tmux_command) },
     DispatcherEntry { command: "view", handler: Handler::Sync(run_view_command) },
     DispatcherEntry { command: "split", handler: Handler::Sync(run_split_command) },

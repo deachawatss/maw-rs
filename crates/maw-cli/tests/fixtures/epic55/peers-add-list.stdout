@@ -1,0 +1,4 @@
+added alpha → http://127.0.0.1:3456 (node-a)
+alias  url                    node    nickname  lastSeen
+-----  ---------------------  ------  --------  --------
+alpha  http://127.0.0.1:3456  node-a  -         -       
