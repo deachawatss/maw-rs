@@ -1,0 +1,4 @@
+team shutdown: alpha
+  request shutdown builder
+  did not force kill builder
+  cleaned up team directories
