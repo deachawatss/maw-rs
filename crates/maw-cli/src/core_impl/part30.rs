@@ -34,6 +34,8 @@ struct ServeState {
     peer_addr_override: Option<SocketAddr>,
     #[cfg(test)]
     now_override: Option<i64>,
+    #[cfg(test)]
+    serve_core_state_override: Option<crate::serve_core::ServecoreSharedState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +91,8 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         peer_addr_override: None,
         #[cfg(test)]
         now_override: None,
+        #[cfg(test)]
+        serve_core_state_override: None,
     });
     println!("maw-rs serve listening http://{local_addr}");
     match axum::serve(
@@ -182,10 +186,23 @@ fn default_bind_host() -> String {
     DEFAULT_SERVE_BIND.to_owned()
 }
 
+fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedState {
+    #[cfg(not(test))]
+    let _ = state;
+    #[cfg(test)]
+    if let Some(state) = &state.serve_core_state_override {
+        return state.clone();
+    }
+    crate::serve_core::ServecoreSharedState::default()
+        .servecore_with_agents_node(load_hey_config().node)
+}
+
 fn serve_router(state: ServeState) -> Router {
+    let serve_core_state = serve_core_state(&state);
     let state = Arc::new(state);
     let router = Router::new();
     let router = crate::serve_core::servecore_mount_core_routes(router);
+    let router = crate::serve_core::modules::servecore_mount_modules(router, &[]);
     let router = router
         .route("/ws", get(ws_relay))
         .route("/ws/pty", get(ws_relay))
@@ -216,6 +233,7 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/workspace/:id/status", get(api_workspace_status))
         .route("/api/workspace/:id/feed", get(api_workspace_feed))
         .route("/api/workspace/:id/message", post(api_workspace_message));
+    let router = crate::serve_core::servecore_with_shared_state(router, serve_core_state);
     crate::serve_core::servecore_apply_pipeline(router)
         .fallback(api_not_found)
         .with_state(state)
@@ -1073,6 +1091,7 @@ mod serve_tests {
             requests: Mutex::new(RequestReplyStore::default()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
+            serve_core_state_override: None,
         });
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -1178,6 +1197,65 @@ mod serve_tests {
             .await
             .expect("public request");
         assert_eq!(public.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serve_agents_real_router_is_public_and_uses_fake_state() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let fake_core = crate::serve_core::ServecoreSharedState::default()
+            .servecore_with_agents_node(Some("node-a".to_owned()))
+            .servecore_with_agents_snapshot(vec![crate::serve_core::ServecoreAgentPane {
+                id: "%86".to_owned(),
+                command: "codex".to_owned(),
+                target: "nova:1.0".to_owned(),
+                title: "nova-agent".to_owned(),
+                cwd: Some("/tmp/maw-rs".to_owned()),
+                pid: Some(8600),
+                last_activity: Some(86),
+            }]);
+        let app = serve_router(ServeState {
+            cached_pubkey: Some(KEY.to_owned()),
+            ws_tx: new_ws_relay(),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
+            now_override: Some(1_782_277_200),
+            serve_core_state_override: Some(fake_core),
+        });
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            });
+            server.await.expect("serve test server");
+        });
+        std::mem::forget(tx);
+
+        let client = reqwest::Client::builder().build().expect("client");
+        let response = client
+            .get(format!("http://{addr}/api/agents"))
+            .send()
+            .await
+            .expect("agents");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.json::<Value>().await.expect("json");
+        assert_eq!(payload["count"], 1);
+        assert_eq!(payload["node"], "node-a");
+        assert_eq!(payload["agents"][0]["target"], "nova:1.0");
+
+        let protected = client
+            .post(format!("http://{addr}/api/triggers/fire"))
+            .send()
+            .await
+            .expect("protected");
+        assert_eq!(protected.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

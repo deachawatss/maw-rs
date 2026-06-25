@@ -1,3 +1,5 @@
+pub mod modules;
+
 use axum::{
     body::Body,
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
@@ -5,9 +7,10 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use maw_hub::WorkspaceConfig;
+use maw_tmux::{TmuxClient, TmuxPane};
 use serde_json::json;
 use std::{
     collections::{BTreeSet, VecDeque},
@@ -44,6 +47,8 @@ pub struct ServecoreSharedState {
     pub trigger_bus: ServecoreTriggerBus,
     pub lifecycle: ServecoreLifecycle,
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
+    pub agents_node: Option<String>,
+    pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
 }
 
 impl Default for ServecoreSharedState {
@@ -53,6 +58,59 @@ impl Default for ServecoreSharedState {
             trigger_bus: ServecoreTriggerBus::default(),
             lifecycle: ServecoreLifecycle::default(),
             hub_workspaces: Arc::new(Vec::new()),
+            agents_node: None,
+            agents_snapshot: None,
+        }
+    }
+}
+
+impl ServecoreSharedState {
+    #[must_use]
+    pub fn servecore_with_agents_node(mut self, node: Option<String>) -> Self {
+        self.agents_node = node;
+        self
+    }
+
+    #[must_use]
+    pub fn servecore_with_agents_snapshot(mut self, panes: Vec<ServecoreAgentPane>) -> Self {
+        self.agents_snapshot = Some(Arc::new(panes));
+        self
+    }
+
+    #[must_use]
+    pub fn servecore_agents_panes(&self) -> Vec<ServecoreAgentPane> {
+        if let Some(snapshot) = &self.agents_snapshot {
+            return snapshot.as_ref().clone();
+        }
+        let mut tmux = TmuxClient::local();
+        tmux.list_panes()
+            .into_iter()
+            .map(ServecoreAgentPane::from)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServecoreAgentPane {
+    pub id: String,
+    pub command: String,
+    pub target: String,
+    pub title: String,
+    pub cwd: Option<String>,
+    pub pid: Option<u32>,
+    pub last_activity: Option<u64>,
+}
+
+impl From<TmuxPane> for ServecoreAgentPane {
+    fn from(pane: TmuxPane) -> Self {
+        Self {
+            id: pane.id,
+            command: pane.command,
+            target: pane.target,
+            title: pane.title,
+            cwd: pane.cwd,
+            pid: pane.pid,
+            last_activity: pane.last_activity,
         }
     }
 }
@@ -192,6 +250,13 @@ impl ServecoreWsRegistry {
     pub fn servecore_paths(&self) -> Vec<String> {
         self.handlers.iter().cloned().collect()
     }
+}
+
+pub fn servecore_with_shared_state<S>(router: Router<S>, state: ServecoreSharedState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(Extension(Arc::new(state)))
 }
 
 pub fn servecore_mount_core_routes<S>(router: Router<S>) -> Router<S>
