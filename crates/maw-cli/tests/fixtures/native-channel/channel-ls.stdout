@@ -1,0 +1,9 @@
+  [36;1mOracle                        Channel[0m
+  ──────────────────────────────  ─────────────────────────────────────────────
+  hermes-discord                  plugin:discord@claude-plugins-official
+                                [90mDISCORD_BOT_TOKEN=<redacted>[0m
+                                [90mDISCORD_STATE_DIR=~/channels-state/hermes[0m
+                                [90mpermissionMode: relay[0m
+                                [90mtoken: pass:discord/hermes-token[0m
+
+  1 oracle(s) with channels

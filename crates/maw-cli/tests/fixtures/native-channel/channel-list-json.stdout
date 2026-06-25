@@ -1,0 +1,14 @@
+{
+  "oracle": "hermes-discord",
+  "permissionMode": "relay",
+  "plugins": [
+    {
+      "env": {
+        "DISCORD_BOT_TOKEN": "<redacted>",
+        "DISCORD_STATE_DIR": "~/channels-state/hermes"
+      },
+      "id": "plugin:discord@claude-plugins-official"
+    }
+  ],
+  "token_source": "pass:discord/hermes-token"
+}

@@ -1,0 +1,15 @@
+usage: maw channel <subcommand> [args]
+
+subcommands:
+  ls [oracle] [--json] [-v] list channels (all or for specific oracle)
+  add <oracle> <plugin>    add channel plugin to oracle
+  rm <oracle> <plugin>     remove channel plugin from oracle
+  providers                list available channel providers
+  setup <oracle>           interactive channel setup wizard
+  test <oracle>            test channel configuration
+  migrate --to-repo [...]  copy global ~/.claude/channels/<oracle>/config.json
+                           into each oracle's <repo>/.claude/channel.json
+                           ([oracle...] empty = all; --dry-run / --remove-global)
+
+shorthand: discord → plugin:discord@claude-plugins-official
+github: prefix → delegates to setup wizard
