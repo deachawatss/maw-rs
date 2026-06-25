@@ -9,13 +9,6 @@ fn run_tmux_command(argv: &[String]) -> CliOutput {
         other => CliOutput { code: 1, stdout: String::new(), stderr: format!("maw tmux: unknown subcommand {other}\n") },
     }
 }
-fn run_view_command(argv: &[String]) -> CliOutput {
-    let mut attach_args = argv.to_vec();
-    attach_args.push("--readonly".to_owned());
-    attach_args.push("--print".to_owned());
-    run_attach_plan(&attach_args)
-}
-fn run_split_command(argv: &[String]) -> CliOutput { run_tmux_split(argv) }
 fn tmux_usage() -> CliOutput { CliOutput { code: 0, stdout: "usage: maw tmux <ls|peek|split|attach> [...]\n".to_owned(), stderr: String::new() } }
 
 fn run_tmux_ls(argv: &[String]) -> CliOutput {

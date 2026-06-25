@@ -1,0 +1,3 @@
+Run: tmux attach -r -t 50-mawjs
+  resolved: mawjs → 50-mawjs
+  detach with: Ctrl-b d
