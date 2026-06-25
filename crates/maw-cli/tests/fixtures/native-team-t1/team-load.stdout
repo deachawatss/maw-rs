@@ -1,0 +1,15 @@
+team charter loaded: beta
+
+wrote artifacts:
+  - <ROOT>/home/.claude/teams/beta/config.json
+  - <ROOT>/home/.claude/teams/beta/inboxes/builder.json
+  - <ROOT>/home/.claude/teams/beta/inboxes/reviewer.json
+  - <ROOT>/psi/memory/mailbox/teams/beta/manifest.json
+
+load safety:
+  - --no-spawn respected
+  - no tmux panes changed
+  - no claude processes spawned
+  - no maw bud or fleet writes
+
+next: maw team list
