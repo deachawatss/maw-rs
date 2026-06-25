@@ -296,8 +296,20 @@ pub fn servecore_apply_pipeline<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    router
-        .fallback(servecore_fallback_views)
+    servecore_apply_pipeline_with_views_config(
+        router,
+        modules::views::ViewsConfig::views_from_process_env(),
+    )
+}
+
+pub fn servecore_apply_pipeline_with_views_config<S>(
+    router: Router<S>,
+    views_config: modules::views::ViewsConfig,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    modules::views::views_apply_fallback_with_config(router, views_config)
         .layer(middleware::from_fn(servecore_auth_default_deny))
         .layer(middleware::from_fn(servecore_engine_proxy))
         .layer(middleware::from_fn(servecore_ws_upgrade_gate))
@@ -364,13 +376,6 @@ async fn servecore_protected_stub() -> impl IntoResponse {
 
 async fn servecore_registry_stub() -> impl IntoResponse {
     Json(json!({"ok": true, "source": "serve-core-registry"}))
-}
-
-async fn servecore_fallback_views() -> impl IntoResponse {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error":"not_found","fallback":"views"})),
-    )
 }
 
 async fn servecore_ws_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {

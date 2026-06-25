@@ -4,6 +4,7 @@
 //! 1. Add one `serve_core/modules/<name>.rs` file.
 //! 2. In that file expose `<name>_lifecycle_module() -> ServecoreLifecycleModule`,
 //!    `<name>_mount(router) -> Router<S>`, and `<name>_registration() -> ServecoreModuleRegistration<S>`.
+//!    `views` is the one approved special case: its mount is no-op and core owns the fallback.
 //! 3. Add one alphabetically sorted line to `servecore_module_registry()`.
 //! 4. If the module introduces a protected route, extend `maw_auth::is_protected()` in the same PR.
 //! 5. Never mount after `servecore_apply_pipeline`; all module routers must pass through default-deny.
@@ -13,8 +14,8 @@ pub mod debug;
 pub mod federation;
 pub mod triggers;
 pub mod triggers_mutate;
+pub mod views;
 pub mod worktrees;
-
 use super::{ServecoreLifecycle, ServecoreLifecycleModule};
 use axum::Router;
 
@@ -55,6 +56,7 @@ where
         federation::federation_registration(),
         triggers::triggers_registration(),
         triggers_mutate::triggersmutate_registration(),
+        views::views_registration(),
         worktrees::worktrees_registration(),
     ]
 }
