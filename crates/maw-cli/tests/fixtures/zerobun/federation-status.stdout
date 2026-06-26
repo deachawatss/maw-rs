@@ -1,0 +1,10 @@
+
+Federation Status
+2 nodes (1 local + 1 peers)
+
+  ●  local-node (local)  online  0ms · 0 agents
+     http://127.0.0.1:31745
+  ●  peer-node  online  0ms · 1 agents
+     http://peer.example:3456
+
+1/1 reachable (one-way; use --verify for pair-symmetric check)
