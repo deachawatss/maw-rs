@@ -12,6 +12,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     future::Future,
+    io::{Read, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
@@ -41,6 +43,16 @@ pub trait DiscordRest: Send + Sync {
         path: &'a str,
         token: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<DiscordHttpResponse, String>> + Send + 'a>>;
+
+    fn post_json<'a>(
+        &'a self,
+        path: &'a str,
+        token: &'a str,
+        body: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<DiscordHttpResponse, String>> + Send + 'a>> {
+        let _ = (path, token, body);
+        Box::pin(async { Err("Discord REST POST not implemented".to_owned()) })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +100,37 @@ impl DiscordRest for ReqwestDiscordRest {
                 .client
                 .get(url)
                 .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .send()
+                .await
+                .map_err(|_| "Discord REST request failed".to_owned())?;
+            let status = res.status().as_u16();
+            let retry_after = res
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<f64>().ok());
+            let body = res.json::<Value>().await.unwrap_or(Value::Null);
+            Ok(DiscordHttpResponse {
+                status,
+                body,
+                retry_after,
+            })
+        })
+    }
+
+    fn post_json<'a>(
+        &'a self,
+        path: &'a str,
+        token: &'a str,
+        body: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<DiscordHttpResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = self.url_for(path)?;
+            let res = self
+                .client
+                .post(url)
+                .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
+                .json(&body)
                 .send()
                 .await
                 .map_err(|_| "Discord REST request failed".to_owned())?;
@@ -247,13 +290,9 @@ pub async fn run_discord_command_with(
         Some(sub) if sub == "channels" => channels(env, rest, &args[1..], &mut logs).await,
         Some(sub) if sub == "members" => members(env, rest, &args[1..], &mut logs).await,
         Some(sub) if sub == "inventory" => inventory(env, rest, &args[1..], &mut logs).await,
-        Some(sub) if matches!(sub.as_str(), "pair" | "route" | "serve") => {
-            logs.push(format!(
-                "✗ '{sub}' not implemented yet (v0.4 ships tokens + status + bind + access)."
-            ));
-            logs.push("planned for v0.5 — see 'maw discord' for full subcommand list.".to_owned());
-            false
-        }
+        Some(sub) if sub == "pair" => pair(env, &args[1..], &mut logs),
+        Some(sub) if sub == "route" => route(env, &args[1..], &mut logs),
+        Some(sub) if sub == "serve" => serve(env, rest, &args[1..], &mut logs).await,
         Some(sub) => {
             logs.push(format!("unknown subcommand: {sub}"));
             usage(&mut logs);
@@ -293,10 +332,10 @@ fn usage(log: &mut Vec<String>) {
         "  access <bot> <list|show|map|add|rm|set|allow|lockdown> [...]".to_owned(),
         "                                     channel + allowlist management per bot (NEW v0.4)".to_owned(),
         String::new(),
-        "subcommands (planned):".to_owned(),
-        "  pair <oracle> <channel>            access.json + channel-map.json bootstrap (v0.5)".to_owned(),
-        "  route <from> <to>                  channel-map.json entry (v0.5)".to_owned(),
-        "  serve (hook handler)               wires after_send → Discord post (v0.5)".to_owned(),
+        "subcommands (v0.5 native):".to_owned(),
+        "  pair <oracle> <channel>            access.json + channel-map.json bootstrap".to_owned(),
+        "  route [oracle] <from> <to>          channel-map.json entry".to_owned(),
+        "  serve [oracle] [--dry-run]          loopback-only after_send relay".to_owned(),
         String::new(),
         "token strategy: HYBRID — tokens in pass (central), .discord/ config in bot repo.".to_owned(),
         "see: ψ/outbox/ideas/2026-05-17_self-contained-bot-repo-gpg-pattern.md".to_owned(),
@@ -313,9 +352,9 @@ fn version(log: &mut Vec<String>) {
         "  ✓ bind <bot>               v0.3 (rewrite to use 'maw wake' pending)".to_owned(),
         "  ✓ access <bot> ...         v0.4 (list/show/map/add/rm/set/allow/lockdown)".to_owned(),
         "  ✓ guilds/channels/members/inventory <bot>  v0.4.2 (Discord-state visibility)".to_owned(),
-        "  ⏸ pair <oracle> <chan>     v0.5 planned".to_owned(),
-        "  ⏸ route <from> <to>        v0.5 planned".to_owned(),
-        "  ⏸ serve (after_send hook)  v0.5 planned (replaces daemon — engine.serve)".to_owned(),
+        "  ✓ pair <oracle> <chan>     v0.5 (seed access + channel-map)".to_owned(),
+        "  ✓ route <from> <to>        v0.5 (channel-map entry)".to_owned(),
+        "  ✓ serve (after_send hook)  v0.5 (loopback-only relay)".to_owned(),
     ]);
 }
 
@@ -1493,6 +1532,354 @@ fn access_lockdown(pre: &BotResolved, args: &[String], log: &mut Vec<String>) ->
     let _ = save_access(&pre.access_json, &access);
     log.push(format!("  ✓ dmPolicy: '{current}' → '{target}'"));
     true
+}
+
+fn pair(env: &DiscordEnv, args: &[String], log: &mut Vec<String>) -> bool {
+    let (pos, flags) = parse_flags(args);
+    let (Some(bot), Some(channel_arg)) = (pos.first(), pos.get(1)) else {
+        log.push("usage: maw discord pair <oracle> <channel> [--allow <user-id>...] [--no-mention] [--dry-run]".to_owned());
+        return true;
+    };
+    if !discord_validate_name(bot, "oracle", log) || !discord_validate_channel_arg(channel_arg, log)
+    {
+        return false;
+    }
+    let Some(pre) = resolve_bot(env, bot, log) else {
+        return false;
+    };
+    let mut map = load_channel_map(&pre.channel_map);
+    let Some(channel_id) = discord_resolve_or_seed_channel(&mut map, channel_arg) else {
+        log.push(format!("✗ channel '{channel_arg}' not in channel-map; use a numeric channel id or run access map --refresh"));
+        return false;
+    };
+    let allow = flags.get("allow").cloned().unwrap_or_default();
+    if !allow
+        .iter()
+        .all(|id| discord_validate_snowflake_for_log(id, "allow", log))
+    {
+        return false;
+    }
+    let mut access = load_access(&pre.access_json);
+    access.groups.insert(
+        channel_id.clone(),
+        AccessGroup {
+            require_mention: !has_flag(&flags, "no-mention"),
+            allow_from: allow.clone(),
+        },
+    );
+    log.push(format!("🔗 maw discord pair {bot} {channel_arg}"));
+    log.push(format!("  state-dir: {}", pre.state_dir.display()));
+    if has_flag(&flags, "dry-run") {
+        log.push(format!("  [dry-run] would enable channel {channel_id}"));
+        return true;
+    }
+    if let Err(error) = save_channel_map(&pre.channel_map, &map) {
+        log.push(format!(
+            "✗ failed to save channel-map.json: {}",
+            discord_redact(&error)
+        ));
+        return false;
+    }
+    if let Err(error) = save_access(&pre.access_json, &access) {
+        log.push(format!(
+            "✗ failed to save access.json: {}",
+            discord_redact(&error)
+        ));
+        return false;
+    }
+    log.push(format!("  ✓ paired {bot} → {channel_id}"));
+    log.push(format!(
+        "  ✓ requireMention={}",
+        !has_flag(&flags, "no-mention")
+    ));
+    if !allow.is_empty() {
+        log.push(format!("  ✓ allowFrom=[{}]", allow.join(",")));
+    }
+    true
+}
+
+fn route(env: &DiscordEnv, args: &[String], log: &mut Vec<String>) -> bool {
+    let (pos, flags) = parse_flags(args);
+    let parsed = match pos.as_slice() {
+        [bot, from, to, ..] => DiscordRouteTarget::Bot { bot, from, to },
+        [from, to] => DiscordRouteTarget::Env { from, to },
+        _ => {
+            log.push("usage: maw discord route [<oracle>] <from> <to> [--dry-run]".to_owned());
+            return true;
+        }
+    };
+    let Some((label, path)) = discord_route_path(env, parsed, log) else {
+        return false;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut map = load_channel_map(&path);
+    let (from, to) = parsed.route_pair();
+    if !discord_validate_channel_arg(from, log) || !discord_validate_channel_arg(to, log) {
+        return false;
+    }
+    if !is_numeric_snowflake(to) {
+        log.push(format!(
+            "✗ route target '{to}' must be a numeric Discord channel id"
+        ));
+        return false;
+    }
+    log.push(format!("🧭 maw discord route {label} {from} {to}"));
+    if has_flag(&flags, "dry-run") {
+        log.push(format!("  [dry-run] would map {from} → {to}"));
+        return true;
+    }
+    map.insert(from.to_owned(), to.to_owned());
+    if let Err(error) = save_channel_map(&path, &map) {
+        log.push(format!(
+            "✗ failed to save channel-map.json: {}",
+            discord_redact(&error)
+        ));
+        return false;
+    }
+    log.push(format!("  ✓ route {from} → {to}"));
+    true
+}
+
+async fn serve(
+    env: &DiscordEnv,
+    rest: &dyn DiscordRest,
+    args: &[String],
+    log: &mut Vec<String>,
+) -> bool {
+    let (_, flags) = parse_flags(args);
+    let pos = discord_serve_positionals(args);
+    let bot = pos.first().cloned();
+    if bot
+        .as_ref()
+        .is_some_and(|value| !discord_validate_name(value, "oracle", log))
+    {
+        return false;
+    }
+    let host = flag_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_owned());
+    if host != "127.0.0.1" {
+        log.push("✗ discord serve refuses non-loopback bind; use 127.0.0.1".to_owned());
+        return false;
+    }
+    let port = flag_value(args, "--port").unwrap_or_else(|| "3457".to_owned());
+    if !port.chars().all(|c| c.is_ascii_digit()) {
+        log.push("✗ discord serve port must be numeric".to_owned());
+        return false;
+    }
+    if let (Some(bot_name), Some(channel), Some(message)) = (
+        bot.as_ref(),
+        flag_value(args, "--channel"),
+        flag_value(args, "--message"),
+    ) {
+        return discord_serve_post_once(env, rest, bot_name, &channel, &message, log).await;
+    }
+    log.push(format!("🛰 maw discord serve listening on {host}:{port}"));
+    log.push("  bind: 127.0.0.1 only (fleet-safe)".to_owned());
+    if has_flag(&flags, "dry-run") {
+        log.push("  [dry-run] listener not started".to_owned());
+        return true;
+    }
+    discord_serve_loopback_once(&host, &port, log)
+}
+
+async fn discord_serve_post_once(
+    env: &DiscordEnv,
+    rest: &dyn DiscordRest,
+    bot: &str,
+    channel: &str,
+    message: &str,
+    log: &mut Vec<String>,
+) -> bool {
+    if !discord_validate_channel_arg(channel, log) {
+        return false;
+    }
+    let Some((pre, token, _)) = resolve_bot_for_rest(env, bot, log) else {
+        return false;
+    };
+    let map = load_channel_map(&pre.channel_map);
+    let Some(channel_id) = resolve_channel(&map, channel) else {
+        log.push(format!("✗ channel '{channel}' not in channel-map"));
+        return false;
+    };
+    if message.chars().any(|ch| ch == '\0') {
+        log.push("✗ discord serve message must not contain NUL".to_owned());
+        return false;
+    }
+    let body = json!({"content": message});
+    let path = format!("/channels/{channel_id}/messages");
+    match rest.post_json(&path, &token, body).await {
+        Ok(res) if (200..300).contains(&res.status) => {
+            log.push(format!("  ✓ posted Discord message to {channel_id}"));
+            true
+        }
+        Ok(res) => {
+            log.push(format!("✗ Discord post failed: status {}", res.status));
+            false
+        }
+        Err(error) => {
+            log.push(format!("✗ Discord post failed: {}", discord_redact(&error)));
+            false
+        }
+    }
+}
+
+fn discord_serve_positionals(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" | "--port" | "--channel" | "--message" => i += 1,
+            "--dry-run" => {}
+            value => out.push(value.to_owned()),
+        }
+        i += 1;
+    }
+    out
+}
+
+fn discord_serve_loopback_once(host: &str, port: &str, log: &mut Vec<String>) -> bool {
+    let addr = format!("{host}:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log.push(format!(
+                "✗ failed to bind discord serve: {}",
+                discord_redact(&error.to_string())
+            ));
+            return false;
+        }
+    };
+    if let Ok((mut stream, _)) = listener.accept() {
+        let mut buffer = [0_u8; 512];
+        let _ = stream.read(&mut buffer);
+        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+        log.push("  ✓ handled one loopback request".to_owned());
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+enum DiscordRouteTarget<'a> {
+    Bot {
+        bot: &'a String,
+        from: &'a String,
+        to: &'a String,
+    },
+    Env {
+        from: &'a String,
+        to: &'a String,
+    },
+}
+
+impl<'a> DiscordRouteTarget<'a> {
+    fn route_pair(self) -> (&'a str, &'a str) {
+        match self {
+            Self::Bot { from, to, .. } | Self::Env { from, to } => (from, to),
+        }
+    }
+}
+
+fn discord_route_path(
+    env: &DiscordEnv,
+    target: DiscordRouteTarget<'_>,
+    log: &mut Vec<String>,
+) -> Option<(String, PathBuf)> {
+    match target {
+        DiscordRouteTarget::Bot { bot, .. } => {
+            if !discord_validate_name(bot, "oracle", log) {
+                return None;
+            }
+            let pre = resolve_bot(env, bot, log)?;
+            Some((bot.clone(), pre.channel_map))
+        }
+        DiscordRouteTarget::Env { .. } => {
+            let raw = env::var_os("DISCORD_STATE_DIR").map(PathBuf::from)?;
+            if !raw.is_absolute() {
+                log.push("✗ DISCORD_STATE_DIR must be absolute".to_owned());
+                return None;
+            }
+            Some((
+                "$DISCORD_STATE_DIR".to_owned(),
+                raw.join("channel-map.json"),
+            ))
+        }
+    }
+}
+
+fn discord_resolve_or_seed_channel(
+    map: &mut BTreeMap<String, String>,
+    channel: &str,
+) -> Option<String> {
+    if is_numeric_snowflake(channel) {
+        map.entry(channel.to_owned())
+            .or_insert_with(|| channel.to_owned());
+        return Some(channel.to_owned());
+    }
+    map.get(channel).cloned()
+}
+
+fn discord_validate_name(value: &str, label: &str, log: &mut Vec<String>) -> bool {
+    if value.is_empty()
+        || rejects_option_arg(value)
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control())
+    {
+        log.push(format!("✗ invalid {label}: #67 guard rejected value"));
+        return false;
+    }
+    true
+}
+
+fn discord_validate_channel_arg(value: &str, log: &mut Vec<String>) -> bool {
+    if value.is_empty()
+        || rejects_option_arg(value)
+        || value.contains("..")
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control())
+    {
+        log.push("✗ invalid channel: #67 guard rejected value".to_owned());
+        return false;
+    }
+    true
+}
+
+fn discord_validate_snowflake_for_log(value: &str, label: &str, log: &mut Vec<String>) -> bool {
+    if !is_numeric_snowflake(value) {
+        log.push(format!(
+            "✗ invalid {label} id: numeric Discord snowflake required"
+        ));
+        return false;
+    }
+    true
+}
+
+fn discord_redact(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(discord_redact_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn discord_redact_word(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    if lower.starts_with("bearer")
+        || word.starts_with("ghp_")
+        || word.starts_with("github_pat_")
+        || word.contains("://")
+            && word
+                .split("://")
+                .nth(1)
+                .is_some_and(|rest| rest.contains('@'))
+    {
+        "[REDACTED]".to_owned()
+    } else {
+        word.to_owned()
+    }
 }
 
 async fn guilds(

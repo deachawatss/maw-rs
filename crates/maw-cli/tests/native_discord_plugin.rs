@@ -5,14 +5,19 @@ use std::{
     collections::BTreeMap,
     fs,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
+    process::Command,
     sync::{Mutex as StdMutex, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 struct MockRest {
     calls: StdMutex<Vec<String>>,
+    posts: StdMutex<Vec<(String, serde_json::Value)>>,
     responses: BTreeMap<String, DiscordHttpResponse>,
 }
 
@@ -30,6 +35,26 @@ impl DiscordRest for MockRest {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| format!("missing mock response: {path}"))
+        })
+    }
+
+    fn post_json<'a>(
+        &'a self,
+        path: &'a str,
+        _token: &'a str,
+        body: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<DiscordHttpResponse, String>> + Send + 'a>> {
+        Box::pin(async move {
+            assert!(path.starts_with('/'));
+            assert!(!path.contains("://"));
+            self.posts
+                .lock()
+                .expect("posts")
+                .push((path.to_owned(), body));
+            self.responses
+                .get(path)
+                .cloned()
+                .ok_or_else(|| "REST error bearer SECRET ghp_SECRET github_pat_SECRET https://user:pass@example.test".to_owned())
         })
     }
 }
@@ -110,6 +135,7 @@ async fn discord_members_rejects_non_numeric_allow_from_without_rest_call() {
     .expect("access with invalid id");
     let rest = MockRest {
         calls: StdMutex::new(Vec::new()),
+        posts: StdMutex::new(Vec::new()),
         responses: BTreeMap::new(),
     };
 
@@ -152,6 +178,7 @@ async fn discord_version_committed_golden_without_ref_checkout() {
     let env = env(&root);
     let rest = MockRest {
         calls: StdMutex::new(Vec::new()),
+        posts: StdMutex::new(Vec::new()),
         responses: BTreeMap::new(),
     };
 
@@ -199,6 +226,7 @@ async fn discord_access_list_and_inventory_use_mocked_rest_only() {
     );
     let rest = MockRest {
         calls: StdMutex::new(Vec::new()),
+        posts: StdMutex::new(Vec::new()),
         responses,
     };
 
@@ -234,4 +262,194 @@ async fn discord_access_list_and_inventory_use_mocked_rest_only() {
     assert!(calls.contains(&"/users/@me/guilds".to_owned()));
     assert!(calls.contains(&"/guilds/999/channels".to_owned()));
     std::env::remove_var("DISCORD_BOT_TOKEN");
+}
+
+fn empty_rest() -> MockRest {
+    MockRest {
+        calls: StdMutex::new(Vec::new()),
+        posts: StdMutex::new(Vec::new()),
+        responses: BTreeMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn discord_pair_route_and_serve_are_native_and_hermetic() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+    std::env::set_var("DISCORD_BOT_TOKEN", "mock-token-never-logged");
+    let root = temp_dir("pair-route-serve");
+    let env = seed_bot(&root, "nova-oracle");
+    let mut responses = BTreeMap::new();
+    responses.insert(
+        "/channels/222/messages".to_owned(),
+        DiscordHttpResponse {
+            status: 200,
+            body: json!({"id": "m1"}),
+            retry_after: None,
+        },
+    );
+    let rest = MockRest {
+        calls: StdMutex::new(Vec::new()),
+        posts: StdMutex::new(Vec::new()),
+        responses,
+    };
+
+    let pair = run_discord_command_with(
+        &[
+            "pair".to_owned(),
+            "nova-oracle".to_owned(),
+            "222".to_owned(),
+            "--allow".to_owned(),
+            "42".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_eq!(pair.code, 0, "{}", pair.stdout);
+    assert!(pair.stdout.contains("✓ paired nova-oracle → 222"));
+    assert!(!pair.stdout.contains("mock-token-never-logged"));
+
+    let route = run_discord_command_with(
+        &[
+            "route".to_owned(),
+            "nova-oracle".to_owned(),
+            "ops".to_owned(),
+            "222".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_eq!(route.code, 0, "{}", route.stdout);
+    assert!(route.stdout.contains("✓ route ops → 222"));
+
+    let posted = run_discord_command_with(
+        &[
+            "serve".to_owned(),
+            "nova-oracle".to_owned(),
+            "--channel".to_owned(),
+            "ops".to_owned(),
+            "--message".to_owned(),
+            "hello discord".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_eq!(posted.code, 0, "{}", posted.stdout);
+    assert!(posted.stdout.contains("✓ posted Discord message to 222"));
+    let posts = rest.posts.lock().expect("posts");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].0, "/channels/222/messages");
+    assert_eq!(posts[0].1["content"], "hello discord");
+    std::env::remove_var("DISCORD_BOT_TOKEN");
+}
+
+#[tokio::test]
+async fn discord_security_guards_reject_bad_inputs_and_non_loopback() {
+    let _guard = env_lock().lock().await;
+    let root = temp_dir("guards");
+    let env = seed_bot(&root, "nova-oracle");
+    let rest = empty_rest();
+
+    let bad_pair = run_discord_command_with(
+        &["pair".to_owned(), "../bad".to_owned(), "111".to_owned()],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_ne!(bad_pair.code, 0);
+    assert!(bad_pair.stdout.contains("#67 guard"));
+
+    let bad_serve = run_discord_command_with(
+        &[
+            "serve".to_owned(),
+            "--host".to_owned(),
+            "0.0.0.0".to_owned(),
+            "--dry-run".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_ne!(bad_serve.code, 0);
+    assert!(bad_serve.stdout.contains("refuses non-loopback"));
+
+    let dry =
+        run_discord_command_with(&["serve".to_owned(), "--dry-run".to_owned()], &env, &rest).await;
+    assert_eq!(dry.code, 0);
+    assert_eq!(
+        dry.stdout,
+        include_str!("fixtures/native-discord/serve-dry-run.stdout")
+    );
+    assert!(!dry.stdout.contains("0.0.0.0"));
+}
+
+#[tokio::test]
+async fn discord_serve_rest_errors_are_redacted() {
+    let _guard = env_lock().lock().await;
+    std::env::set_var("DISCORD_BOT_TOKEN", "mock-token-never-logged");
+    let root = temp_dir("redact");
+    let env = seed_bot(&root, "nova-oracle");
+    let rest = empty_rest();
+    let out = run_discord_command_with(
+        &[
+            "serve".to_owned(),
+            "nova-oracle".to_owned(),
+            "--channel".to_owned(),
+            "general".to_owned(),
+            "--message".to_owned(),
+            "hello".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
+    assert_ne!(out.code, 0);
+    assert!(!out.stdout.contains("bearer SECRET"), "{}", out.stdout);
+    assert!(!out.stdout.contains("ghp_SECRET"), "{}", out.stdout);
+    assert!(!out.stdout.contains("github_pat_SECRET"), "{}", out.stdout);
+    assert!(!out.stdout.contains("user:pass"), "{}", out.stdout);
+    assert!(
+        !out.stdout.contains("mock-token-never-logged"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("[REDACTED]"), "{}", out.stdout);
+    std::env::remove_var("DISCORD_BOT_TOKEN");
+}
+
+fn discord_write_fake_marker(dir: &Path, name: &str, marker: &str) {
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\necho {marker}\nexit 77\n")).expect("fake marker");
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake marker");
+}
+
+#[test]
+fn discord_runtime_fake_maw_no_delegate_proof() {
+    let root = temp_dir("runtime-proof");
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    discord_write_fake_marker(&bin, "maw", "DELEGATED-MAW");
+    discord_write_fake_marker(&bin, "bun", "DELEGATED-BUN");
+    let output = Command::new(env!("CARGO_BIN_EXE_maw-rs"))
+        .arg("discord")
+        .arg("serve")
+        .arg("--dry-run")
+        .env("PATH", &bin)
+        .env("HOME", root.join("home"))
+        .env("GHQ_ROOT", root.join("ghq"))
+        .env("MAW_JS_REF_DIR", "/nonexistent")
+        .output()
+        .expect("run maw-rs discord");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.contains("127.0.0.1"), "stdout={stdout}");
+    assert!(!stdout.contains("DELEGATED-MAW"), "stdout={stdout}");
+    assert!(!stderr.contains("DELEGATED-MAW"), "stderr={stderr}");
+    assert!(!stdout.contains("DELEGATED-BUN"), "stdout={stdout}");
+    assert!(!stderr.contains("DELEGATED-BUN"), "stderr={stderr}");
 }

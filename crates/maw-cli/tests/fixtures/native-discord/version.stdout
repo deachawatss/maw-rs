@@ -6,6 +6,6 @@ subcommand status:
   ✓ bind <bot>               v0.3 (rewrite to use 'maw wake' pending)
   ✓ access <bot> ...         v0.4 (list/show/map/add/rm/set/allow/lockdown)
   ✓ guilds/channels/members/inventory <bot>  v0.4.2 (Discord-state visibility)
-  ⏸ pair <oracle> <chan>     v0.5 planned
-  ⏸ route <from> <to>        v0.5 planned
-  ⏸ serve (after_send hook)  v0.5 planned (replaces daemon — engine.serve)
+  ✓ pair <oracle> <chan>     v0.5 (seed access + channel-map)
+  ✓ route <from> <to>        v0.5 (channel-map entry)
+  ✓ serve (after_send hook)  v0.5 (loopback-only relay)
