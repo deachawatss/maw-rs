@@ -1,0 +1,5 @@
+[31m⚠ WARNING: peers configured but no federationToken set![0m
+[31m  Port 3456 is exposed to network WITHOUT authentication.[0m
+[31m  Add "federationToken" (min 16 chars) to maw.config.json[0m
+[33m⚠ duplicate <oracle>:<node> claim "nova:nova-node" — <local>, peer-a (https://peer.example.test)[0m
+[33m  investigate with `maw peers list` and `maw peers remove <alias>` if stale.[0m
