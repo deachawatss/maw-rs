@@ -1,0 +1,12 @@
+{
+  "description": "Lean profile",
+  "name": "lean",
+  "plugins": [
+    "peek",
+    "profile"
+  ],
+  "tiers": [
+    "core",
+    "standard"
+  ]
+}
