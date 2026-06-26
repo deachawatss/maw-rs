@@ -125,7 +125,21 @@ fn run_scope_delete(argv: &[String], positional: &[&str]) -> CliOutput {
 
 #[allow(dead_code)]
 fn scope_help() -> &'static str {
-    "usage: maw scope <list|create|show|delete> [...]\n  list                                                    — list all scopes\n  create   <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]\n                                                          — create new scope (refuses overwrite)\n  show     <name>                                         — print one scope's JSON\n  delete   <name> [--yes]                                 — remove scope file (confirms unless --yes)\n\nstorage: <CONFIG_DIR>/scopes/<name>.json (one file per scope)\n\nnote: Phase 1 of #642 — primitive only. ACL evaluation, trust list, and\n      cross-scope approval queue are deferred to follow-up issues."
+    "usage: maw scope <list|create|show|delete> [...]
+  list                                                    — list all scopes used by the live ACL gate
+  create   <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]
+                                                          — create new scope (refuses overwrite)
+  show     <name>                                         — print one scope's JSON
+  delete   <name> [--yes]                                 — remove scope file (confirms unless --yes)
+
+storage: <CONFIG_DIR>/scopes/<name>.json (one file per scope)
+trust:   <STATE_DIR>/scope-trust.json (symmetric sender/target approvals)
+
+ACL is live for peer sends: same-scope and trusted sender/target pairs deliver;
+cross-scope untrusted peer sends queue for human approval via `maw inbox pending`.
+Use `maw hey|send --approve` for one human-approved replay, and
+`--approve --trust` to add a symmetric scope trust pair before delivery.
+If scope/trust files are corrupt, peer send fails open with a loud stderr warning."
 }
 
 #[allow(dead_code)]

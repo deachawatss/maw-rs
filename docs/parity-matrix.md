@@ -26,7 +26,7 @@ Legend: **native ✅** = Rust dispatcher/implementation exists; **WASM ✅** = w
 | --- | --- | --- | --- | --- |
 | `hey` | --from, --inbox, --approve, --trust, --no-verify-submit | maw-js source | native ✅ | Rust async transport native; source path differs from maw-js routeComm but top-level delivery exists. |
 | `send` | top-level alias of hey; raw plugin command also exists | maw-js source | native ✅ | Top-level maw-rs send is native hey-style delivery. Raw send-text semantics are separate. |
-| `notify` | --from, --approve, --trust; inbox-only | maw-js source | NOT-PORTED ❌ | maw-js core route only; no DISPATCHER_ENTRIES entry in maw-rs. |
+| `notify` | --from, --approve, --trust; inbox-only | maw-js source + #303 tests | native ✅ | Native notify is inbox-only; peer path is covered by the live scope ACL gate and queues untrusted cross-scope sends. |
 | `peek` | top-level federation-aware peek | maw-js source | WASM ✅ | Covered by WASM parity fixture for peek seeded host; raw tmux peek is native subset. |
 | `messages` | serve/status/stop; --detach --direction --engine --from --json --limit --port --q --state --to | maw-js source | native ✅ | Rust async message service/client exists, but flag/output parity should be rechecked against full plugin before final green. |
 | `reply / rp` | --list; reply to last/listed message | maw-js source | native ✅ | Rust async reply entry exists; mark as native but needs byte-level output audit. |
@@ -97,7 +97,7 @@ Legend: **native ✅** = Rust dispatcher/implementation exists; **WASM ✅** = w
 | `consent` | approve\|reject\|list\|list-trust\|trust\|untrust; --help | maw-js + maw-rs source | WASM ✅ | WASM parity covers read-only list/list-trust only; Rust has low-level consent-* plan commands, not top-level maw consent approvals. |
 | `pair` | generate; --at --expires | maw-js + maw-rs source | stub ⚠️ | Rust pair-code/pair-api low-level entries exist; maw-js top-level pair generate surface not directly matched. |
 | `trust` | add\|remove/rm/delete\|list/ls; --yes | maw-js + maw-rs source | NOT-PORTED ❌ | No top-level Rust trust command; low-level consent-trust-* only. |
-| `scope` | create/delete/info/list/ls/new/remove/rm/show; --lead --members --ttl --yes | maw-js + maw-rs source | stub ⚠️ | Issue #55 native primitive only: Rust supports list/create/show/delete. Full ACL/cross-scope semantics deferred in source help. |
+| `scope` | create/delete/info/list/ls/new/remove/rm/show; --lead --members --ttl --yes | maw-js #642 contract + #303 tests | native ✅ | Scope files, symmetric scope-trust.json, pending approval queue, and peer-send ACL gate are live. Cross-scope untrusted peer sends queue; corrupt ACL/trust fails open with loud warning. |
 | `auto-pair-proof` | low-level proof helper | maw-js + maw-rs source | native ✅ | Rust native plan helper; not a maw-js top-level vendor command. |
 | `recent-hello` | low-level pairing helper | maw-js + maw-rs source | native ✅ | Rust native plan helper; not direct maw-js top-level vendor command. |
 | `pair-code / pair-code-store / pair-api / pair-api-auto` | low-level pairing helpers | maw-js + maw-rs source | native ✅ | Rust native plan helpers; do not count as top-level pair parity. |

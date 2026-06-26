@@ -1,0 +1,8 @@
+id:      abc123
+sender:  alice
+target:  bob
+query:   bob
+sentAt:  2026-06-25T00:00:00.000Z
+status:  pending
+message:
+hello fleet

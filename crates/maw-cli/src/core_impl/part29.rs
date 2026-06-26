@@ -262,11 +262,15 @@ fn send_acl_queue_pending(sender: &str, target: &str, args: &SendArgs) -> Result
     inbox_write_pending(&inbox_state_pending_dir(&env), &message)?;
     Ok(CliOutput {
         code: 0,
-        stdout: format!(
-            "queued pending ACL approval: {id}\n  sender: {sender}\n  target: {target}\n  review: maw inbox show-pending {id}\n  approve: maw inbox approve {id}\n"
-        ),
+        stdout: send_acl_format_queue_output(&id, sender, target),
         stderr: String::new(),
     })
+}
+
+fn send_acl_format_queue_output(id: &str, sender: &str, target: &str) -> String {
+    format!(
+        "queued pending ACL approval: {id}\n  sender: {sender}\n  target: {target}\n  review: maw inbox show-pending {id}\n  approve: maw inbox approve {id}\n"
+    )
 }
 
 fn send_acl_pending_id() -> Result<String, String> {
@@ -1229,6 +1233,16 @@ mod send_acl_hotpath_tests {
         assert!(!fake_log.exists(), "ACL queue must happen before fake/real peer transport");
         assert!(!env.root.join("state").join("peer-key").exists());
         assert_eq!(std::fs::read_dir(env.root.join("state").join("pending")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn send_acl_queue_and_usage_match_committed_goldens() {
+        assert_eq!(
+            send_acl_format_queue_output("2026-06-26T00-00-00-000Z-a1b2c3", "alice", "bob"),
+            include_str!("../../tests/fixtures/native-scope-acl/acl-queue.stdout")
+        );
+        let output = send_usage_error("hey", "hey: --trust requires --approve");
+        assert_eq!(output.stderr, include_str!("../../tests/fixtures/native-scope-acl/send-usage.stderr"));
     }
 
     fn send_acl_vec(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }

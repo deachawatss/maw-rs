@@ -1784,6 +1784,28 @@ mod inbox_tests {
     }
 
     #[test]
+    fn inbox_pending_acl_surfaces_match_committed_goldens() {
+        let env = inbox_temp_env("pending-golden");
+        inbox_pending_fixture(&env, "abc123", "pending");
+        inbox_pending_fixture(&env, "def456", "pending");
+        let mut sender = InboxFakeSender::default();
+
+        let pending = inbox_run(&inbox_strings(&["pending"]), &env, &mut sender).unwrap();
+        assert_eq!(pending, include_str!("../../tests/fixtures/native-scope-acl/inbox-pending-list.stdout"));
+
+        let detail = inbox_run(&inbox_strings(&["show-pending", "abc"]), &env, &mut sender).unwrap();
+        assert_eq!(detail, include_str!("../../tests/fixtures/native-scope-acl/inbox-show-pending.stdout"));
+
+        let approved = inbox_run(&inbox_strings(&["approve", "abc"]), &env, &mut sender).unwrap();
+        assert_eq!(approved, include_str!("../../tests/fixtures/native-scope-acl/inbox-approve.stdout"));
+        assert!(sender.bypass_seen);
+        assert_eq!(sender.sent, vec![("bob".to_owned(), "hello fleet".to_owned())]);
+
+        let rejected = inbox_run(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
+        assert_eq!(rejected, include_str!("../../tests/fixtures/native-scope-acl/inbox-reject.stdout"));
+    }
+
+    #[test]
     fn inbox_pending_show_approve_reject_are_hermetic() {
         let env = inbox_temp_env("pending");
         inbox_pending_fixture(&env, "abc123", "pending");

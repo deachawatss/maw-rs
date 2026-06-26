@@ -211,7 +211,21 @@ fn scope_run_delete(args: &ScopeArgs) -> CliOutput {
 }
 
 fn scope_native_help() -> &'static str {
-    "usage: maw scope <list|create|show|delete> [...]\n  list                                                    — list all scopes\n  create   <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]\n                                                          — create new scope (refuses overwrite)\n  show     <name>                                         — print one scope's JSON\n  delete   <name> [--yes]                                 — remove scope file (confirms unless --yes)\n\nstorage: <CONFIG_DIR>/scopes/<name>.json (one file per scope)\n\nnote: Phase 1 of #642 — primitive only. ACL evaluation, trust list, and\n      cross-scope approval queue are deferred to follow-up issues."
+    "usage: maw scope <list|create|show|delete> [...]
+  list                                                    — list all scopes used by the live ACL gate
+  create   <name> --members <a,b,c> [--lead <m>] [--ttl <iso>]
+                                                          — create new scope (refuses overwrite)
+  show     <name>                                         — print one scope's JSON
+  delete   <name> [--yes]                                 — remove scope file (confirms unless --yes)
+
+storage: <CONFIG_DIR>/scopes/<name>.json (one file per scope)
+trust:   <STATE_DIR>/scope-trust.json (symmetric sender/target approvals)
+
+ACL is live for peer sends: same-scope and trusted sender/target pairs deliver;
+cross-scope untrusted peer sends queue for human approval via `maw inbox pending`.
+Use `maw hey|send --approve` for one human-approved replay, and
+`--approve --trust` to add a symmetric scope trust pair before delivery.
+If scope/trust files are corrupt, peer send fails open with a loud stderr warning."
 }
 
 fn scope_native_error(message: &str) -> CliOutput {
@@ -682,6 +696,26 @@ mod scope_acl_tests {
 
     fn scope_trust_test_path(name: &str) -> std::path::PathBuf {
         scope_acl_temp_dir(name).join("state").join("scope-trust.json")
+    }
+
+    #[test]
+    fn scope_help_matches_live_acl_golden_and_has_no_stale_wording() {
+        let help = format!("{}\n", scope_native_help());
+        assert_eq!(help, include_str!("../../tests/fixtures/native-scope-acl/scope-help.stdout"));
+        let lower = help.to_ascii_lowercase();
+        let stale_terms = [
+            ["de", "ferred"].concat(),
+            ["plan", "-only"].concat(),
+            ["phase", " 1"].concat(),
+            ["phase", "-1"].concat(),
+            ["not", " yet"].concat(),
+        ];
+        for stale in stale_terms {
+            assert!(!lower.contains(stale.as_str()), "stale scope help wording: {stale}");
+        }
+        assert!(help.contains("ACL is live for peer sends"));
+        assert!(help.contains("--approve --trust"));
+        assert!(help.contains("fails open with a loud stderr warning"));
     }
 
     #[test]
