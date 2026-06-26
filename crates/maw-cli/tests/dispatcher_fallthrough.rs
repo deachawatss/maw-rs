@@ -408,3 +408,63 @@ fn loop_guard_returns_unknown_command_instead_of_falling_through() {
 
     remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn plugin_manifest_invoke_is_native_and_never_invokes_path_maw() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("plugin-manifest-native");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    let manifest_dir = plugins_dir.join("ts-proof");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&manifest_dir).expect("plugin dir");
+    write_maw_shim(&bin_dir, 37);
+    write(
+        manifest_dir.join("plugin.json"),
+        r#"{"name":"ts-proof","version":"1.0.0","sdk":"*","target":"js","entry":"index.ts"}"#,
+    )
+    .expect("manifest");
+    write(
+        manifest_dir.join("index.ts"),
+        b"export default () => ({ ok: true });\n",
+    )
+    .expect("entry");
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+    std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
+    std::env::remove_var("MAW_FROM_RS");
+    std::env::remove_var("MAW_RS_HEY_FALLBACK");
+
+    let output = run_cli(&args(&[
+        "plugin-manifest",
+        "invoke",
+        "--scan-dir",
+        plugins_dir.to_str().expect("plugins path"),
+        "--plugin",
+        "ts-proof",
+    ]));
+
+    assert_eq!(dispatcher_status("plugin-manifest"), DispatchKind::Native);
+    assert_eq!(output.code, 2, "{}", output.stdout);
+    assert!(output.stdout.is_empty(), "{}", output.stdout);
+    assert!(
+        output
+            .stderr
+            .contains("No Bun/JS subprocess fallback is available"),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains("DELEGATED-MAW"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains("DELEGATED-MAW"),
+        "{}",
+        output.stderr
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}

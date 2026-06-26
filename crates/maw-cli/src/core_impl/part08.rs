@@ -121,7 +121,7 @@ fn plugin_manifest_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n       maw-rs plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n       maw-rs plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n       maw-rs plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--fake-ts-output <text>] [--fake-wasm-output <text>] [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n"
+            "{message}\nusage: maw-rs plugin-manifest parse --dir <dir> --json <json> [--plan-json]\n       maw-rs plugin-manifest load --dir <dir> [--plan-json]\n       maw-rs plugin-manifest discover --scan-dir <dir>... [--disabled <name>]... [--runtime-version <version>] [--use-cache] [--plan-json]\n       maw-rs plugin-manifest import-symbol --scan-dir <dir>... --plugin <name> --symbol <name> [--module-symbol <name=value>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n       maw-rs plugin-manifest invoke --scan-dir <dir>... --plugin <name> [--source <cli|api|peer>] [--arg <arg>]... [--disabled <name>]... [--runtime-version <version>] [--plan-json]\n"
         ),
     }
 }
@@ -171,21 +171,25 @@ fn render_plugin_import_symbol_json(
 }
 
 fn render_plugin_invoke_json(
-    plugin: &str,
+    plugin: &LoadedPlugin,
     ctx: &InvokeContext,
     result: &InvokeResult,
-    runtime: &PlanInvokeRuntime,
     warnings: &[String],
 ) -> String {
+    let runtime_mode = match plugin.kind {
+        LoadedPluginKind::Wasm => "extism-wasm",
+        LoadedPluginKind::Ts => "universal-cli",
+    };
     format!(
-        "{{\"command\":\"plugin-manifest\",\"kind\":\"invoke\",\"plugin\":{},\"source\":{},\"args\":{},\"result\":{},\"runtime\":{{\"tsCalls\":{},\"wasmCalls\":{},\"lastWasmBytesLen\":{}}},\"warnings\":{}}}\n",
-        json_string(plugin),
+        "{{\"command\":\"plugin-manifest\",\"kind\":\"invoke\",\"plugin\":{},\"source\":{},\"args\":{},\"result\":{},\"runtime\":{{\"mode\":{},\"pluginKind\":{},\"wasmExport\":{},\"hostFnCount\":{},\"noBunFallback\":true,\"tsRefused\":false,\"muslStaticCompat\":\"extism-crate-linked\"}},\"warnings\":{}}}\n",
+        json_string(&plugin.manifest.name),
         json_string(ctx.source.as_str()),
         json_string_array(&ctx.args),
         render_invoke_result_json(result),
-        runtime.ts_calls,
-        runtime.wasm_calls,
-        runtime.last_wasm_bytes_len,
+        json_string(runtime_mode),
+        json_string(plugin.kind.as_str()),
+        json_string(&plugin.wasm_export),
+        HOST_FN_NAMES.len(),
         json_string_array(warnings)
     )
 }

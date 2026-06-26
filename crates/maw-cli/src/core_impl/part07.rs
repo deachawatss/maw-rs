@@ -684,17 +684,7 @@ fn run_plugin_manifest_plan(argv: &[String]) -> CliOutput {
             plugin,
             source,
             args,
-            fake_ts_output,
-            fake_wasm_output,
-        } => run_plugin_manifest_invoke_plan(
-            plan_json,
-            &options,
-            &plugin,
-            source,
-            args,
-            fake_ts_output,
-            fake_wasm_output,
-        ),
+        } => run_plugin_manifest_invoke_plan(plan_json, &options, &plugin, source, args),
     }
 }
 
@@ -736,8 +726,6 @@ fn run_plugin_manifest_invoke_plan(
     plugin_name: &str,
     source: InvokeSource,
     args: Vec<String>,
-    fake_ts_output: Option<String>,
-    fake_wasm_output: Option<String>,
 ) -> CliOutput {
     let report = discover_packages(options);
     let Some(plugin) = report
@@ -751,12 +739,16 @@ fn run_plugin_manifest_invoke_plan(
         return plugin_manifest_usage_error(&format!("plugin '{plugin_name}' is disabled"));
     }
     let ctx = InvokeContext { source, args };
-    let mut runtime = PlanInvokeRuntime::new(fake_ts_output, fake_wasm_output);
+    if plugin.kind == LoadedPluginKind::Ts && !plugin_manifest_invoke_is_universal(&ctx) {
+        return plugin_manifest_ts_refusal(plugin);
+    }
+
+    let mut runtime = ExtismWasmInvokeRuntime::default();
     let result = invoke_plugin(plugin, &ctx, &mut runtime);
     CliOutput {
         code: 0,
         stdout: if plan_json {
-            render_plugin_invoke_json(plugin_name, &ctx, &result, &runtime, &report.warnings)
+            render_plugin_invoke_json(plugin, &ctx, &result, &report.warnings)
         } else if result.ok {
             result
                 .output
@@ -768,41 +760,21 @@ fn run_plugin_manifest_invoke_plan(
     }
 }
 
-struct PlanInvokeRuntime {
-    ts_calls: usize,
-    wasm_calls: usize,
-    last_wasm_bytes_len: usize,
-    ts_result: InvokeResult,
-    wasm_result: InvokeResult,
+fn plugin_manifest_invoke_is_universal(ctx: &InvokeContext) -> bool {
+    matches!(ctx.source, InvokeSource::Cli)
+        && ctx.args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version"))
 }
 
-impl PlanInvokeRuntime {
-    fn new(fake_ts_output: Option<String>, fake_wasm_output: Option<String>) -> Self {
-        Self {
-            ts_calls: 0,
-            wasm_calls: 0,
-            last_wasm_bytes_len: 0,
-            ts_result: fake_ts_output.map_or_else(InvokeResult::ok, InvokeResult::output),
-            wasm_result: fake_wasm_output.map_or_else(InvokeResult::ok, InvokeResult::output),
-        }
-    }
-}
-
-impl PluginInvokeRuntime for PlanInvokeRuntime {
-    fn invoke_ts(&mut self, _plugin: &LoadedPlugin, _ctx: &InvokeContext) -> InvokeResult {
-        self.ts_calls += 1;
-        self.ts_result.clone()
-    }
-
-    fn invoke_wasm(
-        &mut self,
-        _plugin: &LoadedPlugin,
-        _ctx: &InvokeContext,
-        wasm_bytes: &[u8],
-    ) -> InvokeResult {
-        self.wasm_calls += 1;
-        self.last_wasm_bytes_len = wasm_bytes.len();
-        self.wasm_result.clone()
+fn plugin_manifest_ts_refusal(plugin: &LoadedPlugin) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!(
+            "plugin-manifest invoke: TS source plugin '{}' is not executable in the maw-rs Extism-WASM runtime. Build this plugin to WASM and point plugin.json at the WASM artifact (target=wasm / wasm=<file> or entry.kind=wasm). No Bun/JS subprocess fallback is available.\n",
+            plugin.manifest.name
+        ),
     }
 }
 
@@ -833,8 +805,6 @@ enum PluginManifestAction {
         plugin: String,
         source: InvokeSource,
         args: Vec<String>,
-        fake_ts_output: Option<String>,
-        fake_wasm_output: Option<String>,
     },
 }
 
@@ -926,8 +896,6 @@ fn parse_plugin_manifest_invoke_args(argv: &[String]) -> Result<PluginManifestAc
     let mut plugin = None;
     let mut source = InvokeSource::Cli;
     let mut invoke_args = Vec::new();
-    let mut fake_ts_output = None;
-    let mut fake_wasm_output = None;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
@@ -959,18 +927,6 @@ fn parse_plugin_manifest_invoke_args(argv: &[String]) -> Result<PluginManifestAc
                 invoke_args.push(take_plugin_manifest_value(argv, index, "--arg")?);
                 index += 1;
             }
-            "--fake-ts-output" => {
-                fake_ts_output = Some(take_plugin_manifest_value(argv, index, "--fake-ts-output")?);
-                index += 1;
-            }
-            "--fake-wasm-output" => {
-                fake_wasm_output = Some(take_plugin_manifest_value(
-                    argv,
-                    index,
-                    "--fake-wasm-output",
-                )?);
-                index += 1;
-            }
             other => return Err(format!("plugin-manifest invoke: unknown argument {other}")),
         }
         index += 1;
@@ -989,7 +945,5 @@ fn parse_plugin_manifest_invoke_args(argv: &[String]) -> Result<PluginManifestAc
         plugin: plugin.ok_or_else(|| "plugin-manifest invoke: --plugin is required".to_owned())?,
         source,
         args: invoke_args,
-        fake_ts_output,
-        fake_wasm_output,
     })
 }

@@ -1,0 +1,22 @@
+{
+  "command": "plugin-manifest",
+  "kind": "invoke",
+  "plugin": "triggers-parity",
+  "source": "cli",
+  "args": [],
+  "result": {
+    "ok": true,
+    "output": "\u001b[90mNo triggers configured. Add a 'triggers' array to maw.config.json.\u001b[0m\n\n\u001b[90mExample:\u001b[0m\n  \"triggers\": [\n    { \"on\": \"issue-close\", \"repo\": \"Soul-Brews-Studio/maw-js\", \"action\": \"maw hey pulse-oracle 'issue closed'\" },\n    { \"on\": \"pr-merge\", \"repo\": \"Soul-Brews-Studio/maw-js\", \"action\": \"maw done neo-mawjs\" },\n    { \"on\": \"agent-idle\", \"timeout\": 30, \"action\": \"maw sleep {agent}\" }\n  ]",
+    "error": null
+  },
+  "runtime": {
+    "mode": "extism-wasm",
+    "pluginKind": "wasm",
+    "wasmExport": "handle",
+    "hostFnCount": 24,
+    "noBunFallback": true,
+    "tsRefused": false,
+    "muslStaticCompat": "extism-crate-linked"
+  },
+  "warnings": ["2 legacy plugins loaded without artifact hash — build them to enforce integrity."]
+}

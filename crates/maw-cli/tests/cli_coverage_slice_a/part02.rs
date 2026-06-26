@@ -49,7 +49,7 @@ fn plugin_manifest_remaining_text_parser_and_runtime_edges_are_covered() {
             "/tmp",
             "--fake-ts-output",
         ],
-        "plugin-manifest: missing --fake-ts-output value",
+        "plugin-manifest invoke: unknown argument --fake-ts-output",
     );
     assert_usage(
         &[
@@ -59,7 +59,7 @@ fn plugin_manifest_remaining_text_parser_and_runtime_edges_are_covered() {
             "/tmp",
             "--fake-wasm-output",
         ],
-        "plugin-manifest: missing --fake-wasm-output value",
+        "plugin-manifest invoke: unknown argument --fake-wasm-output",
     );
     assert_usage(
         &["plugin-manifest", "invoke", "--bogus"],
@@ -110,18 +110,23 @@ fn plugin_manifest_remaining_text_parser_and_runtime_edges_are_covered() {
     assert_eq!(load_missing.code, 0, "{}", load_missing.stderr);
     assert_eq!(load_missing.stdout, "missing\n");
 
-    let invoke_ok = run_cli(&[
+    let invoke_refused_ts = run_cli(&[
         "plugin-manifest".to_owned(),
         "invoke".to_owned(),
         "--scan-dir".to_owned(),
         plugins_dir.to_string_lossy().into_owned(),
         "--plugin".to_owned(),
         "ts-plug".to_owned(),
-        "--fake-ts-output".to_owned(),
-        "ran ts".to_owned(),
     ]);
-    assert_eq!(invoke_ok.code, 0, "{}", invoke_ok.stderr);
-    assert_eq!(invoke_ok.stdout, "ran ts\n");
+    assert_eq!(invoke_refused_ts.code, 2);
+    assert!(invoke_refused_ts.stdout.is_empty(), "{}", invoke_refused_ts.stdout);
+    assert!(
+        invoke_refused_ts
+            .stderr
+            .contains("TS source plugin 'ts-plug' is not executable"),
+        "{}",
+        invoke_refused_ts.stderr
+    );
 
     let invoke_missing = run_cli(&[
         "plugin-manifest".to_owned(),

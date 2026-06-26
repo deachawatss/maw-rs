@@ -45,8 +45,9 @@ use maw_peer::{
 use maw_plugin_manifest::{
     build_js_plugin_dir, discover_packages, import_plugin_symbol, infer_plugin_capabilities,
     init_js_plugin_dir, install_built_plugin_dir, invoke_plugin, load_manifest_from_dir,
-    parse_manifest, DiscoverPackagesOptions, InvokeContext, InvokeResult, InvokeSource, LoadedPlugin,
-    LoadedPluginKind, MvpWasmInvokeRuntime, PluginInvokeRuntime, PluginManifest, PluginTier,
+    parse_manifest, DiscoverPackagesOptions, ExtismWasmInvokeRuntime, HOST_FN_NAMES, InvokeContext,
+    InvokeResult, InvokeSource, LoadedPlugin, LoadedPluginKind, MvpWasmInvokeRuntime,
+    PluginManifest, PluginTier,
 };
 use maw_plugin_scaffold::{
     build_manifest_json, validate_plugin_name, PluginLanguage as ScaffoldLanguage,
@@ -186,7 +187,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "hub", handler: Handler::Sync(run_hub_plan) },
     DispatcherEntry { command: "xdg", handler: Handler::Sync(run_xdg_plan) },
     DispatcherEntry { command: "plugin-scaffold", handler: Handler::Sync(run_plugin_scaffold_plan) },
-    DispatcherEntry { command: "plugin-manifest", handler: Handler::Sync(run_plugin_manifest_plan) },
     DispatcherEntry { command: "bind-host", handler: Handler::Sync(run_bind_host_plan) },
     DispatcherEntry { command: "tmux", handler: Handler::Sync(run_tmux_command) },
     DispatcherEntry { command: "bring", handler: Handler::Sync(run_bring_plan) },
