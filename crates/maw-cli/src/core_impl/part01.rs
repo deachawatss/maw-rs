@@ -191,7 +191,6 @@ const DISPATCH_01: &[DispatcherEntry] = &[
     DispatcherEntry { command: "tmux", handler: Handler::Sync(run_tmux_command) },
     DispatcherEntry { command: "bring", handler: Handler::Sync(run_bring_plan) },
     DispatcherEntry { command: "b", handler: Handler::Sync(run_bring_plan) },
-    DispatcherEntry { command: "ls", handler: Handler::Sync(run_ls_plan) },
     DispatcherEntry { command: "send-enter", handler: Handler::Sync(run_send_enter_command) },
     DispatcherEntry { command: "feed", handler: Handler::Sync(run_feed_plan) },
     DispatcherEntry { command: "hey", handler: Handler::Async(run_hey_async) },

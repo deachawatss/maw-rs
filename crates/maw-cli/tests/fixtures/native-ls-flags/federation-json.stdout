@@ -1,0 +1,1 @@
+{"nodes":[{"alias":"local","node":"local","local":true,"sessions":[{"name":"50-mawjs","windows":[{"active":false,"index":0,"name":"mawjs"}]}]},{"alias":"blue","node":"blue-node","url":"http://127.0.0.1:9999","sessions":[{"name":"blue-oracle","windows":[{"active":true,"index":0,"name":"main"}]}]}],"totalSessions":2,"reachableNodes":2,"totalNodes":2,"timeoutMs":2000}

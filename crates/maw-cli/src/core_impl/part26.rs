@@ -384,6 +384,12 @@ struct LsPlanOptions {
     recent_limit: Option<usize>,
     filter: Option<String>,
     peer: Option<String>,
+    federation: bool,
+    node: Option<String>,
+    fleet_only: bool,
+    teams: bool,
+    verify: bool,
+    fix: bool,
     now: Option<u64>,
     panes: Vec<TmuxPane>,
     session_created: BTreeMap<String, u64>,
@@ -409,6 +415,12 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
         recent_limit: None,
         filter: None,
         peer: None,
+        federation: false,
+        node: None,
+        fleet_only: false,
+        teams: true,
+        verify: false,
+        fix: false,
         now: None,
         panes: Vec::new(),
         session_created: BTreeMap::new(),
@@ -424,6 +436,26 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
             "--compact" | "-c" => options.mode = LsMode::Compact,
             "--verbose" | "-v" => options.mode = LsMode::Verbose,
             "--channels" => options.channels = true,
+            "--federation" => options.federation = true,
+            "--fleet-only" => options.fleet_only = true,
+            "--no-teams" => options.teams = false,
+            "--node" => {
+                let Some(value) = argv.get(index + 1) else {
+                    return Err(ls_usage_error("✗ maw ls: --node requires a value"));
+                };
+                match ls_validate_value(value, "--node") {
+                    Ok(()) => options.node = Some(value.trim().to_owned()),
+                    Err(message) => return Err(ls_usage_error(&message)),
+                }
+                index += 1;
+            }
+            arg if arg.starts_with("--node=") => {
+                let value = &arg["--node=".len()..];
+                match ls_validate_value(value, "--node") {
+                    Ok(()) => options.node = Some(value.trim().to_owned()),
+                    Err(message) => return Err(ls_usage_error(&message)),
+                }
+            }
             "--active" => {
                 options.active = true;
                 if let Some(next) = argv.get(index + 1) {
@@ -496,27 +528,38 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
                 }
                 index += 1;
             }
-            "--verify" | "--fix" => {
-                // Accepted for top-level maw-js surface parity. This plan-only
-                // port does not mutate/prune worktrees.
-            }
+            "--verify" => options.verify = true,
+            "--fix" => options.fix = true,
             "-a" => {
                 options.all = true;
             }
             arg if arg.starts_with('-') => {
                 return Err(ls_usage_error(&format!("ls: unknown argument {arg}")));
             }
-            arg => positionals.push(arg.to_owned()),
+            arg => {
+                if let Err(message) = ls_validate_value(arg, "filter") {
+                    return Err(ls_usage_error(&message));
+                }
+                positionals.push(arg.to_owned());
+            }
         }
         index += 1;
     }
 
     if let Some(first) = positionals.first() {
-        if options.active || !options.panes.is_empty() {
-            options.filter = Some(first.clone());
-        } else {
+        if options.federation || (!options.active && options.panes.is_empty()) {
             options.peer = Some(first.clone());
+        } else {
+            options.filter = Some(first.clone());
         }
+    }
+
+    if let Some(node) = &options.node {
+        options.filter = Some(node.clone());
+    }
+
+    if options.federation {
+        options.all = true;
     }
 
     Ok(options)
