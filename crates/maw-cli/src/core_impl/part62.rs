@@ -9,6 +9,7 @@ const INBOX_SAFE_DRAIN_DEFAULT_MIN_AGE_SECONDS: u64 = 4 * 60 * 60;
 const INBOX_UNREAD_RED_THRESHOLD: usize = 50;
 const INBOX_OLDEST_RED_SECONDS: u64 = 4 * 60 * 60;
 const INBOX_ARCHIVE_RED_SECONDS: u64 = 8 * 60 * 60;
+const INBOX_PENDING_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InboxEnv {
@@ -93,15 +94,42 @@ type InboxCursorStore = BTreeMap<String, InboxCursorEntry>;
 
 trait InboxSender {
     fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String>;
+    fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
+        self.inbox_send(query, message)
+    }
 }
 
 struct InboxSystemSender;
 
+fn inbox_self_bin() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("MAW_RS_SELF_BIN")
+        .map(std::path::PathBuf::from)
+        .map_or_else(
+            || std::env::current_exe().map_err(|error| format!("inbox: current_exe failed: {error}")),
+            Ok,
+        )
+}
+
 impl InboxSender for InboxSystemSender {
     fn inbox_send(&mut self, query: &str, message: &str) -> Result<(), String> {
         inbox_validate_target_arg(query, "query")?;
-        let output = std::process::Command::new("maw")
+        let output = std::process::Command::new(inbox_self_bin()?)
             .args(["hey", "--", query, message])
+            .output()
+            .map_err(|error| format!("inbox: failed to execute maw hey: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("inbox: maw hey failed: {}", stderr.trim()))
+        }
+    }
+
+    fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
+        inbox_validate_target_arg(query, "query")?;
+        let output = std::process::Command::new(inbox_self_bin()?)
+            .args(["hey", "--", query, message])
+            .env("MAW_ACL_BYPASS", "1")
             .output()
             .map_err(|error| format!("inbox: failed to execute maw hey: {error}"))?;
         if output.status.success() {
@@ -140,10 +168,10 @@ fn inbox_run(
         return Ok(format!("usage: {INBOX_USAGE}\n"));
     }
     match argv.first().map(String::as_str) {
-        Some("pending" | "queue") => inbox_run_pending(env),
-        Some("show-pending" | "pending-show") => inbox_run_show_pending(&argv[1..], env),
-        Some("approve") => inbox_run_approve(&argv[1..], env, sender),
-        Some("reject") => inbox_run_reject(&argv[1..], env),
+        Some("pending" | "queue") => inbox_run_pending(env, inbox_now_ms()),
+        Some("show-pending" | "pending-show") => inbox_run_show_pending(&argv[1..], env, inbox_now_ms()),
+        Some("approve") => inbox_run_approve(&argv[1..], env, sender, inbox_now_ms()),
+        Some("reject") => inbox_run_reject(&argv[1..], env, inbox_now_ms()),
         Some("read") => inbox_run_mark_read(&argv[1..], env),
         Some("show") => inbox_run_show(&argv[1..], env),
         Some("write") => inbox_run_write(&argv[1..], env, inbox_now_ms()),
@@ -168,6 +196,10 @@ fn inbox_real_env() -> InboxEnv {
         oracle: inbox_config_string(&config, "oracle", "local"),
         node: inbox_config_string(&config, "node", "cli"),
     }
+}
+
+fn inbox_state_pending_dir(env: &InboxEnv) -> std::path::PathBuf {
+    env.state_dir.join("pending")
 }
 
 fn inbox_read_config(path: &std::path::Path) -> serde_json::Value {
@@ -619,17 +651,17 @@ fn inbox_drain_candidates(
         .collect()
 }
 
-fn inbox_run_pending(env: &InboxEnv) -> Result<String, String> {
-    let rows = inbox_load_pending(&env.pending_dir)?
+fn inbox_run_pending(env: &InboxEnv, now_ms: u64) -> Result<String, String> {
+    let rows = inbox_load_pending_for_env(env, now_ms)?
         .into_iter()
         .filter(|message| message.status == "pending")
         .collect::<Vec<_>>();
     Ok(inbox_format_pending_list(&rows))
 }
 
-fn inbox_run_show_pending(argv: &[String], env: &InboxEnv) -> Result<String, String> {
+fn inbox_run_show_pending(argv: &[String], env: &InboxEnv, now_ms: u64) -> Result<String, String> {
     let id = inbox_single_id_arg(argv, "usage: maw inbox show-pending <id>")?;
-    let Some(message) = inbox_resolve_pending(&env.pending_dir, id)? else {
+    let Some(message) = inbox_resolve_pending_for_env(env, id, now_ms)? else {
         return Err(format!("pending message not found: {id}"));
     };
     Ok(inbox_format_pending_detail(&message))
@@ -639,9 +671,10 @@ fn inbox_run_approve(
     argv: &[String],
     env: &InboxEnv,
     sender: &mut impl InboxSender,
+    now_ms: u64,
 ) -> Result<String, String> {
     let id = inbox_single_id_arg(argv, "usage: maw inbox approve <id>")?;
-    let Some(mut message) = inbox_resolve_pending(&env.pending_dir, id)? else {
+    let Some(mut message) = inbox_resolve_pending_for_env(env, id, now_ms)? else {
         return Err(format!("pending message not found: {id}"));
     };
     if message.status != "pending" {
@@ -650,27 +683,34 @@ fn inbox_run_approve(
             message.id, message.status
         ));
     }
+    let original_status = message.status.clone();
     "approved".clone_into(&mut message.status);
-    inbox_write_pending(&env.pending_dir, &message)?;
+    let state_pending_dir = inbox_state_pending_dir(env);
+    inbox_write_pending(&state_pending_dir, &message)?;
     let query = message.query.as_deref().unwrap_or(&message.target);
-    sender.inbox_send(query, &message.message)?;
-    inbox_delete_pending(&env.pending_dir, &message.id)?;
+    if let Err(error) = sender.inbox_send_with_acl_bypass(query, &message.message) {
+        original_status.clone_into(&mut message.status);
+        inbox_write_pending(&state_pending_dir, &message)?;
+        return Err(error);
+    }
+    inbox_delete_pending(&state_pending_dir, &message.id)?;
     Ok(format!(
         "approved: {} ({} → {})\n",
         message.id, message.sender, message.target
     ))
 }
 
-fn inbox_run_reject(argv: &[String], env: &InboxEnv) -> Result<String, String> {
+fn inbox_run_reject(argv: &[String], env: &InboxEnv, now_ms: u64) -> Result<String, String> {
     let id = inbox_single_id_arg(argv, "usage: maw inbox reject <id>")?;
-    let Some(mut message) = inbox_resolve_pending(&env.pending_dir, id)? else {
+    let Some(mut message) = inbox_resolve_pending_for_env(env, id, now_ms)? else {
         return Err(format!("pending message not found: {id}"));
     };
+    let state_pending_dir = inbox_state_pending_dir(env);
     if message.status != "rejected" {
         "rejected".clone_into(&mut message.status);
-        inbox_write_pending(&env.pending_dir, &message)?;
+        inbox_write_pending(&state_pending_dir, &message)?;
     }
-    inbox_delete_pending(&env.pending_dir, &message.id)?;
+    inbox_delete_pending(&state_pending_dir, &message.id)?;
     Ok(format!(
         "rejected: {} ({} → {})\n",
         message.id, message.sender, message.target
@@ -1115,7 +1155,26 @@ fn inbox_format_drain_result(result: &InboxDrainResult) -> String {
     format!("{}\n", lines.join("\n"))
 }
 
-fn inbox_load_pending(pending_dir: &std::path::Path) -> Result<Vec<InboxPendingMessage>, String> {
+fn inbox_load_pending_for_env(env: &InboxEnv, now_ms: u64) -> Result<Vec<InboxPendingMessage>, String> {
+    let state_dir = inbox_state_pending_dir(env);
+    inbox_reap_expired_pending(&state_dir, now_ms)?;
+    let mut by_id = BTreeMap::<String, InboxPendingMessage>::new();
+    for message in inbox_load_pending(&env.pending_dir, now_ms, false)? {
+        by_id.entry(message.id.clone()).or_insert(message);
+    }
+    for message in inbox_load_pending(&state_dir, now_ms, true)? {
+        by_id.insert(message.id.clone(), message);
+    }
+    let mut rows = by_id.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.sent_at.cmp(&right.sent_at).then_with(|| left.id.cmp(&right.id)));
+    Ok(rows)
+}
+
+fn inbox_load_pending(
+    pending_dir: &std::path::Path,
+    now_ms: u64,
+    state_owned: bool,
+) -> Result<Vec<InboxPendingMessage>, String> {
     let Ok(entries) = std::fs::read_dir(pending_dir) else {
         return Ok(Vec::new());
     };
@@ -1128,37 +1187,59 @@ fn inbox_load_pending(pending_dir: &std::path::Path) -> Result<Vec<InboxPendingM
         let raw = std::fs::read_to_string(&path)
             .map_err(|error| format!("inbox: read pending {}: {error}", path.display()))?;
         if let Ok(message) = serde_json::from_str::<InboxPendingMessage>(&raw) {
-            rows.push(message);
+            if inbox_pending_is_expired(&message, now_ms) {
+                if state_owned {
+                    let _ = std::fs::remove_file(&path);
+                }
+            } else if inbox_validate_pending_message(&message).is_ok() {
+                rows.push(message);
+            }
         }
     }
     rows.sort_by(|left, right| left.sent_at.cmp(&right.sent_at));
     Ok(rows)
 }
 
-fn inbox_resolve_pending(
-    pending_dir: &std::path::Path,
+fn inbox_resolve_pending_for_env(
+    env: &InboxEnv,
     id: &str,
+    now_ms: u64,
 ) -> Result<Option<InboxPendingMessage>, String> {
     inbox_validate_lookup_arg(id, "pending id")?;
-    let rows = inbox_load_pending(pending_dir)?;
+    let rows = inbox_load_pending_for_env(env, now_ms)?;
     if let Some(exact) = rows.iter().find(|message| message.id == id) {
         return Ok(Some(exact.clone()));
     }
-    Ok(rows.into_iter().find(|message| message.id.starts_with(id)))
+    let matches = rows
+        .into_iter()
+        .filter(|message| message.id.starts_with(id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        _ => Err(format!("pending id prefix is ambiguous: {id}")),
+    }
 }
 
 fn inbox_write_pending(
     pending_dir: &std::path::Path,
     message: &InboxPendingMessage,
 ) -> Result<(), String> {
+    inbox_validate_pending_message(message)?;
     std::fs::create_dir_all(pending_dir)
         .map_err(|error| format!("inbox: create pending dir: {error}"))?;
     let json = serde_json::to_string_pretty(message).map_err(|error| error.to_string())?;
-    std::fs::write(
-        pending_dir.join(format!("{}.json", message.id)),
-        format!("{json}\n"),
-    )
-    .map_err(|error| format!("inbox: write pending {}: {error}", message.id))
+    let path = pending_dir.join(format!("{}.json", message.id));
+    inbox_write_0600_atomic(&path, &(json + "\n"))
+        .map_err(|error| format!("inbox: write pending {}: {error}", message.id))?;
+    let roundtrip = std::fs::read_to_string(&path)
+        .map_err(|error| format!("inbox: validate pending {}: {error}", message.id))?;
+    let parsed = serde_json::from_str::<InboxPendingMessage>(&roundtrip)
+        .map_err(|error| format!("inbox: validate pending json {}: {error}", message.id))?;
+    if parsed != *message {
+        return Err(format!("inbox: validate pending mismatch {}", message.id));
+    }
+    Ok(())
 }
 
 fn inbox_delete_pending(pending_dir: &std::path::Path, id: &str) -> Result<(), String> {
@@ -1170,6 +1251,98 @@ fn inbox_delete_pending(pending_dir: &std::path::Path, id: &str) -> Result<(), S
     Ok(())
 }
 
+fn inbox_reap_expired_pending(pending_dir: &std::path::Path, now_ms: u64) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(pending_dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(message) = serde_json::from_str::<InboxPendingMessage>(&raw) else {
+            continue;
+        };
+        if inbox_pending_is_expired(&message, now_ms) {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("inbox: reap expired pending {}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn inbox_pending_is_expired(message: &InboxPendingMessage, now_ms: u64) -> bool {
+    inbox_parse_iso_ms(&message.sent_at)
+        .is_some_and(|sent_ms| inbox_age_seconds(sent_ms, now_ms) > INBOX_PENDING_TTL_SECONDS)
+}
+
+fn inbox_validate_pending_message(message: &InboxPendingMessage) -> Result<(), String> {
+    inbox_validate_lookup_arg(&message.id, "pending id")?;
+    inbox_validate_target_arg(&message.sender, "sender")?;
+    inbox_validate_target_arg(&message.target, "target")?;
+    if let Some(query) = &message.query {
+        inbox_validate_target_arg(query, "query")?;
+    }
+    if !matches!(message.status.as_str(), "pending" | "approved" | "rejected") {
+        return Err("inbox: invalid pending status".to_owned());
+    }
+    if message.sent_at.is_empty() || message.sent_at.chars().any(char::is_control) {
+        return Err("inbox: invalid pending sentAt".to_owned());
+    }
+    Ok(())
+}
+
+fn inbox_write_0600_atomic(path: &std::path::Path, body: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| format!("create parent failed: {error}"))?;
+    let tmp = inbox_tmp_path(path);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        }
+        let mut file = options.open(&tmp).map_err(|error| format!("tmp create failed: {error}"))?;
+        std::io::Write::write_all(&mut file, body.as_bytes())
+            .map_err(|error| format!("tmp write failed: {error}"))?;
+        file.sync_all().map_err(|error| format!("tmp sync failed: {error}"))?;
+    }
+    std::fs::read_to_string(&tmp).map_err(|error| format!("tmp validate read failed: {error}"))?;
+    std::fs::rename(&tmp, path).map_err(|error| format!("atomic rename failed: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("chmod 0600 failed: {error}"))?;
+    }
+    Ok(())
+}
+
+fn inbox_tmp_path(path: &std::path::Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("pending.json");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    parent.join(format!(".{name}.{}-{nanos}.tmp", std::process::id()))
+}
+
+#[allow(dead_code)]
+fn inbox_pending_id(now_ms: u64, random_hex: &str) -> Result<String, String> {
+    if random_hex.len() != 6 || !random_hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("inbox: pending id random suffix must be 6 hex chars".to_owned());
+    }
+    Ok(format!(
+        "{}-{}",
+        inbox_iso_label(now_ms).replace([':', '.'], "-"),
+        random_hex.to_ascii_lowercase()
+    ))
+}
+
 fn inbox_format_pending_list(rows: &[InboxPendingMessage]) -> String {
     if rows.is_empty() {
         return "no pending messages\n".to_owned();
@@ -1177,7 +1350,7 @@ fn inbox_format_pending_list(rows: &[InboxPendingMessage]) -> String {
     let mut out = String::from("id  sender  target  sentAt  preview\n");
     out.push_str("--  ------  ------  ------  -------\n");
     for row in rows {
-        let preview = inbox_truncate(&row.message.replace('\n', " "), 50);
+        let preview = inbox_pending_preview(&row.message);
         let _ = writeln!(
             out,
             "{}  {}  {}  {}  {preview}",
@@ -1185,6 +1358,15 @@ fn inbox_format_pending_list(rows: &[InboxPendingMessage]) -> String {
         );
     }
     out
+}
+
+fn inbox_pending_preview(message: &str) -> String {
+    let flattened = message.replace('\n', " ");
+    let lower = flattened.to_ascii_lowercase();
+    if lower.contains("token") || lower.contains("secret") || lower.contains("peer-key") {
+        return "[redacted sensitive preview]".to_owned();
+    }
+    inbox_truncate(&flattened, 50)
 }
 
 fn inbox_format_pending_detail(message: &InboxPendingMessage) -> String {
@@ -1467,6 +1649,8 @@ mod inbox_tests {
     #[derive(Default)]
     struct InboxFakeSender {
         sent: Vec<(String, String)>,
+        fail: bool,
+        bypass_seen: bool,
     }
 
     impl InboxSender for InboxFakeSender {
@@ -1475,11 +1659,29 @@ mod inbox_tests {
             self.sent.push((query.to_owned(), message.to_owned()));
             Ok(())
         }
+
+        fn inbox_send_with_acl_bypass(&mut self, query: &str, message: &str) -> Result<(), String> {
+            inbox_validate_target_arg(query, "query")?;
+            self.bypass_seen = true;
+            if std::env::var("MAW_ACL_BYPASS").is_ok() {
+                return Err("test leak: MAW_ACL_BYPASS should not be global".to_owned());
+            }
+            if self.fail {
+                return Err("fake send failed".to_owned());
+            }
+            self.sent.push((query.to_owned(), message.to_owned()));
+            Ok(())
+        }
     }
 
     fn inbox_temp_env(name: &str) -> InboxEnv {
-        let root =
-            std::env::temp_dir().join(format!("maw-inbox-test-{name}-{}", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "maw-inbox-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
         InboxEnv {
             inbox_dir: root.join("psi").join("inbox"),
             pending_dir: root.join("config").join("pending"),
@@ -1507,7 +1709,7 @@ mod inbox_tests {
             status: status.to_owned(),
             message: "hello fleet".to_owned(),
         };
-        inbox_write_pending(&env.pending_dir, &message).unwrap();
+        inbox_write_pending(&inbox_state_pending_dir(env), &message).unwrap();
     }
 
     fn inbox_strings(values: &[&str]) -> Vec<String> {
@@ -1598,8 +1800,95 @@ mod inbox_tests {
             sender.sent,
             vec![("bob".to_owned(), "hello fleet".to_owned())]
         );
+        assert!(sender.bypass_seen);
+        assert!(std::env::var("MAW_ACL_BYPASS").is_err());
+        assert!(!inbox_state_pending_dir(&env).join("abc123.json").exists());
         let rejected = inbox_run(&inbox_strings(&["reject", "def"]), &env, &mut sender).unwrap();
         assert!(rejected.contains("rejected: def456"));
+        assert!(!inbox_state_pending_dir(&env).join("def456.json").exists());
+    }
+
+    #[test]
+    fn inbox_pending_state_first_legacy_fallback_ttl_and_preview_only() {
+        let env = inbox_temp_env("pending-state");
+        let legacy = InboxPendingMessage {
+            id: "same123".to_owned(),
+            sender: "legacy".to_owned(),
+            target: "bob".to_owned(),
+            query: Some("bob".to_owned()),
+            sent_at: "2026-06-25T00:00:00.000Z".to_owned(),
+            status: "pending".to_owned(),
+            message: "legacy full token SECRET_BODY".to_owned(),
+        };
+        inbox_write_pending(&env.pending_dir, &legacy).unwrap();
+        let state = InboxPendingMessage {
+            sender: "state".to_owned(),
+            message: "state full token SECRET_BODY".to_owned(),
+            ..legacy.clone()
+        };
+        inbox_write_pending(&inbox_state_pending_dir(&env), &state).unwrap();
+        let expired = InboxPendingMessage {
+            id: "old999".to_owned(),
+            sent_at: "2026-05-01T00:00:00.000Z".to_owned(),
+            ..state.clone()
+        };
+        inbox_write_pending(&inbox_state_pending_dir(&env), &expired).unwrap();
+
+        let rows = inbox_load_pending_for_env(&env, inbox_parse_iso_ms("2026-06-26T00:00:00.000Z").unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sender, "state");
+        assert!(!inbox_state_pending_dir(&env).join("old999.json").exists());
+
+        let mut sender = InboxFakeSender::default();
+        let list = inbox_run(&inbox_strings(&["queue"]), &env, &mut sender).unwrap();
+        assert!(list.contains("same123"));
+        assert!(list.contains("state"));
+        assert!(!list.contains("SECRET_BODY"));
+        let detail = inbox_run(&inbox_strings(&["show-pending", "same"]), &env, &mut sender).unwrap();
+        assert!(detail.contains("SECRET_BODY"));
+    }
+
+    #[test]
+    fn inbox_pending_approve_send_failure_keeps_file_for_retry() {
+        let env = inbox_temp_env("pending-fail");
+        inbox_pending_fixture(&env, "abc123", "pending");
+        let mut sender = InboxFakeSender {
+            fail: true,
+            ..InboxFakeSender::default()
+        };
+        let err = inbox_run(&inbox_strings(&["approve", "abc"]), &env, &mut sender).expect_err("send failure");
+        assert!(err.contains("fake send failed"));
+        assert!(sender.bypass_seen);
+        let path = inbox_state_pending_dir(&env).join("abc123.json");
+        assert!(path.exists());
+        let pending = inbox_load_pending_for_env(&env, inbox_now_ms()).unwrap();
+        assert_eq!(pending[0].status, "pending");
+    }
+
+    #[test]
+    fn inbox_pending_id_and_atomic_permissions_are_guarded() {
+        let env = inbox_temp_env("pending-perms");
+        inbox_pending_fixture(&env, "abc123", "pending");
+        assert_eq!(
+            inbox_pending_id(inbox_parse_iso_ms("2026-06-26T00:00:00.000Z").unwrap(), "A1B2c3").unwrap(),
+            "2026-06-26T00-00-00-000Z-a1b2c3"
+        );
+        assert!(inbox_pending_id(0, "nope").is_err());
+        let path = inbox_state_pending_dir(&env).join("abc123.json");
+        assert!(path.exists());
+        let siblings = std::fs::read_dir(inbox_state_pending_dir(&env))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!siblings
+            .iter()
+            .any(|name| std::path::Path::new(name).extension().is_some_and(|ext| ext == "tmp")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]
