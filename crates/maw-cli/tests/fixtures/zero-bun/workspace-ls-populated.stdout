@@ -1,0 +1,13 @@
+
+[36;1mWorkspaces[0m  [90m2 joined[0m
+
+  [32m●[0m  [37;1mone[0m  [90m(ws-l1)[0m
+     [36mHub:[0m     https://a.example
+     [36mAgents:[0m  2 agents shared
+     [90m         alice, bob[0m
+     [90mJoined:  2026-04-01[0m
+  [31m●[0m  [37;1mtwo[0m  [90m(ws-l2)[0m
+     [36mHub:[0m     https://b.example
+     [36mAgents:[0m  [90mno agents shared[0m
+     [90mJoined:  2026-04-02[0m
+

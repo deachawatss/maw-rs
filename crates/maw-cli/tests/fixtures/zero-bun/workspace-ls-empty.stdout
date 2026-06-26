@@ -1,0 +1,3 @@
+[90mNo workspaces configured.[0m
+[90m  maw workspace create <name>   Create a new workspace[0m
+[90m  maw workspace join <code>     Join with invite code[0m
