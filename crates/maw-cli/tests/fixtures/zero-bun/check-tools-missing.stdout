@@ -1,0 +1,25 @@
+
+maw check tools
+
+Required:
+  [31m✗[0m bun       [90mnot installed[0m
+  [31m✗[0m gh        [90mnot installed[0m
+  [31m✗[0m ghq       [90mnot installed[0m
+  [31m✗[0m git       [90mnot installed[0m
+  [31m✗[0m tmux      [90mnot installed[0m
+
+Optional (Python plugins):
+  [31m✗[0m uv        [90mnot installed[0m
+  [31m✗[0m uvx       [90mnot installed[0m
+
+Missing:
+  [31m✗[0m bun               https://bun.sh
+  [31m✗[0m gh                https://cli.github.com
+  [31m✗[0m ghq               https://github.com/x-motemen/ghq#install
+  [31m✗[0m git               https://git-scm.com/downloads
+  [31m✗[0m tmux              https://github.com/tmux/tmux/wiki/Installing
+  [31m✗[0m uv                https://docs.astral.sh/uv/getting-started/installation/
+  [31m✗[0m uvx               https://docs.astral.sh/uv/
+
+0 required ✓  ·  0 optional ✓  ·  [31m7 missing[0m
+

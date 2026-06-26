@@ -67,7 +67,7 @@ fn write_maw_shim(dir: &Path, exit_code: u8) {
     write(
         &shim,
         format!(
-            "#!/bin/sh\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\nexit {exit_code}\n"
+            "#!/bin/sh\nprintf 'DELEGATED-MAW\\n'\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\nexit {exit_code}\n"
         ),
     )
     .expect("write maw shim");
@@ -83,12 +83,29 @@ fn write_maw_shim(dir: &Path, exit_code: u8) {
     }
 }
 
+fn write_tool_shim(dir: &Path, name: &str, body: &str) {
+    let shim = dir.join(name);
+    write(&shim, body).expect("write tool shim");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&shim)
+            .expect("tool shim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&shim, permissions).expect("chmod tool shim");
+    }
+}
+
 #[test]
 fn dispatcher_table_marks_native_and_fallback_commands() {
     assert_eq!(dispatcher_status("ls"), DispatchKind::Native);
     assert_eq!(dispatcher_status("hey"), DispatchKind::Native);
+    assert_eq!(dispatcher_status("check"), DispatchKind::Native);
     assert!(native_dispatch_commands().contains(&"ls"));
     assert!(native_dispatch_commands().contains(&"hey"));
+    assert!(native_dispatch_commands().contains(&"check"));
 }
 
 #[test]
@@ -136,7 +153,175 @@ fn hey_can_still_fall_through_to_maw_when_safety_env_is_set() {
     assert!(output.stderr.is_empty(), "{}", output.stderr);
     assert_eq!(
         output.stdout,
-        "MAW_FROM_RS=1\nargs=hey local:nova:claude ping\n"
+        "DELEGATED-MAW\nMAW_FROM_RS=1\nargs=hey local:nova:claude ping\n"
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn check_tools_is_native_and_never_invokes_path_maw() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("check-tools-native");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&plugins_dir).expect("plugins dir");
+    write_maw_shim(&bin_dir, 37);
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+    std::env::remove_var("MAW_FROM_RS");
+    std::env::remove_var("MAW_RS_HEY_FALLBACK");
+
+    let output = run_cli(&args(&["check", "tools"]));
+
+    assert_eq!(dispatcher_status("check"), DispatchKind::Native);
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert!(output.stderr.is_empty(), "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        include_str!("fixtures/zero-bun/check-tools-missing.stdout")
+    );
+    assert!(
+        !output.stdout.contains("DELEGATED-MAW"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        !output.stderr.contains("DELEGATED-MAW"),
+        "{}",
+        output.stderr
+    );
+    assert!(
+        !output.stderr.contains("failed to run maw fallback"),
+        "{}",
+        output.stderr
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn check_tools_extracts_versions_with_argv_only_tool_probes() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("check-tools-present");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&plugins_dir).expect("plugins dir");
+    write_maw_shim(&bin_dir, 37);
+    write_tool_shim(&bin_dir, "bun", "#!/bin/sh\nprintf 'bun 1.2.3\\n'\n");
+    write_tool_shim(&bin_dir, "gh", "#!/bin/sh\nprintf 'gh version 2.3.4\\n'\n");
+    write_tool_shim(&bin_dir, "ghq", "#!/bin/sh\nprintf 'ghq 3.4.5\\n'\n");
+    write_tool_shim(
+        &bin_dir,
+        "git",
+        "#!/bin/sh\nprintf 'git version 4.5.6\\n'\n",
+    );
+    write_tool_shim(&bin_dir, "tmux", "#!/bin/sh\nprintf 'tmux 5.6\\n'\n");
+    write_tool_shim(&bin_dir, "uv", "#!/bin/sh\nprintf 'uv 6.7.8\\n'\n");
+    write_tool_shim(
+        &bin_dir,
+        "uvx",
+        "#!/bin/sh\nprintf 'uvx should-not-run\\n'\n",
+    );
+    write_tool_shim(
+        &bin_dir,
+        "which",
+        "#!/bin/sh\nif [ \"$1\" = uvx ]; then printf 'uvx\\n'; exit 0; fi\nexit 1\n",
+    );
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+    std::env::remove_var("MAW_FROM_RS");
+
+    let output = run_cli(&args(&["check"]));
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert!(output.stderr.is_empty(), "{}", output.stderr);
+    assert!(
+        output.stdout.contains("maw check tools"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("bun       1.2.3"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("gh        2.3.4"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("ghq       3.4.5"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("git       4.5.6"),
+        "{}",
+        output.stdout
+    );
+    assert!(output.stdout.contains("tmux      5.6"), "{}", output.stdout);
+    assert!(
+        output.stdout.contains("uv        6.7.8"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("uvx       6.7.8"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output.stdout.contains("(provided by uv)"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        output
+            .stdout
+            .contains("5 required ✓  ·  2 optional ✓  ·  0 missing"),
+        "{}",
+        output.stdout
+    );
+    assert!(
+        !output.stdout.contains("DELEGATED-MAW"),
+        "{}",
+        output.stdout
+    );
+
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn check_unknown_subcommand_matches_maw_js_usage_without_tool_exec() {
+    let _guard = env_lock().lock().expect("env lock");
+    let _restore = EnvRestore::capture();
+    let root = temp_dir("check-unknown-subcommand");
+    let bin_dir = root.join("bin");
+    let plugins_dir = root.join("plugins");
+    create_dir_all(&bin_dir).expect("bin dir");
+    create_dir_all(&plugins_dir).expect("plugins dir");
+    write_maw_shim(&bin_dir, 37);
+    std::env::set_var("PATH", &bin_dir);
+    std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+
+    let output = run_cli(&args(&["check", "status"]));
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert!(output.stderr.is_empty(), "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        "unknown subcommand: status\nusage: maw check [tools]\n"
+    );
+    assert!(
+        !output.stdout.contains("DELEGATED-MAW"),
+        "{}",
+        output.stdout
     );
 
     remove_dir_all(root).expect("cleanup");
