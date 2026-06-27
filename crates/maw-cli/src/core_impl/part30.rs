@@ -79,6 +79,7 @@ struct ServeArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServePeerPubkey {
     from: String,
+    node: String,
     pubkey: String,
 }
 
@@ -1308,12 +1309,24 @@ fn resolve_request_cached_pubkey(
     let Some(from) = request_from_sign_sender(headers) else {
         return Ok(None);
     };
-    state
+    if let Some(entry) = state.peer_pubkeys.iter().find(|entry| entry.from == from) {
+        return Ok(Some(entry.pubkey.clone()));
+    }
+    let Some(node) = node_from_identity(&from) else {
+        return Err("refuse-missing-peer-key");
+    };
+    let mut node_matches = state
         .peer_pubkeys
         .iter()
-        .find(|entry| entry.from == from)
-        .map(|entry| Some(entry.pubkey.clone()))
-        .ok_or("refuse-missing-peer-key")
+        .filter(|entry| entry.node == node)
+        .filter(|entry| !entry.pubkey.trim().is_empty());
+    let Some(first) = node_matches.next() else {
+        return Err("refuse-missing-peer-key");
+    };
+    if node_matches.any(|entry| entry.pubkey != first.pubkey) {
+        return Err("refuse-ambiguous-peer-key");
+    }
+    Ok(Some(first.pubkey.clone()))
 }
 
 fn request_from_sign_sender(headers: &Headers) -> Option<String> {
@@ -1349,10 +1362,13 @@ fn collect_peer_pubkeys(value: &Value, key_hint: Option<&str>, entries: &mut Vec
         Value::Object(map) => {
             if let Some(pubkey) = object_pubkey(value) {
                 for from in object_from_identities(value, key_hint) {
-                    entries.push(ServePeerPubkey {
-                        from,
-                        pubkey: pubkey.clone(),
-                    });
+                    if let Some(node) = node_from_normalized_identity(&from) {
+                        entries.push(ServePeerPubkey {
+                            from,
+                            node,
+                            pubkey: pubkey.clone(),
+                        });
+                    }
                 }
             }
             for (key, child) in map {
@@ -1368,10 +1384,13 @@ fn collect_peer_pubkeys(value: &Value, key_hint: Option<&str>, entries: &mut Vec
             if let Some(from) = key_hint.and_then(normalize_from_identity) {
                 let pubkey = pubkey.trim();
                 if !pubkey.is_empty() {
-                    entries.push(ServePeerPubkey {
-                        from,
-                        pubkey: pubkey.to_owned(),
-                    });
+                    if let Some(node) = node_from_normalized_identity(&from) {
+                        entries.push(ServePeerPubkey {
+                            from,
+                            node,
+                            pubkey: pubkey.to_owned(),
+                        });
+                    }
                 }
             }
         }
@@ -1433,6 +1452,19 @@ fn normalize_from_identity(value: &str) -> Option<String> {
         return None;
     }
     Some(format!("{oracle}:{node}"))
+}
+
+fn node_from_normalized_identity(value: &str) -> Option<String> {
+    value
+        .split_once(':')
+        .map(|(_, node)| node)
+        .filter(|node| !node.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn node_from_identity(value: &str) -> Option<String> {
+    let normalized = normalize_from_identity(value)?;
+    node_from_normalized_identity(&normalized)
 }
 
 #[derive(Default, Deserialize)]
@@ -1760,6 +1792,13 @@ mod serve_tests {
         Arc::new(FakeServeDelivery::with_capture_agent())
     }
 
+    fn serve_test_peer_pubkey(from: &str, pubkey: &str) -> ServePeerPubkey {
+        ServePeerPubkey {
+            from: from.to_owned(),
+            node: node_from_identity(from).expect("peer identity node"),
+            pubkey: pubkey.to_owned(),
+        }
+    }
 
     fn serve_test_trust_store_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -1865,13 +1904,10 @@ mod serve_tests {
 
     fn captured_send_key() -> ServePeerPubkey {
         let fixture = captured_send_fixture();
-        ServePeerPubkey {
-            from: fixture["headers"]["X-Maw-From"]
-                .as_str()
-                .expect("from")
-                .to_owned(),
-            pubkey: fixture["testPeerKey"].as_str().expect("peer key").to_owned(),
-        }
+        let from = fixture["headers"]["X-Maw-From"]
+            .as_str()
+            .expect("from");
+        serve_test_peer_pubkey(from, fixture["testPeerKey"].as_str().expect("peer key"))
     }
 
     fn captured_send_request() -> axum::http::Request<Body> {
@@ -1910,14 +1946,158 @@ mod serve_tests {
         request
     }
 
+    #[test]
+    fn serve_peer_pubkey_collection_sets_node_for_identity_shapes() {
+        let value = json!({
+            "peers": {
+                "nova:bigboy-vps": "node-key-a",
+                "alias": {"pubkey": "node-key-b", "oracle": "seed", "node": "bigboy-vps"},
+                "direct": {"pubkey": "node-key-c", "from": "gm-bo:bigboy-vps"}
+            }
+        });
+        let mut entries = Vec::new();
+        collect_peer_pubkeys(&value, None, &mut entries);
+        assert!(entries.iter().any(|entry| entry.from == "nova:bigboy-vps"
+            && entry.node == "bigboy-vps"
+            && entry.pubkey == "node-key-a"));
+        assert!(entries.iter().any(|entry| entry.from == "seed:bigboy-vps"
+            && entry.node == "bigboy-vps"
+            && entry.pubkey == "node-key-b"));
+        assert!(entries.iter().any(|entry| entry.from == "gm-bo:bigboy-vps"
+            && entry.node == "bigboy-vps"
+            && entry.pubkey == "node-key-c"));
+    }
+
+    #[tokio::test]
+    async fn serve_o6_node_fallback_accepts_unseeded_oracle_on_known_node() {
+        let node_key = "node-key-bigboy-vps-399";
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey("nova:bigboy-vps", node_key)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello node fallback"}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                node_key,
+                "alloy:bigboy-vps",
+                1_782_277_200,
+            ))
+            .await
+            .expect("node fallback response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["state"], "delivered");
+        assert_eq!(payload["target"], "capture-agent:0");
+        let sends = delivery.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].0, "capture-agent:0");
+        assert_eq!(sends[0].1, "[alloy:bigboy-vps] hello node fallback");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_exact_mismatch_does_not_fallback_to_node_key() {
+        let node_key = "node-key-bigboy-vps-399";
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![
+                serve_test_peer_pubkey("alloy:bigboy-vps", "wrong-exact-key-399"),
+                serve_test_peer_pubkey("nova:bigboy-vps", node_key),
+            ],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"exact must win"}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                node_key,
+                "alloy:bigboy-vps",
+                1_782_277_200,
+            ))
+            .await
+            .expect("exact mismatch response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-mismatch");
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_o6_node_fallback_rejects_unknown_node() {
+        let node_key = "node-key-bigboy-vps-399";
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey("nova:bigboy-vps", node_key)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"unknown node"}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                node_key,
+                "alloy:other-node",
+                1_782_277_200,
+            ))
+            .await
+            .expect("unknown node response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-missing-peer-key");
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_o6_node_fallback_rejects_ambiguous_node_keys() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![
+                serve_test_peer_pubkey("nova:bigboy-vps", "node-key-a-399"),
+                serve_test_peer_pubkey("seed:bigboy-vps", "node-key-b-399"),
+            ],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"ambiguous node"}"#;
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/send",
+                body,
+                "node-key-a-399",
+                "alloy:bigboy-vps",
+                1_782_277_200,
+            ))
+            .await
+            .expect("ambiguous node response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-ambiguous-peer-key");
+        assert!(delivery.sends().is_empty());
+    }
+
     #[tokio::test]
     async fn serve_o6_live_router_accepts_captured_maw_js_send_for_exact_from_key() {
         let app = serve_test_app_with_o6_keys(
             vec![
-                ServePeerPubkey {
-                    from: "other-oracle:other-node".to_owned(),
-                    pubkey: "wrong-first-peer-key".to_owned(),
-                },
+                serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key"),
                 captured_send_key(),
             ],
             1_782_553_858,
@@ -1938,10 +2118,7 @@ mod serve_tests {
     #[tokio::test]
     async fn serve_o6_live_router_rejects_captured_maw_js_send_when_exact_from_key_missing() {
         let app = serve_test_app_with_o6_keys(
-            vec![ServePeerPubkey {
-                from: "other-oracle:other-node".to_owned(),
-                pubkey: "wrong-first-peer-key".to_owned(),
-            }],
+            vec![serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key")],
             1_782_553_858,
             Some(NON_LOOPBACK_TEST_PEER),
         );
@@ -2008,10 +2185,7 @@ mod serve_tests {
     async fn serve_api_send_inbox_true_returns_501_without_tmux_send() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
-            vec![ServePeerPubkey {
-                from: FROM.to_owned(),
-                pubkey: KEY.to_owned(),
-            }],
+            vec![serve_test_peer_pubkey(FROM, KEY)],
             1_782_277_200,
             Some(NON_LOOPBACK_TEST_PEER),
             delivery.clone(),
@@ -2058,10 +2232,7 @@ mod serve_tests {
     async fn serve_api_send_auth_reject_is_logged_without_delivery() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
-            vec![ServePeerPubkey {
-                from: "other-oracle:other-node".to_owned(),
-                pubkey: "wrong-first-peer-key".to_owned(),
-            }],
+            vec![serve_test_peer_pubkey("other-oracle:other-node", "wrong-first-peer-key")],
             1_782_553_858,
             Some(NON_LOOPBACK_TEST_PEER),
             delivery.clone(),
@@ -2091,10 +2262,7 @@ mod serve_tests {
     #[tokio::test]
     async fn serve_o6_from_aware_key_resolution_also_unblocks_api_feed() {
         let app = serve_test_app_with_o6_keys(
-            vec![ServePeerPubkey {
-                from: FROM.to_owned(),
-                pubkey: KEY.to_owned(),
-            }],
+            vec![serve_test_peer_pubkey(FROM, KEY)],
             1_782_277_200,
             Some(NON_LOOPBACK_TEST_PEER),
         );
