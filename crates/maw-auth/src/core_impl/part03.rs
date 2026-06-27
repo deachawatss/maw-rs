@@ -97,6 +97,128 @@ fn signed_at_seconds(signed: &SignedInput) -> Option<i64> {
     }
 }
 
+
+fn header_trimmed<'a>(headers: &'a Headers, name: &str) -> &'a str {
+    headers.get(name).map(str::trim).unwrap_or_default()
+}
+
+fn verify_workspace_hmac(parts: &RequestAuthParts, body_hash: &str) -> Result<Option<String>, String> {
+    let Some(workspace_key) = parts
+        .workspace_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let signature = header_trimmed(&parts.headers, "x-maw-signature");
+    let timestamp_raw = header_trimmed(&parts.headers, "x-maw-timestamp");
+    if signature.is_empty() || timestamp_raw.is_empty() {
+        return Err("missing-signature".to_owned());
+    }
+    let Some(timestamp) = parse_unix_seconds(timestamp_raw) else {
+        return Err("invalid-timestamp".to_owned());
+    };
+    if (parts.now - timestamp).abs() > WINDOW_SEC {
+        return Err("timestamp-out-of-window".to_owned());
+    }
+
+    let auth_version = header_trimmed(&parts.headers, "x-maw-auth-version").to_ascii_lowercase();
+    let method = parts.method.to_uppercase();
+    let mut paths = vec![parts.path.as_str()];
+    let api_prefixed;
+    if !parts.path.starts_with("/api/") {
+        api_prefixed = format!("/api{}", parts.path);
+        paths.push(api_prefixed.as_str());
+    }
+    let mut v1_payloads = Vec::new();
+    let mut v2_payloads = Vec::new();
+    for path in paths {
+        v1_payloads.push(("hmac-v1", format!("{method}:{path}:{timestamp}")));
+        v2_payloads.push(("hmac-v2", format!("{method}:{path}:{timestamp}:{body_hash}")));
+    }
+    let payloads = match auth_version.as_str() {
+        "" | "v1" => v1_payloads,
+        "v2" => v2_payloads,
+        // maw-js stacks current v1 fleet-token headers under auth-version=v3 when
+        // from-signing is also present. Accept the current body-less fleet
+        // signature first, then v2 for future body-bound fleet-token senders.
+        "v3" => v1_payloads.into_iter().chain(v2_payloads).collect(),
+        _ => return Err("unsupported-auth-version".to_owned()),
+    };
+
+    for (who, expected) in payloads {
+        if verify_hmac_sig(workspace_key, &expected, signature) {
+            let from = header_trimmed(&parts.headers, "x-maw-from");
+            return Ok(Some(if from.is_empty() {
+                who.to_owned()
+            } else {
+                format!("{who}:{from}")
+            }));
+        }
+    }
+    Err("signature-invalid".to_owned())
+}
+
+fn verify_cached_from_sign(
+    parts: &RequestAuthParts,
+    signed: &SignedInput,
+    body_hash: &str,
+) -> Result<Option<String>, String> {
+    let Some(cached) = parts
+        .cached_pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if signed.has_v3_sig {
+        let Some(signed_at_sec) = parse_unix_seconds(&signed.v3_timestamp) else {
+            return Err("invalid-timestamp".to_owned());
+        };
+        if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+            return Err("timestamp-out-of-window".to_owned());
+        }
+        let payload = build_from_sign_payload(
+            &signed.from,
+            signed_at_sec,
+            &parts.method,
+            &parts.path,
+            body_hash,
+        );
+        if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
+            return Ok(Some(format!("from-sign:{}", signed.from)));
+        }
+        return Err("pin-mismatch".to_owned());
+    }
+
+    if signed.signed {
+        let Some(signed_at_sec) = parse_iso_seconds(&signed.legacy_signed_at) else {
+            return Err("invalid-signed-at".to_owned());
+        };
+        if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+            return Err("timestamp-out-of-window".to_owned());
+        }
+        let payload = build_legacy_from_sign_payload(
+            &signed.from,
+            &signed.legacy_signed_at,
+            &parts.method,
+            &parts.path,
+            body_hash,
+        );
+        if verify_hmac_sig(cached, &payload, &signed.legacy_sig) {
+            return Ok(Some(format!("from-sign:{}", signed.from)));
+        }
+        return Err("pin-mismatch".to_owned());
+    }
+
+    if !signed.from.is_empty() {
+        return Err("cache-no-sig".to_owned());
+    }
+    Ok(None)
+}
+
 fn ed25519_signature_header(headers: &Headers) -> Option<&str> {
     [
         "x-maw-ed25519-signature",
@@ -225,78 +347,37 @@ fn verify_serve_request(parts: &RequestAuthParts) -> RequestAuthDecision {
     }
 
     let signed = signed_input(&parts.headers);
-    if !signed.has_v3_sig {
-        if !signed.from.is_empty() && ed25519_signature_header(&parts.headers).is_some() {
-            return verify_ed25519_serve_request(parts, &signed);
-        }
-        return RequestAuthDecision::Reject {
-            reason: if signed.signed {
-                "unsupported-signature".to_owned()
-            } else {
-                "missing-credentials".to_owned()
-            },
-        };
-    }
-    if signed.from.is_empty() {
+    if signed.from.is_empty() && (signed.has_v3_sig || ed25519_signature_header(&parts.headers).is_some()) {
         return RequestAuthDecision::Reject {
             reason: "missing-from".to_owned(),
         };
     }
-    let Some(signed_at_sec) = signed_at_seconds(&signed) else {
-        return RequestAuthDecision::Reject {
-            reason: "invalid-timestamp".to_owned(),
-        };
-    };
-    let delta = (parts.now - signed_at_sec).abs();
-    if delta > WINDOW_SEC {
-        return RequestAuthDecision::Reject {
-            reason: "timestamp-out-of-window".to_owned(),
-        };
+    if !signed.has_v3_sig && !signed.from.is_empty() && ed25519_signature_header(&parts.headers).is_some() {
+        return verify_ed25519_serve_request(parts, &signed);
     }
 
     let body_hash = hash_body(parts.body.as_deref());
-    let payload = build_from_sign_payload(
-        &signed.from,
-        signed_at_sec,
-        &parts.method,
-        &parts.path,
-        &body_hash,
-    );
+    let fleet_accept = match verify_workspace_hmac(parts, &body_hash) {
+        Ok(accept) => accept,
+        Err(reason) => return auth_reject(&reason),
+    };
+    let from_accept = match verify_cached_from_sign(parts, &signed, &body_hash) {
+        Ok(accept) => accept,
+        Err(reason) => return auth_reject(&reason),
+    };
 
-    let mut had_hmac_key = false;
-    if let Some(workspace_key) = parts
-        .workspace_key
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        had_hmac_key = true;
-        if verify_hmac_sig(workspace_key, &payload, &signed.v3_sig) {
-            return RequestAuthDecision::Accept {
-                who: format!("hmac-v3:{}", signed.from),
-            };
-        }
+    if let Some(who) = from_accept {
+        return RequestAuthDecision::Accept { who };
     }
-
-    if let Some(cached) = parts
-        .cached_pubkey
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
-            return RequestAuthDecision::Accept {
-                who: format!("from-sign:{}", signed.from),
-            };
-        }
-        return RequestAuthDecision::Reject {
-            reason: "pin-mismatch".to_owned(),
-        };
+    if let Some(who) = fleet_accept {
+        return RequestAuthDecision::Accept { who };
     }
 
     RequestAuthDecision::Reject {
-        reason: if had_hmac_key {
-            "signature-invalid".to_owned()
-        } else {
+        reason: if signed.signed {
             "pin-missing".to_owned()
+        } else {
+            "missing-credentials".to_owned()
         },
     }
 }

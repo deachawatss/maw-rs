@@ -171,9 +171,8 @@ mod auth_native_tests {
     );
 
     fn auth_d2_hmac_headers(method: &str, path: &str, body: &str) -> Vec<String> {
-        let now = AUTH_D2_NOW.parse::<i64>().expect("fixed now");
         let body_hash = hash_body(Some(body.as_bytes()));
-        let payload = build_from_sign_payload(AUTH_D2_FROM, now, method, path, &body_hash);
+        let payload = format!("{method}:{path}:{AUTH_D2_NOW}:{body_hash}");
         let signature = sign_hmac_sig(AUTH_D2_SECRET, &payload);
         vec![
             "--header".to_owned(),
@@ -181,7 +180,9 @@ mod auth_native_tests {
             "--header".to_owned(),
             format!("x-maw-timestamp={AUTH_D2_NOW}"),
             "--header".to_owned(),
-            format!("x-maw-signature-v3={signature}"),
+            "x-maw-auth-version=v2".to_owned(),
+            "--header".to_owned(),
+            format!("x-maw-signature={signature}"),
         ]
     }
 
@@ -279,7 +280,7 @@ mod auth_native_tests {
         let output = auth_run_d2(&args);
         assert_eq!(output.code, 0, "{}", output.stderr);
         assert!(output.stdout.contains("\"kind\":\"accept\""));
-        assert!(output.stdout.contains("\"who\":\"hmac-v3:mawjs:m5\""));
+        assert!(output.stdout.contains("\"who\":\"hmac-v2:mawjs:m5\""));
         assert!(!output.stdout.contains(AUTH_D2_SECRET));
         assert!(!output.stderr.contains(AUTH_D2_SECRET));
     }

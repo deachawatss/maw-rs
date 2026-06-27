@@ -1,0 +1,26 @@
+{
+  "source": "/home/agent/github.com/Soul-Brews-Studio/maw-js/src/lib/federation-auth.ts",
+  "generatedBy": "read-only import of real maw-js federation-auth.ts signing functions; no daemon/comms",
+  "token": "fake-federation-token-393",
+  "peerKey": "fake-peer-key-393",
+  "from": "nova:codex4",
+  "method": "POST",
+  "path": "/api/triggers/fire",
+  "timestamp": 1700000000,
+  "body": "{\"event\":\"agent-idle\"}",
+  "bodyHash": "98e31c8f0c5f043066b34e52684d8c0a9bbc61e0393e4dbba1d644b04abb8878",
+  "fleetHeaders": {
+    "X-Maw-Timestamp": "1700000000",
+    "X-Maw-Signature": "536c867f3d9aa1f97c6c00c6b7e0337fe3d6d9c47ce1e38efe9d58d726d2c821"
+  },
+  "v3Headers": {
+    "X-Maw-From": "nova:codex4",
+    "X-Maw-Signature-V3": "19603ec4c4b9c6ad630809f50bc346066bb553b557b07d9809dfb62d4fb714a2",
+    "X-Maw-Timestamp": "1700000000",
+    "X-Maw-Auth-Version": "v3"
+  },
+  "payloads": {
+    "fleetV1": "POST:/api/triggers/fire:1700000000",
+    "v3": "POST:/api/triggers/fire:1700000000:98e31c8f0c5f043066b34e52684d8c0a9bbc61e0393e4dbba1d644b04abb8878:nova:codex4"
+  }
+}

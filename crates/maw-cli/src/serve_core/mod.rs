@@ -1504,8 +1504,16 @@ fn servecore_auth_headers(headers: &axum::http::HeaderMap) -> maw_auth::Headers 
             servecore_header_to_string(headers, "x-maw-from"),
         ),
         (
+            "x-maw-signature",
+            servecore_header_to_string(headers, "x-maw-signature"),
+        ),
+        (
             "x-maw-signature-v3",
             servecore_header_to_string(headers, "x-maw-signature-v3"),
+        ),
+        (
+            "x-maw-signed-at",
+            servecore_header_to_string(headers, "x-maw-signed-at"),
         ),
         (
             "x-maw-timestamp",
@@ -2651,22 +2659,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn servecore_hmac_v3_allows_nonloopback_protected_request() {
+    async fn servecore_accepts_real_maw_js_stacked_fleet_hmac_v3_headers() {
         let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
         let body = br#"{"event":"agent-idle"}"#;
         let state = ServecoreSharedState::default()
-            .servecore_with_auth(
-                Some("feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface".to_owned()),
-                None,
-            )
+            .servecore_with_auth(Some("fake-federation-token-393".to_owned()), None)
             .servecore_with_auth_now(1_700_000_000);
         let request = Request::builder()
             .method(Method::POST)
             .uri("/api/triggers/fire")
-            .header("x-maw-from", "mawjs:m5")
+            .header("x-maw-from", "nova:codex4")
+            .header(
+                "x-maw-signature",
+                "536c867f3d9aa1f97c6c00c6b7e0337fe3d6d9c47ce1e38efe9d58d726d2c821",
+            )
             .header(
                 "x-maw-signature-v3",
-                "754ff65d7f146fdf18680b484539ffa79e83e2203b393f36c5790ddaf2c03bda",
+                "19603ec4c4b9c6ad630809f50bc346066bb553b557b07d9809dfb62d4fb714a2",
             )
             .header("x-maw-timestamp", "1700000000")
             .header("x-maw-auth-version", "v3")
@@ -2674,6 +2683,33 @@ mod tests {
             .expect("request");
         let response = servecore_auth_request(state, request, peer).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn servecore_rejects_wrong_fleet_token_even_with_valid_from_sign_header() {
+        let peer = SocketAddr::from(([198, 51, 100, 10], 49_152));
+        let body = br#"{"event":"agent-idle"}"#;
+        let state = ServecoreSharedState::default()
+            .servecore_with_auth(Some("wrong-federation-token".to_owned()), None)
+            .servecore_with_auth_now(1_700_000_000);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/triggers/fire")
+            .header("x-maw-from", "nova:codex4")
+            .header(
+                "x-maw-signature",
+                "536c867f3d9aa1f97c6c00c6b7e0337fe3d6d9c47ce1e38efe9d58d726d2c821",
+            )
+            .header(
+                "x-maw-signature-v3",
+                "19603ec4c4b9c6ad630809f50bc346066bb553b557b07d9809dfb62d4fb714a2",
+            )
+            .header("x-maw-timestamp", "1700000000")
+            .header("x-maw-auth-version", "v3")
+            .body(Body::from(body.as_slice().to_vec()))
+            .expect("request");
+        let response = servecore_auth_request(state, request, peer).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

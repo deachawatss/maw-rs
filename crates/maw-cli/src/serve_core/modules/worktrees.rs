@@ -461,9 +461,12 @@ mod tests {
             NOW,
         )
         .expect("headers");
+        let fleet_signature =
+            maw_auth::sign_hmac_sig(KEY, &format!("POST:/api/worktrees/cleanup:{NOW}"));
         let mut request = client
             .post(format!("http://{addr}/api/worktrees/cleanup"))
             .header("content-type", "application/json")
+            .header("x-maw-signature", fleet_signature)
             .body(body);
         for (name, value) in headers.to_btree_map() {
             request = request.header(name.as_str(), value);

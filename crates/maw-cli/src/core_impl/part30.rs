@@ -1151,10 +1151,12 @@ mod serve_tests {
             1_782_277_200,
         )
         .expect("sign trust");
+        let fleet_signature = sign_hmac_sig(KEY, &format!("{method}:{uri}:1782277200"));
         let mut builder = axum::http::Request::builder()
             .method(method)
             .uri(uri)
-            .header(reqwest::header::CONTENT_TYPE, "application/json");
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-maw-signature", fleet_signature);
         for (name, value) in headers.to_btree_map() {
             builder = builder.header(name, value);
         }
