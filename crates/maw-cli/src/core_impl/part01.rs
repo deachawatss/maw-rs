@@ -481,37 +481,12 @@ fn dispatch_cli_plugin(argv: &[String]) -> Option<CliOutput> {
     };
 
     if plugin.entry_path.is_some() {
-        let cli_command = plugin
-            .manifest
-            .cli
-            .as_ref()
-            .map_or("", |c| c.command.as_str());
-        let mut cmd_args: Vec<&str> = cli_command.split_whitespace().collect();
-        for arg in &ctx.args {
-            cmd_args.push(arg.as_str());
-        }
-        let output = std::process::Command::new("maw")
-            .args(&cmd_args)
-            .env("MAW_FROM_RS", "1")
-            .output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                return Some(CliOutput {
-                    code: out.status.code().unwrap_or(1),
-                    stdout,
-                    stderr,
-                });
-            }
-            Err(e) => {
-                return Some(CliOutput {
-                    code: 1,
-                    stdout: String::new(),
-                    stderr: format!("failed to run bun: {e}\n"),
-                });
-            }
-        }
+        return Some(CliOutput {
+            code: 2,
+            stdout: String::new(),
+            stderr: "TS/JS plugin requires prebuilt WASM artifact; no maw-js/Bun fallback\n"
+                .to_owned(),
+        });
     }
 
     let mut runtime = MvpWasmInvokeRuntime;

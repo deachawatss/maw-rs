@@ -16,6 +16,7 @@ struct EnvRestore {
     maw_home: Option<OsString>,
     maw_plugins_dir: Option<OsString>,
     path: Option<OsString>,
+    maw_shim_marker: Option<OsString>,
 }
 
 impl EnvRestore {
@@ -25,6 +26,7 @@ impl EnvRestore {
             maw_home: std::env::var_os("MAW_HOME"),
             maw_plugins_dir: std::env::var_os("MAW_PLUGINS_DIR"),
             path: std::env::var_os("PATH"),
+            maw_shim_marker: std::env::var_os("MAW_SHIM_MARKER"),
         }
     }
 }
@@ -35,6 +37,7 @@ impl Drop for EnvRestore {
         restore_env("MAW_HOME", self.maw_home.take());
         restore_env("MAW_PLUGINS_DIR", self.maw_plugins_dir.take());
         restore_env("PATH", self.path.take());
+        restore_env("MAW_SHIM_MARKER", self.maw_shim_marker.take());
     }
 }
 
@@ -67,7 +70,7 @@ fn write_maw_shim(dir: &Path) {
     let shim = dir.join("maw");
     write(
         &shim,
-        "#!/bin/sh\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\n",
+        "#!/bin/sh\nif [ -n \"$MAW_SHIM_MARKER\" ]; then printf 'invoked\\n' > \"$MAW_SHIM_MARKER\"; fi\nprintf 'MAW_FROM_RS=%s\\n' \"$MAW_FROM_RS\"\nprintf 'args=%s\\n' \"$*\"\n",
     )
     .expect("write maw shim");
 
@@ -109,26 +112,32 @@ fn write_ts_plugin(plugins_dir: &Path, dir_name: &str, command: &str) {
 }
 
 #[test]
-fn dispatch_cli_plugin_finds_matching_plugin_and_runs_maw_bridge() {
+fn dispatch_cli_plugin_finds_matching_ts_plugin_and_refuses_maw_bridge() {
     let _guard = env_lock().lock().expect("env lock");
     let _restore = EnvRestore::capture();
     let root = temp_dir("prefix");
     let bin_dir = root.join("bin");
     let plugins_dir = root.join("plugins");
+    let marker = root.join("maw-shim-invoked");
     create_dir_all(&bin_dir).expect("bin dir");
     create_dir_all(&plugins_dir).expect("plugins dir");
     write_maw_shim(&bin_dir);
     write_ts_plugin(&plugins_dir, "weather-demo", "weather report");
     std::env::set_var("PATH", &bin_dir);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
+    std::env::set_var("MAW_SHIM_MARKER", &marker);
 
     let dispatched = run_cli(&args(&["weather", "report", "--city", "Bangkok"]));
 
-    assert_eq!(dispatched.code, 0, "{}", dispatched.stderr);
-    assert!(dispatched.stderr.is_empty(), "{}", dispatched.stderr);
+    assert_eq!(dispatched.code, 2, "{}", dispatched.stdout);
+    assert!(dispatched.stdout.is_empty(), "{}", dispatched.stdout);
     assert_eq!(
-        dispatched.stdout,
-        "MAW_FROM_RS=1\nargs=weather report --city Bangkok\n"
+        dispatched.stderr,
+        "TS/JS plugin requires prebuilt WASM artifact; no maw-js/Bun fallback\n"
+    );
+    assert!(
+        !marker.exists(),
+        "fake PATH maw was invoked, but TS/JS plugin dispatch must fail closed"
     );
 
     remove_dir_all(root).expect("cleanup");
