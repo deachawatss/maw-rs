@@ -6,6 +6,56 @@
 
 Rust port of the maw-js portable core.
 
+## Install maw-rs
+
+macOS Apple Silicon and Linux x86_64 prebuilt binaries are published on tagged releases.
+The installer downloads the matching asset, verifies its `.sha256` sidecar, backs
+up any existing `maw`, and installs to `~/.local/bin/maw` by default.
+
+Stable release installer:
+
+```bash
+curl -fsSL https://github.com/tonkmac/maw-rs/releases/latest/download/install.sh | sh
+```
+
+Bleeding-edge installer from `alpha`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tonkmac/maw-rs/alpha/install.sh | sh
+```
+
+Pin the installer and binary to a specific release:
+
+```bash
+curl -fsSL https://github.com/tonkmac/maw-rs/releases/download/v0.1.0-alpha.X/install.sh | MAW_VERSION=v0.1.0-alpha.X sh
+```
+
+Options:
+
+```bash
+MAW_VERSION=v0.1.0-alpha.X sh install.sh
+INSTALL_DIR="$HOME/bin" sh install.sh
+sh install.sh --version v0.1.0-alpha.X --install-dir "$HOME/bin"
+```
+
+Supported prebuilt platforms:
+
+- `maw-rs-macos-arm64` — macOS Apple Silicon
+- `maw-rs-linux-x86_64-musl` — Linux x86_64 static binary
+
+Manual fallback:
+
+1. Download the matching binary and `.sha256` sidecar from a release.
+2. Verify the SHA-256 hash.
+3. `chmod +x` the binary and move or symlink it as `maw` in your `PATH`.
+
+If `~/.local/bin` is not on `PATH`, add it to your shell profile. If macOS
+Gatekeeper blocks the binary, run:
+
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/maw
+```
+
 `maw-rs` is intentionally starting with deterministic, side-effect-free crates.
 Each crate copies the same JSON fixture contract from `maw-js/test/spec/` and
 must pass those fixtures in Rust before runtime IO, transports, or CLI commands

@@ -54,6 +54,7 @@ jobs:
     needs: [build-linux-musl, build-macos-arm64]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -61,6 +62,7 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
+          cp install.sh release/install.sh
           ls -la release/
       - name: Create release
         uses: softprops/action-gh-release@v2
