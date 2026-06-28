@@ -21,6 +21,8 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
       - name: Build maw-rs (musl static)
+        env:
+          MAW_BUILD_VERSION: ${{ github.ref_name }}
         run: cargo build --release --target x86_64-unknown-linux-musl --bin maw-rs
       - name: Stage binary
         run: |
@@ -38,6 +40,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build maw-rs (arm64)
+        env:
+          MAW_BUILD_VERSION: ${{ github.ref_name }}
         run: cargo build --release --bin maw-rs
       - name: Stage binary
         run: |

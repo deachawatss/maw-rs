@@ -90,9 +90,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // #317 final: native maw-rs identity. Build metadata is embedded at compile time;
 // never fall through to PATH maw-js for top-level version output.
+pub const MAW_RS_BUILD_VERSION: &str = env!("MAW_BUILD_VERSION");
 pub const MAW_RS_VERSION_STRING: &str = concat!(
     "maw-rs v",
-    env!("CARGO_PKG_VERSION"),
+    env!("MAW_BUILD_VERSION"),
     " (",
     env!("MAW_RS_GIT_HASH"),
     ") built ",
@@ -313,7 +314,9 @@ mod dispatcher_fragment_tests {
             assert_eq!(output.stdout, format!("{MAW_RS_VERSION_STRING}\n"), "{command}");
             assert!(output.stderr.is_empty(), "{command}: {}", output.stderr);
         }
-        assert!(MAW_RS_VERSION_STRING.starts_with(concat!("maw-rs v", env!("CARGO_PKG_VERSION"))));
+        assert!(MAW_RS_VERSION_STRING.starts_with("maw-rs v"));
+        assert!(!MAW_RS_VERSION_STRING.starts_with("maw-rs vv"));
+        assert!(MAW_RS_VERSION_STRING.contains(env!("MAW_RS_GIT_HASH")));
         assert!(MAW_RS_VERSION_STRING.contains(" built "));
     }
 }

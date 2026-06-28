@@ -89,7 +89,7 @@ pub(crate) fn serveidentity_http_payload_read_only() -> Result<serde_json::Value
 
 fn serveidentity_default_read_only_deps() -> Result<ServeidentityDeps, String> {
     Ok(ServeidentityDeps {
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        version: MAW_RS_BUILD_VERSION.to_owned(),
         uptime_seconds: current_epoch_seconds().saturating_sub(serveidentity_process_started_at()),
         clock_utc: serveidentity_now_utc(),
         peer_key: serveidentity_read_peer_key()?,

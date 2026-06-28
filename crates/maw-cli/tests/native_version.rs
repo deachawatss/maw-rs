@@ -39,13 +39,12 @@ fn top_level_version_is_native_and_never_falls_back_to_path_maw() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("maw-rs v"), "{arg} stdout={stdout:?}");
+        assert!(!stdout.starts_with("maw-rs vv"), "{arg} stdout={stdout:?}");
         assert!(
-            stdout.starts_with(include_str!(
-                "fixtures/native-version/version-prefix.stdout"
-            )),
+            stdout.contains(" (") && stdout.contains(") built "),
             "{arg} stdout={stdout:?}"
         );
-        assert!(stdout.contains(" built "), "{arg} stdout={stdout:?}");
         assert!(
             String::from_utf8_lossy(&output.stderr).is_empty(),
             "{arg} stderr={}",
