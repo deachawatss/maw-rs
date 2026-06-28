@@ -33,6 +33,7 @@ struct ServeState {
     workspaces: Mutex<WorkspaceStore>,
     requests: Mutex<RequestReplyStore>,
     delivery: Arc<dyn ServeDelivery>,
+    receiver_inbox: Arc<dyn ServeReceiverInbox>,
     feed: Mutex<Vec<Value>>,
     #[cfg(test)]
     peer_addr_override: Option<SocketAddr>,
@@ -50,6 +51,62 @@ trait ServeDelivery: Send + Sync {
 }
 
 struct ServeSystemDelivery;
+
+trait ServeReceiverInbox: Send + Sync {
+    fn write_receiver_inbox(&self, input: ReceiverInboxInput<'_>) -> ReceiverInboxResult;
+}
+
+#[derive(Default)]
+struct ServeSystemReceiverInbox {
+    #[cfg(test)]
+    enabled: Option<bool>,
+    #[cfg(test)]
+    fixed_now_millis: Option<u128>,
+    #[cfg(test)]
+    psi_root: Option<std::path::PathBuf>,
+}
+
+impl ServeReceiverInbox for ServeSystemReceiverInbox {
+    fn write_receiver_inbox(&self, input: ReceiverInboxInput<'_>) -> ReceiverInboxResult {
+        let enabled = {
+            #[cfg(test)]
+            {
+                self.enabled.unwrap_or_else(receiver_inbox_auto_write_enabled)
+            }
+            #[cfg(not(test))]
+            {
+                receiver_inbox_auto_write_enabled()
+            }
+        };
+        if !enabled {
+            return ReceiverInboxResult::Err {
+                oracle: None,
+                reason: "receiver inbox auto-write disabled".to_owned(),
+            };
+        }
+        let now_millis = {
+            #[cfg(test)]
+            {
+                self.fixed_now_millis.unwrap_or_else(receiver_inbox_now_millis)
+            }
+            #[cfg(not(test))]
+            {
+                receiver_inbox_now_millis()
+            }
+        };
+        let psi_root = {
+            #[cfg(test)]
+            {
+                self.psi_root.as_deref()
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        };
+        persist_receiver_inbox(input, now_millis, psi_root)
+    }
+}
 
 impl ServeDelivery for ServeSystemDelivery {
     fn route_sessions(&self) -> Result<Vec<RouteSession>, String> {
@@ -124,6 +181,7 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         workspaces: Mutex::new(WorkspaceStore::default()),
         requests: Mutex::new(RequestReplyStore::default()),
         delivery: Arc::new(ServeSystemDelivery),
+        receiver_inbox: Arc::new(ServeSystemReceiverInbox::default()),
         feed: Mutex::new(Vec::new()),
         #[cfg(test)]
         peer_addr_override: None,
@@ -368,17 +426,14 @@ fn serve_deliver_send(
     }
 
     if parsed.inbox.unwrap_or(false) {
-        serve_log_delivery_failed(state, &target, &message, &log_from, &log_to, "receiver-inbox-not-yet-native", "inbox");
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "ok": false,
-                "error": "receiver-inbox-not-yet-native",
-                "target": target,
-                "state": "failed"
-            })),
-        )
-            .into_response();
+        let context = ServeInboxContext {
+            config: &config,
+            log_from: &log_from,
+            log_to: &log_to,
+            target: &target,
+            message: &message,
+        };
+        return serve_deliver_inbox(state, headers, &parsed, &context);
     }
 
     let sessions = match state.delivery.route_sessions() {
@@ -413,6 +468,123 @@ fn serve_deliver_send(
             serve_delivery_error(StatusCode::NOT_FOUND, &reason, &target, &detail)
         }
     }
+}
+
+
+struct ServeInboxContext<'a> {
+    config: &'a HeyConfig,
+    log_from: &'a str,
+    log_to: &'a str,
+    target: &'a str,
+    message: &'a str,
+}
+
+fn serve_deliver_inbox(
+    state: &ServeState,
+    headers: &HeaderMap,
+    parsed: &SendBody,
+    context: &ServeInboxContext<'_>,
+) -> axum::response::Response {
+    let target = context.target;
+    let message = context.message;
+    let config = context.config;
+    let log_from = context.log_from;
+    let log_to = context.log_to;
+    let sessions = match state.delivery.route_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "route-list");
+            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", target, &error);
+        }
+    };
+    let resolved = match resolve_route_target(target, &config.route, &sessions) {
+        RouteResult::Local { target } | RouteResult::SelfNode { target } => target,
+        RouteResult::Peer { node, .. } => {
+            let error = format!("peer-forward-unavailable:{node}");
+            serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "peer-forward");
+            return serve_delivery_error(StatusCode::BAD_GATEWAY, "peer-forward-unavailable", target, &error);
+        }
+        RouteResult::Error { reason, detail, .. } => {
+            let error = format!("{reason}: {detail}");
+            serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "resolve");
+            return serve_delivery_error(StatusCode::NOT_FOUND, &reason, target, &detail);
+        }
+    };
+    if !serve_resolved_target_exists(&sessions, &resolved) {
+        let error = format!("target not live in tmux: {resolved}");
+        serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "inbox");
+        return serve_delivery_error(StatusCode::NOT_FOUND, "target-not-live", target, &error);
+    }
+    let from = serve_display_from(headers, config);
+    match state.receiver_inbox.write_receiver_inbox(ReceiverInboxInput {
+        query: target,
+        target: Some(&resolved),
+        to: Some(target),
+        from: &from,
+        message,
+        config,
+    }) {
+        ReceiverInboxResult::Ok(inbox) => {
+            let reason = "--inbox requested; pane injection skipped";
+            serve_log_lifecycle(
+                state,
+                json!({
+                    "kind": "context.message",
+                    "direction": "inbound",
+                    "state": "queued",
+                    "route": "inbox",
+                    "from": serve_truncate(&from, SERVE_LOG_TEXT_MAX),
+                    "to": serve_truncate(log_to, SERVE_LOG_TEXT_MAX),
+                    "target": resolved,
+                    "requestedTarget": target,
+                    "text": serve_truncate(message, SERVE_LOG_TEXT_MAX),
+                    "oracle": inbox.oracle,
+                    "lastLine": reason,
+                    "signed": !header_to_string(headers, "x-maw-from").trim().is_empty(),
+                    "source": "maw-rs-native",
+                }),
+            );
+            Json(json!({
+                "ok": true,
+                "target": resolved,
+                "text": parsed.text.clone().unwrap_or_default(),
+                "source": "inbox",
+                "state": "queued",
+                "inbox": inbox.path.display().to_string(),
+                "reason": reason,
+                "receipt": ["fallback_queued"],
+            }))
+            .into_response()
+        }
+        ReceiverInboxResult::Err { oracle: _, reason } => {
+            serve_log_delivery_failed(state, target, message, log_from, log_to, &reason, "inbox");
+            serve_delivery_error(StatusCode::BAD_GATEWAY, "receiver-inbox-unavailable", target, &reason)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReceiverInboxInput<'a> {
+    query: &'a str,
+    target: Option<&'a str>,
+    to: Option<&'a str>,
+    from: &'a str,
+    message: &'a str,
+    config: &'a HeyConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiverInboxOk {
+    oracle: String,
+    inbox_dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    filename: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiverInboxResult {
+    Ok(ReceiverInboxOk),
+    Err { oracle: Option<String>, reason: String },
 }
 
 struct ServeDeliverContext<'a> {
@@ -622,6 +794,259 @@ fn serve_oracle_from_target(target: &str) -> String {
         .next()
         .unwrap_or(target)
         .to_owned()
+}
+
+fn serve_display_from(headers: &HeaderMap, config: &HeyConfig) -> String {
+    let raw = header_to_string(headers, "x-maw-from");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return serve_local_identity(config);
+    }
+    if let Some((oracle, node)) = raw.split_once(':') {
+        let oracle = oracle.trim();
+        let node = node.trim();
+        if !oracle.is_empty() && !node.is_empty() {
+            return format!("{node}:{oracle}");
+        }
+    }
+    raw.to_owned()
+}
+
+fn receiver_inbox_explicit_enabled(value: Option<std::ffi::OsString>) -> Option<bool> {
+    let value = value?.to_string_lossy().trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn receiver_inbox_auto_write_enabled() -> bool {
+    if let Some(enabled) = receiver_inbox_explicit_enabled(std::env::var_os("MAW_HEY_INBOX_AUTOWRITE")) {
+        return enabled;
+    }
+    std::env::var("MAW_TEST_MODE").ok().as_deref() != Some("1")
+}
+
+fn receiver_inbox_now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis())
+}
+
+fn receiver_inbox_iso_from_millis(millis: u128) -> String {
+    let seconds = i64::try_from(millis / 1_000).unwrap_or(i64::MAX);
+    let ms = u32::try_from(millis % 1_000).unwrap_or(999);
+    let (year, month, day, hour, minute, second) = unix_seconds_to_utc(seconds);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
+}
+
+fn receiver_inbox_strip_pane_suffix(value: &str) -> &str {
+    let Some((prefix, suffix)) = value.rsplit_once('.') else {
+        return value;
+    };
+    if suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        prefix
+    } else {
+        value
+    }
+}
+
+fn receiver_inbox_basename(value: &str) -> &str {
+    std::path::Path::new(value)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(value)
+}
+
+fn receiver_inbox_normalize_oracle_name(raw: Option<&str>) -> Option<String> {
+    let mut value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let colon_value;
+    if value.contains(':') {
+        let parts = value.split(':').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+        colon_value = if parts.len() >= 3 {
+            parts[2]
+        } else {
+            parts.get(1).copied().or_else(|| parts.first().copied()).unwrap_or(value)
+        };
+        value = colon_value;
+    }
+    value = receiver_inbox_strip_pane_suffix(value);
+    value = receiver_inbox_basename(value);
+    if let Some(stripped) = value.strip_suffix("-oracle") {
+        value = stripped;
+    }
+    let trimmed_numeric = value
+        .split_once('-')
+        .and_then(|(prefix, rest)| prefix.bytes().all(|byte| byte.is_ascii_digit()).then_some(rest))
+        .unwrap_or(value);
+    (!trimmed_numeric.is_empty()).then(|| trimmed_numeric.to_owned())
+}
+
+fn receiver_inbox_resolve_oracle(input: &ReceiverInboxInput<'_>) -> Option<String> {
+    receiver_inbox_normalize_oracle_name(input.to)
+        .or_else(|| receiver_inbox_normalize_oracle_name(input.target))
+        .or_else(|| receiver_inbox_normalize_oracle_name(Some(input.query)))
+}
+
+fn receiver_inbox_safe_segment(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.trim().chars() {
+        let safe = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-');
+        if safe {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').chars().take(64).collect::<String>();
+    if out.is_empty() { "unknown".to_owned() } else { out }
+}
+
+fn receiver_inbox_slugify_body(body: &str) -> String {
+    receiver_inbox_safe_segment(&body.split_whitespace().take(6).collect::<Vec<_>>().join("-").to_ascii_lowercase())
+        .chars()
+        .take(48)
+        .collect()
+}
+
+fn receiver_inbox_body(from: &str, to: &str, timestamp: &str, message: &str) -> String {
+    [
+        "---".to_owned(),
+        format!("from: {from}"),
+        format!("to: {to}"),
+        format!("timestamp: {timestamp}"),
+        "read: false".to_owned(),
+        "---".to_owned(),
+        String::new(),
+        message.to_owned(),
+        String::new(),
+    ]
+    .join("\n")
+}
+
+fn receiver_inbox_filename_with_collision_suffix(base: &str, attempt: usize) -> String {
+    if attempt <= 1 {
+        return base.to_owned();
+    }
+    base.strip_suffix(".md")
+        .map_or_else(|| format!("{base}-{attempt}"), |prefix| format!("{prefix}-{attempt}.md"))
+}
+
+fn receiver_inbox_strip_psi_suffix(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.display().to_string();
+    let stripped = text.trim_end_matches('/');
+    if let Some(prefix) = stripped.strip_suffix("/ψ").or_else(|| stripped.strip_suffix("/psi")) {
+        std::path::PathBuf::from(prefix)
+    } else {
+        std::path::PathBuf::from(stripped)
+    }
+}
+
+fn receiver_inbox_config_psi_path() -> Option<std::path::PathBuf> {
+    let env = real_xdg_env();
+    let path = maw_config_path(&env, &["maw.config.json"]);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    value
+        .get("psiPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn receiver_inbox_ghq_root() -> std::path::PathBuf {
+    std::env::var_os("GHQ_ROOT").map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        std::path::PathBuf::from,
+    )
+}
+
+fn receiver_inbox_repo_candidates(
+    oracle: &str,
+    input: &ReceiverInboxInput<'_>,
+    psi_root: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(psi_path) = psi_root {
+        candidates.push(receiver_inbox_strip_psi_suffix(psi_path));
+    } else if let (Some(psi_path), Some(config_oracle)) = (receiver_inbox_config_psi_path(), input.config.oracle.as_deref()) {
+        if receiver_inbox_normalize_oracle_name(Some(config_oracle)).as_deref() == Some(oracle) {
+            candidates.push(receiver_inbox_strip_psi_suffix(&psi_path));
+        }
+    }
+    let manifest = locate_load_manifest();
+    if let Some(entry) = manifest.iter().find(|entry| {
+        receiver_inbox_normalize_oracle_name(Some(&entry.name)).as_deref() == Some(oracle)
+            || entry.window.as_deref().and_then(|window| receiver_inbox_normalize_oracle_name(Some(window))).as_deref()
+                == Some(oracle)
+    }) {
+        if let Some(local_path) = entry.local_path.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            candidates.push(std::path::PathBuf::from(local_path));
+        }
+        if let Some(repo) = entry.repo.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let ghq_root = receiver_inbox_ghq_root();
+            candidates.push(ghq_root.join("github.com").join(repo));
+            candidates.push(ghq_root.join(repo));
+        }
+    }
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.display().to_string()))
+        .filter(|candidate| candidate.exists())
+        .collect()
+}
+
+fn persist_receiver_inbox(
+    input: ReceiverInboxInput<'_>,
+    now_millis: u128,
+    psi_root: Option<&std::path::Path>,
+) -> ReceiverInboxResult {
+    let Some(oracle) = receiver_inbox_resolve_oracle(&input) else {
+        return ReceiverInboxResult::Err { oracle: None, reason: "receiver oracle could not be inferred".to_owned() };
+    };
+    let Some(repo_path) = receiver_inbox_repo_candidates(&oracle, &input, psi_root).into_iter().next() else {
+        return ReceiverInboxResult::Err { oracle: Some(oracle.clone()), reason: format!("receiver repo not found for {oracle}") };
+    };
+    let timestamp = receiver_inbox_iso_from_millis(now_millis);
+    let date_part = &timestamp[..10];
+    let time_part = timestamp[11..16].replace(':', "-");
+    let base_filename = format!(
+        "{date_part}_{time_part}_{}_{}.md",
+        receiver_inbox_safe_segment(input.from),
+        receiver_inbox_slugify_body(input.message)
+    );
+    let inbox_dir = repo_path.join("ψ").join("inbox");
+    let body = receiver_inbox_body(input.from, &oracle, &timestamp, input.message);
+    if let Err(error) = std::fs::create_dir_all(&inbox_dir) {
+        return ReceiverInboxResult::Err { oracle: Some(oracle), reason: error.to_string() };
+    }
+    for attempt in 1..=1000 {
+        let filename = receiver_inbox_filename_with_collision_suffix(&base_filename, attempt);
+        let path = inbox_dir.join(&filename);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = std::io::Write::write_all(&mut file, body.as_bytes()) {
+                    return ReceiverInboxResult::Err { oracle: Some(oracle), reason: error.to_string() };
+                }
+                return ReceiverInboxResult::Ok(ReceiverInboxOk { oracle, inbox_dir, path, filename });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return ReceiverInboxResult::Err { oracle: Some(oracle), reason: error.to_string() },
+        }
+    }
+    ReceiverInboxResult::Err {
+        oracle: Some(oracle),
+        reason: format!("receiver inbox filename collision limit reached for {base_filename}"),
+    }
 }
 
 async fn api_feed_post(
@@ -1802,6 +2227,22 @@ mod serve_tests {
         Arc::new(FakeServeDelivery::with_capture_agent())
     }
 
+    fn serve_test_receiver_inbox() -> Arc<dyn ServeReceiverInbox> {
+        Arc::new(ServeSystemReceiverInbox {
+            enabled: Some(false),
+            fixed_now_millis: Some(1_782_277_200_000),
+            psi_root: None,
+        })
+    }
+
+    fn serve_test_receiver_inbox_at(repo: &std::path::Path, now_millis: u128) -> Arc<dyn ServeReceiverInbox> {
+        Arc::new(ServeSystemReceiverInbox {
+            enabled: Some(true),
+            fixed_now_millis: Some(now_millis),
+            psi_root: Some(repo.join("ψ")),
+        })
+    }
+
     fn serve_test_peer_pubkey(from: &str, pubkey: &str) -> ServePeerPubkey {
         ServePeerPubkey {
             from: from.to_owned(),
@@ -1826,6 +2267,7 @@ mod serve_tests {
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             delivery: serve_test_delivery(),
+            receiver_inbox: serve_test_receiver_inbox(),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -1890,6 +2332,16 @@ mod serve_tests {
         peer_addr_override: Option<SocketAddr>,
         delivery: Arc<dyn ServeDelivery>,
     ) -> Router {
+        serve_test_app_with_o6_keys_delivery_and_inbox(keys, now, peer_addr_override, delivery, serve_test_receiver_inbox())
+    }
+
+    fn serve_test_app_with_o6_keys_delivery_and_inbox(
+        keys: Vec<ServePeerPubkey>,
+        now: i64,
+        peer_addr_override: Option<SocketAddr>,
+        delivery: Arc<dyn ServeDelivery>,
+        receiver_inbox: Arc<dyn ServeReceiverInbox>,
+    ) -> Router {
         serve_router(ServeState {
             cached_pubkey: None,
             peer_pubkeys: keys,
@@ -1897,6 +2349,7 @@ mod serve_tests {
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             delivery,
+            receiver_inbox,
             feed: Mutex::new(Vec::new()),
             peer_addr_override,
             now_override: Some(now),
@@ -2267,8 +2720,58 @@ mod serve_tests {
         assert_eq!(payload["state"], "delivered");
     }
 
+    fn serve_test_inbox_repo(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-receiver-inbox-{label}-{}-{}",
+            std::process::id(),
+            random_hex(4)
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("ψ")).expect("repo psi");
+        repo
+    }
+
     #[tokio::test]
-    async fn serve_api_send_inbox_true_returns_501_without_tmux_send() {
+    async fn serve_api_send_inbox_true_writes_receiver_inbox_without_tmux_send() {
+        let repo = serve_test_inbox_repo("success");
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey("alloy:bigboy-vps", KEY)],
+            1_782_623_880,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            serve_test_receiver_inbox_at(&repo, 1_782_623_880_000),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello nested inbox","inbox":true}"#;
+        let response = app
+            .oneshot(signed_json_request("POST", "/api/send", body, KEY, "alloy:bigboy-vps", 1_782_623_880))
+            .await
+            .expect("inbox response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["source"], "inbox");
+        assert_eq!(payload["state"], "queued");
+        assert_eq!(payload["target"], "capture-agent:0");
+        assert_eq!(payload["receipt"], json!(["fallback_queued"]));
+        assert_eq!(payload["reason"], "--inbox requested; pane injection skipped");
+        assert!(delivery.sends().is_empty(), "inbox-only must not inject tmux");
+
+        let expected = repo
+            .join("ψ")
+            .join("inbox")
+            .join("2026-06-28_05-18_bigboy-vps-alloy_hello-nested-inbox.md");
+        assert_eq!(payload["inbox"], expected.display().to_string());
+        let written = std::fs::read_to_string(&expected).expect("inbox body");
+        assert_eq!(
+            written,
+            "---\nfrom: bigboy-vps:alloy\nto: capture-agent\ntimestamp: 2026-06-28T05:18:00.000Z\nread: false\n---\n\nhello nested inbox\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_disabled_fails_closed_without_fake_queue() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         let app = serve_test_app_with_o6_keys_and_delivery(
             vec![serve_test_peer_pubkey(FROM, KEY)],
@@ -2278,16 +2781,67 @@ mod serve_tests {
         );
         let body = r#"{"target":"capture-agent","text":"hello","inbox":true}"#;
         let response = app
-            .clone()
             .oneshot(signed_json_request("POST", "/api/send", body, KEY, FROM, 1_782_277_200))
             .await
             .expect("inbox response");
         let status = response.status();
         let payload = response_json(response).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{payload}");
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
         assert_eq!(payload["state"], "failed");
-        assert_eq!(payload["error"], "receiver-inbox-not-yet-native");
+        assert_eq!(payload["error"], "receiver-inbox-unavailable");
+        assert!(payload["detail"].as_str().unwrap_or_default().contains("disabled"));
         assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_write_error_fails_closed_without_tmux_send() {
+        let repo = serve_test_inbox_repo("write-error");
+        std::fs::write(repo.join("ψ").join("inbox"), "not a dir").expect("block inbox dir");
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            serve_test_receiver_inbox_at(&repo, 1_782_277_200_000),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello","inbox":true}"#;
+        let response = app
+            .oneshot(signed_json_request("POST", "/api/send", body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("inbox response");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
+        assert_eq!(payload["state"], "failed");
+        assert_eq!(payload["error"], "receiver-inbox-unavailable");
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_inbox_true_uses_exclusive_collision_suffix() {
+        let repo = serve_test_inbox_repo("collision");
+        let inbox_dir = repo.join("ψ").join("inbox");
+        std::fs::create_dir_all(&inbox_dir).expect("inbox dir");
+        let base = inbox_dir.join("2026-06-28_05-18_bigboy-vps-alloy_hello-nested-inbox.md");
+        std::fs::write(&base, "existing").expect("existing base");
+        let app = serve_test_app_with_o6_keys_delivery_and_inbox(
+            vec![serve_test_peer_pubkey("alloy:bigboy-vps", KEY)],
+            1_782_623_880,
+            Some(NON_LOOPBACK_TEST_PEER),
+            Arc::new(FakeServeDelivery::with_capture_agent()),
+            serve_test_receiver_inbox_at(&repo, 1_782_623_880_000),
+        );
+        let body = r#"{"target":"capture-agent","text":"hello nested inbox","inbox":true}"#;
+        let response = app
+            .oneshot(signed_json_request("POST", "/api/send", body, KEY, "alloy:bigboy-vps", 1_782_623_880))
+            .await
+            .expect("inbox response");
+        let payload = response_json(response).await;
+        let suffixed = inbox_dir.join("2026-06-28_05-18_bigboy-vps-alloy_hello-nested-inbox-2.md");
+        assert_eq!(payload["inbox"], suffixed.display().to_string());
+        assert_eq!(std::fs::read_to_string(&base).expect("base"), "existing");
+        assert!(suffixed.is_file());
     }
 
     #[tokio::test]
@@ -2381,6 +2935,7 @@ mod serve_tests {
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             delivery: serve_test_delivery(),
+            receiver_inbox: serve_test_receiver_inbox(),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -2654,6 +3209,7 @@ mod serve_tests {
             workspaces: Mutex::new(WorkspaceStore::default()),
             requests: Mutex::new(RequestReplyStore::default()),
             delivery: serve_test_delivery(),
+            receiver_inbox: serve_test_receiver_inbox(),
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
