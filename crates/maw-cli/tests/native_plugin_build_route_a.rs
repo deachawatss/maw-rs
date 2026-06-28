@@ -156,7 +156,7 @@ fn plugin_build_ts_refusal_does_not_delegate_to_fake_maw_or_bun() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stdout.is_empty(), "stdout: {stdout}");
     assert!(
-        stderr.contains("No Bun/JS subprocess fallback is available"),
+        stderr.contains("JS/TS source builds are intentionally deferred"),
         "{stderr}"
     );
     assert!(!stdout.contains("DELEGATED-MAW"), "{stdout}");

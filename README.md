@@ -61,6 +61,28 @@ Each crate copies the same JSON fixture contract from `maw-js/test/spec/` and
 must pass those fixtures in Rust before runtime IO, transports, or CLI commands
 move over.
 
+## Plugin build/dev support
+
+`maw-rs` supports native Rust-WASM plugin builds. The supported authoring path is:
+
+```bash
+maw plugin create --rust my-plugin
+cd my-plugin
+maw plugin build
+```
+
+That path builds a `wasm32-unknown-unknown` artifact with Cargo, writes a
+`dist/plugin.json` artifact contract, and is loaded through the native Extism
+WASM runtime.
+
+JS/TS plugin source builds are intentionally deferred and fail closed in
+`maw-rs`: no Bun/JS compiler is vendored, and there is no Bun subprocess
+fallback. Existing JS/TS plugins must be converted to Rust-WASM or shipped as a
+prebuilt WASM artifact with `target = "wasm"` and a relative `wasm` path in
+`plugin.json`. This preserves the ZERO-BUN cutover boundary (#59); a future
+Javy/QuickJS-style JS-to-WASM toolchain would need a separate design and
+security review.
+
 ## Phase 1 status
 
 Cargo workspace scaffolded and pushed to `main`.
