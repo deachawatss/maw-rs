@@ -3,7 +3,7 @@ const DISPATCH_136: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(config_run_command),
 }];
 
-const CONFIG_USAGE: &str = "usage: maw config <show|set <key> <value>> [--json]";
+const CONFIG_USAGE: &str = "usage: maw config <show|sources|explain <key>|set <key> <value>> [--json]";
 
 fn config_run_command(argv: &[String]) -> CliOutput {
     match config_dispatch(argv) {
@@ -27,6 +27,8 @@ fn config_dispatch(argv: &[String]) -> Result<String, String> {
     match sub {
         "set" => config_set(argv, json),
         "show" => config_show(reveal),
+        "sources" => config_sources(json),
+        "explain" => config_explain(argv, json),
         _ => Err(CONFIG_USAGE.to_owned()),
     }
 }
@@ -77,13 +79,301 @@ fn config_set(argv: &[String], json: bool) -> Result<String, String> {
 }
 
 fn config_show(reveal: bool) -> Result<String, String> {
-    let mut config = config_read_target()?;
+    let mut loaded = config_load_layers()?;
     if !reveal {
-        config_redact_value(&mut config);
+        config_redact_value(&mut loaded.config);
     }
-    serde_json::to_string_pretty(&config)
+    serde_json::to_string_pretty(&loaded.config)
         .map(|body| format!("{body}\n"))
         .map_err(|error| format!("maw config: failed to render JSON: {error}"))
+}
+
+fn config_sources(json: bool) -> Result<String, String> {
+    let loaded = config_load_layers()?;
+    if json {
+        let rows: Vec<serde_json::Value> = loaded
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "weight": source.weight,
+                    "scope": source.scope,
+                    "local": source.is_local,
+                    "file": source.path.display().to_string(),
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&serde_json::json!({ "sources": rows, "warnings": loaded.warnings }))
+            .map(|body| format!("{body}\n"))
+            .map_err(|error| format!("maw config: failed to render JSON: {error}"));
+    }
+    let mut out = String::new();
+    for source in loaded.sources {
+        let local = if source.is_local { "local" } else { "     " };
+        let _ = writeln!(
+            out,
+            "{:>3} {:<7} {} {}",
+            source.weight,
+            source.scope,
+            local,
+            source.path.display()
+        );
+    }
+    for warning in loaded.warnings {
+        let _ = writeln!(out, "{warning}");
+    }
+    Ok(out)
+}
+
+fn config_explain(argv: &[String], json: bool) -> Result<String, String> {
+    let key = argv
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| (index > 0 && !arg.starts_with('-')).then_some(arg.as_str()))
+        .ok_or_else(|| "usage: maw config explain <key> [--json]".to_owned())?;
+    let loaded = config_load_layers()?;
+    let mut entries = config_provenance_at_path(&loaded.provenance, key);
+    let mut final_value = config_value_at_path(&loaded.config, key).cloned().unwrap_or(serde_json::Value::Null);
+    if config_is_secret_path(key) {
+        final_value = config_mask_secret(&final_value);
+        for entry in &mut entries {
+            entry.value = config_mask_secret(&entry.value);
+        }
+    }
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path,
+                    "weight": entry.weight,
+                    "scope": entry.scope,
+                    "isLocal": entry.is_local,
+                    "action": entry.action,
+                    "value": entry.value,
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&serde_json::json!({ "key": key, "finalValue": final_value, "entries": rows }))
+            .map(|body| format!("{body}\n"))
+            .map_err(|error| format!("maw config: failed to render JSON: {error}"));
+    }
+    let mut out = String::new();
+    let _ = writeln!(out, "key: {key}");
+    for entry in &entries {
+        let local = if entry.is_local { ".local" } else { "" };
+        let value = serde_json::to_string(&entry.value)
+            .map_err(|error| format!("maw config: failed to render value: {error}"))?;
+        let _ = writeln!(
+            out,
+            "{} {}{} {} {}",
+            entry.weight, entry.scope, local, entry.action, entry.path
+        );
+        let _ = writeln!(out, "  {value}");
+    }
+    let final_json = serde_json::to_string(&final_value)
+        .map_err(|error| format!("maw config: failed to render value: {error}"))?;
+    let _ = writeln!(out, "FINAL {final_json}");
+    Ok(out)
+}
+
+
+#[derive(Clone, Debug)]
+struct ConfigLayerSource {
+    path: std::path::PathBuf,
+    weight: u32,
+    is_local: bool,
+    scope: &'static str,
+    scope_rank: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigProvenanceEntry {
+    path: String,
+    weight: u32,
+    scope: &'static str,
+    is_local: bool,
+    value: serde_json::Value,
+    action: &'static str,
+}
+
+struct ConfigLoadedLayers {
+    config: serde_json::Value,
+    sources: Vec<ConfigLayerSource>,
+    provenance: BTreeMap<String, Vec<ConfigProvenanceEntry>>,
+    warnings: Vec<String>,
+}
+
+fn config_load_layers() -> Result<ConfigLoadedLayers, String> {
+    let mut sources = config_discover_sources();
+    if sources.is_empty() {
+        sources.push(ConfigLayerSource {
+            path: maw_config_path(&current_xdg_env(), &["maw.config.json"]),
+            weight: 50,
+            is_local: false,
+            scope: "legacy",
+            scope_rank: 20,
+        });
+    }
+    let mut merged = serde_json::json!({});
+    let mut provenance: BTreeMap<String, Vec<ConfigProvenanceEntry>> = BTreeMap::new();
+    let mut loaded_any = false;
+    for source in &sources {
+        if !source.path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&source.path)
+            .map_err(|error| format!("maw config: failed to read config: {error}"))?;
+        let layer = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| format!("maw config: failed to parse config JSON: {error}"))?;
+        if !layer.is_object() {
+            continue;
+        }
+        loaded_any = true;
+        config_record_provenance(&mut provenance, source, &layer, "");
+        config_deep_merge(&mut merged, layer);
+    }
+    if !loaded_any {
+        merged = serde_json::json!({});
+    }
+    Ok(ConfigLoadedLayers { config: merged, sources, provenance, warnings: Vec::new() })
+}
+
+fn config_discover_sources() -> Vec<ConfigLayerSource> {
+    let env = current_xdg_env();
+    let mut found = Vec::new();
+    let config_dir = maw_config_dir(&env);
+    let user_weighted = config_scan_dir(&config_dir, "user", 20);
+    if user_weighted.is_empty() {
+        let legacy = maw_config_path(&env, &["maw.config.json"]);
+        if legacy.exists() {
+            found.push(ConfigLayerSource { path: legacy, weight: 50, is_local: false, scope: "legacy", scope_rank: 20 });
+        }
+    } else {
+        found.extend(user_weighted);
+    }
+
+    let mut chain = Vec::new();
+    let mut dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for _ in 0..32 {
+        chain.push(dir.clone());
+        let Some(parent) = dir.parent() else { break; };
+        if parent == dir { break; }
+        dir = parent.to_path_buf();
+    }
+    chain.reverse();
+    for (index, dir) in (0u32..).zip(chain) {
+        found.extend(config_scan_dir(&dir.join(".maw"), "project", 30 + index));
+    }
+    found.sort_by(|a, b| {
+        a.weight
+            .cmp(&b.weight)
+            .then(a.scope_rank.cmp(&b.scope_rank))
+            .then(a.is_local.cmp(&b.is_local))
+            .then(a.path.cmp(&b.path))
+    });
+    found
+}
+
+fn config_scan_dir(dir: &std::path::Path, scope: &'static str, scope_rank: u32) -> Vec<ConfigLayerSource> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new(); };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue; };
+        let Some((weight, is_local)) = config_parse_layer_name(name) else { continue; };
+        out.push(ConfigLayerSource { path: entry.path(), weight, is_local, scope, scope_rank });
+    }
+    out
+}
+
+fn config_parse_layer_name(name: &str) -> Option<(u32, bool)> {
+    let rest = name.strip_prefix("maw.config.")?;
+    let (digits, is_local) = rest
+        .strip_suffix(".local.json")
+        .map_or_else(|| rest.strip_suffix(".json").map(|value| (value, false)), |value| Some((value, true)))?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits.parse().ok()?, is_local))
+}
+
+fn config_deep_merge(target: &mut serde_json::Value, layer: serde_json::Value) {
+    let (Some(target_map), Some(layer_map)) = (target.as_object_mut(), layer.as_object()) else {
+        *target = layer;
+        return;
+    };
+    for (key, value) in layer_map {
+        if value.is_null() {
+            target_map.remove(key);
+        } else if value.is_object() && target_map.get(key).is_some_and(serde_json::Value::is_object) {
+            if let Some(target_child) = target_map.get_mut(key) {
+                config_deep_merge(target_child, value.clone());
+            }
+        } else if value.is_object() {
+            let mut child = serde_json::json!({});
+            config_deep_merge(&mut child, value.clone());
+            target_map.insert(key.clone(), child);
+        } else {
+            target_map.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn config_record_provenance(
+    provenance: &mut BTreeMap<String, Vec<ConfigProvenanceEntry>>,
+    source: &ConfigLayerSource,
+    value: &serde_json::Value,
+    parent: &str,
+) {
+    let Some(map) = value.as_object() else { return; };
+    for (key, child) in map {
+        let key_path = if parent.is_empty() { key.clone() } else { format!("{parent}.{key}") };
+        if child.is_null() {
+            provenance.entry(key_path).or_default().push(config_provenance_entry(source, child.clone(), "delete"));
+        } else if child.is_object() {
+            config_record_provenance(provenance, source, child, &key_path);
+        } else {
+            provenance.entry(key_path).or_default().push(config_provenance_entry(source, child.clone(), "set"));
+        }
+    }
+}
+
+fn config_provenance_entry(source: &ConfigLayerSource, value: serde_json::Value, action: &'static str) -> ConfigProvenanceEntry {
+    ConfigProvenanceEntry {
+        path: source.path.display().to_string(),
+        weight: source.weight,
+        scope: source.scope,
+        is_local: source.is_local,
+        value,
+        action,
+    }
+}
+
+fn config_provenance_at_path(provenance: &BTreeMap<String, Vec<ConfigProvenanceEntry>>, key_path: &str) -> Vec<ConfigProvenanceEntry> {
+    if let Some(entries) = provenance.get(key_path) {
+        return entries.clone();
+    }
+    let mut parts: Vec<&str> = key_path.split('.').collect();
+    while parts.len() > 1 {
+        parts.pop();
+        if let Some(entries) = provenance.get(&parts.join(".")) {
+            return entries.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn config_value_at_path<'a>(root: &'a serde_json::Value, key_path: &str) -> Option<&'a serde_json::Value> {
+    let mut cursor = root;
+    for part in key_path.split('.') {
+        cursor = cursor.get(part)?;
+    }
+    Some(cursor)
+}
+
+fn config_is_secret_path(key_path: &str) -> bool {
+    key_path.split('.').any(config_is_secret_key)
 }
 
 fn config_redact_value(value: &mut serde_json::Value) {
@@ -241,11 +531,10 @@ mod config_tests {
     }
 
     #[test]
-    fn config_unknown_subcommand_reports_trimmed_native_usage() {
-        let output = super::config_run_command(&["sources".to_owned()]);
+    fn config_unknown_subcommand_reports_native_usage() {
+        let output = super::config_run_command(&["unknown".to_owned()]);
         assert_eq!(output.code, 1);
-        assert!(output.stderr.contains("usage: maw config <show|set <key> <value>> [--json]"));
-        assert!(!output.stderr.contains("sources|explain"));
+        assert!(output.stderr.contains("usage: maw config <show|sources|explain <key>|set <key> <value>> [--json]"));
     }
 
     #[test]

@@ -131,3 +131,101 @@ fn config_rejects_bad_node_and_port_before_any_delegation() {
     assert!(body.contains("\"node\": \"old-node\""));
     assert!(body.contains("\"port\": 3456"));
 }
+
+#[test]
+fn config_sources_and_explain_match_maw_js_shape_and_merge_layers() {
+    let root = temp_dir("sources");
+    let config = root.join("config");
+    fs::create_dir_all(&config).expect("config dir");
+    fs::write(
+        config.join("maw.config.10.json"),
+        r#"{
+  "node": "base-node",
+  "env": { "A": "one", "B": "base" },
+  "plugins": { "foo": { "enabled": true, "level": 1 } }
+}
+"#,
+    )
+    .expect("base config");
+    fs::write(
+        config.join("maw.config.90.local.json"),
+        r#"{
+  "node": "local-node",
+  "env": { "B": "local", "C": "three" },
+  "plugins": { "foo": { "level": 2 } }
+}
+"#,
+    )
+    .expect("local config");
+
+    let output = run_config(&root, &["config", "sources", "--json"]);
+    assert_no_delegation(&output);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sources: serde_json::Value = serde_json::from_slice(&output.stdout).expect("sources json");
+    assert_eq!(sources["warnings"], serde_json::json!([]));
+    assert_eq!(sources["sources"].as_array().expect("source rows").len(), 2);
+    assert_eq!(sources["sources"][0]["weight"], 10);
+    assert_eq!(sources["sources"][0]["scope"], "user");
+    assert_eq!(sources["sources"][0]["local"], false);
+    assert_eq!(sources["sources"][1]["weight"], 90);
+    assert_eq!(sources["sources"][1]["local"], true);
+
+    let output = run_config(&root, &["config", "explain", "env.B", "--json"]);
+    assert_no_delegation(&output);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let explain: serde_json::Value = serde_json::from_slice(&output.stdout).expect("explain json");
+    assert_eq!(explain["key"], "env.B");
+    assert_eq!(explain["finalValue"], "local");
+    assert_eq!(explain["entries"].as_array().expect("entries").len(), 2);
+    assert_eq!(explain["entries"][0]["value"], "base");
+    assert_eq!(explain["entries"][1]["value"], "local");
+
+    let output = run_config(&root, &["config", "show"]);
+    assert_no_delegation(&output);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).expect("show json");
+    assert_eq!(shown["node"], "local-node");
+    assert_eq!(
+        shown["env"],
+        serde_json::json!({ "A": "one", "B": "local", "C": "three" })
+    );
+    assert_eq!(shown["plugins"]["foo"]["enabled"], true);
+    assert_eq!(shown["plugins"]["foo"]["level"], 2);
+}
+
+#[test]
+fn config_explain_masks_secret_values() {
+    let root = temp_dir("secret-explain");
+    let config = root.join("config");
+    fs::create_dir_all(&config).expect("config dir");
+    fs::write(
+        config.join("maw.config.50.json"),
+        "{\n  \"federationToken\": \"super-secret-token-1234\"\n}\n",
+    )
+    .expect("config");
+
+    let output = run_config(&root, &["config", "explain", "federationToken", "--json"]);
+    assert_no_delegation(&output);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(!stdout.contains("super-secret-token-1234"), "{stdout}");
+    let explain: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(explain["finalValue"], "****...1234");
+    assert_eq!(explain["entries"][0]["value"], "****...1234");
+}
