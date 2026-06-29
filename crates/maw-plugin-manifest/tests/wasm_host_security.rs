@@ -57,6 +57,15 @@ fn call(host: &MawWasmHost, name: &str, args: &Value) -> Value {
     serde_json::from_str(&host.handle_json(name, &args.to_string())).expect("host result json")
 }
 
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
+}
+
 fn spawn_localserver_once(body: &'static str) -> String {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind localserver");
     let addr = listener.local_addr().expect("localserver addr");
@@ -992,6 +1001,10 @@ fn fs_write_resolves_traversal_and_symlink_into_protected_state_before_deny() {
 
 #[test]
 fn fs_remove_host_side_allows_only_declared_root_and_real_files() {
+    if running_as_root() {
+        eprintln!("skip root-only run: OS root bypasses host-side permission assumptions");
+        return;
+    }
     let dir = temp("remove-allowed");
     let victim = dir.join("victim.txt");
     write(&victim, "delete me").expect("victim");
@@ -1069,6 +1082,10 @@ fn fs_remove_denies_outside_root_traversal_symlink_and_glob() {
 
 #[test]
 fn fs_remove_recursive_is_confined_and_does_not_follow_symlink_escape() {
+    if running_as_root() {
+        eprintln!("skip root-only run: OS root bypasses host-side permission assumptions");
+        return;
+    }
     let dir = temp("remove-recursive");
     let outside_dir = temp("remove-recursive-outside");
     let outside_file = outside_dir.join("outside.txt");

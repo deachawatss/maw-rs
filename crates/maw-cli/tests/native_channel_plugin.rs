@@ -515,7 +515,10 @@ fn channel_setup_github_clones_with_fake_ghq_and_registers_config() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    let normalized = stdout.replace(&ghq_root.display().to_string(), "<GHQ_ROOT>");
+    let ghq_display = ghq_root.display().to_string();
+    let normalized = stdout
+        .replace(&format!("/private{ghq_display}"), "<GHQ_ROOT>")
+        .replace(&ghq_display, "<GHQ_ROOT>");
     assert_eq!(
         normalized,
         include_str!("fixtures/native-channel/channel-setup-github-clone.stdout")

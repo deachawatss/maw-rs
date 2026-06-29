@@ -12,6 +12,15 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("maw-plugin-scaffold-{name}-{nonce}"))
 }
 
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|uid| uid.trim() == "0")
+}
+
 #[test]
 fn scaffold_rust_writes_manifest_and_readme() {
     let root = temp_dir("rust");
@@ -192,25 +201,31 @@ fn scaffold_rust_reports_copy_and_write_failures() {
         std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists
     ));
 
-    let readonly_dest = root.join("readonly-dest");
-    let cargo_path = template.join("Cargo.toml");
-    let original_permissions = fs::metadata(&cargo_path)
-        .expect("cargo metadata")
-        .permissions();
-    let mut readonly_permissions = original_permissions.clone();
-    readonly_permissions.set_readonly(true);
-    fs::set_permissions(&cargo_path, readonly_permissions).expect("make cargo readonly");
-    let write_error = scaffold_rust("write-fail", &readonly_dest, &template, "../sdk")
-        .expect_err("readonly Cargo.toml should reject rewrite");
-    assert!(matches!(
-        write_error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-    ));
-    let _ = fs::set_permissions(
-        readonly_dest.join("Cargo.toml"),
-        original_permissions.clone(),
-    );
-    let _ = fs::set_permissions(&cargo_path, original_permissions);
+    if running_as_root() {
+        eprintln!(
+            "skip readonly Cargo.toml rewrite assertion: root bypasses OS readonly permissions"
+        );
+    } else {
+        let readonly_dest = root.join("readonly-dest");
+        let cargo_path = template.join("Cargo.toml");
+        let original_permissions = fs::metadata(&cargo_path)
+            .expect("cargo metadata")
+            .permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        fs::set_permissions(&cargo_path, readonly_permissions).expect("make cargo readonly");
+        let write_error = scaffold_rust("write-fail", &readonly_dest, &template, "../sdk")
+            .expect_err("readonly Cargo.toml should reject rewrite");
+        assert!(matches!(
+            write_error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ));
+        let _ = fs::set_permissions(
+            readonly_dest.join("Cargo.toml"),
+            original_permissions.clone(),
+        );
+        let _ = fs::set_permissions(&cargo_path, original_permissions);
+    }
 
     let readme_template = root.join("readme-template");
     let readme_dest = root.join("readme-dest");
@@ -238,25 +253,31 @@ fn scaffold_as_reports_package_and_readme_write_failures() {
     fs::write(template.join("package.json"), r#"{"name":"template"}"#)
         .expect("write package template");
 
-    let package_path = template.join("package.json");
-    let original_permissions = fs::metadata(&package_path)
-        .expect("package metadata")
-        .permissions();
-    let mut readonly_permissions = original_permissions.clone();
-    readonly_permissions.set_readonly(true);
-    fs::set_permissions(&package_path, readonly_permissions).expect("make package readonly");
-    let package_dest = root.join("package-dest");
-    let package_error = scaffold_as("package-fail", &package_dest, &template)
-        .expect_err("readonly package.json should reject rewrite");
-    assert!(matches!(
-        package_error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-    ));
-    let _ = fs::set_permissions(
-        package_dest.join("package.json"),
-        original_permissions.clone(),
-    );
-    let _ = fs::set_permissions(&package_path, original_permissions);
+    if running_as_root() {
+        eprintln!(
+            "skip readonly package.json rewrite assertion: root bypasses OS readonly permissions"
+        );
+    } else {
+        let package_path = template.join("package.json");
+        let original_permissions = fs::metadata(&package_path)
+            .expect("package metadata")
+            .permissions();
+        let mut readonly_permissions = original_permissions.clone();
+        readonly_permissions.set_readonly(true);
+        fs::set_permissions(&package_path, readonly_permissions).expect("make package readonly");
+        let package_dest = root.join("package-dest");
+        let package_error = scaffold_as("package-fail", &package_dest, &template)
+            .expect_err("readonly package.json should reject rewrite");
+        assert!(matches!(
+            package_error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+        ));
+        let _ = fs::set_permissions(
+            package_dest.join("package.json"),
+            original_permissions.clone(),
+        );
+        let _ = fs::set_permissions(&package_path, original_permissions);
+    }
 
     let readme_template = root.join("readme-template");
     let readme_dest = root.join("readme-dest");
