@@ -28,22 +28,40 @@ fn chmod_exec(path: &Path) {
     }
 }
 
-fn write_fake_maw(bin_dir: &Path) {
-    let maw = bin_dir.join("maw");
-    fs::write(
-        &maw,
+fn write_shell(path: &Path, body: &str) {
+    fs::write(path, body).expect("write fake executable");
+    chmod_exec(path);
+}
+
+fn write_fake_bud_tools(bin_dir: &Path) {
+    for program in ["gh", "ghq", "git"] {
+        write_shell(
+            &bin_dir.join(program),
+            &format!(
+                r#"#!/bin/sh
+printf '{program} %s\n' "$*" >> "$MAW_INCUBATE_BUD_LOG"
+exit 0
+"#
+            ),
+        );
+    }
+}
+
+fn write_fake_self(bin_dir: &Path) -> PathBuf {
+    let fake_self = bin_dir.join("fake-self");
+    write_shell(
+        &fake_self,
         r#"#!/bin/sh
-printf '%s\n' "$*" >> "$MAW_INCUBATE_BUD_LOG"
-printf 'budded %s\n' "$2"
+printf 'self MAW_FROM_RS=%s args=%s\n' "$MAW_FROM_RS" "$*" >> "$MAW_INCUBATE_SELF_LOG"
+exit 0
 "#,
-    )
-    .expect("write fake maw");
-    chmod_exec(&maw);
+    );
+    fake_self
 }
 
 fn write_fake_tmux(bin_dir: &Path) {
     let tmux = bin_dir.join("tmux");
-    fs::write(
+    write_shell(
         &tmux,
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_INCUBATE_TMUX_LOG"
@@ -62,9 +80,7 @@ case "$1" in
     ;;
 esac
 "#,
-    )
-    .expect("write fake tmux");
-    chmod_exec(&tmux);
+    );
 }
 
 fn seed_config(root: &Path) {
@@ -83,9 +99,11 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
     let xdg_config = root.join("xdg-config");
     let xdg_data = root.join("xdg-data");
     let xdg_state = root.join("xdg-state");
+    let ghq_root = root.join("ghq");
     fs::create_dir_all(&home).expect("home");
     fs::create_dir_all(&xdg_data).expect("xdg data");
     fs::create_dir_all(&xdg_state).expect("xdg state");
+    fs::create_dir_all(&ghq_root).expect("ghq root");
 
     Command::new(bin())
         .args(args)
@@ -96,12 +114,22 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
         .env("XDG_CONFIG_HOME", &xdg_config)
         .env("XDG_DATA_HOME", &xdg_data)
         .env("XDG_STATE_HOME", &xdg_state)
+        .env("GHQ_ROOT", &ghq_root)
+        .env("MAW_BUD_OWNER", "org")
         .env("TMUX", root.join("tmux-socket"))
         .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("MAW_RS_SELF_BIN", bin_dir.join("fake-self"))
         .env("MAW_INCUBATE_BUD_LOG", root.join("bud.log"))
+        .env("MAW_INCUBATE_SELF_LOG", root.join("self.log"))
         .env("MAW_INCUBATE_TMUX_LOG", root.join("tmux.log"))
         .output()
         .expect("run maw-rs")
+}
+
+fn normalize_stdout(root: &Path, stdout: Vec<u8>) -> String {
+    String::from_utf8(stdout)
+        .expect("stdout")
+        .replace(&root.display().to_string(), "{ROOT}")
 }
 
 #[test]
@@ -109,7 +137,8 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
     let root = temp_dir("dry-run");
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
-    write_fake_maw(&bin_dir);
+    write_fake_bud_tools(&bin_dir);
+    write_fake_self(&bin_dir);
     seed_config(&root);
 
     let output = run(&root, &["incubate", "org/foo", "--dry-run", "--flash"]);
@@ -121,13 +150,17 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout"),
+        normalize_stdout(&root, output.stdout),
         include_str!("fixtures/native-incubate/dry-run.stdout")
     );
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
-    assert_eq!(
-        fs::read_to_string(root.join("bud.log")).expect("bud log"),
-        "bud foo --repo org/foo --dry-run\n"
+    assert!(
+        !root.join("bud.log").exists(),
+        "dry-run bud must not invoke gh/ghq/git"
+    );
+    assert!(
+        !root.join("self.log").exists(),
+        "dry-run bud must not wake via self-bin"
     );
     assert!(
         !root.join("tmux.log").exists(),
@@ -137,11 +170,12 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
 }
 
 #[test]
-fn native_incubate_dispatches_trigger_after_bud_and_guards_options() {
+fn native_incubate_dispatches_trigger_after_in_process_bud_and_guards_options() {
     let root = temp_dir("send");
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
-    write_fake_maw(&bin_dir);
+    write_fake_bud_tools(&bin_dir);
+    write_fake_self(&bin_dir);
     write_fake_tmux(&bin_dir);
     seed_config(&root);
 
@@ -155,13 +189,19 @@ fn native_incubate_dispatches_trigger_after_bud_and_guards_options() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout"),
+        normalize_stdout(&root, output.stdout),
         include_str!("fixtures/native-incubate/send.stdout")
     );
-    assert_eq!(
-        fs::read_to_string(root.join("bud.log")).expect("bud log"),
-        "bud widgets --repo org/widgets\n"
+    let bud_log = fs::read_to_string(root.join("bud.log")).expect("bud log");
+    assert!(bud_log.contains("gh repo view org/widgets-oracle --json name"));
+    assert!(bud_log.contains("ghq get github.com/org/widgets-oracle"));
+    assert!(bud_log.contains("git -C "));
+    assert!(
+        !bud_log.contains(" maw ") && !bud_log.starts_with("maw "),
+        "incubate must not shell PATH maw; bud_log={bud_log}"
     );
+    let self_log = fs::read_to_string(root.join("self.log")).expect("self log");
+    assert!(self_log.contains("self MAW_FROM_RS=1 args=wake widgets --no-attach --repo-path"));
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(tmux_log.contains("list-windows -a -F #{session_name}|||#{window_index}|||#{window_name}|||#{window_active}|||#{pane_current_path}"));
     assert!(tmux_log.contains("send-keys -t widgets:0 -l /incubate org/widgets --contribute"));

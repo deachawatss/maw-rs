@@ -73,6 +73,12 @@ struct BudSystemWake;
 struct BudSystemHttp;
 struct BudSystemFs;
 
+fn bud_self_bin() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("MAW_RS_SELF_BIN")
+        .map(std::path::PathBuf::from)
+        .map_or_else(|| std::env::current_exe().map_err(|error| error.to_string()), Ok)
+}
+
 impl BudGhGitRunner for BudSystemGhGit {
     fn bud_run(&mut self, program: &str, args: &[String]) -> BudCmdOutput {
         let output = std::process::Command::new(program).args(args).output();
@@ -89,14 +95,22 @@ impl BudGhGitRunner for BudSystemGhGit {
 
 impl BudWakeRunner for BudSystemWake {
     fn bud_wake(&mut self, args: &[String]) -> Result<String, String> {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let output = std::process::Command::new(exe).args(args).output().map_err(|error| error.to_string())?;
+        let exe = bud_self_bin()?;
+        let output = std::process::Command::new(exe)
+            .args(args)
+            .env("MAW_FROM_RS", "1")
+            .output()
+            .map_err(|error| error.to_string())?;
         if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) } else { Err(String::from_utf8_lossy(&output.stderr).into_owned()) }
     }
 
     fn bud_split(&mut self, stem: &str) -> Result<String, String> {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let output = std::process::Command::new(exe).args(["split", stem]).output().map_err(|error| error.to_string())?;
+        let exe = bud_self_bin()?;
+        let output = std::process::Command::new(exe)
+            .args(["split", stem])
+            .env("MAW_FROM_RS", "1")
+            .output()
+            .map_err(|error| error.to_string())?;
         if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).into_owned()) } else { Err(String::from_utf8_lossy(&output.stderr).into_owned()) }
     }
 }

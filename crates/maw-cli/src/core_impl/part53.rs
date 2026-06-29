@@ -264,21 +264,53 @@ fn incubate_build_skill_command(options: &IncubateOptions) -> Result<String, Str
 }
 
 fn incubate_run_bud(stem: &str, options: &IncubateOptions) -> Result<String, String> {
-    let bud_args = incubate_bud_args(stem, options)?;
-    let output = std::process::Command::new("maw")
-        .args(&bud_args)
-        .env("MAW_FROM_RS", "1")
-        .output()
-        .map_err(|error| format!("incubate: failed to run maw bud: {error}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("maw bud exited {}", output.status) };
-        return Err(format!("incubate: bud failed: {detail}"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let bud_options = incubate_bud_options(stem, options)?;
+    let mut gh = BudSystemGhGit;
+    let mut fs = BudSystemFs;
+    let mut wake = BudSystemWake;
+    let mut http = BudSystemHttp;
+    bud_run_options(&bud_options, &mut gh, &mut fs, &mut wake, &mut http)
+        .map_err(|message| format!("incubate: bud failed: {message}"))
 }
 
+fn incubate_bud_options(stem: &str, options: &IncubateOptions) -> Result<BudOptions, String> {
+    incubate_validate_target_arg(stem, "stem")?;
+    let issue = options
+        .issue
+        .map(|issue| {
+            u32::try_from(issue)
+                .map_err(|_| format!("incubate: --issue value {issue} is too large for bud"))
+        })
+        .transpose()?;
+    Ok(BudOptions {
+        name: Some(stem.to_owned()),
+        from: options.from.clone(),
+        from_repo: options.from_repo.clone(),
+        stem: None,
+        org: options.org.clone(),
+        repo: Some(options.source.clone()),
+        issue,
+        issue_repo: None,
+        note: options.note.clone(),
+        nickname: options.nickname.clone(),
+        fast: options.fast,
+        root: options.root,
+        dry_run: options.dry_run,
+        pr: false,
+        split: options.split,
+        scaffold_only: false,
+        seed: options.seed,
+        blank: options.blank,
+        signal_on_birth: options.signal_on_birth,
+        force: options.force,
+        track_vault: options.track_vault,
+        sync_peers: options.sync_peers,
+        parent_session_id: None,
+        session_id: None,
+    })
+}
+
+#[cfg(test)]
 fn incubate_bud_args(stem: &str, options: &IncubateOptions) -> Result<Vec<String>, String> {
     incubate_validate_target_arg(stem, "stem")?;
     let mut args = vec!["bud".to_owned(), stem.to_owned(), "--repo".to_owned(), options.source.clone()];
@@ -304,6 +336,7 @@ fn incubate_bud_args(stem: &str, options: &IncubateOptions) -> Result<Vec<String
     Ok(args)
 }
 
+#[cfg(test)]
 fn incubate_push_option(args: &mut Vec<String>, flag: &str, value: Option<&str>) -> Result<(), String> {
     if let Some(value) = value {
         incubate_validate_path_arg(value, flag)?;
@@ -313,6 +346,7 @@ fn incubate_push_option(args: &mut Vec<String>, flag: &str, value: Option<&str>)
     Ok(())
 }
 
+#[cfg(test)]
 fn incubate_push_bool(args: &mut Vec<String>, flag: &str, enabled: bool) {
     if enabled {
         args.push(flag.to_owned());
@@ -362,8 +396,9 @@ fn incubate_validate_target_arg(value: &str, label: &str) -> Result<(), String> 
 #[cfg(test)]
 mod incubate_tests {
     use super::{
-        incubate_bud_args, incubate_build_skill_command, incubate_derive_stem_from_source,
-        incubate_parse_args, incubate_resolve_mode, IncubateMode,
+        incubate_bud_args, incubate_bud_options, incubate_build_skill_command,
+        incubate_derive_stem_from_source, incubate_parse_args, incubate_resolve_mode,
+        IncubateMode,
     };
 
     fn incubate_strings(values: &[&str]) -> Vec<String> {
@@ -404,6 +439,26 @@ mod incubate_tests {
                 "--split", "--dry-run", "--signal-on-birth", "--force", "--track-vault", "--sync-peers",
             ])
         );
+    }
+
+    #[test]
+    fn incubate_bud_options_are_structural_not_parser_rescanned() {
+        let options = incubate_parse_args(&incubate_strings(&[
+            "org/source",
+            "--stem",
+            "custom",
+            "--note=--split --trust --from=mallory",
+            "--nickname=-leading-opaque",
+            "--dry-run",
+        ]))
+        .expect("parse incubate");
+        let bud_options = incubate_bud_options("custom", &options).expect("bud options");
+        assert_eq!(bud_options.name.as_deref(), Some("custom"));
+        assert_eq!(bud_options.repo.as_deref(), Some("org/source"));
+        assert_eq!(bud_options.note.as_deref(), Some("--split --trust --from=mallory"));
+        assert_eq!(bud_options.nickname.as_deref(), Some("-leading-opaque"));
+        assert!(!bud_options.split, "flag-like note text must not enable --split");
+        assert!(bud_options.dry_run);
     }
 
     #[test]

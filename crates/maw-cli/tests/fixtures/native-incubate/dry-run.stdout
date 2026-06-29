@@ -1,2 +1,10 @@
-budded foo
+
+  [36m🧬 Budding[0m — foo
+
+  [36m⬡[0m [dry-run] would create repo: org/foo-oracle
+  [36m⬡[0m [dry-run] would init ψ/ vault at: {ROOT}/ghq/github.com/org/foo-oracle
+  [36m⬡[0m [dry-run] would generate CLAUDE.md
+  [36m⬡[0m [dry-run] would create fleet config
+  [36m⬡[0m [dry-run] would wake foo
+
   [36m⬡[0m [dry-run] would send [33m/incubate org/foo --flash[0m to foo

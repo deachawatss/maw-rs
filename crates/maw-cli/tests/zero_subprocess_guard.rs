@@ -12,27 +12,9 @@ fn production_code_has_no_path_maw_subprocess_regressions() {
     let mut hits = Vec::new();
     scan_crate_sources(&workspace_root.join("crates"), workspace_root, &mut hits);
 
-    let unexpected: Vec<_> = hits
-        .iter()
-        .filter(|hit| !is_allowed_path_maw_defer(hit))
-        .collect();
-
     assert!(
-        unexpected.is_empty(),
-        "production code must not invoke PATH-resolved `maw` via `{PATH_MAW_PATTERN}`; unexpected hits:\n{}\n\nall hits:\n{}",
-        format_hits(&unexpected),
-        format_hits(&hits.iter().collect::<Vec<_>>())
-    );
-
-    assert_eq!(
-        hits.len(),
-        1,
-        "the only documented PATH-maw subprocess defer should be incubate_run_bud pending #420; hits:\n{}",
-        format_hits(&hits.iter().collect::<Vec<_>>())
-    );
-    assert!(
-        is_allowed_path_maw_defer(&hits[0]),
-        "the remaining PATH-maw hit must be the documented incubate_run_bud #420 defer; hits:\n{}",
+        hits.is_empty(),
+        "after #420, production code must have zero PATH-maw subprocess hits; hits:\n{}",
         format_hits(&hits.iter().collect::<Vec<_>>())
     );
 }
@@ -137,17 +119,6 @@ fn enclosing_fn(lines: &[&str], index: usize) -> Option<String> {
             .and_then(|rest| rest.split_once('('))
             .map(|(name, _)| name.to_owned())
     })
-}
-
-fn is_allowed_path_maw_defer(hit: &Hit) -> bool {
-    // #59 locks the PATH-maw anti-pattern only: maw code must not shell out to a
-    // PATH-resolved `maw` subcommand. The single remaining exception is the
-    // documented incubate -> bud defer pending #420's run_cli-reachable bud
-    // runner/fs/gh/wake injection seam. Self-bin/current_exe spawns are a
-    // separate future concern and intentionally out of scope for this guard.
-    hit.rel_path == "crates/maw-cli/src/core_impl/part53.rs"
-        && hit.enclosing_fn.as_deref() == Some("incubate_run_bud")
-        && hit.line.contains(PATH_MAW_PATTERN)
 }
 
 fn format_hits(hits: &[&Hit]) -> String {
