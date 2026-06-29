@@ -246,7 +246,7 @@ fn oracleworkon_render_plan(options: &OracleworkonOptions) -> String {
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_SPLIT)
         || oracleworkon_has_flag(options, ORACLEWORKON_FLAG_TILED)
     {
-        out.push_str("  note: simple workon execution is live; advanced daemon/attach orchestration remains deferred to #295 PR-B.\n");
+        out.push_str("  note: simple workon execution is live; advanced daemon orchestration is available through the native serve orchestrator.\n");
     }
     out
 }
@@ -277,7 +277,7 @@ fn oracleworkon_spawn_with_orchestrator(
     };
     let handle = orchestrator.spawn_workon(
         request,
-        std::sync::Arc::new(crate::serve_core::ServecoreStubEngine),
+        std::sync::Arc::new(crate::serve_core::ServecoreNativeEngine),
     )?;
     Ok(oracleworkon_render_spawn(&handle))
 }
@@ -445,7 +445,7 @@ esac
         let args = oracleworkon_strings(&["demo", "--task", "feat", "--dry-run", "--engine", "codex", "--prompt", "ship it", "--with", "nova", "--split"]);
         let output = oracleworkon_run(&args, oracleworkon_fleet).expect("plan");
         assert!(output.contains("maw workon demo feat --layout nested"));
-        assert!(output.contains("advanced daemon/attach orchestration remains deferred to #295 PR-B"));
+        assert!(output.contains("advanced daemon orchestration is available through the native serve orchestrator"));
     }
 
     #[test]
