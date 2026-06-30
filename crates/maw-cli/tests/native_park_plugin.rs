@@ -194,8 +194,7 @@ fn seed_parked_json(
          \"note\": \"{note}\",\n  \
          \"parkedAt\": \"{parked_at}\"\n}}\n"
     );
-    fs::write(parked_dir.join(format!("{window}.json")), content)
-        .expect("write parked json");
+    fs::write(parked_dir.join(format!("{window}.json")), content).expect("write parked json");
 }
 
 #[test]
@@ -243,18 +242,14 @@ fn native_park_with_note_writes_file_and_stdout_golden() {
         json_path.display()
     );
     let json_text = fs::read_to_string(&json_path).expect("read json");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&json_text).expect("parse json");
+    let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("parse json");
     assert_eq!(parsed["window"], "win-a");
     assert_eq!(parsed["session"], "test-session");
     assert_eq!(parsed["note"], "a note");
     assert_eq!(parsed["branch"], "feat/x");
     assert_eq!(parsed["lastCommit"], "abc123 msg");
     // git status --short lines are trimmed (leading space stripped)
-    assert_eq!(
-        parsed["dirtyFiles"],
-        serde_json::json!(["M file.rs"])
-    );
+    assert_eq!(parsed["dirtyFiles"], serde_json::json!(["M file.rs"]));
 
     // No delegation to PATH maw.
     assert!(!stdout.contains("DELEGATED-MAW"), "stdout={stdout}");
@@ -324,10 +319,7 @@ fn native_park_ls_empty_shows_no_parked_tabs() {
     );
     let stdout = String::from_utf8(out.stdout).expect("stdout");
     // Empty → dim "no parked tabs"
-    assert!(
-        stdout.contains("no parked tabs"),
-        "stdout={stdout}"
-    );
+    assert!(stdout.contains("no parked tabs"), "stdout={stdout}");
     assert!(stdout.contains("\x1b[90m"), "should be dim: {stdout}");
 
     fs::remove_dir_all(root).expect("cleanup");
@@ -415,10 +407,7 @@ fn native_park_no_delegated_maw_no_bun() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        !combined.contains("DELEGATED-MAW"),
-        "combined={combined}"
-    );
+    assert!(!combined.contains("DELEGATED-MAW"), "combined={combined}");
     assert!(!combined.contains("bun"), "combined={combined}");
 
     fs::remove_dir_all(root).expect("cleanup");
@@ -441,7 +430,12 @@ fn native_park_no_tmux_returns_error_not_delegation() {
     let repo_dir = root.join("my-repo");
     fs::create_dir_all(&repo_dir).expect("repo dir");
 
-    let out = run(&root, &["park", "a note"], Some(repo_dir.to_str().expect("path")), false);
+    let out = run(
+        &root,
+        &["park", "a note"],
+        Some(repo_dir.to_str().expect("path")),
+        false,
+    );
     // Should exit non-zero (tmux failed).
     assert!(!out.status.success(), "should fail when no tmux");
 
@@ -451,10 +445,7 @@ fn native_park_no_tmux_returns_error_not_delegation() {
         String::from_utf8_lossy(&out.stderr)
     );
     // Must NOT contain delegation strings.
-    assert!(
-        !combined.contains("DELEGATED-MAW"),
-        "combined={combined}"
-    );
+    assert!(!combined.contains("DELEGATED-MAW"), "combined={combined}");
     assert!(!combined.contains("bun"), "combined={combined}");
 
     fs::remove_dir_all(root).expect("cleanup");

@@ -13,8 +13,7 @@ fn temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let path =
-        std::env::temp_dir().join(format!("maw-rs-native-project-{name}-{stamp}"));
+    let path = std::env::temp_dir().join(format!("maw-rs-native-project-{name}-{stamp}"));
     fs::create_dir_all(&path).expect("temp dir");
     path
 }
@@ -74,8 +73,7 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
 }
 
 /// Golden strings from crates/maw-plugin-manifest/tests/fixtures/wasm-parity/project/
-const GOLDEN_NO_ARGS_STDOUT: &str =
-    "usage: maw project <learn|incubate|find|list> [args...]\n  \
+const GOLDEN_NO_ARGS_STDOUT: &str = "usage: maw project <learn|incubate|find|list> [args...]\n  \
      learn    <url>   \u{2014} clone repo for study (symlink in \u{03c8}/learn/)\n  \
      incubate <url>   \u{2014} clone repo for development (symlink in \u{03c8}/incubate/)\n  \
      find     <query> \u{2014} search tracked repos (alias: search)\n  \
@@ -162,7 +160,11 @@ fn native_project_learn_with_url_matches_golden() {
 
     let out = run(
         &root,
-        &["project", "learn", "https://github.com/Soul-Brews-Studio/maw-js"],
+        &[
+            "project",
+            "learn",
+            "https://github.com/Soul-Brews-Studio/maw-js",
+        ],
     );
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("stdout");
@@ -182,7 +184,11 @@ fn native_project_incubate_with_url_matches_golden() {
 
     let out = run(
         &root,
-        &["project", "incubate", "https://github.com/Soul-Brews-Studio/maw-rs"],
+        &[
+            "project",
+            "incubate",
+            "https://github.com/Soul-Brews-Studio/maw-rs",
+        ],
     );
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("stdout");
