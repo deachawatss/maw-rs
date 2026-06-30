@@ -5,11 +5,11 @@ const DISPATCH_291: &[DispatcherEntry] = &[
     },
     DispatcherEntry {
         command: "project",
-        handler: Handler::Sync(run_project_fail_closed_command),
+        handler: Handler::Sync(run_project_command),
     },
     DispatcherEntry {
         command: "park",
-        handler: Handler::Sync(run_park_fail_closed_command),
+        handler: Handler::Sync(run_park_command),
     },
     DispatcherEntry {
         command: "cleanup",
@@ -65,13 +65,113 @@ fn run_learn_command(argv: &[String]) -> CliOutput {
     }
 }
 
-fn run_project_fail_closed_command(_: &[String]) -> CliOutput {
-    missing_cmd_fail_closed("project")
+// ── project ──────────────────────────────────────────────────────────────────
+
+const PROJECT_TRACK_URL: &str = "https://github.com/Soul-Brews-Studio/maw-js/issues/523";
+
+fn project_help() -> String {
+    format!(
+        "usage: maw project <learn|incubate|find|list> [args...]\n\
+         \x20 learn    <url>   \u{2014} clone repo for study (symlink in \u{03c8}/learn/)\n\
+         \x20 incubate <url>   \u{2014} clone repo for development (symlink in \u{03c8}/incubate/)\n\
+         \x20 find     <query> \u{2014} search tracked repos (alias: search)\n\
+         \x20 list             \u{2014} list all tracked repos\n\
+         \n\
+         see Oracle skill /project for the full implementation (scaffold tracks {PROJECT_TRACK_URL})."
+    )
 }
 
-fn run_park_fail_closed_command(_: &[String]) -> CliOutput {
-    missing_cmd_fail_closed("park")
+fn project_stub_line(action: &str, detail: &str) -> String {
+    format!(
+        "project {action}: {detail} \u{2014} not yet implemented in core plugin; \
+         use Oracle skill /project for full behavior.\n\
+         \x20 track: {PROJECT_TRACK_URL}"
+    )
 }
+
+fn run_project_command(argv: &[String]) -> CliOutput {
+    // Filter out every `--`-prefixed token first.
+    let positional: Vec<&str> = argv
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .collect();
+
+    let sub = positional.first().copied().unwrap_or("");
+    match sub {
+        "" => CliOutput {
+            code: 0,
+            stdout: project_help(),
+            stderr: String::new(),
+        },
+        "learn" | "incubate" => {
+            let url = positional.get(1).copied().unwrap_or("");
+            if url.is_empty() {
+                CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: format!("usage: maw project {sub} <url>"),
+                }
+            } else {
+                let dir = if sub == "learn" {
+                    "\u{03c8}/learn"
+                } else {
+                    "\u{03c8}/incubate"
+                };
+                CliOutput {
+                    code: 0,
+                    stdout: project_stub_line(
+                        sub,
+                        &format!(
+                            "would clone \"{url}\" and symlink into {dir}/<owner>/<repo>"
+                        ),
+                    ),
+                    stderr: String::new(),
+                }
+            }
+        }
+        "find" | "search" => {
+            let query = positional.get(1).copied().unwrap_or("");
+            if query.is_empty() {
+                CliOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "usage: maw project find <query>".to_owned(),
+                }
+            } else {
+                CliOutput {
+                    code: 0,
+                    stdout: project_stub_line(
+                        "find",
+                        &format!(
+                            "would search tracked repos for \"{query}\" \
+                             across \u{03c8}/learn and \u{03c8}/incubate"
+                        ),
+                    ),
+                    stderr: String::new(),
+                }
+            }
+        }
+        "list" => CliOutput {
+            code: 0,
+            stdout: project_stub_line(
+                "list",
+                "would list all tracked repos from \u{03c8}/learn and \u{03c8}/incubate",
+            ),
+            stderr: String::new(),
+        },
+        other => CliOutput {
+            code: 1,
+            stdout: project_help(),
+            stderr: format!(
+                "maw project: unknown subcommand \"{other}\" (expected learn|incubate|find|list)"
+            ),
+        },
+    }
+}
+
+// park implementation lives in part292.rs (run_park_command, resolve_park,
+// time_ago_ms, and helpers). All are in scope via include!.
 
 fn run_cleanup_fail_closed_command(_: &[String]) -> CliOutput {
     missing_cmd_fail_closed("cleanup")
@@ -214,23 +314,187 @@ mod missing_cmds_tests291 {
     }
 
     #[test]
-    fn project_park_cleanup_refuse_nonzero_without_delegation_text() {
-        for command in ["project", "park", "cleanup"] {
-            let output = run_cli(&args(&[command, "--anything"]));
-            assert_eq!(output.code, 1, "{command}");
-            assert!(output.stdout.is_empty(), "{command}: stdout={}", output.stdout);
-            assert_eq!(
-                output.stderr,
-                format!(
-                    "{command} not yet native in maw-rs — port pending; use maw-js for now\n"
-                ),
-                "{command}"
-            );
-            assert!(!output.stdout.contains("DELEGATED-MAW"), "{command}");
-            assert!(!output.stderr.contains("DELEGATED-MAW"), "{command}");
-            assert!(!output.stdout.contains("bun"), "{command}");
-            assert!(!output.stderr.contains("bun"), "{command}");
-        }
+    fn cleanup_refuses_nonzero_without_delegation_text() {
+        // cleanup is still fail-closed; project and park are now native.
+        let output = run_cli(&args(&["cleanup", "--anything"]));
+        assert_eq!(output.code, 1, "cleanup");
+        assert!(output.stdout.is_empty(), "cleanup: stdout={}", output.stdout);
+        assert_eq!(
+            output.stderr,
+            "cleanup not yet native in maw-rs — port pending; use maw-js for now\n",
+        );
+        assert!(!output.stdout.contains("DELEGATED-MAW"));
+        assert!(!output.stderr.contains("DELEGATED-MAW"));
+        assert!(!output.stdout.contains("bun"));
+        assert!(!output.stderr.contains("bun"));
+    }
+
+    #[test]
+    fn project_no_args_returns_help_exit0() {
+        let out = run_project_command(&[]);
+        assert_eq!(out.code, 0, "stdout={} stderr={}", out.stdout, out.stderr);
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.contains("usage: maw project"));
+        assert!(out.stdout.contains("learn"));
+        assert!(out.stdout.contains("incubate"));
+        assert!(out.stdout.contains("find"));
+        assert!(out.stdout.contains("list"));
+        assert!(out.stdout.contains(PROJECT_TRACK_URL));
+        // No trailing newline (goldens authoritative).
+        assert!(!out.stdout.ends_with('\n'), "stdout must not end with newline");
+    }
+
+    #[test]
+    fn project_list_returns_stub_exit0() {
+        let out = run_project_command(&args(&["list"]));
+        assert_eq!(out.code, 0);
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.contains("project list: would list all tracked repos"));
+        assert!(out.stdout.contains(PROJECT_TRACK_URL));
+        assert!(!out.stdout.ends_with('\n'));
+    }
+
+    #[test]
+    fn project_learn_with_url_returns_stub_exit0() {
+        let out = run_project_command(&args(&[
+            "learn",
+            "https://github.com/Soul-Brews-Studio/maw-js",
+        ]));
+        assert_eq!(out.code, 0);
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.contains(
+            "project learn: would clone \"https://github.com/Soul-Brews-Studio/maw-js\""
+        ));
+        assert!(out.stdout.contains("\u{03c8}/learn/<owner>/<repo>"));
+        assert!(!out.stdout.ends_with('\n'));
+    }
+
+    #[test]
+    fn project_incubate_with_url_returns_stub_exit0() {
+        let out = run_project_command(&args(&[
+            "incubate",
+            "https://github.com/Soul-Brews-Studio/maw-rs",
+        ]));
+        assert_eq!(out.code, 0);
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.contains(
+            "project incubate: would clone \"https://github.com/Soul-Brews-Studio/maw-rs\""
+        ));
+        assert!(out.stdout.contains("\u{03c8}/incubate/<owner>/<repo>"));
+        assert!(!out.stdout.ends_with('\n'));
+    }
+
+    #[test]
+    fn project_find_with_query_returns_stub_exit0() {
+        let out = run_project_command(&args(&["find", "oracle"]));
+        assert_eq!(out.code, 0);
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.contains(
+            "project find: would search tracked repos for \"oracle\""
+        ));
+        assert!(!out.stdout.ends_with('\n'));
+    }
+
+    #[test]
+    fn project_search_alias_works() {
+        let out = run_project_command(&args(&["search", "oracle"]));
+        assert_eq!(out.code, 0);
+        assert!(out.stderr.is_empty());
+        // search is aliased to find output
+        assert!(out.stdout.contains("project find:"));
+    }
+
+    #[test]
+    fn project_learn_missing_url_exit1() {
+        let out = run_project_command(&args(&["learn"]));
+        assert_eq!(out.code, 1);
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.stderr, "usage: maw project learn <url>");
+    }
+
+    #[test]
+    fn project_incubate_missing_url_exit1() {
+        let out = run_project_command(&args(&["incubate"]));
+        assert_eq!(out.code, 1);
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.stderr, "usage: maw project incubate <url>");
+    }
+
+    #[test]
+    fn project_find_missing_query_exit1() {
+        let out = run_project_command(&args(&["find"]));
+        assert_eq!(out.code, 1);
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.stderr, "usage: maw project find <query>");
+    }
+
+    #[test]
+    fn project_bogus_subcommand_exit1_both_streams() {
+        let out = run_project_command(&args(&["bogus"]));
+        assert_eq!(out.code, 1);
+        assert!(!out.stdout.is_empty(), "stdout should contain help");
+        assert!(out.stdout.contains("usage: maw project"));
+        assert_eq!(
+            out.stderr,
+            "maw project: unknown subcommand \"bogus\" (expected learn|incubate|find|list)"
+        );
+    }
+
+    #[test]
+    fn project_dashes_filtered_before_sub_detection() {
+        // --foo list → --foo is filtered → sub = list
+        let out = run_project_command(&args(&["--foo", "list"]));
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("project list:"));
+    }
+
+    #[test]
+    fn resolve_park_no_args_uses_current() {
+        let current = "main-win";
+        let known = vec!["main-win".to_owned(), "other-win".to_owned()];
+        let (target, note) = resolve_park(&[], current, &known);
+        assert_eq!(target, "main-win");
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn resolve_park_known_other_window_as_target() {
+        let current = "main-win";
+        let known = vec!["main-win".to_owned(), "other-win".to_owned()];
+        let raw = args(&["other-win", "my note"]);
+        let (target, note) = resolve_park(&raw, current, &known);
+        assert_eq!(target, "other-win");
+        assert_eq!(note.as_deref(), Some("my note"));
+    }
+
+    #[test]
+    fn resolve_park_known_window_same_as_current_uses_current_note() {
+        let current = "main-win";
+        let known = vec!["main-win".to_owned()];
+        let raw = args(&["main-win", "a note"]);
+        let (target, note) = resolve_park(&raw, current, &known);
+        // first arg is known but IS current → falls through to note path
+        assert_eq!(target, "main-win");
+        assert_eq!(note.as_deref(), Some("main-win a note"));
+    }
+
+    #[test]
+    fn resolve_park_unknown_first_arg_becomes_note() {
+        let current = "main-win";
+        let known = vec!["main-win".to_owned()];
+        let raw = args(&["handoff note here"]);
+        let (target, note) = resolve_park(&raw, current, &known);
+        assert_eq!(target, "main-win");
+        assert_eq!(note.as_deref(), Some("handoff note here"));
+    }
+
+    #[test]
+    fn time_ago_ms_boundaries() {
+        assert_eq!(time_ago_ms(59 * 60_000), "59m ago");
+        assert_eq!(time_ago_ms(60 * 60_000), "1h ago");
+        assert_eq!(time_ago_ms(23 * 3_600_000), "23h ago");
+        assert_eq!(time_ago_ms(24 * 3_600_000), "1d ago");
+        assert_eq!(time_ago_ms(0), "0m ago");
     }
 
     #[test]
