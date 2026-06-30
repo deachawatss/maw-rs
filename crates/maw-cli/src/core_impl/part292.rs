@@ -324,6 +324,5 @@ fn cmd_park_ls() -> Result<String, String> {
             state.window
         );
     }
-    out.push('\n');
     Ok(out)
 }

@@ -390,8 +390,11 @@ fn native_park_ls_with_entries_shows_header_and_rows() {
     assert!(stdout.contains("(no note)"), "stdout={stdout}");
     assert!(stdout.contains("no branch"), "stdout={stdout}");
     assert!(stdout.contains("clean"), "stdout={stdout}");
-    // Trailing blank line
-    assert!(stdout.ends_with("\n\n"), "should end with blank line: {stdout:?}");
+    // Trailing: exactly one newline after the last row (maw-js parity, not a blank line)
+    assert!(
+        stdout.ends_with('\n') && !stdout.ends_with("\n\n"),
+        "should end with exactly one trailing newline (maw-js parity): {stdout:?}"
+    );
 
     fs::remove_dir_all(root).expect("cleanup");
 }
