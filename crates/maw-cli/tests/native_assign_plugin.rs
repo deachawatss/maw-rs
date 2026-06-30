@@ -67,6 +67,12 @@ case "$1" in
   list-windows|capture-pane)
     printf ''
     ;;
+  load-buffer)
+    # Real tmux `load-buffer -` consumes stdin. Drain it with a shell builtin
+    # (`cat` is not on the test's restricted PATH) so the parent's write_all
+    # never races into a closed pipe (was a flaky EPIPE / status 127).
+    while read -r _; do :; done
+    ;;
   *)
     exit 0
     ;;

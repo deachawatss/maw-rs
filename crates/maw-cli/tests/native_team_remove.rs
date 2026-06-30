@@ -70,8 +70,13 @@ fn live_panes() -> &'static str {
 }
 
 fn normalize(root: &Path, bytes: &[u8]) -> String {
+    // On macOS, std::env::temp_dir() lives under /var/folders or /tmp, but the
+    // command output canonicalizes through the /private symlink — so replace the
+    // canonical path too, otherwise a stray `/private` prefix leaks into goldens.
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     String::from_utf8(bytes.to_vec())
         .expect("utf8")
+        .replace(&canonical.display().to_string(), "<ROOT>")
         .replace(&root.display().to_string(), "<ROOT>")
 }
 
