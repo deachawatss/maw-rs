@@ -135,6 +135,11 @@ const ABOUT_ATHENA_TRANSCRIPT: &[ExpectedHostCall] = &[
         "/data/about/athena/worktrees/agent.json",
     ),
 ];
+const ACTIVITY_ATHENA_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
+];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -471,6 +476,26 @@ fn golden_parity_about_committed_golden_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_activity_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for args in [&["athena:0"][..], &["athena:0", "--json"][..]] {
+        run_parity_case(ParityCase {
+            plugin: "activity",
+            manifest_name: "activity-parity",
+            args,
+            expected_host_calls: Some(ACTIVITY_ATHENA_TRANSCRIPT.len()),
+            expected_host_transcript: Some(ACTIVITY_ATHENA_TRANSCRIPT),
+        });
+    }
+    run_parity_case(ParityCase {
+        plugin: "activity",
+        manifest_name: "activity-parity",
+        args: &[],
+        expected_host_calls: Some(0),
+        expected_host_transcript: None,
+    });
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -750,6 +775,18 @@ fn about_wasm_declares_only_read_caps() {
             ][..]
         ),
         "about fixture must declare only bounded read caps"
+    );
+}
+
+#[test]
+fn activity_wasm_declares_only_tmux_read_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/activity");
+    let wasm_plugin = load_wasm_fixture(&fixture, "activity-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["tmux:read".to_owned()][..]),
+        "activity fixture must declare only tmux read caps"
     );
 }
 

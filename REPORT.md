@@ -33,7 +33,7 @@ Ranking principles:
 8. `panes` - daily pane metadata read; likely tmux read/tags read.
 9. `find` - diagnostic search across sessions/fleet metadata; bounded read if scoped carefully.
 10. `locate` - diagnostic oracle lookup; bounded read of fleet/config/tmux.
-11. `activity` - read-only pane activity classification; bounded tmux capture with fixture snapshots.
+11. `activity` - read-only pane activity classification; bounded tmux capture with fixture snapshots. Converted in this follow-up batch.
 12. `capture` - direct tmux capture; read-only but output-size behavior needs careful parity.
 13. `discover` - federation inventory/status read; likely config/tmux read.
 14. `transport` - transport diagnostics; likely read-only.
@@ -128,6 +128,11 @@ Per-oracle plugin note:
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/about/`
   - Covered CLI cases: `athena` and no args.
   - Capabilities: `fs:read:data`, `fs:read:config`, `tmux:read`.
+- `activity` converted as an AssemblyScript WASM parity fixture:
+  - Source: `examples/wasm-parity/activity/src/plugin.ts`
+  - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/activity/`
+  - Covered CLI cases: `athena:0`, `athena:0 --json`, and no args.
+  - Capabilities: `tmux:read`.
 
 ## Test evidence
 
@@ -143,6 +148,9 @@ Per-oracle plugin note:
 - `npm run build:about` from `packages/wasm-sdk` passed.
 - `cargo test -p maw-plugin-manifest about` passed: 2 about parity/capability tests.
 - Before the `about` commit: `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- `npm run build:activity` from `packages/wasm-sdk` passed.
+- `cargo test -p maw-plugin-manifest activity` passed: 2 activity parity/capability tests.
+- Before the `activity` commit: `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 
 ## Blockers / risks
 
