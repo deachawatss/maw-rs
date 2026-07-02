@@ -188,15 +188,20 @@ fn broadcast_team_manifest_member_names(team: &str) -> Vec<String> {
 
 fn broadcast_fleet_session_names(fleet: &str) -> BTreeSet<String> {
     let wanted = broadcast_normalized_names(fleet);
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return BTreeSet::new(); };
     let mut sessions = BTreeSet::new();
-    for path in entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")) {
-        let Some(json) = broadcast_read_json(&path) else { continue; };
-        let name = json.get("name").and_then(serde_json::Value::as_str).unwrap_or_default();
-        let file = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or_default();
-        let candidates = [json.get("groupName").and_then(serde_json::Value::as_str).unwrap_or_default(), file, name, &broadcast_strip_numeric_prefix(name)];
-        if candidates.iter().any(|candidate| wanted.contains(*candidate)) && !name.is_empty() { sessions.insert(name.to_owned()); }
+    for entry in fleet_load_entries() {
+        let name = entry.session.name.as_str();
+        let file = entry.file.strip_suffix(".json").unwrap_or(&entry.file);
+        let stripped = broadcast_strip_numeric_prefix(name);
+        let candidates = [
+            entry.session.group_name.as_str(),
+            file,
+            name,
+            stripped.as_str(),
+        ];
+        if candidates.iter().any(|candidate| wanted.contains(*candidate)) && !name.is_empty() {
+            sessions.insert(name.to_owned());
+        }
     }
     sessions
 }

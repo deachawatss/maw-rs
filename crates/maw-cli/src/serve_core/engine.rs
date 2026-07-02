@@ -91,7 +91,11 @@ pub(crate) fn serveengine_run_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     struct EnvGuard {
         key: &'static str,
@@ -117,8 +121,15 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
         let mut path = std::env::temp_dir();
-        path.push(format!("maw-rs-serveengine-{name}-{}", std::process::id()));
+        path.push(format!(
+            "maw-rs-serveengine-{name}-{}-{stamp}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("temp");
         path
@@ -158,7 +169,7 @@ printf '{{"cwd":"%s","argv":["%s","%s","%s","%s"]}}' "$(pwd)" "$1" "$2" "$3" "$4
                 "nested".to_owned(),
             ],
             &root,
-            Duration::from_secs(10),
+            SERVEENGINE_CHILD_TIMEOUT,
         )
         .expect("run");
         let body = fs::read_to_string(marker).expect("marker");

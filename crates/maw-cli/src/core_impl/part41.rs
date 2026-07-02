@@ -329,26 +329,12 @@ fn locate_fleet_entry_matches(entry: &LocateFleetEntry, names: &BTreeSet<String>
 }
 
 fn locate_load_fleet_entries() -> Vec<LocateFleetEntry> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else {
-        return Vec::new();
-    };
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-        .collect::<Vec<_>>();
-    files.sort();
-    files
+    fleet_load_entries()
         .into_iter()
-        .filter_map(|path| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            let session = serde_json::from_str::<NativeFleetSession>(&text).ok()?;
-            Some(LocateFleetEntry {
-                file: path.file_name()?.to_str()?.to_owned(),
-                path: path_string(path),
-                session,
-            })
+        .map(|entry| LocateFleetEntry {
+            file: entry.file,
+            path: path_string(entry.path),
+            session: entry.session,
         })
         .collect()
 }

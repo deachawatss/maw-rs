@@ -91,7 +91,7 @@ fn check_run_tool_probe(program: &str, args: &[&str]) -> CheckToolProbe133 {
         return CheckToolProbe133 { present: false, output: String::new() };
     };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => {

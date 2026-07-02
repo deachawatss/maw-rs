@@ -279,33 +279,15 @@ fn about_config_session(oracle: &str) -> Option<String> {
 
 #[cfg(not(test))]
 fn about_fleet_entry(oracle: &str) -> Option<AboutFleetEntry> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let entries = std::fs::read_dir(fleet_dir).ok()?;
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-        .collect::<Vec<_>>();
-    files.sort();
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(session) = serde_json::from_str::<NativeFleetSession>(&text) else {
-            continue;
-        };
-        let has_oracle = session.windows.iter().any(|window| {
+    for entry in fleet_load_entries() {
+        let has_oracle = entry.session.windows.iter().any(|window| {
             let window_name = window.name.to_lowercase();
             window_name == format!("{oracle}-oracle") || window_name == oracle
         });
         if has_oracle {
             return Some(AboutFleetEntry {
-                file: path
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                session,
+                file: entry.file,
+                session: entry.session,
             });
         }
     }

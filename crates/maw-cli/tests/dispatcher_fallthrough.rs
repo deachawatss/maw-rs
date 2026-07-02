@@ -10,6 +10,12 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 struct EnvRestore {
     maw_from_rs: Option<OsString>,
     home: Option<OsString>,
@@ -131,7 +137,7 @@ fn dispatcher_table_marks_native_and_unknown_commands() {
 
 #[test]
 fn native_command_stays_native_without_invoking_maw_fallback() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("native");
     let bin_dir = root.join("bin");
@@ -155,7 +161,7 @@ fn native_command_stays_native_without_invoking_maw_fallback() {
 
 #[test]
 fn unknown_command_is_native_error_and_never_invokes_path_maw() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("unknown-native");
     let bin_dir = root.join("bin");
@@ -196,7 +202,7 @@ fn unknown_command_is_native_error_and_never_invokes_path_maw() {
 
 #[test]
 fn env_fallback_hatches_are_ignored_and_never_invoke_path_maw() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("fallback-hatches-removed");
     let bin_dir = root.join("bin");
@@ -265,7 +271,7 @@ fn env_fallback_hatches_are_ignored_and_never_invoke_path_maw() {
 
 #[test]
 fn check_tools_is_native_and_never_invokes_path_maw() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("check-tools-native");
     let bin_dir = root.join("bin");
@@ -308,7 +314,7 @@ fn check_tools_is_native_and_never_invokes_path_maw() {
 
 #[test]
 fn check_tools_extracts_versions_with_argv_only_tool_probes() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("check-tools-present");
     let bin_dir = root.join("bin");
@@ -403,7 +409,7 @@ fn check_tools_extracts_versions_with_argv_only_tool_probes() {
 
 #[test]
 fn check_unknown_subcommand_matches_maw_js_usage_without_tool_exec() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("check-unknown-subcommand");
     let bin_dir = root.join("bin");
@@ -433,6 +439,7 @@ fn check_unknown_subcommand_matches_maw_js_usage_without_tool_exec() {
 
 #[tokio::test]
 async fn sync_async_handler_guard_refuses_to_block_inside_runtime() {
+    let _guard = lock_env();
     let output = run_cli(&args(&["hey", "local:nova:claude", "ping"]));
 
     assert_ne!(output.code, 0);
@@ -446,7 +453,7 @@ async fn sync_async_handler_guard_refuses_to_block_inside_runtime() {
 
 #[test]
 fn maw_from_rs_loop_guard_env_no_longer_reenables_hey_fallback() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("loop-guard-cutover");
     let bin_dir = root.join("bin");
@@ -484,7 +491,7 @@ fn maw_from_rs_loop_guard_env_no_longer_reenables_hey_fallback() {
 
 #[test]
 fn plugin_manifest_invoke_is_native_and_never_invokes_path_maw() {
-    let _guard = env_lock().lock().expect("env lock");
+    let _guard = lock_env();
     let _restore = EnvRestore::capture();
     let root = temp_dir("plugin-manifest-native");
     let bin_dir = root.join("bin");

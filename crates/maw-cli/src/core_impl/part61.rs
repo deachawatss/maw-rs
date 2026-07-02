@@ -20,6 +20,7 @@ struct FleetOptions {
 enum FleetCommand {
     Census,
     Doctor,
+    Gc,
     Init,
     Health,
     Consolidate,
@@ -60,6 +61,7 @@ struct FleetState {
     config_dir: std::path::PathBuf,
     ghq_root: std::path::PathBuf,
     config: FleetConfigSummary,
+    fleet_entries: Vec<NativeFleetEntry>,
     sessions: Vec<FleetSessionSummary>,
     disabled_count: usize,
 }
@@ -70,6 +72,24 @@ struct FleetFinding {
     code: String,
     subject: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetGcCandidate {
+    name: String,
+    path: std::path::PathBuf,
+    disabled_path: std::path::PathBuf,
+    missing_repos: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FleetGcResult {
+    name: String,
+    path: std::path::PathBuf,
+    disabled_path: std::path::PathBuf,
+    missing_repos: Vec<String>,
+    status: String,
+    detail: Option<String>,
 }
 
 fn run_fleet_command(argv: &[String]) -> CliOutput {
@@ -85,6 +105,7 @@ fn fleet_run(argv: &[String]) -> Result<(i32, String), String> {
     match options.command {
         FleetCommand::Census => Ok((0, fleet_render_census(&state, options.json)?)),
         FleetCommand::Doctor | FleetCommand::Health => fleet_run_doctor(&state, &options),
+        FleetCommand::Gc => fleet_run_gc(&state, &options, &mut maw_tmux::CommandTmuxRunner::new()),
         FleetCommand::Wake => fleet_run_wake(&state, &options),
         FleetCommand::Sleep => fleet_run_sleep(&state, &options),
         FleetCommand::Init => fleet_run_named_plan(&state, &options, "init"),
@@ -132,6 +153,7 @@ fn fleet_set_command(options: &mut FleetOptions, seen: &mut bool, value: &str) -
     options.command = match value {
         "ls" | "list" | "census" => FleetCommand::Census,
         "doctor" => FleetCommand::Doctor,
+        "gc" | "garbage-collect" => FleetCommand::Gc,
         "init" => FleetCommand::Init,
         "health" => FleetCommand::Health,
         "consolidate" => FleetCommand::Consolidate,
@@ -146,7 +168,7 @@ fn fleet_set_command(options: &mut FleetOptions, seen: &mut bool, value: &str) -
 }
 
 fn fleet_usage() -> String {
-    "usage: maw fleet [ls|doctor|health|init|consolidate|resume|sync|wake|sleep] [--json] [--dry-run] [--fix] [--reboot] [--all] [--kill] [--resume]".to_owned()
+    "usage: maw fleet [ls|doctor|health|gc|init|consolidate|resume|sync|wake|sleep] [--json] [--dry-run] [--fix] [--reboot] [--all] [--kill] [--resume]".to_owned()
 }
 
 fn fleet_load_state() -> Result<FleetState, String> {
@@ -154,8 +176,10 @@ fn fleet_load_state() -> Result<FleetState, String> {
     let config_dir = maw_config_dir(&env);
     let ghq_root = ghq_root();
     let config = fleet_load_config(&env);
-    let (sessions, disabled_count) = fleet_load_sessions(&config_dir)?;
-    Ok(FleetState { config_dir, ghq_root, config, sessions, disabled_count })
+    let fleet_entries = fleet_load_entries_result_for_env(&env, "fleet")?;
+    let sessions = fleet_entries_to_summaries(&fleet_entries);
+    let disabled_count = fleet_disabled_count_for_env(&env);
+    Ok(FleetState { config_dir, ghq_root, config, fleet_entries, sessions, disabled_count })
 }
 
 fn fleet_load_config(env: &MawXdgEnv) -> FleetConfigSummary {
@@ -199,43 +223,23 @@ fn fleet_agent_node(value: &str) -> String {
     value.split(':').next().unwrap_or(value).to_owned()
 }
 
-fn fleet_load_sessions(config_dir: &std::path::Path) -> Result<(Vec<FleetSessionSummary>, usize), String> {
-    let fleet_dir = config_dir.join("fleet");
-    let Ok(entries) = std::fs::read_dir(&fleet_dir) else { return Ok((Vec::new(), 0)); };
-    let mut paths = entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>();
-    paths.sort();
-    let disabled_count = paths.iter().filter(|path| fleet_is_disabled_path(path)).count();
-    let sessions = paths.into_iter().filter_map(|path| fleet_load_session(&path).transpose()).collect::<Result<Vec<_>, _>>()?;
-    Ok((sessions, disabled_count))
-}
-
-fn fleet_is_disabled_path(path: &std::path::Path) -> bool {
-    path.extension().and_then(std::ffi::OsStr::to_str) == Some("disabled")
-}
-
-fn fleet_load_session(path: &std::path::Path) -> Result<Option<FleetSessionSummary>, String> {
-    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") { return Ok(None); }
-    let text = std::fs::read_to_string(path).map_err(|error| format!("fleet: cannot read {}: {error}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("fleet: invalid json {}: {error}", path.display()))?;
-    let Some(name) = value.get("name").and_then(serde_json::Value::as_str) else { return Ok(None); };
-    let windows = fleet_parse_windows(&value);
-    Ok(Some(FleetSessionSummary { name: name.to_owned(), windows, disabled: false }))
-}
-
-fn fleet_parse_windows(value: &serde_json::Value) -> Vec<FleetWindowSummary> {
-    value
-        .get("windows")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(fleet_window_from_value)
+fn fleet_entries_to_summaries(entries: &[NativeFleetEntry]) -> Vec<FleetSessionSummary> {
+    entries
+        .iter()
+        .map(|entry| FleetSessionSummary {
+            name: entry.session.name.clone(),
+            windows: entry
+                .session
+                .windows
+                .iter()
+                .map(|window| FleetWindowSummary {
+                    name: if window.name.is_empty() { "main".to_owned() } else { window.name.clone() },
+                    repo: window.repo.clone(),
+                })
+                .collect(),
+            disabled: false,
+        })
         .collect()
-}
-
-fn fleet_window_from_value(value: &serde_json::Value) -> Option<FleetWindowSummary> {
-    let name = value.get("name").and_then(serde_json::Value::as_str).unwrap_or("main").to_owned();
-    let repo = value.get("repo")?.as_str()?.to_owned();
-    Some(FleetWindowSummary { name, repo })
 }
 
 fn fleet_render_census(state: &FleetState, json: bool) -> Result<String, String> {
@@ -402,6 +406,174 @@ fn fleet_exit_code(findings: &[FleetFinding]) -> i32 {
     }
 }
 
+fn fleet_run_gc<R: maw_tmux::TmuxRunner>(
+    state: &FleetState,
+    options: &FleetOptions,
+    runner: &mut R,
+) -> Result<(i32, String), String> {
+    let live = fleet_live_session_names(runner)?;
+    let candidates = fleet_gc_candidates(state, &live);
+    let results = if options.dry_run {
+        candidates
+            .into_iter()
+            .map(|candidate| fleet_gc_result(candidate, "planned", None))
+            .collect::<Vec<_>>()
+    } else {
+        fleet_apply_gc_candidates(candidates)
+    };
+    let code = i32::from(results.iter().any(|result| result.status == "failed"));
+    if options.json {
+        return Ok((code, fleet_json_gc(state, options, &live, &results)?));
+    }
+    Ok((code, fleet_render_gc(state, options, &live, &results)))
+}
+
+fn fleet_live_session_names<R: maw_tmux::TmuxRunner>(runner: &mut R) -> Result<BTreeSet<String>, String> {
+    let args = ["-F".to_owned(), "#{session_name}".to_owned()];
+    let raw = match runner.run("list-sessions", &args) {
+        Ok(raw) => raw,
+        Err(error) if error.message.contains("no server running") => String::new(),
+        Err(error) => return Err(format!("fleet gc: cannot list tmux sessions: {}", error.message)),
+    };
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+fn fleet_gc_candidates(state: &FleetState, live: &BTreeSet<String>) -> Vec<FleetGcCandidate> {
+    let mut candidates = Vec::new();
+    for entry in &state.fleet_entries {
+        if live.contains(&entry.session.name) {
+            continue;
+        }
+        let repos = fleet_session_repo_slugs(&entry.session);
+        if repos.is_empty() {
+            continue;
+        }
+        let missing = repos
+            .iter()
+            .filter(|repo| !state.ghq_root.join("github.com").join(repo).exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.len() == repos.len() {
+            candidates.push(FleetGcCandidate {
+                name: entry.session.name.clone(),
+                path: entry.path.clone(),
+                disabled_path: fleet_disabled_path(&entry.path),
+                missing_repos: missing,
+            });
+        }
+    }
+    candidates
+}
+
+fn fleet_session_repo_slugs(session: &NativeFleetSession) -> Vec<String> {
+    let mut repos = session
+        .windows
+        .iter()
+        .map(|window| window.repo.trim())
+        .filter(|repo| !repo.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    repos.sort();
+    repos.dedup();
+    repos
+}
+
+fn fleet_apply_gc_candidates(candidates: Vec<FleetGcCandidate>) -> Vec<FleetGcResult> {
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            if candidate.disabled_path.exists() {
+                return fleet_gc_result(candidate, "skipped", Some("disabled file already exists".to_owned()));
+            }
+            match std::fs::rename(&candidate.path, &candidate.disabled_path) {
+                Ok(()) => fleet_gc_result(candidate, "disabled", None),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => fleet_gc_result(candidate, "skipped", Some("source file is already gone".to_owned())),
+                Err(error) => fleet_gc_result(candidate, "failed", Some(error.to_string())),
+            }
+        })
+        .collect()
+}
+
+fn fleet_gc_result(candidate: FleetGcCandidate, status: &str, detail: Option<String>) -> FleetGcResult {
+    FleetGcResult {
+        name: candidate.name,
+        path: candidate.path,
+        disabled_path: candidate.disabled_path,
+        missing_repos: candidate.missing_repos,
+        status: status.to_owned(),
+        detail,
+    }
+}
+
+fn fleet_render_gc(
+    state: &FleetState,
+    options: &FleetOptions,
+    live: &BTreeSet<String>,
+    results: &[FleetGcResult],
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "fleet gc node {}", state.config.node);
+    let _ = writeln!(out, "  live sessions: {}", live.len());
+    let _ = writeln!(out, "  candidates: {}", results.len());
+    if results.is_empty() {
+        out.push_str("  ok: no stale fleet entries\n");
+        return out;
+    }
+    for result in results {
+        let verb = if options.dry_run {
+            "[dry-run] would disable"
+        } else {
+            result.status.as_str()
+        };
+        let _ = write!(
+            out,
+            "  - {verb} {} -> {}",
+            result.path.display(),
+            result.disabled_path.display()
+        );
+        if !result.missing_repos.is_empty() {
+            let _ = write!(out, " (missing repos: {})", result.missing_repos.join(", "));
+        }
+        if let Some(detail) = &result.detail {
+            let _ = write!(out, " ({detail})");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn fleet_json_gc(
+    state: &FleetState,
+    options: &FleetOptions,
+    live: &BTreeSet<String>,
+    results: &[FleetGcResult],
+) -> Result<String, String> {
+    let value = serde_json::json!({
+        "node": state.config.node,
+        "dryRun": options.dry_run,
+        "liveSessionCount": live.len(),
+        "candidateCount": results.len(),
+        "candidates": results.iter().map(fleet_json_gc_result).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).map(|text| format!("{text}\n")).map_err(|error| error.to_string())
+}
+
+fn fleet_json_gc_result(result: &FleetGcResult) -> serde_json::Value {
+    serde_json::json!({
+        "name": result.name,
+        "path": result.path,
+        "disabledPath": result.disabled_path,
+        "missingRepos": result.missing_repos,
+        "status": result.status,
+        "detail": result.detail,
+    })
+}
+
 fn fleet_run_wake(state: &FleetState, options: &FleetOptions) -> Result<(i32, String), String> {
     let sessions = fleet_wake_targets(state, options.all);
     if options.json { return Ok((0, fleet_json_action(state, "wake", &sessions, options)?)); }
@@ -471,6 +643,21 @@ mod fleet_tests {
     use super::*;
 
     fn fleet_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
+
+    #[derive(Default)]
+    struct FleetMockTmux {
+        sessions: String,
+    }
+
+    impl maw_tmux::TmuxRunner for FleetMockTmux {
+        fn run(&mut self, subcommand: &str, _args: &[String]) -> Result<String, maw_tmux::TmuxError> {
+            if subcommand == "list-sessions" {
+                Ok(self.sessions.clone())
+            } else {
+                Err(maw_tmux::TmuxError::new(format!("unexpected tmux command {subcommand}")))
+            }
+        }
+    }
 
     fn fleet_temp_root(name: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -557,6 +744,29 @@ mod fleet_tests {
             assert!(output.stdout.contains("\"action\": \"wake\""));
             assert!(output.stdout.contains("\"sessionCount\": 1"));
             assert!(!output.stdout.contains("22-dormant"));
+        });
+    }
+
+    #[test]
+    fn fleet_gc_dry_run_lists_only_nonlive_entries_with_all_repos_missing() {
+        fleet_with_fixture(|root| {
+            let ghost = root.join("config/fleet/04-ghost.json");
+            std::fs::write(
+                &ghost,
+                r#"{"name":"04-ghost","windows":[{"name":"ghost","repo":"acme/ghost"}]}"#,
+            )
+            .expect("ghost");
+            let state = fleet_load_state().expect("state");
+            let options = fleet_parse_args(&fleet_strings(&["gc", "--dry-run"])).expect("parse");
+            let mut tmux = FleetMockTmux { sessions: String::new() };
+            let (code, stdout) = fleet_run_gc(&state, &options, &mut tmux).expect("gc");
+
+            assert_eq!(code, 0);
+            assert!(stdout.contains("[dry-run] would disable"));
+            assert!(stdout.contains("04-ghost.json"));
+            assert!(!stdout.contains("03-alpha.json"));
+            assert!(ghost.exists());
+            assert!(!ghost.with_file_name("04-ghost.json.disabled").exists());
         });
     }
 }

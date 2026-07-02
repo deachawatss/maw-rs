@@ -23,7 +23,7 @@ struct CaptureWindow {
     name: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CaptureFleetEntry {
     name: String,
 }
@@ -141,12 +141,9 @@ fn capture_parse_sessions(raw: &str) -> Vec<CaptureSession> {
 }
 
 fn capture_load_fleet() -> Vec<CaptureFleetEntry> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return Vec::new(); };
-    entries
-        .flatten()
-        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
-        .filter_map(|text| serde_json::from_str::<CaptureFleetEntry>(&text).ok())
+    load_native_fleet()
+        .into_iter()
+        .map(|session| CaptureFleetEntry { name: session.name })
         .collect()
 }
 
