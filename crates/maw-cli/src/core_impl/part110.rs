@@ -2,24 +2,6 @@ const DISPATCH_110: &[DispatcherEntry] = &[
     DispatcherEntry { command: "find", handler: Handler::Sync(find_run_command) },
 ];
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-struct FindFleetSession {
-    name: String,
-    #[serde(default)]
-    windows: Vec<FindFleetWindow>,
-    #[serde(default)]
-    sync_peers: Vec<String>,
-    #[serde(default)]
-    project_repos: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-struct FindFleetWindow {
-    name: String,
-    #[serde(default)]
-    repo: String,
-}
-
 #[derive(Debug, Clone)]
 struct FindArgs {
     keyword: String,
@@ -163,7 +145,7 @@ fn find_maybe_push_oracle(
     }
 }
 
-fn find_fleet_matches(fleet: &[FindFleetSession], kw: &str, oracle_filter: Option<&str>) -> Vec<String> {
+fn find_fleet_matches(fleet: &[NativeFleetSession], kw: &str, oracle_filter: Option<&str>) -> Vec<String> {
     let mut matches = Vec::new();
     for session in fleet {
         find_maybe_push_fleet_session(session, kw, oracle_filter, &mut matches);
@@ -172,7 +154,7 @@ fn find_fleet_matches(fleet: &[FindFleetSession], kw: &str, oracle_filter: Optio
 }
 
 fn find_maybe_push_fleet_session(
-    session: &FindFleetSession,
+    session: &NativeFleetSession,
     kw: &str,
     oracle_filter: Option<&str>,
     out: &mut Vec<String>,
@@ -199,7 +181,7 @@ fn find_maybe_push_fleet_session(
     }
 }
 
-fn find_maybe_push_window(window: &FindFleetWindow, kw: &str, out: &mut Vec<String>) {
+fn find_maybe_push_window(window: &NativeFleetWindow, kw: &str, out: &mut Vec<String>) {
     if window.name.to_lowercase().contains(kw) || window.repo.to_lowercase().contains(kw) {
         let detail = if window.repo.is_empty() {
             format!("window {}", window.name)
@@ -212,7 +194,7 @@ fn find_maybe_push_window(window: &FindFleetWindow, kw: &str, out: &mut Vec<Stri
 
 fn find_code_targets(
     repos_root: &std::path::Path,
-    fleet: &[FindFleetSession],
+    fleet: &[NativeFleetSession],
     oracle_filter: Option<&str>,
 ) -> Vec<(String, std::path::PathBuf)> {
     let mut targets = Vec::new();
@@ -225,7 +207,7 @@ fn find_code_targets(
 
 fn find_maybe_push_fleet_target(
     repos_root: &std::path::Path,
-    session: &FindFleetSession,
+    session: &NativeFleetSession,
     oracle_filter: Option<&str>,
     targets: &mut Vec<(String, std::path::PathBuf)>,
 ) {
@@ -399,42 +381,6 @@ fn find_ghq_root() -> std::path::PathBuf {
     )
 }
 
-fn find_load_fleet() -> Vec<FindFleetSession> {
-    let fleet_dir = find_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return Vec::new(); };
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-        .collect::<Vec<_>>();
-    files.sort();
-    files
-        .into_iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .filter_map(|text| serde_json::from_str(&text).ok())
-        .collect()
-}
-
-fn find_config_dir() -> std::path::PathBuf {
-    let env = find_current_xdg_env();
-    maw_config_dir(&env)
-}
-
-fn find_current_xdg_env() -> MawXdgEnv {
-    let home = std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-    let vars = [
-        "MAW_HOME",
-        "MAW_CONFIG_DIR",
-        "MAW_XDG",
-        "XDG_CONFIG_HOME",
-        "XDG_STATE_HOME",
-        "MAW_STATE_DIR",
-        "XDG_DATA_HOME",
-        "MAW_DATA_DIR",
-        "XDG_CACHE_HOME",
-        "MAW_CACHE_DIR",
-    ]
-    .into_iter()
-    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)));
-    MawXdgEnv::with_vars(home, vars)
+fn find_load_fleet() -> Vec<NativeFleetSession> {
+    load_native_fleet()
 }

@@ -42,15 +42,8 @@ struct OracleRegistry {
     retired: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct OracleFleetSession { #[serde(default)] windows: Vec<OracleFleetWindow> }
-
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-struct OracleFleetWindow { name: String, #[serde(default)] repo: String }
-
 #[derive(Debug, Clone)]
-struct OracleFleetEntry { session: OracleFleetSession }
+struct OracleFleetEntry { session: NativeFleetSession }
 
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -285,16 +278,10 @@ fn oracle_find_filesystem(name: &str) -> Option<OracleEntry> {
 }
 
 fn oracle_fleet_entries() -> Vec<OracleFleetEntry> {
-    let Ok(entries) = std::fs::read_dir(active_config_dir().join("fleet")) else { return Vec::new(); };
-    let mut files = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).collect::<Vec<_>>();
-    files.sort();
-    files.iter().filter_map(oracle_parse_fleet).collect()
-}
-
-fn oracle_parse_fleet(path: &std::path::PathBuf) -> Option<OracleFleetEntry> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let session = serde_json::from_str::<OracleFleetSession>(&text).ok()?;
-    Some(OracleFleetEntry { session })
+    fleet_load_entries()
+        .into_iter()
+        .map(|entry| OracleFleetEntry { session: entry.session })
+        .collect()
 }
 
 fn oracle_text_list(registry: &OracleRegistry, entries: &[OracleEntry], awake: &BTreeMap<String, String>, show_path: bool) -> String {
