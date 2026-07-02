@@ -1949,7 +1949,7 @@ mod inbox_tests {
     #[test]
     fn inbox_path_has_no_self_spawn_or_acl_env_channel() {
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let part62 = std::fs::read_to_string(manifest_dir.join("src/core_impl/part62.rs"))
+        let part62 = std::fs::read_to_string(manifest_dir.join("src/core_impl/inbox.rs"))
             .expect("read part62");
         let part62_prod = part62
             .split_once("#[cfg(test)]")
@@ -1958,7 +1958,7 @@ mod inbox_tests {
         assert!(!part62_prod.contains("current_exe"));
         assert!(!part62_prod.contains("MAW_ACL_BYPASS"));
 
-        let part29 = std::fs::read_to_string(manifest_dir.join("src/core_impl/part29.rs"))
+        let part29 = std::fs::read_to_string(manifest_dir.join("src/core_impl/send_federation.rs"))
             .expect("read part29");
         let part29_prod = part29
             .split_once("#[cfg(test)]")
