@@ -173,7 +173,7 @@ fn wake_parse_value_arg(argv: &[String], index: usize, options: &mut WakeOptions
         "--peer" | "--from" => { wake_set_peer_or_from(options, arg, &wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--layout" => { options.layout = Some(wake_take_value(argv, index, "--layout", wake_validate_layout)?); 2 }
         "--snapshot" => { options.snapshot = Some(wake_take_value(argv, index, "--snapshot", wake_validate_target_value)?); 2 }
-        "--engine" => { options.engine = Some(wake_take_value(argv, index, "--engine", wake_validate_target_value)?); 2 }
+        "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--name" => { options.name = Some(wake_take_value(argv, index, "--name", wake_validate_slug)?); 2 }
         _ => return wake_parse_equals_arg(arg, options),
     };
@@ -418,9 +418,29 @@ fn wake_sanitize_branch(value: &str) -> String {
     value.chars().map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' { ch } else { '-' }).collect()
 }
 
+/// Resolve an engine alias through `maw.config.json` `commands` (matches
+/// `workon` + maw-js): custom engines like `omx-1` expand to their full shell
+/// command; real binaries (codex/claude) fall through to the literal name.
+/// Fixes the fleet codex-team recipe (omx-N) that previously ran a bare `omx-1`.
+fn wake_resolve_engine_command(engine: &str) -> String {
+    let config = active_config_dir().join("maw.config.json");
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("commands").cloned())
+        .and_then(|commands| {
+            commands
+                .get(engine)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| engine.to_owned())
+}
+
 fn wake_command(window: &str, cwd: &std::path::Path, options: &WakeOptionsNative) -> String {
     let engine = options.engine.as_deref().unwrap_or("codex");
-    let mut command = format!("cd {} && {engine}", wake_shell_quote(&cwd.display().to_string()));
+    let resolved = wake_resolve_engine_command(engine);
+    let mut command = format!("cd {} && {resolved}", wake_shell_quote(&cwd.display().to_string()));
     if options.resume { command.push_str(" resume"); }
     if options.channels { command.push_str(" --channels plugin:discord@claude-plugins-official"); }
     if let Some(prompt) = &options.prompt { let _ = write!(command, " {}", wake_shell_quote(prompt)); }
@@ -552,6 +572,30 @@ mod wake_tests {
         assert!(options.dry_run && options.no_attach && options.fresh);
         assert!(wake_parse_args(&wake_strings(&["--", "neo"])).expect_err("separator guard").contains("unknown argument"));
         assert!(wake_parse_args(&wake_strings(&["neo", "--task", "-bad"])).expect_err("value guard").contains("must not start"));
+    }
+
+    #[test]
+    fn wake_short_e_flag_and_config_commands_engine_resolution() {
+        // short `-e` is accepted as an alias of `--engine`
+        let options = wake_parse_args(&wake_strings(&["neo", "-e", "omx-1"])).expect("parse -e");
+        assert_eq!(options.engine.as_deref(), Some("omx-1"));
+
+        // custom engines resolve to their full command from maw.config.json `commands`;
+        // real binaries not in the map fall through to the literal name.
+        wake_with_fixture(|_| {
+            let dir = active_config_dir();
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(
+                dir.join("maw.config.json"),
+                r#"{"commands":{"omx-1":"bun codex-setup.ts 1 && CODEX_HOME=$PWD/.codex omx --direct --madmax","default":"claude"}}"#,
+            )
+            .expect("write config");
+            assert_eq!(
+                wake_resolve_engine_command("omx-1"),
+                "bun codex-setup.ts 1 && CODEX_HOME=$PWD/.codex omx --direct --madmax"
+            );
+            assert_eq!(wake_resolve_engine_command("codex"), "codex");
+        });
     }
 
     #[test]
