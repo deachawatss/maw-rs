@@ -10,23 +10,37 @@ struct NativeScope {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, Default, PartialEq, Eq)]
 struct NativeFleetSession {
     name: String,
+    #[serde(default, alias = "groupName")]
+    group_name: String,
     #[serde(default)]
     windows: Vec<NativeFleetWindow>,
-    #[serde(default)]
+    #[serde(default, alias = "syncPeers")]
     sync_peers: Vec<String>,
-    #[serde(default)]
+    #[serde(default, alias = "projectRepos")]
     project_repos: Vec<String>,
+    #[serde(default, alias = "skipCommand")]
+    skip_command: Option<serde_json::Value>,
+    #[serde(default, alias = "buddedFrom")]
+    budded_from: Option<String>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Deserialize, Default, PartialEq, Eq)]
 struct NativeFleetWindow {
     name: String,
     #[serde(default)]
     repo: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeFleetEntry {
+    file: String,
+    path: std::path::PathBuf,
+    session: NativeFleetSession,
 }
 
 #[allow(dead_code)]
@@ -492,12 +506,199 @@ fn ghq_root() -> std::path::PathBuf {
     })
 }
 
+fn fleet_read_dirs_for_env(env: &MawXdgEnv) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![
+        maw_state_path(env, &["fleet"]),
+        env.home_dir().join(".maw").join("fleet"),
+        maw_config_path(env, &["fleet"]),
+    ];
+    dirs.dedup();
+    dirs
+}
+
+fn fleet_disabled_count_for_env(env: &MawXdgEnv) -> usize {
+    fleet_read_dirs_for_env(env)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| fleet_is_disabled_file(path))
+        .count()
+}
+
+fn fleet_is_json_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")
+}
+
+fn fleet_is_disabled_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str) == Some("disabled")
+}
+
+fn fleet_disabled_path(path: &std::path::Path) -> std::path::PathBuf {
+    let file = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("fleet.json");
+    path.with_file_name(format!("{file}.disabled"))
+}
+
+fn fleet_load_entries() -> Vec<NativeFleetEntry> {
+    fleet_load_entries_for_env(&current_xdg_env())
+}
+
+fn fleet_load_entries_result(label: &str) -> Result<Vec<NativeFleetEntry>, String> {
+    fleet_load_entries_result_for_env(&current_xdg_env(), label)
+}
+
+fn fleet_load_entries_for_env(env: &MawXdgEnv) -> Vec<NativeFleetEntry> {
+    fleet_load_entries_impl(fleet_read_dirs_for_env(env), false, "fleet").unwrap_or_default()
+}
+
+fn fleet_load_entries_result_for_env(env: &MawXdgEnv, label: &str) -> Result<Vec<NativeFleetEntry>, String> {
+    fleet_load_entries_impl(fleet_read_dirs_for_env(env), true, label)
+}
+
+fn fleet_load_entries_impl(dirs: Vec<std::path::PathBuf>, strict: bool, label: &str) -> Result<Vec<NativeFleetEntry>, String> {
+    let mut entries = Vec::new();
+    let mut seen_prior_dirs = BTreeSet::new();
+    for dir in dirs {
+        let mut seen_this_dir = BTreeSet::new();
+        let mut files = match std::fs::read_dir(&dir) {
+            Ok(values) => values
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| fleet_is_json_file(path))
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) if strict => return Err(format!("{label}: read {}: {error}", dir.display())),
+            Err(_) => Vec::new(),
+        };
+        files.sort();
+        for path in files {
+            let Some(entry) = fleet_parse_entry(&path, strict, label)? else { continue; };
+            if !seen_prior_dirs.contains(&entry.session.name) {
+                seen_this_dir.insert(entry.session.name.clone());
+                entries.push(entry);
+            }
+        }
+        seen_prior_dirs.extend(seen_this_dir);
+    }
+    Ok(entries)
+}
+
+fn fleet_parse_entry(path: &std::path::Path, strict: bool, label: &str) -> Result<Option<NativeFleetEntry>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if strict => return Err(format!("{label}: read {}: {error}", path.display())),
+        Err(_) => return Ok(None),
+    };
+    let session = match serde_json::from_str::<NativeFleetSession>(&text) {
+        Ok(session) => session,
+        Err(error) if strict => return Err(format!("{label}: parse {}: {error}", path.display())),
+        Err(_) => return Ok(None),
+    };
+    if session.name.is_empty() {
+        return Ok(None);
+    }
+    let file = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_owned();
+    Ok(Some(NativeFleetEntry { file, path: path.to_path_buf(), session }))
+}
+
 fn load_native_fleet() -> Vec<NativeFleetSession> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return Vec::new(); };
-    let mut files = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).collect::<Vec<_>>();
-    files.sort();
-    files.into_iter().filter_map(|path| std::fs::read_to_string(path).ok()).filter_map(|text| serde_json::from_str(&text).ok()).collect()
+    fleet_load_entries().into_iter().map(|entry| entry.session).collect()
+}
+
+#[cfg(test)]
+mod native_fleet_loader_tests {
+    use super::*;
+
+    fn fleet_loader_temp_root(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("maw-rs-fleet-loader-{name}-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp root");
+        root
+    }
+
+    fn fleet_loader_write(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("parent dir");
+        std::fs::write(path, text).expect("write");
+    }
+
+    fn fleet_loader_env<F>(root: &std::path::Path, test: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarRestore::capture("HOME");
+        let _maw_home = EnvVarRestore::capture("MAW_HOME");
+        let _maw_xdg = EnvVarRestore::capture("MAW_XDG");
+        let _maw_state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _maw_config = EnvVarRestore::capture("MAW_CONFIG_DIR");
+        let _xdg_config = EnvVarRestore::capture("XDG_CONFIG_HOME");
+        let _xdg_state = EnvVarRestore::capture("XDG_STATE_HOME");
+
+        std::env::set_var("HOME", root.join("home"));
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::remove_var("MAW_HOME");
+        std::env::remove_var("MAW_XDG");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_STATE_HOME");
+        test();
+    }
+
+    #[test]
+    fn native_fleet_loader_merges_state_legacy_and_config_with_precedence() {
+        let root = fleet_loader_temp_root("merge");
+        fleet_loader_write(
+            &root.join("state/fleet/01-alpha.json"),
+            r#"{"name":"01-alpha","windows":[{"name":"state","repo":"org/state"}],"syncPeers":["beta"],"projectRepos":["org/project"],"skipCommand":true,"buddedFrom":"root"}"#,
+        );
+        fleet_loader_write(
+            &root.join("home/.maw/fleet/01-alpha.json"),
+            r#"{"name":"01-alpha","windows":[{"name":"legacy","repo":"org/legacy"}]}"#,
+        );
+        fleet_loader_write(
+            &root.join("home/.maw/fleet/02-beta.json"),
+            r#"{"name":"02-beta","windows":[{"name":"beta","repo":"org/beta"}]}"#,
+        );
+        fleet_loader_write(
+            &root.join("config/fleet/03-gamma.json"),
+            r#"{"name":"03-gamma","groupName":"fallback","windows":[{"name":"gamma","repo":"org/gamma"}]}"#,
+        );
+        fleet_loader_write(&root.join("state/fleet/99-disabled.json.disabled"), "{}");
+
+        fleet_loader_env(&root, || {
+            let entries = fleet_load_entries();
+            let names = entries.iter().map(|entry| entry.session.name.as_str()).collect::<Vec<_>>();
+            assert_eq!(names, vec!["01-alpha", "02-beta", "03-gamma"]);
+            assert_eq!(entries[0].session.windows[0].repo, "org/state");
+            assert_eq!(entries[0].session.sync_peers, vec!["beta"]);
+            assert_eq!(entries[0].session.project_repos, vec!["org/project"]);
+            assert_eq!(entries[0].session.skip_command, Some(serde_json::json!(true)));
+            assert_eq!(entries[0].session.budded_from.as_deref(), Some("root"));
+            assert_eq!(entries[2].session.group_name, "fallback");
+            assert_eq!(fleet_disabled_count_for_env(&current_xdg_env()), 1);
+        });
+    }
+
+    #[test]
+    fn native_fleet_loader_preserves_same_dir_duplicates_for_ambiguity_checks() {
+        let root = fleet_loader_temp_root("duplicates");
+        fleet_loader_write(
+            &root.join("config/fleet/01-alpha-a.json"),
+            r#"{"name":"01-alpha","windows":[{"name":"a","repo":"org/a"}]}"#,
+        );
+        fleet_loader_write(
+            &root.join("config/fleet/01-alpha-b.json"),
+            r#"{"name":"01-alpha","windows":[{"name":"b","repo":"org/b"}]}"#,
+        );
+
+        fleet_loader_env(&root, || {
+            let entries = fleet_load_entries();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].session.name, "01-alpha");
+            assert_eq!(entries[1].session.name, "01-alpha");
+        });
+    }
 }
 
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {

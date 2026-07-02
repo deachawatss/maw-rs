@@ -7,24 +7,7 @@ const ABSORB_SYNC_DIRS: &[&str] = &["memory/learnings", "memory/retrospectives",
 struct AbsorbOptions { donor: String, receiver: String, dry_run: bool }
 
 #[derive(Debug, Clone)]
-struct AbsorbFleetEntry { file: String, path: std::path::PathBuf, session: AbsorbFleetSession }
-
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct AbsorbFleetSession {
-    name: String,
-    #[serde(default, alias = "group_name")]
-    group_name: String,
-    #[serde(default)]
-    windows: Vec<AbsorbFleetWindow>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-struct AbsorbFleetWindow {
-    name: String,
-    #[serde(default)]
-    repo: String,
-}
+struct AbsorbFleetEntry { file: String, path: std::path::PathBuf, session: NativeFleetSession }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AbsorbSyncResult { synced: Vec<(String, usize)>, total: usize }
@@ -93,24 +76,22 @@ fn absorb_run_sync_and_archive(out: &mut String, donor_path: &std::path::Path, r
 }
 
 fn absorb_render_complete(out: &mut String, donor: &AbsorbFleetEntry, donor_name: &str, receiver_name: &str) {
-    let disabled = donor.path.with_file_name(format!("{}.disabled", donor.file));
+    let disabled = fleet_disabled_path(&donor.path);
     let archived = if disabled.exists() { "archived" } else { "archive attempted" };
     let _ = writeln!(out, "\n  {donor_name} absorbed into {receiver_name}; donor {archived}.\n");
 }
 
 fn absorb_load_fleet_entries() -> Result<Vec<AbsorbFleetEntry>, String> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(&fleet_dir) else { return Ok(Vec::new()); };
-    let mut files = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).collect::<Vec<_>>();
-    files.sort();
-    files.into_iter().map(absorb_parse_fleet_file).collect()
-}
-
-fn absorb_parse_fleet_file(path: std::path::PathBuf) -> Result<AbsorbFleetEntry, String> {
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("absorb: read {}: {error}", path.display()))?;
-    let session = serde_json::from_str::<AbsorbFleetSession>(&text).map_err(|error| format!("absorb: parse {}: {error}", path.display()))?;
-    let file = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_owned();
-    Ok(AbsorbFleetEntry { file, path, session })
+    fleet_load_entries_result("absorb").map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| AbsorbFleetEntry {
+                file: entry.file,
+                path: entry.path,
+                session: entry.session,
+            })
+            .collect()
+    })
 }
 
 fn absorb_find_fleet_entry(entries: &[AbsorbFleetEntry], query: &str) -> Option<AbsorbFleetEntry> {
@@ -230,7 +211,16 @@ mod absorb_tests {
 
     #[test]
     fn absorb_entry_lookup_matches_session_group_window_and_repo() {
-        let entry = AbsorbFleetEntry { file: "01-neo.json".to_owned(), path: std::path::PathBuf::from("/tmp/01-neo.json"), session: AbsorbFleetSession { name: "01-neo-oracle".to_owned(), group_name: "team-neo".to_owned(), windows: vec![AbsorbFleetWindow { name: "neo-oracle".to_owned(), repo: "org/neo-oracle".to_owned() }] } };
+        let entry = AbsorbFleetEntry {
+            file: "01-neo.json".to_owned(),
+            path: std::path::PathBuf::from("/tmp/01-neo.json"),
+            session: NativeFleetSession {
+                name: "01-neo-oracle".to_owned(),
+                group_name: "team-neo".to_owned(),
+                windows: vec![NativeFleetWindow { name: "neo-oracle".to_owned(), repo: "org/neo-oracle".to_owned() }],
+                ..NativeFleetSession::default()
+            },
+        };
         assert!(absorb_find_fleet_entry(std::slice::from_ref(&entry), "neo").is_some());
         assert!(absorb_find_fleet_entry(std::slice::from_ref(&entry), "team-neo").is_some());
         assert!(absorb_find_fleet_entry(&[entry], "neo-oracle").is_some());

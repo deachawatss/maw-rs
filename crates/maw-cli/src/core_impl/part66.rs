@@ -62,13 +62,6 @@ struct DreamReport {
     speculations: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct DreamFleetSession { #[serde(default)] windows: Vec<DreamFleetWindow> }
-
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-struct DreamFleetWindow { #[serde(default)] repo: String, #[serde(default)] name: String }
-
 fn run_dream_command(argv: &[String]) -> CliOutput {
     match dream_run(argv) {
         Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
@@ -181,18 +174,8 @@ fn dream_add_ghq_repo_paths(paths: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-fn dream_load_fleet() -> Vec<DreamFleetSession> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return Vec::new(); };
-    let mut paths = entries.flatten().map(|entry| entry.path()).collect::<Vec<_>>();
-    paths.sort();
-    paths.into_iter().filter_map(|path| dream_read_fleet_session(&path)).collect()
-}
-
-fn dream_read_fleet_session(path: &std::path::Path) -> Option<DreamFleetSession> {
-    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") { return None; }
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<DreamFleetSession>(&text).ok()
+fn dream_load_fleet() -> Vec<NativeFleetSession> {
+    load_native_fleet()
 }
 
 fn dream_repo_state(path: &std::path::Path, now_days: i64) -> DreamRepo {

@@ -72,29 +72,13 @@ fn archive_validate_oracle(value: &str) -> Result<(), String> {
 }
 
 fn archive_find_entry(oracle: &str) -> Result<Option<ArchiveFleetEntry>, String> {
-    let fleet_dir = active_config_dir().join("fleet");
-    let Ok(entries) = std::fs::read_dir(&fleet_dir) else {
-        return Ok(None);
-    };
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-        .collect::<Vec<_>>();
-    files.sort();
-
-    for path in files {
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("archive: read {}: {error}", path.display()))?;
-        let session = serde_json::from_str::<NativeFleetSession>(&text)
-            .map_err(|error| format!("archive: parse {}: {error}", path.display()))?;
-        if archive_session_oracle_name(&session.name) == oracle {
-            let file = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or_default()
-                .to_owned();
-            return Ok(Some(ArchiveFleetEntry { file, path, session }));
+    for entry in fleet_load_entries_result("archive")? {
+        if archive_session_oracle_name(&entry.session.name) == oracle {
+            return Ok(Some(ArchiveFleetEntry {
+                file: entry.file,
+                path: entry.path,
+                session: entry.session,
+            }));
         }
     }
     Ok(None)
@@ -211,7 +195,7 @@ fn archive_render_disable(out: &mut String, entry: &ArchiveFleetEntry, options: 
         return Ok(());
     }
     archive_require_yes(options)?;
-    let disabled = entry.path.with_file_name(format!("{}.disabled", entry.file));
+    let disabled = fleet_disabled_path(&entry.path);
     match std::fs::rename(&entry.path, &disabled) {
         Ok(()) => {
             let _ = writeln!(out, "  \x1b[32m✓\x1b[0m fleet config disabled: {}.disabled", entry.file);
@@ -346,6 +330,7 @@ mod archive_tests {
             windows: vec![NativeFleetWindow { name: name.to_owned(), repo: repo.to_owned() }],
             sync_peers: peers.iter().map(|value| (*value).to_owned()).collect(),
             project_repos: Vec::new(),
+            ..NativeFleetSession::default()
         }
     }
 

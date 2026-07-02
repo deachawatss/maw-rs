@@ -308,12 +308,19 @@ mod attach_tests {
     use super::*;
 
     #[derive(Default)]
-    struct AttachFakeRunner { calls: Vec<(String, Vec<String>)> }
+    struct AttachFakeRunner {
+        calls: Vec<(String, Vec<String>)>,
+        sessions: String,
+    }
 
     impl maw_tmux::TmuxRunner for AttachFakeRunner {
         fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
-            if subcommand == "list-sessions" { Ok("50-mawjs\n05-volt\n".to_owned()) } else { Ok(String::new()) }
+            if subcommand == "list-sessions" {
+                Ok(if self.sessions.is_empty() { "50-mawjs\n05-volt\n".to_owned() } else { self.sessions.clone() })
+            } else {
+                Ok(String::new())
+            }
         }
     }
 
@@ -332,6 +339,29 @@ mod attach_tests {
         assert_eq!(output.code, 0);
         assert!(output.stdout.contains("Run: tmux attach -t 50-mawjs"));
         assert_eq!(runner.calls[0].0, "list-sessions");
+    }
+
+    #[test]
+    fn attach_prefers_live_tmux_session_over_stale_legacy_fleet_file() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = EnvVarRestore::capture("HOME");
+        let root = std::env::temp_dir().join(format!("maw-rs-attach-live-over-fleet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("home/.maw/fleet")).expect("legacy fleet dir");
+        std::fs::write(
+            root.join("home/.maw/fleet/ghost.json"),
+            r#"{"name":"ghost","windows":[{"name":"ghost","repo":"acme/dead"}]}"#,
+        )
+        .expect("legacy fleet file");
+        std::env::set_var("HOME", root.join("home"));
+
+        let mut runner = AttachFakeRunner { sessions: "05-ghost\n".to_owned(), ..AttachFakeRunner::default() };
+        let output = attach_run_with_runner(&attach_strings(&["ghost", "--plan-json"]), &mut runner).unwrap();
+
+        assert_eq!(output.code, 0, "{}{}", output.stdout, output.stderr);
+        assert!(output.stdout.contains("\"session\":\"05-ghost\""));
+        assert!(output.stdout.contains("\"action\":\"print\""));
+        assert!(runner.calls.iter().any(|call| call.0 == "list-sessions"));
     }
 
     #[test]

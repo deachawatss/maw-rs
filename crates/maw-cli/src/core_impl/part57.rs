@@ -19,22 +19,24 @@ struct DoneWorktree { main_path: std::path::PathBuf, full_path: std::path::PathB
 #[derive(Debug, Clone)]
 struct DoneContext {
     repos_root: std::path::PathBuf,
-    config_dir: std::path::PathBuf,
+    fleet_dirs: Vec<std::path::PathBuf>,
 }
 
 impl DoneContext {
     fn from_env() -> Self {
+        let env = current_xdg_env();
         Self {
             repos_root: ghq_root().join("github.com"),
-            config_dir: active_config_dir(),
+            fleet_dirs: fleet_read_dirs_for_env(&env),
         }
     }
 
     fn with_cwd(cwd: &std::path::Path) -> Self {
+        let env = current_xdg_env();
         Self {
             repos_root: done_repos_root_from_cwd(cwd)
                 .unwrap_or_else(|| ghq_root().join("github.com")),
-            config_dir: active_config_dir(),
+            fleet_dirs: fleet_read_dirs_for_env(&env),
         }
     }
 }
@@ -363,10 +365,11 @@ fn done_remove_from_fleet_config(window_lower: &str, context: &DoneContext, stdo
 }
 
 fn done_fleet_config_files(context: &DoneContext) -> Vec<std::path::PathBuf> {
-    let Ok(entries) = std::fs::read_dir(context.config_dir.join("fleet")) else { return Vec::new(); };
-    let mut files = entries.flatten().map(|entry| entry.path()).filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json")).collect::<Vec<_>>();
-    files.sort();
-    files
+    fleet_load_entries_impl(context.fleet_dirs.clone(), false, "fleet")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect()
 }
 
 fn done_git(args: &[String]) -> Result<String, String> {

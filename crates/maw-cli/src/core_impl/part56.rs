@@ -50,27 +50,10 @@ struct ForgetWorktree {
     name: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct ForgetFleetSession {
-    name: String,
-    #[serde(default, alias = "group_name")]
-    group_name: String,
-    #[serde(default)]
-    windows: Vec<ForgetFleetWindow>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize, Default, PartialEq, Eq)]
-struct ForgetFleetWindow {
-    name: String,
-    #[serde(default)]
-    repo: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ForgetFleetEntry {
     path: std::path::PathBuf,
-    session: ForgetFleetSession,
+    session: NativeFleetSession,
 }
 
 trait ForgetTmux {
@@ -193,7 +176,7 @@ fn forget_plan_with_env<T: ForgetTmux>(
     tmux: &mut T,
 ) -> Result<ForgetResult, String> {
     let repo = forget_resolve_repo(&options.oracle, ghq)?;
-    let fleet_entry = forget_resolve_fleet_entry(&options.oracle, &repo.repo_name, &maw_config_dir(env))?;
+    let fleet_entry = forget_resolve_fleet_entry(&options.oracle, &repo.repo_name, env)?;
     let session_name = forget_resolve_session_name(&options.oracle, &repo.repo_name, fleet_entry.as_ref(), &tmux.forget_list_all())?;
     let snapshot_files = forget_matching_snapshot_files(&options.oracle, &repo.repo_name, session_name.as_deref(), env)?;
     let mut actions = vec![ForgetAction {
@@ -257,7 +240,7 @@ fn forget_apply<T: ForgetTmux, D: ForgetDoneRunner>(
         }
     }
 
-    let config_dir = maw_config_dir(env);
+    let fleet_dirs = fleet_read_dirs_for_env(env);
     let snapshots_dirs = forget_snapshot_dirs(env);
     for index in 0..result.actions.len() {
         let layer = result.actions[index].layer;
@@ -267,13 +250,28 @@ fn forget_apply<T: ForgetTmux, D: ForgetDoneRunner>(
         let target = result.actions[index].target.clone();
         let path = std::path::PathBuf::from(&target);
         let allowed = if layer == "fleet" {
-            forget_path_inside(&path, &config_dir.join("fleet"))
+            fleet_dirs.iter().any(|dir| forget_path_inside(&path, dir))
         } else {
             snapshots_dirs.iter().any(|dir| forget_path_inside(&path, dir))
         };
         if !allowed {
             result.actions[index].status = "failed";
-            result.actions[index].detail = Some("refused path outside maw config/state snapshots".to_owned());
+            result.actions[index].detail = Some("refused path outside maw fleet/snapshots".to_owned());
+            continue;
+        }
+        if layer == "fleet" {
+            let disabled = fleet_disabled_path(&path);
+            match std::fs::rename(&path, &disabled) {
+                Ok(()) => {
+                    result.actions[index].status = "removed";
+                    result.actions[index].detail = Some(format!("disabled as {}", disabled.display()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => result.actions[index].status = "skipped",
+                Err(error) => {
+                    result.actions[index].status = "failed";
+                    result.actions[index].detail = Some(error.to_string());
+                }
+            }
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -374,10 +372,10 @@ fn forget_resolve_repo(oracle: &str, ghq: &std::path::Path) -> Result<ForgetRepo
 fn forget_resolve_fleet_entry(
     oracle: &str,
     repo_name: &str,
-    config_dir: &std::path::Path,
+    env: &MawXdgEnv,
 ) -> Result<Option<ForgetFleetEntry>, String> {
     let aliases = forget_aliases_for(oracle, repo_name);
-    let mut matches = forget_load_fleet_entries(config_dir)
+    let mut matches = forget_load_fleet_entries(env)
         .into_iter()
         .filter(|entry| forget_fleet_entry_matches(entry, &aliases))
         .collect::<Vec<_>>();
@@ -389,21 +387,12 @@ fn forget_resolve_fleet_entry(
     Ok(matches.pop())
 }
 
-fn forget_load_fleet_entries(config_dir: &std::path::Path) -> Vec<ForgetFleetEntry> {
-    let fleet_dir = config_dir.join("fleet");
-    let Ok(entries) = std::fs::read_dir(fleet_dir) else { return Vec::new(); };
-    let mut files = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(std::ffi::OsStr::to_str) == Some("json"))
-        .collect::<Vec<_>>();
-    files.sort();
-    files
+fn forget_load_fleet_entries(env: &MawXdgEnv) -> Vec<ForgetFleetEntry> {
+    fleet_load_entries_for_env(env)
         .into_iter()
-        .filter_map(|path| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            let session = serde_json::from_str::<ForgetFleetSession>(&text).ok()?;
-            Some(ForgetFleetEntry { path, session })
+        .map(|entry| ForgetFleetEntry {
+            path: entry.path,
+            session: entry.session,
         })
         .collect()
 }
