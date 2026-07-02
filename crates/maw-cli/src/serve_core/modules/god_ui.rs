@@ -1,6 +1,13 @@
 use super::ServecoreModuleRegistration;
 use crate::serve_core::{ServecoreAgentPane, ServecoreLifecycleModule, ServecoreSharedState};
-use axum::{response::IntoResponse, routing::get, Extension, Json, Router};
+use axum::{
+    body::{to_bytes, Body},
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Extension, Json, Router,
+};
+use maw_tmux::{TmuxSession, TmuxWindow};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::{
@@ -12,6 +19,7 @@ use std::{
 };
 
 const GODUI_TEAM_RECENT_MS: u64 = 2 * 60 * 60 * 1_000;
+const GODUI_POST_BODY_LIMIT: usize = 64 * 1024;
 
 #[must_use]
 pub fn godui_lifecycle_module() -> ServecoreLifecycleModule {
@@ -39,8 +47,11 @@ where
     router
         .route("/api/costs", get(godui_costs_get))
         .route("/api/teams", get(godui_teams_get))
-        .route("/api/ui-state", get(godui_ui_state_get))
-        .route("/api/asks", get(godui_asks_get))
+        .route(
+            "/api/ui-state",
+            get(godui_ui_state_get).post(godui_ui_state_post),
+        )
+        .route("/api/asks", get(godui_asks_get).post(godui_asks_post))
         .route("/api/pin-info", get(godui_pin_info_get))
 }
 
@@ -58,8 +69,16 @@ async fn godui_ui_state_get() -> impl IntoResponse {
     Json(godui_ui_state_payload()).into_response()
 }
 
+async fn godui_ui_state_post(req: Request<Body>) -> Response {
+    godui_store_json_body(req, &godui_current_dir_file("ui-state.json")).await
+}
+
 async fn godui_asks_get() -> impl IntoResponse {
     Json(godui_asks_payload()).into_response()
+}
+
+async fn godui_asks_post(req: Request<Body>) -> Response {
+    godui_store_json_body(req, &godui_current_dir_file("asks.json")).await
 }
 
 async fn godui_pin_info_get() -> impl IntoResponse {
@@ -113,6 +132,58 @@ fn godui_pin_info_payload() -> GoduiPinInfoResponse {
     }
 }
 
+pub(crate) fn godui_ws_initial_frames(sessions: Vec<TmuxSession>) -> Vec<String> {
+    let mut frames = Vec::with_capacity(3);
+    frames.push(godui_ws_json_text(
+        &json!({"type": "feed-history", "events": []}),
+    ));
+    frames.extend(godui_ws_session_recent_frames(sessions));
+    frames
+}
+
+pub(crate) fn godui_ws_session_recent_frames(sessions: Vec<TmuxSession>) -> Vec<String> {
+    let sessions = godui_ws_sessions(sessions);
+    vec![
+        godui_ws_json_text(&json!({"type": "sessions", "sessions": sessions})),
+        godui_ws_json_text(&json!({"type": "recent", "agents": godui_ws_recent_agents(&sessions)})),
+    ]
+}
+
+fn godui_ws_json_text(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+}
+
+async fn godui_store_json_body(req: Request<Body>, path: &Path) -> Response {
+    let body = match to_bytes(req.into_body(), GODUI_POST_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("body read failed: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    let payload = match serde_json::from_slice::<Value>(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("body must be valid json: {error}")})),
+            )
+                .into_response()
+        }
+    };
+    match godui_write_json(path, &payload) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 struct GoduiTeamsResponse {
     teams: Vec<Value>,
@@ -123,6 +194,28 @@ struct GoduiTeamsResponse {
 struct GoduiPinInfoResponse {
     length: usize,
     enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct GoduiWsSession {
+    name: String,
+    windows: Vec<GoduiWsWindow>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct GoduiWsWindow {
+    index: u32,
+    name: String,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct GoduiWsRecentAgent {
+    target: String,
+    name: String,
+    session: String,
 }
 
 fn godui_scan_teams(
@@ -245,7 +338,47 @@ fn godui_read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+fn godui_write_json(path: &Path, payload: &Value) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "null".to_owned());
+    fs::write(path, format!("{text}\n"))
+}
+
+fn godui_ws_sessions(sessions: Vec<TmuxSession>) -> Vec<GoduiWsSession> {
+    sessions
+        .into_iter()
+        .map(|session| GoduiWsSession {
+            name: session.name,
+            windows: session.windows.into_iter().map(godui_ws_window).collect(),
+        })
+        .collect()
+}
+
+fn godui_ws_window(window: TmuxWindow) -> GoduiWsWindow {
+    GoduiWsWindow {
+        index: window.index,
+        name: window.name,
+        active: window.active,
+        cwd: window.cwd,
+    }
+}
+
+fn godui_ws_recent_agents(sessions: &[GoduiWsSession]) -> Vec<GoduiWsRecentAgent> {
+    sessions
+        .iter()
+        .flat_map(|session| {
+            session.windows.iter().map(|window| GoduiWsRecentAgent {
+                target: format!("{}:{}", session.name, window.index),
+                name: window.name.clone(),
+                session: session.name.clone(),
+            })
+        })
+        .collect()
+}
+
 fn godui_current_dir_file(name: &str) -> PathBuf {
+    if let Some(root) = std::env::var_os("MAW_GODUI_STATE_DIR") {
+        return PathBuf::from(root).join(name);
+    }
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(name)
@@ -302,6 +435,45 @@ mod tests {
         assert_eq!(costs["total"]["cost"], 0.0);
         assert_eq!(costs["total"]["sessions"], 0);
         assert_eq!(costs["total"]["agents"], 0);
+    }
+
+    #[test]
+    fn godui_ws_frames_match_maw_js_sessions_and_recent_shapes() {
+        let sessions = godui_ws_sessions(vec![TmuxSession {
+            name: "142-athena".to_owned(),
+            windows: vec![
+                TmuxWindow {
+                    index: 1,
+                    name: "athena-oracle".to_owned(),
+                    active: true,
+                    cwd: Some("/opt/athena".to_owned()),
+                },
+                TmuxWindow {
+                    index: 2,
+                    name: "athena-codex-1".to_owned(),
+                    active: false,
+                    cwd: None,
+                },
+            ],
+        }]);
+
+        assert_eq!(
+            serde_json::to_value(&sessions).expect("sessions json"),
+            json!([{
+                "name": "142-athena",
+                "windows": [
+                    {"index": 1, "name": "athena-oracle", "active": true, "cwd": "/opt/athena"},
+                    {"index": 2, "name": "athena-codex-1", "active": false}
+                ]
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(godui_ws_recent_agents(&sessions)).expect("recent json"),
+            json!([
+                {"target": "142-athena:1", "name": "athena-oracle", "session": "142-athena"},
+                {"target": "142-athena:2", "name": "athena-codex-1", "session": "142-athena"}
+            ])
+        );
     }
 
     #[test]
@@ -388,6 +560,54 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| value.starts_with("application/json")));
         }
+    }
+
+    #[tokio::test]
+    async fn godui_post_routes_persist_json_and_return_ok() {
+        let root = godui_test_root("post");
+        fs::create_dir_all(&root).expect("root");
+        let original_state_dir = std::env::var_os("MAW_GODUI_STATE_DIR");
+        std::env::set_var("MAW_GODUI_STATE_DIR", &root);
+        let router = servecore_mount_core_routes(Router::new());
+        let router = servecore_mount_modules(router, &["god-ui".to_owned()]);
+        let router = servecore_with_shared_state(router, ServecoreSharedState::default());
+        let app = servecore_apply_pipeline(router);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/ui-state")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .body(Body::from(r#"{"mission":"live"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(godui_ui_state_payload(), json!({"mission": "live"}));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/asks")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .body(Body::from(r#"[{"id":1}]"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(godui_asks_payload(), json!([{"id": 1}]));
+
+        if let Some(original_state_dir) = original_state_dir {
+            std::env::set_var("MAW_GODUI_STATE_DIR", original_state_dir);
+        } else {
+            std::env::remove_var("MAW_GODUI_STATE_DIR");
+        }
+        fs::remove_dir_all(root).ok();
     }
 
     fn godui_test_root(name: &str) -> PathBuf {

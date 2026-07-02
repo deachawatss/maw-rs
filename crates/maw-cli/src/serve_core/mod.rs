@@ -16,7 +16,7 @@ use axum::{
     Extension, Json, Router,
 };
 use maw_hub::WorkspaceConfig;
-use maw_tmux::{TmuxClient, TmuxPane};
+use maw_tmux::{TmuxClient, TmuxPane, TmuxSession};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -101,6 +101,7 @@ pub struct ServecoreSharedState {
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
+    pub godui_sessions_snapshot: Option<Arc<Vec<TmuxSession>>>,
     pub auth_workspace_key: Option<String>,
     pub auth_cached_pubkey: Option<String>,
     pub auth_ed25519_pins: maw_auth::Ed25519TofuPins,
@@ -118,6 +119,7 @@ impl Default for ServecoreSharedState {
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
             agents_snapshot: None,
+            godui_sessions_snapshot: None,
             auth_workspace_key: None,
             auth_cached_pubkey: None,
             auth_ed25519_pins: Arc::new(Mutex::new(maw_auth::Ed25519TofuStore::default())),
@@ -146,6 +148,12 @@ impl ServecoreSharedState {
     }
 
     #[must_use]
+    pub fn servecore_with_godui_sessions_snapshot(mut self, sessions: Vec<TmuxSession>) -> Self {
+        self.godui_sessions_snapshot = Some(Arc::new(sessions));
+        self
+    }
+
+    #[must_use]
     pub fn servecore_agents_panes(&self) -> Vec<ServecoreAgentPane> {
         if let Some(snapshot) = &self.agents_snapshot {
             return snapshot.as_ref().clone();
@@ -155,6 +163,15 @@ impl ServecoreSharedState {
             .into_iter()
             .map(ServecoreAgentPane::from)
             .collect()
+    }
+
+    #[must_use]
+    pub fn servecore_godui_sessions(&self) -> Vec<TmuxSession> {
+        if let Some(snapshot) = &self.godui_sessions_snapshot {
+            return snapshot.as_ref().clone();
+        }
+        let mut tmux = TmuxClient::local();
+        tmux.list_all()
     }
 
     #[must_use]
@@ -1709,14 +1726,30 @@ async fn servecore_ws_stream(
             .await;
         return;
     };
+    if kind == ServecoreWsKind::Engine
+        && !servecore_ws_send_godui_initial(&mut socket, &state, &config).await
+    {
+        state.engine.servecore_ws_close(kind, target.as_deref());
+        return;
+    }
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + config.heartbeat_interval,
         config.heartbeat_interval,
+    );
+    let mut godui_refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        Duration::from_secs(2),
     );
     let idle_timer = tokio::time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
     loop {
         tokio::select! {
+            _ = godui_refresh.tick(), if kind == ServecoreWsKind::Engine => {
+                if !servecore_ws_send_godui_session_recent(&mut socket, &state, &config).await {
+                    break;
+                }
+                idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+            }
             _ = heartbeat.tick() => {
                 if servecore_ws_send(&mut socket, Message::Ping(Vec::new()), config.send_timeout).await.is_err() {
                     break;
@@ -1743,6 +1776,48 @@ async fn servecore_ws_stream(
         }
     }
     state.engine.servecore_ws_close(kind, target.as_deref());
+}
+
+async fn servecore_ws_send_godui_initial(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    config: &modules::ws::WsConfig,
+) -> bool {
+    servecore_ws_send_text_frames(
+        socket,
+        modules::god_ui::godui_ws_initial_frames(state.servecore_godui_sessions()),
+        config,
+    )
+    .await
+}
+
+async fn servecore_ws_send_godui_session_recent(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    config: &modules::ws::WsConfig,
+) -> bool {
+    servecore_ws_send_text_frames(
+        socket,
+        modules::god_ui::godui_ws_session_recent_frames(state.servecore_godui_sessions()),
+        config,
+    )
+    .await
+}
+
+async fn servecore_ws_send_text_frames(
+    socket: &mut WebSocket,
+    frames: Vec<String>,
+    config: &modules::ws::WsConfig,
+) -> bool {
+    for frame in frames {
+        if servecore_ws_send(socket, Message::Text(frame), config.send_timeout)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 async fn servecore_ws_handle_frame(
@@ -2942,6 +3017,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn servecore_ws_engine_sends_godui_sessions_on_connect() {
+        let state = ServecoreSharedState::default().servecore_with_godui_sessions_snapshot(vec![
+            TmuxSession {
+                name: "142-athena".to_owned(),
+                windows: vec![
+                    maw_tmux::TmuxWindow {
+                        index: 1,
+                        name: "athena-oracle".to_owned(),
+                        active: true,
+                        cwd: Some("/opt/athena".to_owned()),
+                    },
+                    maw_tmux::TmuxWindow {
+                        index: 2,
+                        name: "athena-codex-1".to_owned(),
+                        active: false,
+                        cwd: None,
+                    },
+                ],
+            },
+        ]);
+        let addr = servecore_spawn_ws_test_server(state, modules::ws::WsConfig::default()).await;
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect websocket");
+        let mut frames = Vec::new();
+        while frames.len() < 3 {
+            let received = ws.next().await.expect("frame").expect("frame ok");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = received {
+                frames.push(serde_json::from_str::<serde_json::Value>(&text).expect("json frame"));
+            }
+        }
+
+        assert_eq!(frames[0]["type"], "feed-history");
+        assert_eq!(frames[0]["events"], json!([]));
+        assert_eq!(frames[1]["type"], "sessions");
+        assert_eq!(frames[1]["sessions"][0]["name"], "142-athena");
+        assert_eq!(frames[1]["sessions"][0]["windows"][0]["cwd"], "/opt/athena");
+        assert_eq!(frames[2]["type"], "recent");
+        assert_eq!(
+            frames[2]["agents"],
+            json!([
+                {"target": "142-athena:1", "name": "athena-oracle", "session": "142-athena"},
+                {"target": "142-athena:2", "name": "athena-codex-1", "session": "142-athena"}
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn servecore_ws_rejects_bad_tunnel_target_before_upgrade() {
         let addr = servecore_spawn_ws_test_server(
             ServecoreSharedState::default(),
@@ -2964,7 +3087,7 @@ mod tests {
             max_connections: 8,
         };
         let addr = servecore_spawn_ws_test_server(ServecoreSharedState::default(), config).await;
-        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/tmux"))
             .await
             .expect("connect websocket");
         let close = tokio::time::timeout(Duration::from_secs(2), async {
