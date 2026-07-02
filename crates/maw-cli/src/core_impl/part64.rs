@@ -18,6 +18,7 @@ struct WakeOptionsNative {
     snapshot: Option<String>,
     engine: Option<String>,
     name: Option<String>,
+    repo_path: Option<std::path::PathBuf>,
     all: bool,
     all_local: bool,
     attach: bool,
@@ -153,7 +154,7 @@ fn wake_default_options() -> WakeOptionsNative {
     WakeOptionsNative {
         target: String::new(), task: None, wt: None, prompt: None, repo: None, issue: None, pr: None,
         incubate: None, parent: None, peer: None, layout: None, from: None, snapshot: None, engine: None,
-        name: None, all: false, all_local: false, attach: true, dry_run: false, fresh: false,
+        name: None, repo_path: None, all: false, all_local: false, attach: true, dry_run: false, fresh: false,
         from_snapshot: false, kill: false, list: false, main: false, new_window: false, no_attach: false,
         pick: false, resume: false, solo: false, split: false, bud: false, channels: false, wait: false,
     }
@@ -175,6 +176,7 @@ fn wake_parse_value_arg(argv: &[String], index: usize, options: &mut WakeOptions
         "--snapshot" => { options.snapshot = Some(wake_take_value(argv, index, "--snapshot", wake_validate_target_value)?); 2 }
         "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--name" => { options.name = Some(wake_take_value(argv, index, "--name", wake_validate_slug)?); 2 }
+        "--repo-path" => { options.repo_path = Some(std::path::PathBuf::from(wake_take_value(argv, index, "--repo-path", wake_validate_target_value)?)); 2 }
         _ => return wake_parse_equals_arg(arg, options),
     };
     Ok(Some(consumed))
@@ -363,6 +365,9 @@ fn wake_oracle(options: &WakeOptionsNative) -> Result<String, String> {
 }
 
 fn wake_repo_path(options: &WakeOptionsNative, oracle: &str) -> Result<std::path::PathBuf, String> {
+    // `--repo-path <dir>` is an explicit filesystem override (used by `team up`
+    // to point at the bound worktree) — it bypasses ghq/fleet resolution.
+    if let Some(repo_path) = &options.repo_path { return Ok(repo_path.clone()); }
     if let Some(repo) = &options.repo { return Ok(wake_ghq_root().join("github.com").join(repo)); }
     if let Some(repo) = &options.incubate { return Ok(wake_ghq_root().join("github.com").join(repo)); }
     if options.target.contains('/') { return Ok(wake_ghq_root().join("github.com").join(&options.target)); }
@@ -596,6 +601,21 @@ mod wake_tests {
             );
             assert_eq!(wake_resolve_engine_command("codex"), "codex");
         });
+    }
+
+    #[test]
+    fn wake_repo_path_flag_overrides_repo_resolution() {
+        // `team up` passes `--repo-path <worktree>`; wake must accept it and use it
+        // directly, bypassing ghq/fleet lookup.
+        let options = wake_parse_args(&wake_strings(&[
+            "coder-1", "--repo-path", "/tmp/wt/coder-1", "-e", "codex", "--no-attach",
+        ]))
+        .expect("parse --repo-path");
+        assert_eq!(options.repo_path.as_deref(), Some(std::path::Path::new("/tmp/wt/coder-1")));
+        assert_eq!(
+            wake_repo_path(&options, "coder-1").expect("resolve"),
+            std::path::PathBuf::from("/tmp/wt/coder-1")
+        );
     }
 
     #[test]
