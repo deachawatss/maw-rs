@@ -140,6 +140,30 @@ const ACTIVITY_ATHENA_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
     ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
 ];
+const DISCOVER_CONFIG_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new("maw.fs.list", "fs:read:config", "/config/fleet"),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:config",
+        "/config/fleet/50-mawjs.json",
+    ),
+];
+const DISCOVER_CONFIG_JSON_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
+    ExpectedHostCall::new("maw.fs.list", "fs:read:config", "/config/fleet"),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:config",
+        "/config/fleet/50-mawjs.json",
+    ),
+    ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
+];
+const DISCOVER_AWAKE_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.tmux.list_sessions",
+    "tmux:read",
+    "tmux://sessions",
+)];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -496,6 +520,33 @@ fn golden_parity_activity_committed_golden_and_wasm_outputs_match_seeded_host() 
 }
 
 #[test]
+fn golden_parity_discover_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&["--peers", "config"][..], DISCOVER_CONFIG_TRANSCRIPT),
+        (
+            &["--peers", "config", "--json"][..],
+            DISCOVER_CONFIG_JSON_TRANSCRIPT,
+        ),
+        (&["--awake"][..], DISCOVER_AWAKE_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "discover",
+            manifest_name: "discover-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+        });
+    }
+    run_parity_case(ParityCase {
+        plugin: "discover",
+        manifest_name: "discover-parity",
+        args: &["--peers", "bogus"],
+        expected_host_calls: Some(0),
+        expected_host_transcript: None,
+    });
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -787,6 +838,24 @@ fn activity_wasm_declares_only_tmux_read_caps() {
         wasm_plugin.manifest.capabilities.as_deref(),
         Some(&["tmux:read".to_owned()][..]),
         "activity fixture must declare only tmux read caps"
+    );
+}
+
+#[test]
+fn discover_wasm_declares_only_read_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/discover");
+    let wasm_plugin = load_wasm_fixture(&fixture, "discover-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(
+            &[
+                "sdk:config:read".to_owned(),
+                "fs:read:config".to_owned(),
+                "tmux:read".to_owned(),
+            ][..]
+        ),
+        "discover fixture must declare only bounded read caps"
     );
 }
 

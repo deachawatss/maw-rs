@@ -35,7 +35,7 @@ Ranking principles:
 10. `locate` - diagnostic oracle lookup; bounded read of fleet/config/tmux.
 11. `activity` - read-only pane activity classification; bounded tmux capture with fixture snapshots. Converted in this follow-up batch.
 12. `capture` - direct tmux capture; read-only but output-size behavior needs careful parity.
-13. `discover` - federation inventory/status read; likely config/tmux read.
+13. `discover` - federation inventory/status read; likely config/tmux read. Converted in this follow-up batch.
 14. `transport` - transport diagnostics; likely read-only.
 15. `peers` - peer alias read/manage; read subcommands first, mutating subcommands later.
 16. `trust` - trust list read/manage; consent/trust mutation needs human-at-terminal boundaries.
@@ -133,6 +133,11 @@ Per-oracle plugin note:
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/activity/`
   - Covered CLI cases: `athena:0`, `athena:0 --json`, and no args.
   - Capabilities: `tmux:read`.
+- `discover` converted as an AssemblyScript WASM parity fixture:
+  - Source: `examples/wasm-parity/discover/src/plugin.ts`
+  - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/discover/`
+  - Covered CLI cases: `--peers config`, `--peers config --json`, `--awake`, and invalid `--peers bogus`.
+  - Capabilities: `sdk:config:read`, `fs:read:config`, `tmux:read`.
 
 ## Test evidence
 
@@ -151,8 +156,12 @@ Per-oracle plugin note:
 - `npm run build:activity` from `packages/wasm-sdk` passed.
 - `cargo test -p maw-plugin-manifest activity` passed: 2 activity parity/capability tests.
 - Before the `activity` commit: `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- `npm run build:discover` from `packages/wasm-sdk` passed.
+- `cargo test -p maw-plugin-manifest discover` passed: discover-filtered package tests, including 2 discover parity/capability tests.
+- Before the `discover` commit: `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 
 ## Blockers / risks
 
 - No hard blocker yet.
 - `cargo clippy --all-targets` may be expensive for the full workspace; it remains required before each plugin commit.
+- `discover` is intentionally scoped to read-only config/fleet/tmux paths for this batch; scout/both network discovery remains outside this fixture.
