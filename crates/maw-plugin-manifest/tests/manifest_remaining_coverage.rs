@@ -32,7 +32,9 @@ fn optional_manifest_sections_cover_absent_and_missing_member_edges() {
 #[test]
 fn relative_manifest_dir_resolves_against_current_dir() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original = std::env::current_dir().expect("cwd");
     let root = make_temp_dir("relative-dir");
     let plugin_dir = root.join("plugins/relative-plugin");
@@ -394,6 +396,7 @@ fn minimal_manifest(name: &str) -> PluginManifest {
         tier: None,
         wasm: None,
         entry: None,
+        entry_export: None,
         sdk: "*".to_owned(),
         cli: None,
         api: None,
@@ -419,6 +422,7 @@ fn loaded_plugin(root: &Path, name: &str, manifest: PluginManifest) -> LoadedPlu
         dir: root.join(name),
         wasm_path: PathBuf::new(),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }
@@ -434,6 +438,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path,
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Wasm,
         disabled: false,
     }

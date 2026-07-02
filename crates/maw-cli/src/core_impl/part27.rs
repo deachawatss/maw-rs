@@ -20,18 +20,20 @@ fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
 
 fn render_ls_plan(options: &LsPlanOptions) -> CliOutput {
     if let Some(peer) = &options.peer {
-        return CliOutput {
-            code: 0,
-            stdout: if options.json {
-                format!(
-                    "{{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":{},\"sessions\":[]}}\n",
-                    json_string(peer)
-                )
-            } else {
-                format!("ls peer {peer}: no fake sessions\n")
-            },
-            stderr: String::new(),
-        };
+        if !options.federation {
+            return CliOutput {
+                code: 0,
+                stdout: if options.json {
+                    format!(
+                        "{{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":{},\"sessions\":[]}}\n",
+                        json_string(peer)
+                    )
+                } else {
+                    format!("ls peer {peer}: no fake sessions\n")
+                },
+                stderr: String::new(),
+            };
+        }
     }
 
     let mut live_options;
@@ -48,12 +50,19 @@ fn render_ls_plan(options: &LsPlanOptions) -> CliOutput {
         options
     };
     let panes = project_ls_panes(effective_options);
+    if options.federation {
+        return ls_render_federation(options, &panes);
+    }
+    let (verify_out, fix_out) = ls_render_verify_fix(options);
     CliOutput {
         code: 0,
         stdout: if options.json {
             render_ls_json(options, &panes)
         } else {
-            render_ls_text(options, &panes)
+            let mut out = render_ls_text(options, &panes);
+            out.push_str(&verify_out);
+            out.push_str(&fix_out);
+            out
         },
         stderr: String::new(),
     }
@@ -90,6 +99,12 @@ fn project_ls_panes(options: &LsPlanOptions) -> Vec<LsPanePlan> {
                 && options.mode == LsMode::Compact
                 && !is_default_ls_oracle_session(session)
             {
+                return None;
+            }
+            if options.fleet_only && !is_default_ls_oracle_session(session) {
+                return None;
+            }
+            if !options.teams && is_ls_team_session(session) {
                 return None;
             }
             let source = None;
@@ -165,6 +180,10 @@ fn is_ls_channel_session(session: &str) -> bool {
     session.ends_with("-discord") && !session.contains("discord-admin")
 }
 
+fn is_ls_team_session(session: &str) -> bool {
+    session.starts_with("team-") || session.contains(":team-") || session.contains("-team-")
+}
+
 fn is_ls_agent_command(command: &str) -> bool {
     let command = command.to_lowercase();
     command.contains("claude") || command.contains("codex") || command.contains("node")
@@ -194,6 +213,21 @@ fn render_ls_json(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
         "\"scope\":\"local\"".to_owned(),
         "\"json\":true".to_owned(),
     ];
+    if let Some(node) = &options.node {
+        fields.push(format!("\"node\":{}", json_string(node)));
+    }
+    if options.fleet_only {
+        fields.push("\"fleetOnly\":true".to_owned());
+    }
+    if !options.teams {
+        fields.push("\"teams\":false".to_owned());
+    }
+    if options.verify {
+        fields.push("\"verify\":true".to_owned());
+    }
+    if options.fix {
+        fields.push("\"fix\":true".to_owned());
+    }
     if options.active {
         fields.push(format!(
             "\"activeThresholdSec\":{}",
@@ -406,12 +440,20 @@ fn ls_help_ok() -> CliOutput {
             "",
             "Usage:",
             "  maw ls                  list live local sessions (default)",
-            "  maw ls <peer>           list sessions on a federation peer",
-            "  maw ls --all            aggregate sessions from all known peers",
-            "  maw ls --json           emit JSON (combine with <peer> or --all)",
+            "  maw ls <filter>         filter local sessions",
+            "  maw ls <peer>           list sessions on a federation peer (legacy)",
+            "  maw ls --federation     list local + peer sessions",
+            "  maw ls --federation <peer>  drill into one peer",
+            "  maw ls --federation --node <node>  filter the federated view",
+            "  maw ls --json           emit JSON",
             "  maw ls --active [30m]   local sessions touched within a recent threshold",
+            "  maw ls --fleet-only     hide orphan/ad hoc tmux sessions (legacy filter)",
+            "  maw ls --no-teams       hide L2 Claude Code teams from ~/.claude/teams",
             "  maw ls --verify         include worktree-bind diagnostics",
             "  maw ls --fix            prune orphaned worktrees (local only)",
+            "",
+            "Peer aliases are resolved from the maw state peers store (see: maw peers list).",
+            "For registered fleet config, use maw fleet ls.",
         ]
         .join("\n")
             + "\n",
@@ -424,7 +466,7 @@ fn ls_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs ls [<peer>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n"
+            "{message}\nusage: maw-rs ls [<filter>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--federation] [--fleet-only] [--node <node>] [--verify] [--fix] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n"
         ),
     }
 }

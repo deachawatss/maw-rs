@@ -20,6 +20,7 @@ fn invoke_source_and_mvp_ts_runtime_report_metadata_contracts() {
     let plugin = LoadedPlugin {
         kind: LoadedPluginKind::Ts,
         entry_path: Some(root.join("index.ts")),
+        wasm_export: "handle".to_owned(),
         ..write_wasm_plugin(&root, "ts-runtime-default", WASM_HANDLE_ZERO)
     };
     let result = MvpWasmInvokeRuntime.invoke_ts(
@@ -174,6 +175,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
             tier: None,
             wasm: Some(format!("{name}.wasm")),
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -194,6 +196,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path,
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Wasm,
         disabled: false,
     }

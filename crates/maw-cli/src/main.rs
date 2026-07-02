@@ -1,25 +1,46 @@
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     io::IsTerminal,
     process::{Command, Stdio},
 };
 
 use maw_tmux::{resolve_tmux_attach_session, TmuxAttachSessionResolution, TmuxClient};
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    std::process::exit(main_code(&argv));
+    std::process::exit(main_code_async(&argv).await);
 }
 
+async fn main_code_async(argv: &[String]) -> i32 {
+    main_code_async_with(argv, maybe_exec_attach).await
+}
+
+#[cfg(test)]
 fn main_code(argv: &[String]) -> i32 {
     main_code_with(argv, maybe_exec_attach)
 }
 
+#[cfg(test)]
 fn main_code_with(argv: &[String], attach: impl FnOnce(&[String]) -> Option<i32>) -> i32 {
     if let Some(code) = attach(argv) {
         return code;
     }
     let output = maw_cli::run_cli(argv);
+    print!("{}", output.stdout);
+    eprint!("{}", output.stderr);
+    output.code
+}
+
+async fn main_code_async_with(
+    argv: &[String],
+    attach: impl FnOnce(&[String]) -> Option<i32>,
+) -> i32 {
+    if let Some(code) = attach(argv) {
+        return code;
+    }
+    let output = maw_cli::run_cli_async(argv).await;
     print!("{}", output.stdout);
     eprint!("{}", output.stderr);
     output.code
@@ -48,7 +69,11 @@ fn maybe_exec_attach_with(
 }
 
 fn run_tmux_attach(tmux_args: Vec<String>) -> i32 {
-    let status = Command::new("tmux")
+    run_tmux_attach_with(OsStr::new("tmux"), tmux_args)
+}
+
+fn run_tmux_attach_with(program: &OsStr, tmux_args: Vec<String>) -> i32 {
+    let status = Command::new(program)
         .args(tmux_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -124,68 +149,29 @@ fn attach_exec_tmux_args(
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_exec_tmux_args, main_code, main_code_with, maybe_exec_attach_with, run_tmux_attach,
+        attach_exec_tmux_args, main_code, main_code_async_with, main_code_with,
+        maybe_exec_attach_with, run_tmux_attach_with,
     };
-    use std::{
-        env,
-        ffi::OsString,
-        fs,
-        sync::{Mutex, OnceLock},
-    };
+    use std::ffi::OsStr;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    fn path_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct PathRestore(Option<OsString>);
-
-    impl Drop for PathRestore {
-        fn drop(&mut self) {
-            if let Some(path) = self.0.take() {
-                env::set_var("PATH", path);
-            } else {
-                env::remove_var("PATH");
-            }
-        }
-    }
-
     #[test]
     fn run_tmux_attach_reports_status_and_spawn_errors() {
-        let _guard = path_lock().lock().expect("path lock");
-        let _restore = PathRestore(env::var_os("PATH"));
-        let dir = env::temp_dir().join(format!("maw-rs-fake-tmux-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create fake tmux dir");
-        let tmux = dir.join("tmux");
-        fs::write(&tmux, "#!/bin/sh\nexit 7\n").expect("write fake tmux");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&tmux)
-                .expect("fake tmux metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&tmux, permissions).expect("chmod fake tmux");
-        }
+        assert_eq!(
+            run_tmux_attach_with(OsStr::new("/bin/sh"), args(&["-c", "exit 7"])),
+            7
+        );
 
-        env::set_var("PATH", &dir);
-        assert_eq!(run_tmux_attach(args(&["attach", "-t", "50-mawjs"])), 7);
-
-        env::set_var("PATH", dir.join("missing"));
-        assert_eq!(run_tmux_attach(args(&["attach", "-t", "50-mawjs"])), 1);
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn path_restore_covers_missing_path_cleanup() {
-        let _guard = path_lock().lock().expect("path lock");
-        let _restore = PathRestore(None);
+        let missing = std::env::temp_dir()
+            .join(format!("maw-rs-missing-tmux-{}", std::process::id()))
+            .join("tmux");
+        assert_eq!(
+            run_tmux_attach_with(missing.as_os_str(), args(&["attach", "-t", "50-mawjs"])),
+            1
+        );
     }
 
     #[test]
@@ -268,6 +254,14 @@ mod tests {
     #[test]
     fn main_code_with_returns_fast_attach_status_without_running_cli() {
         assert_eq!(main_code_with(&args(&["a", "50-mawjs"]), |_| Some(23)), 23);
+    }
+
+    #[tokio::test]
+    async fn main_code_async_with_returns_fast_attach_status_without_running_cli() {
+        assert_eq!(
+            main_code_async_with(&args(&["a", "50-mawjs"]), |_| Some(29)).await,
+            29
+        );
     }
 
     #[test]

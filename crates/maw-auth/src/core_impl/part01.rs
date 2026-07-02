@@ -2,7 +2,11 @@
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -439,6 +443,223 @@ impl FromVerifyDecision {
             Self::RefuseMalformed { .. } => "refuse-malformed",
         }
     }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestAuthDecision {
+    Accept { who: String },
+    Reject { reason: String },
+}
+
+impl RequestAuthDecision {
+    #[must_use]
+    pub fn is_accept(&self) -> bool {
+        matches!(self, Self::Accept { .. })
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Accept { .. } => None,
+            Self::Reject { reason } => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ed25519TofuStore {
+    pins: BTreeMap<String, String>,
+    backing_file: Option<std::path::PathBuf>,
+    poisoned: bool,
+}
+
+impl Ed25519TofuStore {
+    #[must_use]
+    pub fn file_backed(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        match ed25519_tofu_load_pins(&path) {
+            Ed25519TofuLoad::Ok(pins) => Self {
+                pins,
+                backing_file: Some(path),
+                poisoned: false,
+            },
+            Ed25519TofuLoad::NotFound => Self {
+                pins: BTreeMap::new(),
+                backing_file: Some(path),
+                poisoned: false,
+            },
+            Ed25519TofuLoad::Corrupt => Self {
+                pins: BTreeMap::new(),
+                backing_file: Some(path),
+                poisoned: true,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn pinned(&self, from: &str) -> Option<&str> {
+        self.pins.get(from).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pins.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pins.is_empty()
+    }
+
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn pin_first_contact(&mut self, from: &str, pubkey_hex: &str) -> bool {
+        if self.poisoned
+            || self.pins.contains_key(from)
+            || !ed25519_tofu_valid_pin(from, pubkey_hex)
+        {
+            return false;
+        }
+        self.pins.insert(from.to_owned(), pubkey_hex.to_owned());
+        if self.ed25519_tofu_persist().is_err() {
+            self.pins.remove(from);
+            return false;
+        }
+        true
+    }
+
+    fn ed25519_tofu_persist(&self) -> Result<(), std::io::Error> {
+        let Some(path) = &self.backing_file else {
+            return Ok(());
+        };
+        ed25519_tofu_write_atomic(path, &self.pins)
+    }
+}
+
+enum Ed25519TofuLoad {
+    Ok(BTreeMap<String, String>),
+    NotFound,
+    Corrupt,
+}
+
+fn ed25519_tofu_load_pins(path: &std::path::Path) -> Ed25519TofuLoad {
+    let Ok(path) = ed25519_tofu_safe_path(path) else {
+        return Ed25519TofuLoad::Corrupt;
+    };
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ed25519TofuLoad::NotFound;
+        }
+        Err(_) => return Ed25519TofuLoad::Corrupt,
+    };
+    let Ok(parsed) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) else {
+        return Ed25519TofuLoad::Corrupt;
+    };
+    if parsed
+        .iter()
+        .all(|(from, pubkey)| ed25519_tofu_valid_pin(from, pubkey))
+    {
+        Ed25519TofuLoad::Ok(parsed)
+    } else {
+        Ed25519TofuLoad::Corrupt
+    }
+}
+
+fn ed25519_tofu_valid_pin(from: &str, pubkey_hex: &str) -> bool {
+    ed25519_tofu_valid_from(from) && ed25519_tofu_valid_pubkey(pubkey_hex)
+}
+
+fn ed25519_tofu_valid_from(from: &str) -> bool {
+    let value = from.trim();
+    !value.is_empty()
+        && value == from
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value.chars().all(|ch| !ch.is_control())
+}
+
+fn ed25519_tofu_valid_pubkey(pubkey_hex: &str) -> bool {
+    pubkey_hex.len() == 64 && pubkey_hex.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn ed25519_tofu_write_atomic(
+    path: &std::path::Path,
+    pins: &BTreeMap<String, String>,
+) -> Result<(), std::io::Error> {
+    let final_path = ed25519_tofu_safe_path(path)?;
+    let tmp_path = final_path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(pins).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(tmp_path, final_path)
+}
+
+fn ed25519_tofu_safe_path(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
+    if ed25519_tofu_has_traversal(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path traversal",
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path missing parent",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let parent = parent.canonicalize()?;
+    let Some(name) = path.file_name() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path missing file name",
+        ));
+    };
+    let final_path = parent.join(name);
+    if final_path.starts_with(&parent) {
+        Ok(final_path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tofu path escapes parent",
+        ))
+    }
+}
+
+fn ed25519_tofu_has_traversal(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    })
+}
+
+pub type Ed25519TofuPins = Arc<Mutex<Ed25519TofuStore>>;
+
+#[derive(Debug, Clone)]
+pub struct RequestAuthParts {
+    pub method: String,
+    pub path: String,
+    pub headers: Headers,
+    pub body: Option<Vec<u8>>,
+    pub peer_ip: Option<IpAddr>,
+    pub workspace_key: Option<String>,
+    pub cached_pubkey: Option<String>,
+    pub ed25519_pins: Option<Ed25519TofuPins>,
+    pub now: i64,
+}
+
+pub trait VerifyRequestInput {
+    type Decision;
+
+    fn verify_request_input(&self) -> Self::Decision;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

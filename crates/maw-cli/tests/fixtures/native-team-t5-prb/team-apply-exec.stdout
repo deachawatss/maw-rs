@@ -1,0 +1,4 @@
+team apply: alpha (alpha) execute
+role	state	action
+builder	missing	spawn member
+reviewer	dead	skip dead member (team up can resume)

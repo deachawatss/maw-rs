@@ -1,0 +1,2 @@
+  [32m✓[0m promoted — 77-mawjs:test-cli → isolated:test-cli
+      [90m↻ undo: tmux move-window -s isolated:test-cli -t 77-mawjs:[0m

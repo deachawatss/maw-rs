@@ -97,8 +97,165 @@ fn signed_at_seconds(signed: &SignedInput) -> Option<i64> {
     }
 }
 
-#[must_use]
-pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
+
+fn header_trimmed<'a>(headers: &'a Headers, name: &str) -> &'a str {
+    headers.get(name).map(str::trim).unwrap_or_default()
+}
+
+fn verify_workspace_hmac(parts: &RequestAuthParts, body_hash: &str) -> Result<Option<String>, String> {
+    let Some(workspace_key) = parts
+        .workspace_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let signature = header_trimmed(&parts.headers, "x-maw-signature");
+    let timestamp_raw = header_trimmed(&parts.headers, "x-maw-timestamp");
+    if signature.is_empty() || timestamp_raw.is_empty() {
+        return Err("missing-signature".to_owned());
+    }
+    let Some(timestamp) = parse_unix_seconds(timestamp_raw) else {
+        return Err("invalid-timestamp".to_owned());
+    };
+    if (parts.now - timestamp).abs() > WINDOW_SEC {
+        return Err("timestamp-out-of-window".to_owned());
+    }
+
+    let auth_version = header_trimmed(&parts.headers, "x-maw-auth-version").to_ascii_lowercase();
+    let method = parts.method.to_uppercase();
+    let mut paths = vec![parts.path.as_str()];
+    let api_prefixed;
+    if !parts.path.starts_with("/api/") {
+        api_prefixed = format!("/api{}", parts.path);
+        paths.push(api_prefixed.as_str());
+    }
+    let mut v1_payloads = Vec::new();
+    let mut v2_payloads = Vec::new();
+    for path in paths {
+        v1_payloads.push(("hmac-v1", format!("{method}:{path}:{timestamp}")));
+        v2_payloads.push(("hmac-v2", format!("{method}:{path}:{timestamp}:{body_hash}")));
+    }
+    let payloads = match auth_version.as_str() {
+        "" | "v1" => v1_payloads,
+        "v2" => v2_payloads,
+        // maw-js stacks current v1 fleet-token headers under auth-version=v3 when
+        // from-signing is also present. Accept the current body-less fleet
+        // signature first, then v2 for future body-bound fleet-token senders.
+        "v3" => v1_payloads.into_iter().chain(v2_payloads).collect(),
+        _ => return Err("unsupported-auth-version".to_owned()),
+    };
+
+    for (who, expected) in payloads {
+        if verify_hmac_sig(workspace_key, &expected, signature) {
+            let from = header_trimmed(&parts.headers, "x-maw-from");
+            return Ok(Some(if from.is_empty() {
+                who.to_owned()
+            } else {
+                format!("{who}:{from}")
+            }));
+        }
+    }
+    Err("signature-invalid".to_owned())
+}
+
+fn from_verify_candidate_paths(path: &str) -> Vec<String> {
+    let primary = if path.is_empty() { "/" } else { path };
+    let mut paths = vec![primary.to_owned()];
+    if primary.starts_with('/') && primary != "/api" && !primary.starts_with("/api/") {
+        let api_prefixed = format!("/api{primary}");
+        if !paths.iter().any(|path| path == &api_prefixed) {
+            paths.push(api_prefixed);
+        }
+    }
+    paths
+}
+
+fn verify_cached_from_sign(
+    parts: &RequestAuthParts,
+    signed: &SignedInput,
+    body_hash: &str,
+) -> Result<Option<String>, String> {
+    let Some(cached) = parts
+        .cached_pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if signed.has_v3_sig {
+        let Some(signed_at_sec) = parse_unix_seconds(&signed.v3_timestamp) else {
+            return Err("invalid-timestamp".to_owned());
+        };
+        if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+            return Err("timestamp-out-of-window".to_owned());
+        }
+        for path in from_verify_candidate_paths(&parts.path) {
+            let payload = build_from_sign_payload(
+                &signed.from,
+                signed_at_sec,
+                &parts.method,
+                &path,
+                body_hash,
+            );
+            if verify_hmac_sig(cached, &payload, &signed.v3_sig) {
+                return Ok(Some(format!("from-sign:{}", signed.from)));
+            }
+        }
+        return Err("pin-mismatch".to_owned());
+    }
+
+    if signed.signed {
+        let Some(signed_at_sec) = parse_iso_seconds(&signed.legacy_signed_at) else {
+            return Err("invalid-signed-at".to_owned());
+        };
+        if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+            return Err("timestamp-out-of-window".to_owned());
+        }
+        for path in from_verify_candidate_paths(&parts.path) {
+            let payload = build_legacy_from_sign_payload(
+                &signed.from,
+                &signed.legacy_signed_at,
+                &parts.method,
+                &path,
+                body_hash,
+            );
+            if verify_hmac_sig(cached, &payload, &signed.legacy_sig) {
+                return Ok(Some(format!("from-sign:{}", signed.from)));
+            }
+        }
+        return Err("pin-mismatch".to_owned());
+    }
+
+    if !signed.from.is_empty() {
+        return Err("cache-no-sig".to_owned());
+    }
+    Ok(None)
+}
+
+fn ed25519_signature_header(headers: &Headers) -> Option<&str> {
+    [
+        "x-maw-ed25519-signature",
+        "x-maw-signature-ed25519",
+        "x-maw-from-signature-ed25519",
+    ]
+    .into_iter()
+    .find_map(|name| headers.get(name).map(str::trim).filter(|value| !value.is_empty()))
+}
+
+fn ed25519_pubkey_header(headers: &Headers) -> Option<&str> {
+    [
+        "x-maw-ed25519-pubkey",
+        "x-maw-pubkey",
+        "x-maw-peer-pubkey",
+    ]
+    .into_iter()
+    .find_map(|name| headers.get(name).map(str::trim).filter(|value| !value.is_empty()))
+}
+
+fn verify_from_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     let signed = signed_input(&args.headers);
     let cached = args
         .cached_pubkey
@@ -142,29 +299,36 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     }
 
     let body_hash = hash_body(args.body.as_deref());
-    let payload = if signed.has_v3_sig {
-        build_from_sign_payload(
-            &signed.from,
-            signed_at_sec,
-            &args.method,
-            &args.path,
-            &body_hash,
-        )
-    } else {
-        build_legacy_from_sign_payload(
-            &signed.from,
-            &signed.legacy_signed_at,
-            &args.method,
-            &args.path,
-            &body_hash,
-        )
-    };
     let signature = if signed.has_v3_sig {
         &signed.v3_sig
     } else {
         &signed.legacy_sig
     };
-    if !verify_hmac_sig(cached, &payload, signature) {
+    let mut verified = false;
+    for path in from_verify_candidate_paths(&args.path) {
+        let payload = if signed.has_v3_sig {
+            build_from_sign_payload(
+                &signed.from,
+                signed_at_sec,
+                &args.method,
+                &path,
+                &body_hash,
+            )
+        } else {
+            build_legacy_from_sign_payload(
+                &signed.from,
+                &signed.legacy_signed_at,
+                &args.method,
+                &path,
+                &body_hash,
+            )
+        };
+        if verify_hmac_sig(cached, &payload, signature) {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
         return FromVerifyDecision::RefuseMismatch {
             reason: "signature-invalid".to_owned(),
             from: signed.from,
@@ -173,6 +337,219 @@ pub fn verify_request(args: &VerifyRequestArgs) -> FromVerifyDecision {
     FromVerifyDecision::AcceptVerified {
         reason: "cache-sig-valid".to_owned(),
         from: signed.from,
+    }
+}
+
+
+impl VerifyRequestInput for VerifyRequestArgs {
+    type Decision = FromVerifyDecision;
+
+    fn verify_request_input(&self) -> Self::Decision {
+        verify_from_request(self)
+    }
+}
+
+impl VerifyRequestInput for RequestAuthParts {
+    type Decision = RequestAuthDecision;
+
+    fn verify_request_input(&self) -> Self::Decision {
+        verify_serve_request(self)
+    }
+}
+
+#[must_use]
+pub fn verify_request<T: VerifyRequestInput + ?Sized>(input: &T) -> T::Decision {
+    input.verify_request_input()
+}
+
+fn verify_serve_request(parts: &RequestAuthParts) -> RequestAuthDecision {
+    if parts.peer_ip.is_some_and(|ip| ip.is_loopback()) {
+        return RequestAuthDecision::Accept {
+            who: "loopback".to_owned(),
+        };
+    }
+
+    let signed = signed_input(&parts.headers);
+    if signed.from.is_empty() && (signed.has_v3_sig || ed25519_signature_header(&parts.headers).is_some()) {
+        return RequestAuthDecision::Reject {
+            reason: "missing-from".to_owned(),
+        };
+    }
+    if !signed.has_v3_sig && !signed.from.is_empty() && ed25519_signature_header(&parts.headers).is_some() {
+        return verify_ed25519_serve_request(parts, &signed);
+    }
+
+    let body_hash = hash_body(parts.body.as_deref());
+    let fleet_accept = match verify_workspace_hmac(parts, &body_hash) {
+        Ok(accept) => accept,
+        Err(reason) => return auth_reject(&reason),
+    };
+    let from_accept = match verify_cached_from_sign(parts, &signed, &body_hash) {
+        Ok(accept) => accept,
+        Err(reason) => return auth_reject(&reason),
+    };
+
+    if let Some(who) = from_accept {
+        return RequestAuthDecision::Accept { who };
+    }
+    if let Some(who) = fleet_accept {
+        return RequestAuthDecision::Accept { who };
+    }
+
+    RequestAuthDecision::Reject {
+        reason: if signed.signed {
+            "pin-missing".to_owned()
+        } else {
+            "missing-credentials".to_owned()
+        },
+    }
+}
+
+
+fn verify_ed25519_serve_request(
+    parts: &RequestAuthParts,
+    signed: &SignedInput,
+) -> RequestAuthDecision {
+    let Some(signed_at_sec) = parse_unix_seconds(&signed.v3_timestamp) else {
+        return auth_reject("invalid-timestamp");
+    };
+    if (parts.now - signed_at_sec).abs() > WINDOW_SEC {
+        return auth_reject("timestamp-out-of-window");
+    }
+    let Some(signature_hex) = ed25519_signature_header(&parts.headers) else {
+        return auth_reject("missing-credentials");
+    };
+    let key_hex = match ed25519_select_pubkey(parts, &signed.from) {
+        Ok(key) => key,
+        Err(reason) => return auth_reject(reason),
+    };
+    let body_hash = hash_body(parts.body.as_deref());
+    let mut verified = false;
+    for path in from_verify_candidate_paths(&parts.path) {
+        let payload = build_from_sign_payload(
+            &signed.from,
+            signed_at_sec,
+            &parts.method,
+            &path,
+            &body_hash,
+        );
+        if verify_ed25519_signature(&key_hex, payload.as_bytes(), signature_hex) {
+            verified = true;
+            break;
+        }
+    }
+    if !verified {
+        return auth_reject("ed25519-signature-invalid");
+    }
+    if let Err(reason) = ed25519_pin_verified_key(parts, &signed.from, &key_hex) {
+        return auth_reject(reason);
+    }
+    RequestAuthDecision::Accept {
+        who: format!("ed25519:{}", signed.from),
+    }
+}
+
+fn ed25519_select_pubkey(parts: &RequestAuthParts, from: &str) -> Result<String, &'static str> {
+    let observed = ed25519_pubkey_header(&parts.headers).map(str::to_owned);
+    if let Some(pins) = &parts.ed25519_pins {
+        let guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_poisoned() {
+            return Err("tofu-store-corrupt");
+        }
+        if let Some(pinned) = guard.pinned(from) {
+            if observed.as_deref().is_some_and(|key| key != pinned) {
+                return Err("ed25519-pin-mismatch");
+            }
+            return Ok(pinned.to_owned());
+        }
+        return observed.ok_or("ed25519-pin-missing");
+    }
+    parts
+        .cached_pubkey
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or("ed25519-pin-missing")
+}
+
+fn ed25519_pin_verified_key(
+    parts: &RequestAuthParts,
+    from: &str,
+    key_hex: &str,
+) -> Result<(), &'static str> {
+    let Some(pins) = &parts.ed25519_pins else {
+        return Ok(());
+    };
+    let mut guard = pins.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.is_poisoned() {
+        return Err("tofu-store-corrupt");
+    }
+    if let Some(pinned) = guard.pinned(from) {
+        if pinned == key_hex {
+            return Ok(());
+        }
+        return Err("ed25519-pin-mismatch");
+    }
+    if guard.pin_first_contact(from, key_hex) {
+        Ok(())
+    } else {
+        Err("ed25519-pin-mismatch")
+    }
+}
+
+fn verify_ed25519_signature(key_hex: &str, payload: &[u8], signature_hex: &str) -> bool {
+    let Some(key_bytes) = hex_to_array::<32>(key_hex) else {
+        return false;
+    };
+    let Some(signature_bytes) = hex_to_array::<64>(signature_hex) else {
+        return false;
+    };
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key_bytes) else {
+        return false;
+    };
+    let Ok(signature) = ed25519_dalek::Signature::try_from(signature_bytes.as_slice()) else {
+        return false;
+    };
+    key.verify_strict(payload, &signature).is_ok()
+}
+
+fn hex_to_array<const N: usize>(raw: &str) -> Option<[u8; N]> {
+    let value = raw.trim();
+    if value.len() != N * 2 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0_u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+fn auth_reject(reason: &str) -> RequestAuthDecision {
+    RequestAuthDecision::Reject {
+        reason: reason.to_owned(),
+    }
+}
+
+#[must_use]
+pub fn is_protected(path: &str, method: &str) -> bool {
+    let method = method.to_ascii_uppercase();
+    let normalized = auth_normalize_protected_path(path);
+    matches!(
+        (method.as_str(), normalized.as_str()),
+        ("POST", "/triggers/fire" | "/worktrees/cleanup" | "/orchestration/workon" | "/trust" | "/trust/revoke")
+            | ("GET", "/trust")
+    ) || (method == "POST" && normalized.starts_with("/plugins/"))
+}
+
+fn auth_normalize_protected_path(path: &str) -> String {
+    let path_only = path.split('?').next().unwrap_or(path);
+    let normalized = path_only.strip_prefix("/api").unwrap_or(path_only);
+    if normalized.is_empty() {
+        "/".to_owned()
+    } else {
+        normalized.to_owned()
     }
 }
 
@@ -404,10 +781,42 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        consent_status_str, constant_time_eq, parse_iso_millis, parse_second_millis,
-        sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof, verify_hmac_sig, AutoPairIdentity,
-        ConsentStatus,
+        consent_status_str, constant_time_eq, from_verify_candidate_paths, parse_iso_millis,
+        parse_second_millis, sign_hmac_sig, timestamp_seconds, verify_auto_pair_proof,
+        verify_hmac_sig, AutoPairIdentity, ConsentStatus,
     };
+
+    #[test]
+    fn auth_is_protected_matches_serve_daemon_surface() {
+        assert!(super::is_protected("/triggers/fire", "POST"));
+        assert!(super::is_protected("/api/triggers/fire", "post"));
+        assert!(super::is_protected("/api/worktrees/cleanup?dry=1", "POST"));
+        assert!(super::is_protected("/api/orchestration/workon", "POST"));
+        assert!(super::is_protected("/api/plugins/reload", "POST"));
+        assert!(!super::is_protected("/api/plugins", "GET"));
+        assert!(!super::is_protected("/api/identity", "GET"));
+        assert!(!super::is_protected("/api/triggers", "GET"));
+    }
+
+    #[test]
+    fn from_verify_candidate_paths_add_api_variant_without_double_prefix() {
+        assert_eq!(
+            from_verify_candidate_paths("/send"),
+            vec!["/send".to_owned(), "/api/send".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("/api/send"),
+            vec!["/api/send".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("/"),
+            vec!["/".to_owned(), "/api/".to_owned()]
+        );
+        assert_eq!(
+            from_verify_candidate_paths("relative"),
+            vec!["relative".to_owned()]
+        );
+    }
 
     #[test]
     fn private_helpers_cover_unreachable_public_edges() {

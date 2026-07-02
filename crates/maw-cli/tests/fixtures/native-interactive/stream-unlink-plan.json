@@ -1,0 +1,1 @@
+{"command":"stream","source":null,"into":"view","name":"oracle","target":"view:oracle","createdDestination":false,"renamedSharedWindow":false,"unlinked":true,"tmuxCommands":[["unlink-window","-t","view:oracle"]]}

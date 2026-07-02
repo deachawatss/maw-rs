@@ -185,15 +185,18 @@ where
     /// Returns the runner error when tmux rejects the request.
     pub fn send_keys_literal(&mut self, target: &str, text: &str) -> Result<(), TmuxError> {
         self.runner
-            .run(
-                "send-keys",
-                &[
-                    "-t".to_owned(),
-                    target.to_owned(),
-                    "-l".to_owned(),
-                    text.to_owned(),
-                ],
-            )
+            .run("send-keys", &tmux_send_keys_literal_args(target, text))
+            .map(|_| ())
+    }
+
+    /// Send one Enter key through `tmux send-keys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux rejects the request.
+    pub fn send_enter(&mut self, target: &str) -> Result<(), TmuxError> {
+        self.runner
+            .run("send-keys", &tmux_send_enter_args(target))
             .map(|_| ())
     }
 

@@ -1,0 +1,16 @@
+{
+  "method": "POST",
+  "path": "/api/send",
+  "body": "{\"target\":\"capture-agent\",\"text\":\"[capture-sender-node:capture-oracle] hello from 393av2 capture\"}",
+  "capturedAt": "2026-06-27T09:50:58Z",
+  "testFederationToken": "capture-test-token-393av2",
+  "testPeerKey": "capture-peer-key-393av2",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Maw-Auth-Version": "v3",
+    "X-Maw-From": "capture-oracle:capture-sender-node",
+    "X-Maw-Signature": "58da65100b8ca2a2b3cf4437133e7760bae3b32289afcb14d836061ad60a51b9",
+    "X-Maw-Signature-V3": "7b14ee6061c0d9320d55149883517339deac7a0b2bd3257602471ec6e20b1a4c",
+    "X-Maw-Timestamp": "1782553858"
+  }
+}

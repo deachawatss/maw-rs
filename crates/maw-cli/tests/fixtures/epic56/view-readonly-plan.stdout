@@ -1,0 +1,3 @@
+[36mattach[0m  → mawjs-view
+Run: tmux attach-session -t mawjs-view
+  detach with: Ctrl-b d

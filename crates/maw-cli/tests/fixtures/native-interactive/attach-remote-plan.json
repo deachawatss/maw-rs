@@ -1,0 +1,1 @@
+{"command":"attach","alias":"a","target":"peer-one:50-mawjs","action":"remote-attach","tier":3,"node":"peer-one","sessionName":"50-mawjs","sshAlias":"peer-one","yes":true,"attachSshArgs":["--node","peer-one","--session","50-mawjs","--ssh-alias","peer-one"]}

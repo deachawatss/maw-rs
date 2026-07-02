@@ -166,6 +166,8 @@ fn parse_auth_verify_args(argv: &[String]) -> Result<AuthPlanAction, String> {
     };
     let mut cached_pubkey = None;
     let mut headers = Vec::new();
+    let mut peer_ip = None;
+    let mut workspace_key_env = None;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
@@ -191,6 +193,20 @@ fn parse_auth_verify_args(argv: &[String]) -> Result<AuthPlanAction, String> {
                 cached_pubkey = Some(take_auth_value(argv, index, "--cached-pubkey")?);
                 index += 1;
             }
+            "--peer-ip" => {
+                let raw = take_auth_value(argv, index, "--peer-ip")?;
+                peer_ip = Some(
+                    raw.parse::<IpAddr>()
+                        .map_err(|_| "auth verify-request: --peer-ip must be an IP address".to_owned())?,
+                );
+                index += 1;
+            }
+            "--workspace-key-env" => {
+                let raw = take_auth_value(argv, index, "--workspace-key-env")?;
+                auth_validate_env_name(&raw)?;
+                workspace_key_env = Some(raw);
+                index += 1;
+            }
             "--header" => {
                 let raw = take_auth_value(argv, index, "--header")?;
                 let Some((name, value)) = raw.split_once('=') else {
@@ -211,7 +227,23 @@ fn parse_auth_verify_args(argv: &[String]) -> Result<AuthPlanAction, String> {
         body: common.body,
         cached_pubkey,
         headers,
+        peer_ip,
+        workspace_key_env,
     })
+}
+
+fn auth_validate_env_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err("auth verify-request: --workspace-key-env must not be empty".to_owned());
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err("auth verify-request: --workspace-key-env must be an env var name".to_owned());
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_alphanumeric())) {
+        return Err("auth verify-request: --workspace-key-env must be an env var name".to_owned());
+    }
+    Ok(())
 }
 
 fn take_auth_value(argv: &[String], index: usize, name: &str) -> Result<String, String> {
@@ -365,6 +397,26 @@ fn render_auth_verify_json(decision: &FromVerifyDecision) -> String {
         "{{\"command\":\"auth\",\"kind\":\"verify-request\",\"decision\":{{{}}}}}\n",
         render_auth_decision_fields(decision).join(",")
     )
+}
+
+fn render_auth_verify_d2_json(decision: &RequestAuthDecision) -> String {
+    format!(
+        "{{\"command\":\"auth\",\"kind\":\"verify-request\",\"mode\":\"d2\",\"decision\":{{{}}}}}\n",
+        render_auth_request_decision_fields(decision).join(",")
+    )
+}
+
+fn render_auth_request_decision_fields(decision: &RequestAuthDecision) -> Vec<String> {
+    match decision {
+        RequestAuthDecision::Accept { who } => vec![
+            "\"kind\":\"accept\"".to_owned(),
+            format!("\"who\":{}", json_string(who)),
+        ],
+        RequestAuthDecision::Reject { reason } => vec![
+            "\"kind\":\"reject\"".to_owned(),
+            format!("\"reason\":{}", json_string(reason)),
+        ],
+    }
 }
 
 fn render_auth_verify_legacy_from_json(

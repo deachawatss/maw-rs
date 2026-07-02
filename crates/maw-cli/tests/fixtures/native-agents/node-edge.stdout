@@ -1,0 +1,4 @@
+NODE          SESSION               WINDOW                ORACLE          STATE   PID
+-------------------------------------------------------------------------------------
+edge          nova                  nova-oracle           nova            [33midle[0m    ?
+edge          wish-oracle           wish-oracle           wish            [33midle[0m    ?

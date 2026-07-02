@@ -1,0 +1,6 @@
+  [36;1mChannel Test: hermes-discord[0m
+
+  plugin:discord@claude-plugins-official
+    [32m✓ plugin installed[0m
+    [32m✓ state dir exists[0m
+    [32m✓ token available[0m

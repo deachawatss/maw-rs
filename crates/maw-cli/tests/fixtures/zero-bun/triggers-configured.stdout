@@ -1,0 +1,12 @@
+
+[36mWorkflow Triggers[0m  (6 configured)
+
+  Event         Repo/Filter                   Action                                  Last Fired
+  ────────────────────────────────────────────────────────────────────────────────────────────────────
+  [35missue-close[0m [33m[once][0mSoul-Brews-Studio/maw-js      maw hey pulse-oracle issue closed       [90m—[0m
+  [32mpr-merge[0m      Soul-Brews-Studio/maw-js      maw done neo-mawjs                      [90m—[0m
+  [33magent-idle[0m    timeout: 30s                  maw sleep {agent}                       [90m—[0m
+  [36magent-wake[0m    —                           maw hey awakened-oracle hi              [90m—[0m
+  [31magent-crash[0m   —                           maw hey ops-oracle crash happened       [90m—[0m
+  custom-event           —                           xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...  [90m—[0m
+

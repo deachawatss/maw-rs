@@ -1,0 +1,13 @@
+{
+  "name": "consent-parity",
+  "version": "1.0.0",
+  "sdk": "*",
+  "entry": {
+    "kind": "wasm",
+    "path": "plugin.wasm",
+    "export": "handle"
+  },
+  "capabilities": [
+    "sdk:consent:read"
+  ]
+}

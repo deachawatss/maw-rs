@@ -69,6 +69,45 @@ fn plugin_manifest_parse_plan_cli_matches_maw_js_manifest_fixture() {
 }
 
 #[test]
+fn plugin_manifest_parse_accepts_target_wasm_and_matches_golden() {
+    let dir = make_temp_dir("parse-target-wasm");
+    write(dir.join("plugin.wasm"), b"wasm").expect("wasm");
+
+    let manifest = json!({
+        "name": "target-wasm",
+        "version": "1.0.0",
+        "target": "wasm",
+        "wasm": "plugin.wasm",
+        "sdk": "*",
+        "cli": { "command": "target-wasm" }
+    });
+    let output = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "parse".to_owned(),
+        "--dir".to_owned(),
+        dir.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+        manifest.to_string(),
+        "--plan-json".to_owned(),
+    ]);
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    let mut stable = serde_json::from_str::<serde_json::Value>(&output.stdout)
+        .expect("plugin-manifest parse json");
+    stable
+        .as_object_mut()
+        .expect("parse object")
+        .remove("dir");
+    let golden = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../fixtures/native-plugin-manifest/target-wasm-parse.stdout"
+    ))
+    .expect("golden json");
+    assert_eq!(stable, golden);
+
+    remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn plugin_manifest_load_plan_cli_matches_maw_js_loader_contract() {
     let missing = make_temp_dir("missing");
     let output = json_output(&run_cli(&[
@@ -103,6 +142,7 @@ fn plugin_manifest_load_plan_cli_matches_maw_js_loader_contract() {
     assert_eq!(output["plugin"]["disabled"], false);
     assert_eq!(output["plugin"]["manifest"]["name"], "test-pkg");
     assert_eq!(output["plugin"]["manifest"]["wasm"], "plugin.wasm");
+    assert!(output["plugin"]["manifest"]["target"].is_null());
     assert_eq!(
         output["plugin"]["wasmPath"],
         dir.join("plugin.wasm").to_string_lossy().as_ref()
@@ -110,6 +150,37 @@ fn plugin_manifest_load_plan_cli_matches_maw_js_loader_contract() {
     assert!(output["plugin"]["entryPath"].is_null());
 
     remove_dir_all(dir).expect("cleanup load");
+
+    let target_dir = make_temp_dir("load-target-wasm");
+    write(target_dir.join("plugin.wasm"), b"wasm").expect("wasm");
+    write_manifest(
+        &target_dir,
+        &json!({
+            "name": "target-wasm-load",
+            "version": "1.0.0",
+            "target": "wasm",
+            "wasm": "plugin.wasm",
+            "sdk": "*"
+        }),
+    );
+
+    let target_output = json_output(&run_cli(&[
+        "plugin-manifest".to_owned(),
+        "load".to_owned(),
+        "--dir".to_owned(),
+        target_dir.to_string_lossy().into_owned(),
+        "--plan-json".to_owned(),
+    ]));
+
+    assert_eq!(target_output["plugin"]["kind"], "wasm");
+    assert_eq!(target_output["plugin"]["manifest"]["target"], "wasm");
+    assert_eq!(
+        target_output["plugin"]["wasmPath"],
+        target_dir.join("plugin.wasm").to_string_lossy().as_ref()
+    );
+    assert!(target_output["plugin"]["entryPath"].is_null());
+
+    remove_dir_all(target_dir).expect("cleanup target load");
 }
 
 #[test]
@@ -550,4 +621,3 @@ fn plugin_manifest_invoke_plan_cli_reports_universal_version_and_help() {
 
     remove_dir_all(root).expect("cleanup invoke version");
 }
-

@@ -1,0 +1,1 @@
+{"argv":["wake","nova","--task","feat-295","--engine","claude47","--split","--no-attach","--repo","acme/demo","--prompt","<redacted>"],"engine":"claude47","leader_argv":["wake","nova","--task","feat-295","--engine","claude47","--split","--no-attach","--repo","acme/demo","--prompt","<redacted>"],"pane":"%42","status":"spawned","swarm_argv":["swarm","wish","codex","--tiled"]}

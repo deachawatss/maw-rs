@@ -1,0 +1,12 @@
+  [36;1mChannel Providers[0m (5 available)
+
+  Provider        Type       Plugin ID                                     Status
+  ─────────────── ────────── ───────────────────────────────────────────── ──────────
+  discord         chat       plugin:discord@claude-plugins-official        [32m✓ installed[0m
+  telegram        chat       plugin:telegram@claude-plugins-official       [90mnot installed[0m
+  imessage        chat       plugin:imessage@claude-plugins-official       [90mnot installed[0m
+  fakechat        chat       plugin:fakechat@claude-plugins-official       [90mnot installed[0m
+  relay           custom     server:relay                                  [90mnot installed[0m
+
+  Install: [36m/plugin install <provider>@claude-plugins-official[0m
+  Custom:  [36mmaw channel add <oracle> server:<name>[0m (for .mcp.json servers)

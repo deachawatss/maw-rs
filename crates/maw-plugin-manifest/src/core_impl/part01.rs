@@ -6,8 +6,11 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -94,6 +97,7 @@ pub struct PluginEngineServe {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginTarget {
     Js,
+    Wasm,
 }
 
 impl PluginTarget {
@@ -101,6 +105,7 @@ impl PluginTarget {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Js => "js",
+            Self::Wasm => "wasm",
         }
     }
 }

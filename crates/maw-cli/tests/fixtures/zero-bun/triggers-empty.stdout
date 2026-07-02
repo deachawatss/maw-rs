@@ -1,0 +1,8 @@
+[90mNo triggers configured. Add a 'triggers' array to maw.config.json.[0m
+
+[90mExample:[0m
+  "triggers": [
+    { "on": "issue-close", "repo": "Soul-Brews-Studio/maw-js", "action": "maw hey pulse-oracle 'issue closed'" },
+    { "on": "pr-merge", "repo": "Soul-Brews-Studio/maw-js", "action": "maw done neo-mawjs" },
+    { "on": "agent-idle", "timeout": 30, "action": "maw sleep {agent}" }
+  ]

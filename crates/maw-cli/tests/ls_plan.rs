@@ -99,7 +99,7 @@ fn ls_plan_rejects_unknown_flags() {
         CliOutput {
             code: 2,
             stdout: String::new(),
-            stderr: "ls: unknown argument --bad\nusage: maw-rs ls [<peer>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n".to_owned(),
+            stderr: "ls: unknown argument --bad\nusage: maw-rs ls [<filter>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--federation] [--fleet-only] [--node <node>] [--verify] [--fix] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n".to_owned(),
         }
     );
 }

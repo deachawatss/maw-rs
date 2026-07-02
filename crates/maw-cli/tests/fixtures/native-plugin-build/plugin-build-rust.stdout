@@ -1,0 +1,5 @@
+built Rust WASM plugin route-probe
+  target: wasm32-unknown-unknown
+  wasm: ./target/wasm32-unknown-unknown/release/route_probe.wasm
+  dist: dist/plugin.wasm
+  sha256: sha256:cd5d4935a48c0672cb06407bb443bc0087aff947c6b864bac886982c73b3027f

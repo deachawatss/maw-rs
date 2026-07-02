@@ -1,0 +1,4 @@
+   name  plugins  tiers          description                                                     
+-  ----  -------  -----          -----------                                                     
+   all   -        -              All plugins (Phase 1 default — equivalent to no profile filter).
+*  lean  2        core,standard  Lean profile                                                    

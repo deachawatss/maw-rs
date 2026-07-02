@@ -1,0 +1,11 @@
+team remove: alpha
+member	worker
+target	mawjs-worker
+state	live
+action	dry-run
+session	lead-session
+
+  teardown: would maw done mawjs-worker (keep branch)
+  charter: would remove 'worker' from <ROOT>/.maw/teams/alpha.yaml
+
+No changes made

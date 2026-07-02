@@ -1,12 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs::{create_dir_all, remove_dir_all, write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maw_plugin_manifest::{
     import_plugin_symbol, reset_discover_cache, LoadedPlugin, LoadedPluginKind, PluginManifest,
     PluginModule,
 };
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn make_temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -23,6 +26,8 @@ fn make_temp_dir(label: &str) -> PathBuf {
 
 #[test]
 fn import_plugin_symbol_returns_whitelisted_named_exports() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("happy");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -56,6 +61,8 @@ fn import_plugin_symbol_returns_whitelisted_named_exports() {
 
 #[test]
 fn import_plugin_symbol_rejects_missing_names_before_loading() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let no_plugins = Vec::new();
     assert_error(
         import_plugin_symbol("", "thing", &no_plugins, |_| Ok(BTreeMap::new())),
@@ -69,6 +76,8 @@ fn import_plugin_symbol_rejects_missing_names_before_loading() {
 
 #[test]
 fn import_plugin_symbol_rejects_absent_or_disabled_plugins() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("disabled");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -95,6 +104,8 @@ fn import_plugin_symbol_rejects_absent_or_disabled_plugins() {
 
 #[test]
 fn import_plugin_symbol_rejects_missing_module_surface_and_private_symbols() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("surface");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -126,6 +137,8 @@ fn import_plugin_symbol_rejects_missing_module_surface_and_private_symbols() {
 
 #[test]
 fn import_plugin_symbol_rejects_module_paths_that_escape_plugin_dir() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("escape");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -148,6 +161,8 @@ fn import_plugin_symbol_rejects_module_paths_that_escape_plugin_dir() {
 
 #[test]
 fn import_plugin_symbol_rejects_runtime_module_missing_allowlisted_export() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("missing-export");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -172,6 +187,8 @@ fn import_plugin_symbol_rejects_runtime_module_missing_allowlisted_export() {
 
 #[test]
 fn import_plugin_symbol_caches_successful_symbol_imports_until_reset() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+
     let root = make_temp_dir("cache");
     let dir = root.join("helper");
     create_dir_all(&dir).expect("plugin dir");
@@ -222,6 +239,7 @@ fn make_plugin(dir: &Path, module: Option<PluginModule>, disabled: bool) -> Load
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -242,6 +260,7 @@ fn make_plugin(dir: &Path, module: Option<PluginModule>, disabled: bool) -> Load
         dir: dir.to_path_buf(),
         wasm_path: PathBuf::new(),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled,
     }

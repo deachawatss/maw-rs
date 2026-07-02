@@ -1,0 +1,7 @@
+usage: maw channel migrate --to-repo [oracle...] [--dry-run] [--remove-global]
+  copies global ~/.claude/channels/<oracle>/config.json into
+  <repo>/.claude/channel.json so config travels with the repo (#1195).
+
+  no [oracle...] args = migrate every oracle with global config.
+  --dry-run            = show what would happen, no writes.
+  --remove-global      = delete the global config after a successful copy.

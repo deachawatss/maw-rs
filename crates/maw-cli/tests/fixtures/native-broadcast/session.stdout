@@ -1,0 +1,5 @@
+[32msent[0m → 01-alpha:neo-oracle
+
+[32m✓[0m Broadcast to 1 windows (1 skipped) [scope: session=01-alpha]
+  [90mskipped breakdown:[0m
+    [90mnon-agent-pane: 1[0m

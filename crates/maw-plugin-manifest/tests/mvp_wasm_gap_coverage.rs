@@ -35,6 +35,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
             tier: None,
             wasm: Some(format!("{name}.wasm")),
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -55,6 +56,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: dir.join(format!("{name}.wasm")),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Wasm,
         disabled: false,
     };

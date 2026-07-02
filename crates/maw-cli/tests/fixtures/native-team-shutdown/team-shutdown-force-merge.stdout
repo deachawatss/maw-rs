@@ -1,0 +1,7 @@
+team shutdown: alpha
+  request shutdown builder
+  request shutdown reviewer
+  force kill builder %1
+  force kill reviewer %2
+  merged team knowledge
+  cleaned up team directories

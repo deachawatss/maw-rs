@@ -1,0 +1,6 @@
+[32m✓[0m spawn prompt written for 'builder'
+  [90mpast life: no[0m
+  [90mengine: codex[0m
+  [90mprompt: <ROOT>/psi/memory/mailbox/teams/alpha/builder-spawn-prompt.md[0m
+
+  [32m✓ --exec[0m spawned builder with controlled maw invocation

@@ -1,0 +1,7 @@
+promote-mutation-deferred
+  source: 77-mawjs:test-cli
+  destination: isolated
+  destination-exists: false
+  force: false
+  attach: true
+  note: tmux move-window + rollback lands in #299 PR-B

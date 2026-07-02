@@ -1,0 +1,29 @@
+{
+  "name": "atlas",
+  "repoPath": "__REPO_PLACEHOLDER__",
+  "hasPsi": true,
+  "sessionName": "alpha",
+  "windowCount": 2,
+  "fleetConfigPath": "__CONFIG_PLACEHOLDER__/maw/fleet/alpha.json",
+  "federationNode": "edge",
+  "inAgentsConfig": true,
+  "federation": [],
+  "manifestEntry": {
+    "name": "atlas",
+    "sources": [
+      "fleet",
+      "session",
+      "agent",
+      "oracles-json"
+    ],
+    "node": "edge",
+    "session": "alpha",
+    "window": "atlas-oracle",
+    "repo": "acme/atlas-oracle",
+    "localPath": "__REPO_PLACEHOLDER__",
+    "sessionId": "session-uuid",
+    "hasPsi": true,
+    "hasFleetConfig": true,
+    "isLive": false
+  }
+}

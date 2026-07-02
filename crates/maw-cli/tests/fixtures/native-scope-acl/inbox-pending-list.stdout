@@ -1,0 +1,4 @@
+id  sender  target  sentAt  preview
+--  ------  ------  ------  -------
+abc123  alice  bob  2026-06-25T00:00:00.000Z  hello fleet
+def456  alice  bob  2026-06-25T00:00:00.000Z  hello fleet

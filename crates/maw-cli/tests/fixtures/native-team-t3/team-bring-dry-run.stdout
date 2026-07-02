@@ -1,0 +1,4 @@
+[36m⚡[0m bringing 2 oracle(s) into workspace 'alpha' (dry-run)
+[90mwould wake builder --session alpha --split[0m
+[90mwould wake reviewer --session alpha --split[0m
+No changes made

@@ -1,0 +1,37 @@
+{
+  "window": 2,
+  "buckets": [
+    "2026-06-24",
+    "2026-06-25"
+  ],
+  "agents": [
+    {
+      "name": "tonkmac-alpha-oracle",
+      "dailyCosts": [
+        0.0,
+        90.0
+      ],
+      "totalCost": 90.0,
+      "hadActivity": [
+        false,
+        true
+      ]
+    },
+    {
+      "name": "beta-agent",
+      "dailyCosts": [
+        1.5,
+        0.0
+      ],
+      "totalCost": 1.5,
+      "hadActivity": [
+        true,
+        false
+      ]
+    }
+  ],
+  "total": {
+    "cost": 91.5,
+    "agents": 2
+  }
+}

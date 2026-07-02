@@ -333,14 +333,15 @@ fn target_and_capability_validators_cover_valid_invalid_and_warning_branches() {
         parse_target(&json!({ "target": "js" })).expect("valid target"),
         Some(PluginTarget::Js)
     );
+    assert_eq!(
+        parse_target(&json!({ "target": "wasm" })).expect("valid wasm target"),
+        Some(PluginTarget::Wasm)
+    );
     assert_eq!(PluginTarget::Js.as_str(), "js");
+    assert_eq!(PluginTarget::Wasm.as_str(), "wasm");
     expect_target_error(
         &json!({ "target": 1 }),
         "plugin.json: target must be a string",
-    );
-    expect_target_error(
-        &json!({ "target": "wasm" }),
-        "plugin.json: target \"wasm\" not yet supported",
     );
     expect_target_error(
         &json!({ "target": "python" }),

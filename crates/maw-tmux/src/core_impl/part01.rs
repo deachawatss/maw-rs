@@ -491,6 +491,8 @@ impl CommandTmuxRunner {
         let (program, rest) = command_line
             .split_first()
             .expect("tmux command line always includes a program");
+        validate_tmux_program(program)?;
+        validate_tmux_option_values(rest)?;
         let mut command = Command::new(program);
         command.args(rest);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -533,6 +535,38 @@ impl CommandTmuxRunner {
             )))
         }
     }
+}
+
+fn validate_tmux_program(program: &std::ffi::OsStr) -> Result<(), TmuxError> {
+    let display = program.to_string_lossy();
+    if display.is_empty() || display.trim() != display || display.starts_with('-') {
+        Err(TmuxError::new(
+            "tmux program must be non-empty, unpadded, and not start with '-'",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_tmux_option_values(args: &[OsString]) -> Result<(), TmuxError> {
+    let mut previous_wants_target = false;
+    for arg in args {
+        let value = arg.to_string_lossy();
+        if previous_wants_target {
+            if value.is_empty() || value.trim() != value || value.starts_with('-') {
+                return Err(TmuxError::new(
+                    "tmux target/session must be non-empty, unpadded, and not start with '-'",
+                ));
+            }
+            previous_wants_target = false;
+            continue;
+        }
+        previous_wants_target = matches!(value.as_ref(), "-t" | "-s");
+    }
+    if previous_wants_target {
+        return Err(TmuxError::new("tmux target/session option missing value"));
+    }
+    Ok(())
 }
 
 fn tmux_program_io_error(

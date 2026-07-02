@@ -1,0 +1,8 @@
+oracle-skills v0.1.0
+  Pass through to arra-oracle-skills to manage Oracle skills across AI coding agents.
+
+  usage: maw oracle-skills [args...] — pass through to arra-oracle-skills for skill management
+
+  surfaces:
+    cli: maw oracle-skills
+

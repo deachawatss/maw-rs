@@ -200,11 +200,28 @@ fn parse_declared_manifest_file(
     key: &str,
     dir: &Path,
 ) -> Result<Option<String>, String> {
-    let Some(path) = object
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-    else {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let path = if key == "entry" {
+        if let Some(path) = value.as_str().filter(|path| !path.is_empty()) {
+            path
+        } else if let Some(entry) = value.as_object() {
+            let kind = entry.get("kind").and_then(Value::as_str);
+            if kind != Some("wasm") {
+                return Err("plugin.json: entry.kind must be \"wasm\" when entry is an object".to_owned());
+            }
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| "plugin.json: entry.path must be a non-empty string".to_owned())?
+        } else {
+            return Err("plugin.json: entry must be a string or wasm entry object".to_owned());
+        }
+    } else if let Some(path) = value.as_str().filter(|path| !path.is_empty()) {
+        path
+    } else {
         return Ok(None);
     };
     let declared_path = dir.join(path);
@@ -216,6 +233,19 @@ fn parse_declared_manifest_file(
             declared_path.display()
         ))
     }
+}
+
+fn parse_entry_export(object: &Map<String, Value>) -> Result<Option<String>, String> {
+    let Some(entry) = object.get("entry").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let Some(raw) = entry.get("export") else {
+        return Ok(Some("handle".to_owned()));
+    };
+    raw.as_str()
+        .filter(|value| !value.is_empty())
+        .map(|value| Some(value.to_owned()))
+        .ok_or_else(|| "plugin.json: entry.export must be a non-empty string".to_owned())
 }
 
 fn manifest_field_for_error(object: &Map<String, Value>, key: &str) -> String {
@@ -297,6 +327,7 @@ mod tests {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -322,6 +353,7 @@ mod tests {
             dir,
             wasm_path: PathBuf::new(),
             entry_path: None,
+            wasm_export: "handle".to_owned(),
             kind: LoadedPluginKind::Wasm,
             disabled: false,
         }

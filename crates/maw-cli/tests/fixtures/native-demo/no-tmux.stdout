@@ -1,0 +1,7 @@
+
+  [36mmaw demo[0m — simulated multi-agent session
+
+  [90mThis demo requires an active tmux session.[0m
+  Run: [36mtmux new-session -s demo[0m
+  Then re-run: [36mmaw demo[0m
+

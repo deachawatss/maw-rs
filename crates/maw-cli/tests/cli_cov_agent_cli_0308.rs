@@ -516,7 +516,7 @@ fn plugin_manifest_0308_invoke_source_and_runtime_edges_are_stable() {
         ],
         "plugin-manifest: missing --arg value",
     );
-    assert_ok_contains(
+    assert_usage_contains(
         &[
             "plugin-manifest",
             "invoke",
@@ -526,12 +526,10 @@ fn plugin_manifest_0308_invoke_source_and_runtime_edges_are_stable() {
             "ts-plugin",
             "--source",
             "api",
-            "--fake-ts-output",
-            "api-ok",
         ],
-        "api-ok",
+        "TS source plugin 'ts-plugin' is not executable",
     );
-    assert_ok_contains(
+    assert_usage_contains(
         &[
             "plugin-manifest",
             "invoke",
@@ -543,11 +541,9 @@ fn plugin_manifest_0308_invoke_source_and_runtime_edges_are_stable() {
             "peer",
             "--arg",
             "one",
-            "--fake-ts-output",
-            "peer-ok",
             "--plan-json",
         ],
-        "\"source\":\"peer\"",
+        "No Bun/JS subprocess fallback is available",
     );
     assert_ok_contains(
         &[

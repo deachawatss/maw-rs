@@ -1,0 +1,4 @@
+  [36m⬡[0m [dry-run] would skip retro (no retrospective command for this engine)
+  [36m⬡[0m [dry-run] would git add + commit + push in /work/repo/agents/task-done
+  [36m⬡[0m [dry-run] would kill window 13-nova:task-done
+  [36m⬡[0m [dry-run] would remove worktree + fleet config

@@ -1,0 +1,5 @@
+team liveness: alpha (alpha)
+role	identity	engine	state	action
+builder	builder	codex	live	liveness live
+reviewer	reviewer	claude	dead	liveness dead
+scout	scout	omx	missing	liveness missing

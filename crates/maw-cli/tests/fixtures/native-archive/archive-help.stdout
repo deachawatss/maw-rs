@@ -1,0 +1,1 @@
+usage: maw archive <oracle> [--dry-run] [--yes] — archive an oracle's tmux session and data

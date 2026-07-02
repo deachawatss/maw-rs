@@ -1,0 +1,5 @@
+maw messages serve: stopped
+engine: http://127.0.0.1:3456
+registered: no
+db: /tmp/maw-rs-native-ms-fixed/message-ledger.sqlite
+log: /tmp/maw-rs-native-ms-fixed/engine-plugins/messages.log

@@ -1,0 +1,9 @@
+{
+  "result": {
+    "error": "usage: maw learn <repo> [--fast|--deep]",
+    "ok": false,
+    "output": null
+  },
+  "stderr": "usage: maw learn <repo> [--fast|--deep]",
+  "stdout": ""
+}

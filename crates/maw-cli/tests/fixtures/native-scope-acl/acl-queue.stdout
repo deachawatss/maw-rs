@@ -1,0 +1,5 @@
+queued pending ACL approval: 2026-06-26T00-00-00-000Z-a1b2c3
+  sender: alice
+  target: bob
+  review: maw inbox show-pending 2026-06-26T00-00-00-000Z-a1b2c3
+  approve: maw inbox approve 2026-06-26T00-00-00-000Z-a1b2c3

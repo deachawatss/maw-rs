@@ -7,8 +7,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+ed25519-dalek = "2.2"
 hmac = "0.12"
 sha2 = "0.10"
+serde_json = "1"
 
 [lints]
 workspace = true

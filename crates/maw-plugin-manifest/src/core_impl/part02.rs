@@ -10,18 +10,13 @@ pub fn parse_target(manifest: &Value) -> Result<Option<PluginTarget>, String> {
     let Some(target_string) = target.as_str() else {
         return Err("plugin.json: target must be a string".to_owned());
     };
-    if target_string == "wasm" {
-        return Err(
-            "plugin.json: target \"wasm\" not yet supported (Phase C). Use target \"js\" for now."
-                .to_owned(),
-        );
+    match target_string {
+        "js" => Ok(Some(PluginTarget::Js)),
+        "wasm" => Ok(Some(PluginTarget::Wasm)),
+        _ => Err(format!(
+            "plugin.json: unknown target {target} (expected \"js\" or \"wasm\")"
+        )),
     }
-    if target_string != "js" {
-        return Err(format!(
-            "plugin.json: unknown target {target} (expected \"js\")"
-        ));
-    }
-    Ok(Some(PluginTarget::Js))
 }
 
 /// Parse optional `capabilityNamespaces`.
@@ -368,6 +363,7 @@ pub struct PluginManifest {
     pub tier: Option<PluginTier>,
     pub wasm: Option<String>,
     pub entry: Option<String>,
+    pub entry_export: Option<String>,
     pub sdk: String,
     pub cli: Option<PluginCli>,
     pub api: Option<PluginApi>,
@@ -392,6 +388,7 @@ pub struct LoadedPlugin {
     pub dir: PathBuf,
     pub wasm_path: PathBuf,
     pub entry_path: Option<PathBuf>,
+    pub wasm_export: String,
     pub kind: LoadedPluginKind,
     pub disabled: bool,
 }
@@ -482,4 +479,3 @@ pub trait PluginInvokeRuntime {
         wasm_bytes: &[u8],
     ) -> InvokeResult;
 }
-

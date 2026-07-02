@@ -1,0 +1,5 @@
+team up: alpha (alpha) status
+role	identity	engine	state	action
+builder	builder	codex	live	skip live
+reviewer	reviewer	claude	dead	would relaunch in place with resume
+scout	scout	omx	missing	would fresh wake --wt agents/scout -e omx

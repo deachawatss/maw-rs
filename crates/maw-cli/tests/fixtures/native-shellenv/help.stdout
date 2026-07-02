@@ -1,0 +1,17 @@
+usage: maw shellenv <shell>
+
+Emit shell init code for eval-style installation.
+
+  Install (zsh):
+    eval "$(maw shellenv zsh)"     # add to ~/.zshrc
+
+  Install (bash):
+    eval "$(maw shellenv bash)"    # add to ~/.bashrc
+
+Available shells: zsh, bash
+(fish deferred to v2 — see #812)
+
+The emitted snippet installs a maw() function that adds:
+  maw warp [<oracle>]    cd into an oracle's repo (default: mawjs)
+  maw <other>            pass-through to the real binary
+

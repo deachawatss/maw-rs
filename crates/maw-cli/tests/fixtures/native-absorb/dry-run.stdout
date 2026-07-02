@@ -1,0 +1,8 @@
+
+  Absorbing donor-oracle -> receiver-oracle
+
+  [dry-run] would sync psi memory: {ROOT}/ghq/github.com/org/donor-oracle -> {ROOT}/ghq/github.com/org/receiver-oracle
+  [dry-run] would archive donor via: maw archive donor-oracle
+  [dry-run] would switch client: tmux switch-client -t '02-receiver-oracle'
+
+  [dry-run] absorb preview complete; no files, fleet entries, repos, or tmux clients changed.

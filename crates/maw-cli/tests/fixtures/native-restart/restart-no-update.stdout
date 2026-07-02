@@ -1,0 +1,11 @@
+
+  [36m🔄 maw restart[0m
+
+  [90m1. No stale sessions[0m
+
+  [90m2. Update skipped (--no-update)[0m
+
+  [33m3. Stopping fleet...[0m
+  [33m4. Waking fleet...[0m
+
+  [32m✓ restart complete[0m

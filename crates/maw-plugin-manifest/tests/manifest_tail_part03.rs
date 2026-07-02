@@ -105,7 +105,9 @@ fn import_symbol_propagates_loader_and_canonicalize_errors() {
 #[test]
 fn scan_dirs_uses_explicit_plugins_dir_env() {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = ENV_LOCK.lock().expect("env lock");
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let original = std::env::var_os("MAW_PLUGINS_DIR");
     let original_maw_home = std::env::var_os("MAW_HOME");
     let original_home = std::env::var_os("HOME");
@@ -134,6 +136,7 @@ fn loaded_plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -157,6 +160,7 @@ fn loaded_plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: PathBuf::new(),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }

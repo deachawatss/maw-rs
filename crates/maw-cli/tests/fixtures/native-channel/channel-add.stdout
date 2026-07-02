@@ -1,0 +1,5 @@
+  [32m✅[0m channel added: hermes-discord → plugin:discord@claude-plugins-official
+     env: DISCORD_BOT_TOKEN=<redacted>
+     env: DISCORD_STATE_DIR=~/.claude/channels/hermes-discord
+     token: pass:discord/hermes-token
+     next: [36mmaw wake hermes-discord[0m (channels auto-injected)

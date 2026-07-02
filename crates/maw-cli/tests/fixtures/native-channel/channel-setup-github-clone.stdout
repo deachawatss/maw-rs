@@ -1,0 +1,23 @@
+
+  [36;1m🔧 Git Channel Setup for hermes-git[0m
+  ─────────────────────────────────────────────
+
+  [36mStep 1/4: Locate repo[0m
+  source: github:ARRA-01/claude-channel-relay
+  ghq root: <GHQ_ROOT>
+  repo: <GHQ_ROOT>/github.com/ARRA-01/claude-channel-relay
+  [32m✓[0m cloned with ghq get
+
+  [36mStep 2/4: Token + dependencies[0m
+  [32m✓[0m token source: pass:github/hermes-token (reference only)
+  [90m· no package.json — bun install skipped[0m
+
+  [36mStep 3/4: MCP record[0m
+  [32m✓[0m server:relay → bun run --cwd <GHQ_ROOT>/github.com/ARRA-01/claude-channel-relay start (native default)
+  [90m· setup records MCP only; it does not spawn the MCP command[0m
+
+  [36mStep 4/4: Register config[0m
+  [32m✓[0m wrote ~/.claude/channels/hermes-git/config.json (0600)
+  [90m· dev-server spawn is out of scope for setup[0m
+
+  [32m✅ Git channel setup complete[0m

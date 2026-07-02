@@ -1,0 +1,11 @@
+team charter spawn complete: beta
+
+roles (2):
+  - builder
+  - reviewer
+
+spawn safety:
+  - preflight passed
+  - governance approval flag present
+  - --exec passed through to local cmdTeamSpawn
+  - existing:* and new:* targets blocked in this implementation

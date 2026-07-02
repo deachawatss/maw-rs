@@ -28,6 +28,7 @@ fn run_auth_from_address(plan_json: bool, oracle: Option<&str>, node: &str) -> C
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_auth_verify_request(
     plan_json: bool,
     method: String,
@@ -36,7 +37,22 @@ fn run_auth_verify_request(
     body: Option<String>,
     cached_pubkey: Option<String>,
     headers: Vec<(String, String)>,
+    peer_ip: Option<IpAddr>,
+    workspace_key_env: Option<String>,
 ) -> CliOutput {
+    if peer_ip.is_some() || workspace_key_env.is_some() {
+        return run_auth_verify_request_d2(
+            plan_json,
+            method,
+            path,
+            timestamp,
+            body,
+            cached_pubkey,
+            headers,
+            peer_ip,
+            workspace_key_env,
+        );
+    }
     let decision = verify_request(&VerifyRequestArgs {
         method,
         path,
@@ -53,6 +69,68 @@ fn run_auth_verify_request(
             format!("{}\n", decision.kind())
         },
         stderr: String::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_auth_verify_request_d2(
+    plan_json: bool,
+    method: String,
+    path: String,
+    timestamp: i64,
+    body: Option<String>,
+    cached_pubkey: Option<String>,
+    headers: Vec<(String, String)>,
+    peer_ip: Option<IpAddr>,
+    workspace_key_env: Option<String>,
+) -> CliOutput {
+    let workspace_key = workspace_key_env.and_then(|name| auth_read_workspace_key_env(&name));
+    let headers = Headers::new(headers);
+    let ed25519_pins = auth_ed25519_cli_pins(&headers, cached_pubkey.as_deref());
+    let decision = verify_request(&RequestAuthParts {
+        method,
+        path,
+        headers,
+        body: body.map(std::string::String::into_bytes),
+        peer_ip,
+        workspace_key,
+        cached_pubkey,
+        ed25519_pins: Some(ed25519_pins),
+        now: timestamp,
+    });
+    CliOutput {
+        code: 0,
+        stdout: if plan_json {
+            render_auth_verify_d2_json(&decision)
+        } else {
+            format!("{}\n", auth_request_decision_kind(&decision))
+        },
+        stderr: String::new(),
+    }
+}
+
+
+fn auth_ed25519_cli_pins(
+    headers: &Headers,
+    cached_pubkey: Option<&str>,
+) -> std::sync::Arc<std::sync::Mutex<Ed25519TofuStore>> {
+    let mut store = Ed25519TofuStore::default();
+    if headers.get("x-maw-ed25519-signature").is_some() {
+        if let (Some(from), Some(pubkey)) = (headers.get("x-maw-from"), cached_pubkey) {
+            let _ = store.pin_first_contact(from, pubkey);
+        }
+    }
+    std::sync::Arc::new(std::sync::Mutex::new(store))
+}
+
+fn auth_read_workspace_key_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn auth_request_decision_kind(decision: &RequestAuthDecision) -> &'static str {
+    match decision {
+        RequestAuthDecision::Accept { .. } => "accept",
+        RequestAuthDecision::Reject { .. } => "reject",
     }
 }
 
@@ -465,6 +543,8 @@ enum AuthPlanAction {
         body: Option<String>,
         cached_pubkey: Option<String>,
         headers: Vec<(String, String)>,
+        peer_ip: Option<IpAddr>,
+        workspace_key_env: Option<String>,
     },
 }
 

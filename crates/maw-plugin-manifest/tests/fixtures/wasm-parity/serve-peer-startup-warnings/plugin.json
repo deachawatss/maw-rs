@@ -1,0 +1,14 @@
+{
+  "name": "serve-peer-startup-warnings-parity",
+  "version": "1.0.0",
+  "sdk": "*",
+  "entry": {
+    "kind": "wasm",
+    "path": "plugin.wasm",
+    "export": "handle"
+  },
+  "capabilities": [
+    "fs:read:config",
+    "fs:read:state"
+  ]
+}

@@ -1,0 +1,6 @@
+maw messages serve detached: native cutover uses maw serve daemon
+registered: /api/message-ledger on http://127.0.0.1:3456
+upstream: built-in maw serve /api/message-ledger (requested port 0)
+serve: stopped
+db: /tmp/maw-rs-native-ms-fixed/message-ledger.sqlite
+log: /tmp/maw-rs-native-ms-fixed/engine-plugins/messages.log

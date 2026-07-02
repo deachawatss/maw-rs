@@ -1,0 +1,4 @@
+  [36m⬡[0m [dry-run] window 'task-done' not running — nothing to auto-save
+  [90m○[0m window 'task-done' not running
+  [36m⬡[0m [dry-run] would remove worktree org/repo/agents/task-done
+  [36m⬡[0m [dry-run] would remove 'task-done' from fleet config if present

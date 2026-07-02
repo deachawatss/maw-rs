@@ -1,0 +1,1 @@
+tmux split-window -v -l 25% -t %isolated -- echo hi

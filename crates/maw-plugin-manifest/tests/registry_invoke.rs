@@ -308,6 +308,7 @@ fn make_plugin(dir: &Path, kind: LoadedPluginKind) -> LoadedPlugin {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -328,6 +329,7 @@ fn make_plugin(dir: &Path, kind: LoadedPluginKind) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: dir.join("missing.wasm"),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind,
         disabled: false,
     }

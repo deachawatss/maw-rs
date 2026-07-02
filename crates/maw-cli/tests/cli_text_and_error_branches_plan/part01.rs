@@ -170,7 +170,7 @@ fn plugin_manifest_text_rendering_and_parser_errors_are_stable() {
         ]),
         "42\n",
     );
-    assert_ok_text(
+    assert_usage_error(
         &run_cli(&[
             "plugin-manifest".to_owned(),
             "invoke".to_owned(),
@@ -178,22 +178,24 @@ fn plugin_manifest_text_rendering_and_parser_errors_are_stable() {
             plugins_dir.display().to_string(),
             "--plugin".to_owned(),
             "alpha".to_owned(),
-            "--fake-ts-output".to_owned(),
-            "hello from ts".to_owned(),
         ]),
-        "hello from ts\n",
+        "TS source plugin 'alpha' is not executable",
     );
-    assert_ok_text(
-        &run_cli(&[
-            "plugin-manifest".to_owned(),
-            "invoke".to_owned(),
-            "--scan-dir".to_owned(),
-            plugins_dir.display().to_string(),
-            "--plugin".to_owned(),
-            "wasm-plug".to_owned(),
-        ]),
-        "ok\n",
+    let invalid_wasm = run_cli(&[
+        "plugin-manifest".to_owned(),
+        "invoke".to_owned(),
+        "--scan-dir".to_owned(),
+        plugins_dir.display().to_string(),
+        "--plugin".to_owned(),
+        "wasm-plug".to_owned(),
+    ]);
+    assert_eq!(invalid_wasm.code, 0, "{}", invalid_wasm.stderr);
+    assert!(
+        invalid_wasm.stdout.contains("wasm instantiation failed"),
+        "{}",
+        invalid_wasm.stdout
     );
+    assert!(invalid_wasm.stderr.is_empty(), "{}", invalid_wasm.stderr);
 
     assert_usage_error(
         &run_cli(&[

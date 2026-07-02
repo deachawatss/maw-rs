@@ -1,0 +1,4 @@
+promote: 'test-cli' matches 2 windows
+  [90m• 77-mawjs:test-cli[0m
+  [90m• other:test-cli[0m
+  [90muse: maw promote <session>:<window>[0m

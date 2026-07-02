@@ -1,0 +1,3 @@
+[90m...[0m sending /exit to 01-nova:nova-oracle
+  [33m![0m force-killed nova-oracle (did not exit gracefully)
+[32msleep[0m nova (nova-oracle)

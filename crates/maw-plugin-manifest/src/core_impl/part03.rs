@@ -16,6 +16,41 @@ impl PluginInvokeRuntime for MvpWasmInvokeRuntime {
     }
 }
 
+fn parse_invoke_result_stdout(stdout: &[u8]) -> Result<InvokeResult, String> {
+    let value: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("failed to parse InvokeResult JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "InvokeResult JSON must be an object".to_owned())?;
+    let ok = object
+        .get("ok")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "InvokeResult JSON must contain boolean ok".to_owned())?;
+    let output = optional_string_field(object, "output")?;
+    let error = optional_string_field(object, "error")?;
+    Ok(InvokeResult { ok, output, error })
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    object.get(field).map_or(Ok(None), |value| {
+        value
+            .as_str()
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| format!("InvokeResult JSON field {field} must be a string"))
+    })
+}
+
+fn invoke_context_json(ctx: &InvokeContext) -> String {
+    serde_json::json!({
+        "source": ctx.source.as_str(),
+        "args": ctx.args,
+    })
+    .to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginNameAndTier {
     pub name: String,
@@ -65,6 +100,9 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
     let sdk = parse_manifest_sdk(object)?;
     let wasm = parse_declared_manifest_file(object, "wasm", dir)?;
     let entry = parse_declared_manifest_file(object, "entry", dir)?;
+    let entry_export = parse_entry_export(object)?;
+    let target = parse_target(&raw)?;
+    validate_target_payload(target, wasm.as_deref(), entry.as_deref())?;
 
     let capability_namespaces = parse_capability_namespaces(&raw)?;
     let extra_namespaces: Vec<&str> = capability_namespaces
@@ -84,6 +122,7 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
         tier: parse_tier(&raw)?,
         wasm,
         entry,
+        entry_export,
         sdk,
         cli: parse_cli(&raw)?,
         api: parse_api(&raw)?,
@@ -100,13 +139,36 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
         module: parse_module(&raw)?,
         transport: parse_transport(&raw)?,
         engine: parse_engine(&raw)?,
-        target: parse_target(&raw)?,
+        target,
         capability_namespaces,
         capabilities,
         capability_warnings,
         dependencies: parse_dependencies(&raw)?,
         artifact: parse_artifact(&raw)?,
     })
+}
+
+fn validate_target_payload(
+    target: Option<PluginTarget>,
+    wasm: Option<&str>,
+    entry: Option<&str>,
+) -> Result<(), String> {
+    if target != Some(PluginTarget::Wasm) {
+        return Ok(());
+    }
+    let entry_is_wasm = entry.is_some_and(|entry| {
+        Path::new(entry)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+    });
+    if wasm.is_some() || entry_is_wasm {
+        Ok(())
+    } else {
+        Err(
+            "plugin.json: target \"wasm\" requires a wasm file (Phase C); JS entry plugins must use target \"js\""
+                .to_owned(),
+        )
+    }
 }
 
 /// Load and validate `plugin.json` from a plugin directory.
@@ -124,10 +186,19 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String
         .map_err(|error| format!("plugin.json: failed to read: {error}"))?;
     let manifest = parse_manifest(&json_text, dir)?;
     let has_entry = manifest.entry.is_some();
-    let has_artifact_js = manifest
-        .artifact
+    let has_wasm_entry = manifest
+        .entry
         .as_ref()
-        .is_some_and(|artifact| !artifact.path.is_empty());
+        .is_some_and(|entry| {
+            Path::new(entry)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+        });
+    let has_artifact_js = manifest.artifact.as_ref().is_some_and(|artifact| {
+        !Path::new(&artifact.path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wasm"))
+    });
     let effective_entry = manifest.entry.as_ref().or_else(|| {
         if has_artifact_js {
             manifest.artifact.as_ref().map(|artifact| &artifact.path)
@@ -140,9 +211,15 @@ pub fn load_manifest_from_dir(dir: &Path) -> Result<Option<LoadedPlugin>, String
         wasm_path: manifest
             .wasm
             .as_ref()
+            .or_else(|| manifest.entry.as_ref().filter(|_| has_wasm_entry))
             .map_or_else(PathBuf::new, |wasm| resolve_dir_path(dir, wasm)),
-        entry_path: effective_entry.map(|entry| resolve_dir_path(dir, entry)),
-        kind: if has_entry || has_artifact_js {
+        entry_path: effective_entry.filter(|_| !has_wasm_entry)
+            .map(|entry| resolve_dir_path(dir, entry)),
+        wasm_export: manifest
+            .entry_export
+            .clone()
+            .unwrap_or_else(|| "handle".to_owned()),
+        kind: if (has_entry && !has_wasm_entry) || has_artifact_js {
             LoadedPluginKind::Ts
         } else {
             LoadedPluginKind::Wasm
@@ -190,6 +267,7 @@ where
     let mut plugins = Vec::new();
     let mut warnings = Vec::new();
     let mut legacy_count = 0usize;
+    let mut seen_plugin_names = BTreeSet::new();
 
     for base_dir in &options.scan_dirs {
         let Ok(entries) = std::fs::read_dir(base_dir) else {
@@ -203,10 +281,16 @@ where
                 continue;
             }
             match discover_plugin_dir(&entry.path(), options) {
-                PluginDiscovery::Loaded(loaded) => plugins.push(loaded),
+                PluginDiscovery::Loaded(loaded) => {
+                    if seen_plugin_names.insert(loaded.manifest.name.clone()) {
+                        plugins.push(loaded);
+                    }
+                }
                 PluginDiscovery::Legacy(loaded) => {
-                    legacy_count += 1;
-                    plugins.push(loaded);
+                    if seen_plugin_names.insert(loaded.manifest.name.clone()) {
+                        legacy_count += 1;
+                        plugins.push(loaded);
+                    }
                 }
                 PluginDiscovery::Warning(warning) => warnings.push(warning),
                 PluginDiscovery::Skip => {}
@@ -524,7 +608,7 @@ mod part03_coverage_tests {
 
     #[test]
     fn resolve_dir_path_handles_absolute_relative_and_missing_cwd_fallback() {
-        let _guard = CWD_LOCK.lock().expect("cwd lock");
+        let _guard = CWD_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let original = std::env::current_dir().expect("cwd");
         let root = std::env::temp_dir().join(format!(
             "maw-rs-resolve-dir-path-{}",

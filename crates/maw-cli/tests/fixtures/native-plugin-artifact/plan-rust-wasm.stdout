@@ -1,0 +1,11 @@
+plugin artifact plan: rust-wasm
+  status: supported
+  project: route-probe
+  manifest: plugin.json
+  artifact: target/wasm32-unknown-unknown/release/route_probe.wasm
+  sha256: required-before-install
+  capabilities: messages:ledger
+  runtime: extism-wasm
+  export: handle
+  build: cargo build --release --target wasm32-unknown-unknown
+  no-bun: true

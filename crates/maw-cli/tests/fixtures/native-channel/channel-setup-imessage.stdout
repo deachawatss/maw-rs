@@ -1,0 +1,22 @@
+
+  [36;1m🔧 imessage Channel Setup for hermes-imessage[0m
+  ─────────────────────────────────────────────
+
+  [36mStep 1/4: Plugin check[0m
+  [32m✓[0m plugin:imessage@claude-plugins-official installed
+
+  [36mStep 2/4: macOS check[0m
+  [32m✓[0m macOS detected
+  [90mℹ Full Disk Access required for Messages.app — grant when prompted[0m
+
+  [36mStep 3/4: Register channel[0m
+  [32m✓[0m registered
+
+  [36mStep 4/4: Done![0m
+
+  [32m✅ Setup complete![0m
+
+  Start oracle with channels:
+    [36mmaw wake hermes-imessage[0m
+
+  [90mNat pre-approved — no pairing needed. Bot responds immediately.[0m

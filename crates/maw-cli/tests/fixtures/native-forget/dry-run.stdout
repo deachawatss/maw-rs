@@ -1,0 +1,5 @@
+[36mforget[0m neo → neo-oracle
+  [36m⬡[0m [dry-run] would worktrees: <ROOT>/ghq/github.com/acme/neo-oracle (maw done --all + linked worktree sweep)
+  [36m⬡[0m [dry-run] would tmux: 03-neo (kill-session)
+  [36m⬡[0m [dry-run] would fleet: <ROOT>/config/fleet/03-neo.json
+  [36m⬡[0m [dry-run] would snapshots: <ROOT>/state/snapshots/neo.json

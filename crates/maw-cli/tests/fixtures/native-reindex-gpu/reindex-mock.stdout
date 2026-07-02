@@ -1,0 +1,3 @@
+[32m✓[0m reindex-gpu posted 2 document(s) to https://gpu.example.test/api/embed
+  status: 200
+  index: <ROOT>/index.json

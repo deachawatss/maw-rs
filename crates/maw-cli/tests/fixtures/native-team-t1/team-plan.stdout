@@ -1,0 +1,20 @@
+team charter plan: beta
+description: Beta team
+goal: Ship T1
+
+members (2):
+  - builder (target=auto, model=gpt-5.5)
+  - reviewer (target=auto, cwd=/tmp/review)
+
+would prepare artifacts:
+  - <ROOT>/home/.claude/teams/beta/config.json
+  - <ROOT>/home/.claude/teams/beta/inboxes/builder.json
+  - <ROOT>/home/.claude/teams/beta/inboxes/reviewer.json
+  - <ROOT>/psi/memory/mailbox/teams/beta/manifest.json
+
+phase-0 safety:
+  - read-only plan only
+  - no files written
+  - no tmux panes changed
+  - no claude processes spawned
+  - no maw bud or fleet writes

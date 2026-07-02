@@ -1,0 +1,6 @@
+plugin artifact plan: js-bun
+  status: refused
+  project: legacy-js
+  reason: JS/TS Bun plugins are refused at ZERO-BUN cutover unless they provide a prebuilt WASM artifact
+  action: rewrite as Rust WASM or install a prebuilt WASM artifact with sha256; no Bun subprocess fallback is available
+  no-bun: true

@@ -30,7 +30,9 @@ fn optional_manifest_error_tails_cover_direct_parsers() {
 #[test]
 fn relative_manifest_paths_and_symbol_cache_tail_are_exercised() {
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = CWD_LOCK.lock().expect("cwd lock");
+    let _guard = CWD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     reset_discover_cache();
     let original = std::env::current_dir().expect("cwd");
     let root = temp_dir("relative-cache");
@@ -164,6 +166,7 @@ fn plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
             tier: None,
             wasm: None,
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -187,6 +190,7 @@ fn plugin(dir: &Path, module_path: Option<&str>) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: dir.join("helper.wasm"),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Ts,
         disabled: false,
     }
@@ -201,6 +205,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
             tier: None,
             wasm: Some(format!("{name}.wasm")),
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -221,6 +226,7 @@ fn write_wasm_plugin(dir: &Path, name: &str, bytes: &[u8]) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: dir.join(format!("{name}.wasm")),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Wasm,
         disabled: false,
     };

@@ -1,0 +1,32 @@
+
+  [36;1m🔧 discord Channel Setup for hermes-discord[0m
+  ─────────────────────────────────────────────
+
+  [36mStep 1/7: Plugin check[0m
+  [32m✓[0m plugin:discord@claude-plugins-official installed
+
+  [36mStep 2/7: Bot token[0m
+  [32m✓[0m token from pass: discord/hermes-token
+  [90mclient: 123456789012345678[0m
+
+  [36mStep 3/7: State directory[0m
+  [32m✓[0m ~/.claude/channels/hermes-discord/
+
+  [36mStep 4/7: Guild / Server[0m
+    1. Ops Guild (999999999999999999) ←
+    2. Other Guild (888888888888888888)
+  [32m✓[0m guild: Ops Guild
+
+  [36mStep 5/7: Access config + seed[0m
+  [32m✓[0m existing access.json preserved
+
+  [36mStep 6/7: Register channel[0m
+  [32m✓[0m registered: hermes-discord → plugin:discord@claude-plugins-official
+
+  [32m✅ Setup complete![0m
+
+  Start oracle with channels:
+    [36mmaw wake hermes-discord[0m
+
+  [90mNat pre-approved — no pairing needed. Bot responds immediately.[0m
+  [90mAdd others: /discord:access allow <user-id>[0m

@@ -103,7 +103,7 @@ fn auth_usage_error(message: &str) -> CliOutput {
        maw-rs auth hmac-sign --secret <secret> --payload <payload> [--plan-json]
        maw-rs auth hmac-verify --secret <secret> --payload <payload> --signature <hex> [--plan-json]
        maw-rs auth constants [--plan-json]
-       maw-rs auth sign-v3 --peer-key <key> --from <oracle:node> [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--plan-json]\n       maw-rs auth verify-request [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--cached-pubkey <key>] [--header <key=value>]... [--plan-json]\n       maw-rs auth loopback --address <address> [--plan-json]\n       maw-rs auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n       maw-rs auth hash-body [--body <body>] [--plan-json]\n"
+       maw-rs auth sign-v3 --peer-key <key> --from <oracle:node> [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--plan-json]\n       maw-rs auth verify-request [--method <method>] [--path <path>] [--now <sec>] [--body <body>] [--cached-pubkey <key>] [--peer-ip <ip>] [--workspace-key-env <name>] [--header <key=value>]... [--plan-json]\n       maw-rs auth loopback --address <address> [--plan-json]\n       maw-rs auth from-address --node <node> [--oracle <oracle>] [--plan-json]\n       maw-rs auth hash-body [--body <body>] [--plan-json]\n"
         ),
     }
 }

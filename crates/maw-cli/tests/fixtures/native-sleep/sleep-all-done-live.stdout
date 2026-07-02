@@ -1,0 +1,2 @@
+[32msleep --all-done[0m 01-nova
+  slept %21 pid=421 window=worktree-task- command=read

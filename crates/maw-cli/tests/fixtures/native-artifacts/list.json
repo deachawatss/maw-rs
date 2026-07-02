@@ -1,0 +1,21 @@
+[
+  {
+    "team": "alpha",
+    "taskId": "101",
+    "subject": "Ship native artifacts",
+    "status": "completed",
+    "owner": "nova",
+    "files": 5,
+    "hasResult": true,
+    "createdAt": "2026-06-25T00:00:00Z"
+  },
+  {
+    "team": "beta",
+    "taskId": "202",
+    "subject": "Pending beta task",
+    "status": "in_progress",
+    "files": 2,
+    "hasResult": false,
+    "createdAt": "2026-06-24T00:00:00Z"
+  }
+]

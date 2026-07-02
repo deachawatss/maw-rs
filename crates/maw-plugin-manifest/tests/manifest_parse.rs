@@ -33,6 +33,24 @@ fn parse_manifest_happy_path_matches_maw_js_tests() {
     assert_eq!(manifest.sdk, "^1.0.0");
     assert_eq!(manifest.cli, None);
 
+    let wasm_target = parse_manifest(
+        &json!({ "name": "wasm-target", "version": "1.0.0", "wasm": "plugin.wasm", "sdk": "*", "target": "wasm" })
+            .to_string(),
+        &dir,
+    )
+    .expect("target wasm manifest");
+    assert_eq!(wasm_target.target, Some(PluginTarget::Wasm));
+    assert_eq!(wasm_target.wasm, Some("plugin.wasm".to_owned()));
+
+    let wasm_entry_target = parse_manifest(
+        &json!({ "name": "wasm-entry-target", "version": "1.0.0", "entry": "plugin.wasm", "sdk": "*", "target": "wasm" })
+            .to_string(),
+        &dir,
+    )
+    .expect("target wasm entry manifest");
+    assert_eq!(wasm_entry_target.target, Some(PluginTarget::Wasm));
+    assert_eq!(wasm_entry_target.entry, Some("plugin.wasm".to_owned()));
+
     let manifest = parse_manifest(
         &json!({
             "name": "full-plugin",
@@ -186,4 +204,31 @@ fn expect_manifest_error(json_text: &str, dir: &std::path::Path, expected: &str)
         error.contains(expected),
         "{error:?} did not contain {expected:?}"
     );
+}
+
+#[test]
+fn parse_manifest_accepts_wasm_entry_object_export() {
+    let root = make_temp_dir("entry-object-export");
+    write(root.join("plugin.wasm"), b"wasm").expect("wasm");
+    let manifest = parse_manifest(
+        r#"{"name":"entry-export","version":"1.0.0","sdk":"*","entry":{"kind":"wasm","path":"plugin.wasm","export":"run"}}"#,
+        &root,
+    )
+    .expect("manifest");
+    assert_eq!(manifest.entry.as_deref(), Some("plugin.wasm"));
+    assert_eq!(manifest.entry_export.as_deref(), Some("run"));
+    remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn parse_manifest_rejects_empty_wasm_entry_export() {
+    let root = make_temp_dir("entry-object-bad-export");
+    write(root.join("plugin.wasm"), b"wasm").expect("wasm");
+    let err = parse_manifest(
+        r#"{"name":"entry-export","version":"1.0.0","sdk":"*","entry":{"kind":"wasm","path":"plugin.wasm","export":""}}"#,
+        &root,
+    )
+    .unwrap_err();
+    assert_eq!(err, "plugin.json: entry.export must be a non-empty string");
+    remove_dir_all(root).expect("cleanup");
 }

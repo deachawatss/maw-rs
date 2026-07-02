@@ -1,0 +1,14 @@
+team charter preflight: beta
+status: passed
+
+checks:
+  ✓ team name: 'beta' is accepted
+  ✓ member roles: 2 unique role(s)
+  ✓ existing artifacts: no config/inbox/manifest collisions found
+
+preflight safety:
+  - read-only preflight only
+  - no files written
+  - no tmux panes changed
+  - no claude processes spawned
+  - no maw bud or fleet writes

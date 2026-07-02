@@ -1,0 +1,7 @@
+team apply: alpha (alpha) dry-run
+role	identity	engine	state	action
+builder	builder	codex	live	skip live
+reviewer	reviewer	claude	dead	skip dead member (team up can resume)
+scout	scout	omx	missing	would spawn member
+
+No changes made (pass --apply after T5/T4 design lands)

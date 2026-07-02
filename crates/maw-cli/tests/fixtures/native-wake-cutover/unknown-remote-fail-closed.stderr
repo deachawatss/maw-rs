@@ -1,0 +1,1 @@
+wake: node 'elsewhere' not in namedPeers or peers; add to maw.config.json namedPeers; refusing maw-js fallback

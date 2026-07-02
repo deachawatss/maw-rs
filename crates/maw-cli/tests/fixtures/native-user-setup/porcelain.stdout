@@ -1,0 +1,5 @@
+root	{ROOT}/home/.claude/projects
+stale	1
+orphan	1
+duplicate	0
+candidate	-tmp-missing-agents-01	/tmp/missing/agents/01

@@ -1,0 +1,7 @@
+
+  [36;1m🔧 Git Channel Setup for hermes-git[0m
+  ─────────────────────────────────────────────
+
+  [33m⚠[0m github:ARRA-01/claude-channel-relay setup is plan-only in native PR-C
+  [90mno external clone, no JS dependency install, no dev server registration performed[0m
+  [90mdeferred to channel migrate/setup destructive design gate[0m

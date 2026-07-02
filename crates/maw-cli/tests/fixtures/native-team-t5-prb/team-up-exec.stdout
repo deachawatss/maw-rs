@@ -1,0 +1,4 @@
+team up: alpha (alpha) execute
+role	state	action
+builder	missing	fresh wake
+reviewer	dead	resume in place

@@ -1,0 +1,3 @@
+promote refused — session 'isolated' already exists.
+  [90muse: maw promote 77-mawjs:test-cli --as <new-name>[0m
+  [90mor:  maw promote 77-mawjs:test-cli --force[0m  (merges into existing)

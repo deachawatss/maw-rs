@@ -365,6 +365,7 @@ fn plugin(dir: &Path, name: &str) -> LoadedPlugin {
             tier: None,
             wasm: Some(format!("{name}.wasm")),
             entry: None,
+            entry_export: None,
             sdk: "*".to_owned(),
             cli: None,
             api: None,
@@ -385,6 +386,7 @@ fn plugin(dir: &Path, name: &str) -> LoadedPlugin {
         dir: dir.to_path_buf(),
         wasm_path: dir.join(format!("{name}.wasm")),
         entry_path: None,
+        wasm_export: "handle".to_owned(),
         kind: LoadedPluginKind::Wasm,
         disabled: false,
     }

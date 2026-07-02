@@ -1,0 +1,1 @@
+{"command":"federation","action":"sync","node":"local-node","dryRun":false,"check":false,"force":false,"prune":false,"dirty":true,"diff":{"add":[{"oracle":"remote","peerNode":"peer-node","fromPeer":"fakepeer"}],"stale":[],"conflict":[],"unreachable":[]},"applied":[],"agents":{"local-agent":"local"}}
