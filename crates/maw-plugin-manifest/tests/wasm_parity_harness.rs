@@ -84,6 +84,24 @@ const CONTACTS_LIST_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
     "fs:read:data",
     "/data/contacts.json",
 )];
+const SIGNALS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/ψ/memory/signals"),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/alpha.json",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/beta.json",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/old.json",
+    ),
+];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -373,6 +391,19 @@ fn golden_parity_contacts_committed_golden_and_wasm_outputs_match_seeded_host() 
 }
 
 #[test]
+fn golden_parity_signals_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for args in [&[][..], &["--days", "3", "--json"][..]] {
+        run_parity_case(ParityCase {
+            plugin: "signals",
+            manifest_name: "signals-parity",
+            args,
+            expected_host_calls: Some(SIGNALS_TRANSCRIPT.len()),
+            expected_host_transcript: Some(SIGNALS_TRANSCRIPT),
+        });
+    }
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -610,6 +641,18 @@ fn contacts_wasm_declares_only_bounded_data_caps() {
         wasm_plugin.manifest.capabilities.as_deref(),
         Some(&["fs:read:data".to_owned(), "fs:write:data".to_owned()][..]),
         "contacts fixture must declare only bounded data read/write caps"
+    );
+}
+
+#[test]
+fn signals_wasm_declares_only_bounded_data_read_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/signals");
+    let wasm_plugin = load_wasm_fixture(&fixture, "signals-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["fs:read:data".to_owned()][..]),
+        "signals fixture must declare only bounded data read caps"
     );
 }
 

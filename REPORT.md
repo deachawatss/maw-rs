@@ -113,11 +113,18 @@ Per-oracle plugin note:
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/contacts/`
   - Covered CLI cases: no args, `ls`, and `rm` without a name.
   - Capabilities: `fs:read:data`, `fs:write:data`.
+- `signals` converted as an AssemblyScript WASM parity fixture:
+  - Source: `examples/wasm-parity/signals/src/plugin.ts`
+  - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/signals/`
+  - Covered CLI cases: no args and `--days 3 --json`.
+  - Capabilities: `fs:read:data`.
 
 ## Test evidence
 
 - `npm run build:contacts` from `packages/wasm-sdk` passed; rebuilt wasm matched the committed fixture bytes with `cmp`.
 - `cargo test -p maw-plugin-manifest contacts` passed: 2 contacts parity/capability tests.
+- `npm run build:signals` from `packages/wasm-sdk` passed.
+- `cargo test -p maw-plugin-manifest signals` passed: 2 signals parity/capability tests.
 
 ## Blockers / risks
 
