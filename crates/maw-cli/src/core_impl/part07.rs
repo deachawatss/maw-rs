@@ -60,20 +60,33 @@ fn run_plugin_plan(argv: &[String]) -> CliOutput {
             },
             Err(message) => plugin_usage_error(&message),
         },
-        PluginAction::Install { source_dir, install_root, plan_json } => match install_built_plugin_dir(&source_dir, &install_root) {
-            Ok(summary) => CliOutput {
-                code: 0,
-                stdout: if plan_json {
-                    let copied = summary.copied_files.iter().map(path_string).collect::<Vec<_>>();
-                    format!("{{\"command\":\"plugin\",\"kind\":\"install\",\"name\":{},\"version\":{},\"sourceDir\":{},\"installDir\":{},\"copiedFiles\":{}}}\n", json_string(&summary.name), json_string(&summary.version), json_string(&path_string(&summary.source_dir)), json_string(&path_string(&summary.install_dir)), json_string_array(&copied))
-                } else {
-                    format!("installed {}@{} {}\n", summary.name, summary.version, path_string(&summary.install_dir))
+        PluginAction::Install { source, install_root, plan_json } => {
+            let install_root = install_root.unwrap_or_else(resolve_default_plugin_root);
+            let result = match source {
+                InstallSource::Local(source_dir) => install_built_plugin_dir(&source_dir, &install_root),
+                InstallSource::Git { url, reference } => {
+                    install_from_git(&url, reference.as_deref(), &install_root, true)
+                }
+            };
+            match result {
+                Ok(summary) => CliOutput {
+                    code: 0,
+                    stdout: render_plugin_install_summary(&summary, plan_json),
+                    stderr: String::new(),
                 },
-                stderr: String::new(),
-            },
-            Err(message) => plugin_usage_error(&message),
-        },
+                Err(message) => plugin_usage_error(&message),
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallSource {
+    Git {
+        url: String,
+        reference: Option<String>,
+    },
+    Local(std::path::PathBuf),
 }
 
 enum PluginAction {
@@ -84,7 +97,7 @@ enum PluginAction {
     InferCapabilities { source: String, plan_json: bool },
     Build { dir: std::path::PathBuf, emit_types: bool, plan_json: bool },
     Init { name: String, dir: std::path::PathBuf, plan_json: bool },
-    Install { source_dir: std::path::PathBuf, install_root: std::path::PathBuf, plan_json: bool },
+    Install { source: InstallSource, install_root: Option<std::path::PathBuf>, plan_json: bool },
 }
 
 #[derive(Default)]
@@ -188,8 +201,9 @@ fn parse_plugin_init_args(argv: &[String]) -> Result<PluginAction, PluginParseEr
 }
 
 fn parse_plugin_install_args(argv: &[String]) -> Result<PluginAction, PluginParseError> {
-    let mut source_dir = None;
+    let mut source = None;
     let mut install_root = None;
+    let mut reference = None;
     let mut plan_json = false;
     let mut index = 0;
     while index < argv.len() {
@@ -199,16 +213,285 @@ fn parse_plugin_install_args(argv: &[String]) -> Result<PluginAction, PluginPars
                 install_root = Some(take_plugin_manifest_path(argv, index, "--root").map_err(PluginParseError::Usage)?);
                 index += 1;
             }
-            other if !other.starts_with('-') && source_dir.is_none() => source_dir = Some(std::path::PathBuf::from(other)),
+            "--ref" => {
+                reference = Some(take_plugin_manifest_value(argv, index, "--ref").map_err(PluginParseError::Usage)?);
+                index += 1;
+            }
+            other if !other.starts_with('-') && source.is_none() => source = Some(other.to_owned()),
             other => return Err(PluginParseError::Usage(format!("plugin install: unknown argument {other}"))),
         }
         index += 1;
     }
+    let source = source.ok_or_else(|| PluginParseError::Usage("plugin install: source dir or git url is required".to_owned()))?;
     Ok(PluginAction::Install {
-        source_dir: source_dir.ok_or_else(|| PluginParseError::Usage("plugin install: source dir is required".to_owned()))?,
-        install_root: install_root.ok_or_else(|| PluginParseError::Usage("plugin install: --root is required for native plan installs".to_owned()))?,
+        source: classify_plugin_install_source(&source, reference).map_err(PluginParseError::Usage)?,
+        install_root,
         plan_json,
     })
+}
+
+fn classify_plugin_install_source(
+    value: &str,
+    reference: Option<String>,
+) -> Result<InstallSource, String> {
+    if is_explicit_git_install_source(value) {
+        return Ok(InstallSource::Git {
+            url: value.to_owned(),
+            reference,
+        });
+    }
+
+    let path = std::path::PathBuf::from(value);
+    if is_github_shorthand_install_source(value, &path) {
+        return Ok(InstallSource::Git {
+            url: format!("https://github.com/{value}"),
+            reference,
+        });
+    }
+
+    if reference.is_some() {
+        return Err("plugin install: --ref is only supported for git sources".to_owned());
+    }
+    Ok(InstallSource::Local(path))
+}
+
+fn is_explicit_git_install_source(value: &str) -> bool {
+    value.starts_with("http")
+        || value.starts_with("git@")
+        || std::path::Path::new(value)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("git"))
+        || value.contains("://")
+}
+
+fn is_github_shorthand_install_source(value: &str, path: &std::path::Path) -> bool {
+    if path.exists()
+        || value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("~/")
+        || value.contains('\\')
+    {
+        return false;
+    }
+    let mut parts = value.split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(repo) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !owner.is_empty()
+        && !repo.is_empty()
+        && owner != "."
+        && owner != ".."
+        && repo != "."
+        && repo != ".."
+}
+
+fn resolve_default_plugin_root() -> std::path::PathBuf {
+    maw_data_path(&real_xdg_env(), &["plugins"])
+}
+
+fn install_from_git(
+    url: &str,
+    reference: Option<&str>,
+    root: &std::path::Path,
+    build: bool,
+) -> Result<maw_plugin_manifest::PluginInstallSummary, String> {
+    let tmp = create_plugin_install_temp_dir()?;
+    let result = install_from_git_in_temp(url, reference, root, build, &tmp);
+    let cleanup = std::fs::remove_dir_all(&tmp);
+    match (result, cleanup) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Err(message), _) => Err(message),
+        (Ok(_), Err(error)) => Err(format!("plugin install: temp cleanup failed: {error}")),
+    }
+}
+
+fn install_from_git_in_temp(
+    url: &str,
+    reference: Option<&str>,
+    root: &std::path::Path,
+    build: bool,
+    tmp: &std::path::Path,
+) -> Result<maw_plugin_manifest::PluginInstallSummary, String> {
+    git_clone_plugin_repo(url, reference, tmp)?;
+    if build {
+        build_js_plugin_dir(tmp, false)?;
+    }
+    install_built_plugin_dir(tmp, root)
+}
+
+fn create_plugin_install_temp_dir() -> Result<std::path::PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    for attempt in 0..100 {
+        let dir = std::env::temp_dir().join(format!(
+            "maw-rs-plugin-install-{}-{nanos}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("plugin install: temp dir create failed: {error}")),
+        }
+    }
+    Err("plugin install: temp dir collision".to_owned())
+}
+
+fn git_clone_plugin_repo(
+    url: &str,
+    reference: Option<&str>,
+    dest: &std::path::Path,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .stdin(std::process::Stdio::null());
+    if let Some(reference) = reference {
+        command.arg("--branch").arg(reference);
+    }
+    let output = command
+        .arg(url)
+        .arg(dest)
+        .output()
+        .map_err(|error| format!("plugin install: failed to run git clone: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "plugin install: git clone failed{}",
+        command_failure_detail(&output)
+    ))
+}
+
+fn command_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
+}
+
+fn render_plugin_install_summary(
+    summary: &maw_plugin_manifest::PluginInstallSummary,
+    plan_json: bool,
+) -> String {
+    if plan_json {
+        let copied = summary.copied_files.iter().map(path_string).collect::<Vec<_>>();
+        format!("{{\"command\":\"plugin\",\"kind\":\"install\",\"name\":{},\"version\":{},\"sourceDir\":{},\"installDir\":{},\"copiedFiles\":{}}}\n", json_string(&summary.name), json_string(&summary.version), json_string(&path_string(&summary.source_dir)), json_string(&path_string(&summary.install_dir)), json_string_array(&copied))
+    } else {
+        format!(
+            "installed {}@{} {}\n",
+            summary.name,
+            summary.version,
+            path_string(&summary.install_dir)
+        )
+    }
+}
+
+#[cfg(test)]
+mod plugin_install_tests {
+    use super::{classify_plugin_install_source, InstallSource};
+
+    fn temp_existing_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "maw-rs-plugin-install-classifier-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn classifier_accepts_explicit_git_url_forms() {
+        assert_eq!(
+            classify_plugin_install_source("https://github.com/owner/repo", None).expect("https"),
+            InstallSource::Git {
+                url: "https://github.com/owner/repo".to_owned(),
+                reference: None,
+            }
+        );
+        assert_eq!(
+            classify_plugin_install_source(
+                "git@github.com:owner/repo.git",
+                Some("main".to_owned()),
+            )
+            .expect("ssh"),
+            InstallSource::Git {
+                url: "git@github.com:owner/repo.git".to_owned(),
+                reference: Some("main".to_owned()),
+            }
+        );
+        assert_eq!(
+            classify_plugin_install_source("file:///tmp/plugin-fixture", None).expect("file"),
+            InstallSource::Git {
+                url: "file:///tmp/plugin-fixture".to_owned(),
+                reference: None,
+            }
+        );
+        assert_eq!(
+            classify_plugin_install_source("owner/repo.git", None).expect("suffix"),
+            InstallSource::Git {
+                url: "owner/repo.git".to_owned(),
+                reference: None,
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_maps_owner_repo_shorthand_to_github_when_not_local() {
+        assert_eq!(
+            classify_plugin_install_source("Soul-Brews-Studio/maw-js", Some("alpha".to_owned()))
+                .expect("shorthand"),
+            InstallSource::Git {
+                url: "https://github.com/Soul-Brews-Studio/maw-js".to_owned(),
+                reference: Some("alpha".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_keeps_local_paths_local() {
+        assert_eq!(
+            classify_plugin_install_source("local-plugin", None).expect("plain local"),
+            InstallSource::Local(std::path::PathBuf::from("local-plugin"))
+        );
+
+        let dir = temp_existing_dir("existing");
+        assert_eq!(
+            classify_plugin_install_source(&dir.display().to_string(), None).expect("existing"),
+            InstallSource::Local(dir.clone())
+        );
+
+        let pathish = "./missing-plugin";
+        assert_eq!(
+            classify_plugin_install_source(pathish, None).expect("pathish"),
+            InstallSource::Local(std::path::PathBuf::from(pathish))
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn classifier_rejects_ref_for_local_source() {
+        let error = classify_plugin_install_source("local-plugin", Some("main".to_owned()))
+            .expect_err("local ref rejected");
+        assert!(error.contains("--ref is only supported for git sources"));
+    }
 }
 
 fn parse_plugin_ls_args(argv: &[String]) -> Result<PluginAction, PluginParseError> {

@@ -68,6 +68,7 @@ fn build_js_plugin_dir_writes_dist_manifest_with_inferred_caps_and_dts() {
         &std::fs::read_to_string(plugin.join("dist/plugin.json")).expect("read dist manifest"),
     )
     .expect("valid dist manifest");
+    assert_eq!(dist_manifest["entry"], "./index.js");
     assert_eq!(dist_manifest["artifact"]["path"], "./index.js");
     assert_eq!(dist_manifest["artifact"]["sha256"], summary.sha256);
     assert_eq!(
