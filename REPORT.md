@@ -44,7 +44,7 @@ Ranking principles:
 19. `messages` - high value, but SQLite-backed ledger and API surface make it larger.
 20. `pr` - useful, but likely needs bounded `gh` exec/API decisions.
 21. `assign` - useful GitHub action; external side effects mean later.
-22. `about` - useful read-only oracle information.
+22. `about` - useful read-only oracle information. Converted in this follow-up batch.
 23. `pulse` - task pulse add/list/cleanup; split read/write modes.
 24. `rename` - bounded tmux mutation; similar risk class to `tag`.
 25. `zoom` - bounded tmux mutation.
@@ -123,6 +123,11 @@ Per-oracle plugin note:
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/costs/`
   - Covered CLI cases: no args and `--daily --json`.
   - Capabilities: `sdk:localserver`.
+- `about` converted as an AssemblyScript WASM parity fixture:
+  - Source: `examples/wasm-parity/about/src/plugin.ts`
+  - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/about/`
+  - Covered CLI cases: `athena` and no args.
+  - Capabilities: `fs:read:data`, `fs:read:config`, `tmux:read`.
 
 ## Test evidence
 
@@ -134,7 +139,10 @@ Per-oracle plugin note:
 - `cargo test -p maw-plugin-manifest costs` passed: 2 costs parity/capability tests.
 - Before `a6b6b56e` (`contacts`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 - Before `93fd199b` (`signals`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
-- Before `b002f650` (`costs`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- Before `df9ddc3a` (`costs`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- `npm run build:about` from `packages/wasm-sdk` passed.
+- `cargo test -p maw-plugin-manifest about` passed: 2 about parity/capability tests.
+- Before the `about` commit: `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 
 ## Blockers / risks
 

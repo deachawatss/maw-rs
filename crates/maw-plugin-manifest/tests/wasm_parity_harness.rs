@@ -112,6 +112,29 @@ const COSTS_DAILY_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
     "sdk:localserver",
     "localserver:/api/costs/daily",
 )];
+const ABOUT_ATHENA_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/oracles/athena.json"),
+    ExpectedHostCall::new("maw.tmux.list_sessions", "tmux:read", "tmux://sessions"),
+    ExpectedHostCall::new("maw.fs.list", "fs:read:config", "/config/fleet"),
+    ExpectedHostCall::new("maw.fs.read", "fs:read:config", "/config/fleet/alpha.json"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:0"),
+    ExpectedHostCall::new("maw.tmux.capture", "tmux:read", "athena:1"),
+    ExpectedHostCall::new(
+        "maw.fs.list",
+        "fs:read:data",
+        "/data/about/athena/worktrees",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/about/athena/worktrees/main.json",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/about/athena/worktrees/agent.json",
+    ),
+];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -430,6 +453,24 @@ fn golden_parity_costs_committed_golden_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_about_committed_golden_and_wasm_outputs_match_seeded_host() {
+    run_parity_case(ParityCase {
+        plugin: "about",
+        manifest_name: "about-parity",
+        args: &["athena"],
+        expected_host_calls: Some(ABOUT_ATHENA_TRANSCRIPT.len()),
+        expected_host_transcript: Some(ABOUT_ATHENA_TRANSCRIPT),
+    });
+    run_parity_case(ParityCase {
+        plugin: "about",
+        manifest_name: "about-parity",
+        args: &[],
+        expected_host_calls: Some(0),
+        expected_host_transcript: None,
+    });
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -691,6 +732,24 @@ fn costs_wasm_declares_only_localserver_caps() {
         wasm_plugin.manifest.capabilities.as_deref(),
         Some(&["sdk:localserver".to_owned()][..]),
         "costs fixture must use the host-pinned localserver cap only"
+    );
+}
+
+#[test]
+fn about_wasm_declares_only_read_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/about");
+    let wasm_plugin = load_wasm_fixture(&fixture, "about-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(
+            &[
+                "fs:read:data".to_owned(),
+                "fs:read:config".to_owned(),
+                "tmux:read".to_owned(),
+            ][..]
+        ),
+        "about fixture must declare only bounded read caps"
     );
 }
 
