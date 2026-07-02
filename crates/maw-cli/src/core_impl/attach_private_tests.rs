@@ -1,3 +1,4 @@
+//maw:noauto
 #[test]
     fn private_attach_renderers_cover_live_action_variants() {
         let switch = TmuxAttachAction::SwitchClient {

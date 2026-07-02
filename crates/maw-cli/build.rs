@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -6,10 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug)]
-struct PartFile {
-    number: u32,
+struct CoreFile {
+    name: String,
+    order: Option<u32>,
+    dispatch_number: Option<u32>,
+    tmux_sub_number: Option<u32>,
     path: PathBuf,
 }
+
+const HEADER_SCAN_LINES: usize = 10;
 
 fn main() {
     if let Err(error) = generate() {
@@ -27,7 +34,7 @@ fn generate() -> io::Result<()> {
 
     println!("cargo:rerun-if-changed=src/core_impl");
 
-    let parts = collect_part_files(&core_impl_dir)?;
+    let parts = collect_core_files(&core_impl_dir)?;
     let mut includes = String::new();
     let mut dispatch_numbers = Vec::new();
     let mut tmux_sub_numbers = Vec::new();
@@ -37,25 +44,10 @@ fn generate() -> io::Result<()> {
         writeln!(includes, "include!({:?});", part.path.display().to_string())
             .expect("write to String");
 
-        let contents = fs::read_to_string(&part.path)?;
-        if let Some(dispatch_number) = find_dispatch_const_number(&contents) {
-            assert_eq!(
-                dispatch_number,
-                part.number,
-                "{} declares DISPATCH_{dispatch_number:02}, expected DISPATCH_{:02}",
-                part.path.display(),
-                part.number
-            );
+        if let Some(dispatch_number) = part.dispatch_number {
             dispatch_numbers.push(dispatch_number);
         }
-        if let Some(tmux_sub_number) = find_tmux_sub_const_number(&contents) {
-            assert_eq!(
-                tmux_sub_number,
-                part.number,
-                "{} declares TMUX_SUB_{tmux_sub_number:02}, expected TMUX_SUB_{:02}",
-                part.path.display(),
-                part.number
-            );
+        if let Some(tmux_sub_number) = part.tmux_sub_number {
             tmux_sub_numbers.push(tmux_sub_number);
         }
     }
@@ -80,8 +72,8 @@ fn generate() -> io::Result<()> {
     Ok(())
 }
 
-fn collect_part_files(core_impl_dir: &Path) -> io::Result<Vec<PartFile>> {
-    let mut parts = Vec::new();
+fn collect_core_files(core_impl_dir: &Path) -> io::Result<Vec<CoreFile>> {
+    let mut files = Vec::new();
     for entry in fs::read_dir(core_impl_dir)? {
         let path = entry?.path();
         if !path.is_file() {
@@ -90,29 +82,75 @@ fn collect_part_files(core_impl_dir: &Path) -> io::Result<Vec<PartFile>> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Some(number) = part_number(file_name) else {
+        if file_name == "mod.rs" || path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
-        };
-        parts.push(PartFile { number, path });
+        }
+        let contents = fs::read_to_string(&path)?;
+        if has_noauto_header(&contents) {
+            continue;
+        }
+        let dispatch_number = find_dispatch_const_number(&contents);
+        let tmux_sub_number = find_tmux_sub_const_number(&contents);
+        let order = header_order(&contents)
+            .or(dispatch_number)
+            .or(tmux_sub_number);
+        files.push(CoreFile {
+            name: file_name.to_owned(),
+            order,
+            dispatch_number,
+            tmux_sub_number,
+            path,
+        });
     }
 
-    parts.sort_by_key(|part| part.number);
-    for window in parts.windows(2) {
-        assert_ne!(
-            window[0].number, window[1].number,
-            "duplicate core_impl part number {:02}",
-            window[0].number
-        );
-    }
-    Ok(parts)
+    files.sort_by(compare_core_files);
+    assert_unique(
+        "DISPATCH",
+        files.iter().filter_map(|file| file.dispatch_number),
+    );
+    assert_unique(
+        "TMUX_SUB",
+        files.iter().filter_map(|file| file.tmux_sub_number),
+    );
+    Ok(files)
 }
 
-fn part_number(file_name: &str) -> Option<u32> {
-    let rest = file_name.strip_prefix("part")?.strip_suffix(".rs")?;
-    if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+fn compare_core_files(left: &CoreFile, right: &CoreFile) -> Ordering {
+    match (left.order, right.order) {
+        (Some(left_order), Some(right_order)) => left_order
+            .cmp(&right_order)
+            .then_with(|| left.name.cmp(&right.name)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.name.cmp(&right.name),
     }
-    rest.parse().ok()
+}
+
+fn has_noauto_header(contents: &str) -> bool {
+    contents
+        .lines()
+        .take(HEADER_SCAN_LINES)
+        .any(|line| line.trim() == "//maw:noauto")
+}
+
+fn header_order(contents: &str) -> Option<u32> {
+    contents.lines().take(HEADER_SCAN_LINES).find_map(|line| {
+        let rest = line.trim().strip_prefix("//maw:order")?.trim();
+        if rest.is_empty() {
+            return None;
+        }
+        rest.parse().ok()
+    })
+}
+
+fn assert_unique(label: &str, numbers: impl Iterator<Item = u32>) {
+    let mut seen = BTreeSet::new();
+    for number in numbers {
+        assert!(
+            seen.insert(number),
+            "duplicate core_impl {label}_{number:02}"
+        );
+    }
 }
 
 fn find_dispatch_const_number(contents: &str) -> Option<u32> {
