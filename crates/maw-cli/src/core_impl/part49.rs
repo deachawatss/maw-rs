@@ -73,18 +73,36 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
     }
 }
 
-fn workon_usage() -> String { "usage: maw workon <repo> [task] [--layout nested|legacy]".to_owned() }
+fn workon_usage() -> String { "usage: maw workon <repo|.|path> [task] [--layout nested|legacy]".to_owned() }
 
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
     let repo = workon_resolve_repo(&options.repo)?;
-    workon_cmd_with_runner(options, &repo, &mut maw_tmux::CommandTmuxRunner::new())
+    let (stdout, attach_session) = workon_cmd_with_runner(options, &repo, &mut maw_tmux::CommandTmuxRunner::new())?;
+    let Some(session) = attach_session else { return Ok(stdout) };
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Ok(format!("{stdout}run: tmux attach -t {session}\n"));
+    }
+    print!("{stdout}");
+    workon_attach_interactive(&session)?;
+    Ok(String::new())
+}
+
+fn workon_attach_interactive(session: &str) -> Result<(), String> {
+    let status = std::process::Command::new("tmux")
+        .args(["attach", "-t", session])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|error| format!("workon: failed to attach tmux: {error}"))?;
+    if status.success() { Ok(()) } else { Err(format!("workon: tmux attach exited with status {status}")) }
 }
 
 fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     options: &WorkonOptions,
     repo: &WorkonRepo,
     runner: &mut R,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let mut stdout = String::new();
     let mut target_path = repo.repo_path.clone();
     let mut window_name = repo.repo_name.clone();
@@ -125,43 +143,103 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         taskless_oracle = true;
     }
 
-    if std::env::var_os("TMUX").is_none() { return Err("not in a tmux session — run inside tmux".to_owned()); }
-    let session = workon_tmux_run(runner, "display-message", &["-p", "#{session_name}"])?;
-    if session.is_empty() { return Err("could not detect current tmux session".to_owned()); }
+    if std::env::var_os("TMUX").is_some() {
+        let session = workon_tmux_run(runner, "display-message", &["-p", "#{session_name}"])?;
+        if session.is_empty() { return Err("could not detect current tmux session".to_owned()); }
+        workon_ensure_window(runner, &session, &window_name, &target_path, taskless_oracle, &mut stdout)?;
+        return Ok((stdout, None));
+    }
+
+    // outside tmux: attach-or-create a session named after the repo
+    // (deliberate divergence — maw-js errors "not in a tmux session" here)
+    let session = repo.repo_name.clone();
     workon_validate_tmux_target(&session)?;
+    if workon_tmux_run(runner, "has-session", &["-t", &format!("={session}")]).is_err() {
+        workon_tmux_run(
+            runner,
+            "new-session",
+            &["-d", "-s", &session, "-c", workon_path_str(&target_path)?, "-n", &window_name],
+        )?;
+        workon_send_window_command(runner, &session, &window_name, &target_path)?;
+        if taskless_oracle {
+            if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
+                let _ = writeln!(stdout, "\x1b[32m+\x1b[0m fleet registered {session}:{window_name}");
+            }
+        }
+        let _ = writeln!(stdout, "\x1b[32m✅\x1b[0m workon '{window_name}' in new session {session} → {}", target_path.display());
+    } else {
+        workon_ensure_window(runner, &session, &window_name, &target_path, taskless_oracle, &mut stdout)?;
+    }
+    Ok((stdout, Some(session)))
+}
+
+fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    session: &str,
+    window_name: &str,
+    target_path: &std::path::Path,
+    taskless_oracle: bool,
+    stdout: &mut String,
+) -> Result<(), String> {
+    workon_validate_tmux_target(session)?;
     workon_validate_tmux_target(&format!("{session}:{window_name}"))?;
 
-    let windows = workon_list_windows(runner, &session)?;
-    if windows.iter().any(|name| name == &window_name) {
+    let windows = workon_list_windows(runner, session)?;
+    if windows.iter().any(|name| name == window_name) {
         workon_tmux_run(runner, "select-window", &["-t", &format!("{session}:{window_name}")])?;
         let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing existing window '{window_name}' in {session}");
-        return Ok(stdout);
+        return Ok(());
     }
 
     workon_tmux_run(
         runner,
         "new-window",
-        &["-t", &session, "-n", &window_name, "-c", workon_path_str(&target_path)?],
+        &["-t", session, "-n", window_name, "-c", workon_path_str(target_path)?],
     )?;
-    let command = workon_build_command_in_dir(&window_name, &target_path);
-    let send_text_args = maw_tmux::tmux_send_keys_literal_args(&format!("{session}:{window_name}"), &command);
-    workon_tmux_run_owned(runner, "send-keys", &send_text_args)?;
-    let send_enter_args = maw_tmux::tmux_send_enter_args(&format!("{session}:{window_name}"));
-    workon_tmux_run_owned(runner, "send-keys", &send_enter_args)?;
+    workon_send_window_command(runner, session, window_name, target_path)?;
 
     if taskless_oracle {
-        if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
+        if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(session, window_name, target_path)? {
             let _ = writeln!(stdout, "\x1b[32m+\x1b[0m fleet registered {session}:{window_name}");
         }
     }
 
     let _ = writeln!(stdout, "\x1b[32m✅\x1b[0m workon '{window_name}' in {session} → {}", target_path.display());
-    Ok(stdout)
+    Ok(())
+}
+
+fn workon_send_window_command<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    session: &str,
+    window_name: &str,
+    target_path: &std::path::Path,
+) -> Result<(), String> {
+    let command = workon_build_command_in_dir(window_name, target_path);
+    let send_text_args = maw_tmux::tmux_send_keys_literal_args(&format!("{session}:{window_name}"), &command);
+    workon_tmux_run_owned(runner, "send-keys", &send_text_args)?;
+    let send_enter_args = maw_tmux::tmux_send_enter_args(&format!("{session}:{window_name}"));
+    workon_tmux_run_owned(runner, "send-keys", &send_enter_args)?;
+    Ok(())
 }
 
 fn workon_resolve_repo(repo: &str) -> Result<WorkonRepo, String> {
+    if repo == "." || repo.starts_with("./") || repo.starts_with('/') {
+        return workon_resolve_repo_from_path(std::path::Path::new(repo));
+    }
     let search_term = repo.rsplit('/').next().unwrap_or(repo);
     let Some(repo_path) = workon_ghq_find(search_term) else { return Err(format!("repo not found: {repo}")); };
+    let repo_name = repo_path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_owned();
+    let parent_dir = repo_path.parent().ok_or_else(|| format!("workon: repo has no parent: {}", repo_path.display()))?.to_path_buf();
+    Ok(WorkonRepo { repo_path, repo_name, parent_dir })
+}
+
+fn workon_resolve_repo_from_path(dir: &std::path::Path) -> Result<WorkonRepo, String> {
+    let toplevel = workon_git(dir, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| format!("workon: '{}' is not inside a git repository", dir.display()))?;
+    let repo_path = std::path::PathBuf::from(toplevel.trim());
+    if repo_path.as_os_str().is_empty() {
+        return Err(format!("workon: cannot resolve git toplevel for '{}'", dir.display()));
+    }
     let repo_name = repo_path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_owned();
     let parent_dir = repo_path.parent().ok_or_else(|| format!("workon: repo has no parent: {}", repo_path.display()))?.to_path_buf();
     Ok(WorkonRepo { repo_path, repo_name, parent_dir })
@@ -345,7 +423,7 @@ mod workon_tests {
     use super::*;
 
     #[derive(Default)]
-    struct WorkonMockTmux { calls: Vec<(String, Vec<String>)>, session: String, windows: String }
+    struct WorkonMockTmux { calls: Vec<(String, Vec<String>)>, session: String, windows: String, has_session: bool }
 
     impl maw_tmux::TmuxRunner for WorkonMockTmux {
         fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> {
@@ -353,7 +431,10 @@ mod workon_tests {
             match subcommand {
                 "display-message" => Ok(self.session.clone()),
                 "list-windows" => Ok(self.windows.clone()),
-                "new-window" | "send-keys" | "select-window" => Ok(String::new()),
+                "has-session" => {
+                    if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
+                }
+                "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
         }
@@ -378,10 +459,74 @@ mod workon_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
 
-        let stdout = workon_cmd_with_runner(&options, &repo, &mut runner).expect("reuse");
+        let (stdout, attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("reuse");
 
         assert_eq!(stdout, "\x1b[33m⚡\x1b[0m reusing existing window 'demo' in 50-mawjs\n");
+        assert!(attach.is_none());
         assert_eq!(runner.calls[2], ("select-window".to_owned(), workon_strings(&["-t", "50-mawjs:demo"])));
+    }
+
+    #[test]
+    fn workon_outside_tmux_creates_session_and_requests_attach() {
+        let temp = std::env::temp_dir().join("maw-rs-workon-unit");
+        let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
+        let options = WorkonOptions { repo: "demo".to_owned(), task: None, layout: WorkonLayout::Nested };
+        let mut runner = WorkonMockTmux::default();
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::remove_var("TMUX");
+
+        let (stdout, attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("create session");
+
+        assert_eq!(attach.as_deref(), Some("demo"));
+        assert!(stdout.contains("workon 'demo' in new session demo"), "{stdout}");
+        assert_eq!(runner.calls[0], ("has-session".to_owned(), workon_strings(&["-t", "=demo"])));
+        assert_eq!(runner.calls[1].0, "new-session");
+        assert_eq!(&runner.calls[1].1[..3], &workon_strings(&["-d", "-s", "demo"])[..]);
+        assert_eq!(&runner.calls[1].1[5..], &workon_strings(&["-n", "demo"])[..]);
+        assert_eq!(runner.calls[2].0, "send-keys");
+        assert_eq!(runner.calls[3].0, "send-keys");
+        assert_eq!(runner.calls.len(), 4);
+    }
+
+    #[test]
+    fn workon_outside_tmux_reuses_live_session_and_window() {
+        let temp = std::env::temp_dir().join("maw-rs-workon-unit");
+        let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
+        let options = WorkonOptions { repo: "demo".to_owned(), task: None, layout: WorkonLayout::Nested };
+        let mut runner = WorkonMockTmux { has_session: true, windows: "demo\n".to_owned(), ..Default::default() };
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::remove_var("TMUX");
+
+        let (stdout, attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("reuse session");
+
+        assert_eq!(attach.as_deref(), Some("demo"));
+        assert!(stdout.contains("reusing existing window 'demo' in demo"), "{stdout}");
+        assert_eq!(runner.calls[0].0, "has-session");
+        assert_eq!(runner.calls[1].0, "list-windows");
+        assert_eq!(runner.calls[2], ("select-window".to_owned(), workon_strings(&["-t", "demo:demo"])));
+    }
+
+    #[test]
+    fn workon_path_arg_resolves_via_git_toplevel() {
+        // shells out to real git — hold the env lock so PATH-mutating tests can't race us
+        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("maw-rs-workon-dot-{}", std::process::id()));
+        let repo_dir = base.join("acme").join("demo");
+        std::fs::create_dir_all(repo_dir.join("sub")).expect("mkdirs");
+        assert!(
+            std::process::Command::new("git").arg("-C").arg(&repo_dir).args(["init", "-q"]).status().expect("git init").success()
+        );
+
+        let resolved = workon_resolve_repo(repo_dir.join("sub").to_str().expect("utf8")).expect("resolve");
+
+        assert_eq!(resolved.repo_name, "demo");
+        assert_eq!(
+            std::fs::canonicalize(&resolved.repo_path).expect("canonical repo"),
+            std::fs::canonicalize(&repo_dir).expect("canonical dir")
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
