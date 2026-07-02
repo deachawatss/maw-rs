@@ -41,7 +41,8 @@ printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
   display-message) printf '50-mawjs\n' ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
-  new-window|send-keys|select-window) exit 0 ;;
+  has-session) exit 1 ;;
+  new-session|new-window|send-keys|select-window) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
@@ -51,6 +52,11 @@ esac
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_GIT_LOG"
 if [ "$3" = "branch" ]; then exit 1; fi
+if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
+  cd "$2" 2>/dev/null || exit 128
+  pwd
+  exit 0
+fi
 if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   mkdir -p "$5"
   printf 'gitdir: fake\n' > "$5/.git"
@@ -78,9 +84,29 @@ exit 9
 }
 
 fn run(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(bin())
+    run_with_tmux_env(root, bin_dir, args, Some("/tmp/tmux-1000/default,123,0"))
+}
+
+fn run_with_tmux_env(
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+    tmux_env: Option<&str>,
+) -> std::process::Output {
+    run_from(root, root, bin_dir, args, tmux_env)
+}
+
+fn run_from(
+    cwd: &Path,
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+    tmux_env: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(bin());
+    command
         .args(args)
-        .current_dir(root)
+        .current_dir(cwd)
         .env_clear()
         .env("PATH", bin_dir)
         .env("HOME", root.join("home"))
@@ -91,15 +117,16 @@ fn run(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
         .env("MAW_TEST_MODE", "1")
         .env("MAW_JS_REF_DIR", "/nonexistent")
         .env("GHQ_ROOT", root.join("ghq"))
-        .env("TMUX", "/tmp/tmux-1000/default,123,0")
         .env("MAW_FAKE_TMUX_LOG", root.join("tmux.log"))
         .env(
             "MAW_FAKE_TMUX_WINDOWS",
             fs::read_to_string(root.join("windows.txt")).expect("windows"),
         )
-        .env("MAW_FAKE_GIT_LOG", root.join("git.log"))
-        .output()
-        .expect("run maw-rs")
+        .env("MAW_FAKE_GIT_LOG", root.join("git.log"));
+    if let Some(value) = tmux_env {
+        command.env("TMUX", value);
+    }
+    command.output().expect("run maw-rs")
 }
 
 fn normalize_root(text: &str, root: &Path) -> String {
@@ -167,6 +194,69 @@ fn native_workon_reuse_window_is_hermetic_and_does_not_spawn() {
         "{tmux_log}"
     );
     assert!(!tmux_log.contains("new-window"), "{tmux_log}");
+}
+
+#[test]
+fn native_workon_outside_tmux_creates_session_and_prints_attach_plan() {
+    let root = temp_dir("outside");
+    let bin_dir = seed_hermetic_root(&root, "");
+
+    let output = run_with_tmux_env(&root, &bin_dir, &["workon", "demo"], None);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(
+        stdout.contains("workon 'demo' in new session demo"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("run: tmux attach -t demo"), "{stdout}");
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(tmux_log.contains("has-session -t =demo"), "{tmux_log}");
+    assert!(
+        tmux_log.contains("new-session -d -s demo -c") && tmux_log.contains("-n demo"),
+        "{tmux_log}"
+    );
+    assert!(
+        tmux_log.contains("send-keys -t demo:demo -l echo launch"),
+        "{tmux_log}"
+    );
+    assert!(!tmux_log.contains("display-message"), "{tmux_log}");
+}
+
+#[test]
+fn native_workon_dot_resolves_current_repo() {
+    let root = temp_dir("dot");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+
+    let output = run_from(
+        &repo,
+        &root,
+        &bin_dir,
+        &["workon", "."],
+        Some("/tmp/tmux-1000/default,123,0"),
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("workon 'demo' in 50-mawjs"), "{stdout}");
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(
+        tmux_log.contains("new-window -t 50-mawjs -n demo -c"),
+        "{tmux_log}"
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert!(git_log.contains("rev-parse --show-toplevel"), "{git_log}");
 }
 
 #[test]

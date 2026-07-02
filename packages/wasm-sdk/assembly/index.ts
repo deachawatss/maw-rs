@@ -13,6 +13,7 @@ import { length } from "@extism/as-pdk/lib/env";
 @external("extism:host/user", "maw.fs.stat") declare function mawFsStat(input: u64): u64;
 @external("extism:host/user", "maw.exec.run") declare function mawExecRun(input: u64): u64;
 @external("extism:host/user", "maw.http.request") declare function mawHttpRequest(input: u64): u64;
+@external("extism:host/user", "maw.localserver.request") declare function mawLocalserverRequest(input: u64): u64;
 @external("extism:host/user", "maw.tmux.list_sessions") declare function mawTmuxListSessions(input: u64): u64;
 @external("extism:host/user", "maw.tmux.capture") declare function mawTmuxCapture(input: u64): u64;
 @external("extism:host/user", "maw.tmux.send_keys") declare function mawTmuxSendKeys(input: u64): u64;
@@ -149,6 +150,7 @@ export function fsList(argsJson: string): string { return call(mawFsList, argsJs
 export function fsStat(argsJson: string): string { return call(mawFsStat, argsJson); }
 export function hostExec(argsJson: string): string { return call(mawExecRun, argsJson); }
 export function curlFetch(argsJson: string): string { return call(mawHttpRequest, argsJson); }
+export function localserverRequest(argsJson: string): string { return call(mawLocalserverRequest, argsJson); }
 export function listSessions(argsJson: string = "{}"): string { return call(mawTmuxListSessions, argsJson); }
 export function capture(argsJson: string): string { return call(mawTmuxCapture, argsJson); }
 export function sendKeys(argsJson: string): string { return call(mawTmuxSendKeys, argsJson); }
