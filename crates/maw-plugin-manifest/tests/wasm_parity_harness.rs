@@ -102,6 +102,16 @@ const SIGNALS_TRANSCRIPT: &[ExpectedHostCall] = &[
         "/data/ψ/memory/signals/old.json",
     ),
 ];
+const COSTS_SUMMARY_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.localserver.request",
+    "sdk:localserver",
+    "localserver:/api/costs",
+)];
+const COSTS_DAILY_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.localserver.request",
+    "sdk:localserver",
+    "localserver:/api/costs/daily",
+)];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -404,6 +414,22 @@ fn golden_parity_signals_committed_golden_and_wasm_outputs_match_seeded_host() {
 }
 
 #[test]
+fn golden_parity_costs_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&[][..], COSTS_SUMMARY_TRANSCRIPT),
+        (&["--daily", "--json"][..], COSTS_DAILY_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "costs",
+            manifest_name: "costs-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+        });
+    }
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -653,6 +679,18 @@ fn signals_wasm_declares_only_bounded_data_read_caps() {
         wasm_plugin.manifest.capabilities.as_deref(),
         Some(&["fs:read:data".to_owned()][..]),
         "signals fixture must declare only bounded data read caps"
+    );
+}
+
+#[test]
+fn costs_wasm_declares_only_localserver_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/costs");
+    let wasm_plugin = load_wasm_fixture(&fixture, "costs-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["sdk:localserver".to_owned()][..]),
+        "costs fixture must use the host-pinned localserver cap only"
     );
 }
 

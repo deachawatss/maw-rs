@@ -118,6 +118,11 @@ Per-oracle plugin note:
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/signals/`
   - Covered CLI cases: no args and `--days 3 --json`.
   - Capabilities: `fs:read:data`.
+- `costs` converted as an AssemblyScript WASM parity fixture:
+  - Source: `examples/wasm-parity/costs/src/plugin.ts`
+  - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/costs/`
+  - Covered CLI cases: no args and `--daily --json`.
+  - Capabilities: `sdk:localserver`.
 
 ## Test evidence
 
@@ -125,6 +130,11 @@ Per-oracle plugin note:
 - `cargo test -p maw-plugin-manifest contacts` passed: 2 contacts parity/capability tests.
 - `npm run build:signals` from `packages/wasm-sdk` passed.
 - `cargo test -p maw-plugin-manifest signals` passed: 2 signals parity/capability tests.
+- `npm run build:costs` from `packages/wasm-sdk` passed.
+- `cargo test -p maw-plugin-manifest costs` passed: 2 costs parity/capability tests.
+- Before `a6b6b56e` (`contacts`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- Before `93fd199b` (`signals`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
+- Before `b002f650` (`costs`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 
 ## Blockers / risks
 
