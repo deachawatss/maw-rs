@@ -62,8 +62,8 @@ pub(crate) fn serveengine_run_with_timeout(
     let mut child = Command::new(program)
         .args(argv)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .current_dir(cwd)
         .spawn()
         .map_err(|error| format!("serve-orchestration: spawn failed: {error}"))?;
