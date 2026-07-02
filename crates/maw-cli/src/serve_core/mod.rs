@@ -9,7 +9,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         ConnectInfo,
     },
-    http::{Method, Request, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -1438,10 +1438,56 @@ fn servecore_validate_path(path: &str) -> Result<(), String> {
 }
 
 async fn servecore_cors_preflight(req: Request<Body>, next: Next) -> Response {
+    let origin = req.headers().get("origin").cloned();
+    let allow_headers = req
+        .headers()
+        .get("access-control-request-headers")
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("Content-Type, Authorization"));
+
     if req.method() == Method::OPTIONS {
-        return StatusCode::NO_CONTENT.into_response();
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        servecore_add_cors_headers(response.headers_mut(), origin.as_ref(), &allow_headers);
+        return response;
     }
-    next.run(req).await
+
+    let mut response = next.run(req).await;
+    servecore_add_cors_headers(response.headers_mut(), origin.as_ref(), &allow_headers);
+    response
+}
+
+fn servecore_add_cors_headers(
+    headers: &mut HeaderMap,
+    origin: Option<&HeaderValue>,
+    allow_headers: &HeaderValue,
+) {
+    let Some(origin) = origin else {
+        return;
+    };
+    headers.insert("access-control-allow-origin", origin.clone());
+    headers.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert("access-control-allow-headers", allow_headers.clone());
+    servecore_add_vary_origin(headers);
+}
+
+fn servecore_add_vary_origin(headers: &mut HeaderMap) {
+    let Some(existing) = headers.get("vary").and_then(|value| value.to_str().ok()) else {
+        headers.insert("vary", HeaderValue::from_static("Origin"));
+        return;
+    };
+    if existing
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case("origin"))
+    {
+        return;
+    }
+    let value = format!("{existing}, Origin");
+    let value =
+        HeaderValue::from_str(&value).unwrap_or_else(|_| HeaderValue::from_static("Origin"));
+    headers.insert("vary", value);
 }
 
 async fn servecore_ws_upgrade_gate(req: Request<Body>, next: Next) -> Response {
@@ -2588,6 +2634,80 @@ mod tests {
                 "registry",
                 "fallback-views",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn servecore_cors_reflects_origin_on_preflight_and_404() {
+        let app = servecore_apply_pipeline(servecore_mount_core_routes(Router::new()));
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/costs")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .header("access-control-request-headers", "x-maw-from,content-type")
+                    .body(Body::empty())
+                    .expect("preflight"),
+            )
+            .await
+            .expect("preflight response");
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-methods")
+                .and_then(|value| value.to_str().ok()),
+            Some("GET, POST, OPTIONS")
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|value| value.to_str().ok()),
+            Some("x-maw-from,content-type")
+        );
+        assert_eq!(
+            preflight
+                .headers()
+                .get("vary")
+                .and_then(|value| value.to_str().ok()),
+            Some("Origin")
+        );
+
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/missing-god-ui-route")
+                    .header("origin", "https://god.buildwithoracle.com")
+                    .body(Body::empty())
+                    .expect("missing"),
+            )
+            .await
+            .expect("missing response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
+        assert_eq!(
+            missing
+                .headers()
+                .get("access-control-allow-headers")
+                .and_then(|value| value.to_str().ok()),
+            Some("Content-Type, Authorization")
         );
     }
 

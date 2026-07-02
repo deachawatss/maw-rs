@@ -12,6 +12,7 @@
 pub mod agents;
 pub mod debug;
 pub mod federation;
+pub mod god_ui;
 pub mod identity;
 pub mod pair;
 pub mod thread_store;
@@ -58,6 +59,7 @@ where
         agents::agents_registration(),
         debug::debug_registration(),
         federation::federation_registration(),
+        god_ui::godui_registration(),
         identity::identity_registration(),
         pair::pair_registration(),
         thread_store::threadstore_registration(),

@@ -352,9 +352,10 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/workspace/:id/status", get(api_workspace_status))
         .route("/api/workspace/:id/feed", get(api_workspace_feed))
         .route("/api/workspace/:id/message", post(api_workspace_message));
+    let router = router.fallback(api_not_found);
     let router = crate::serve_core::servecore_apply_pipeline(router);
     let router = crate::serve_core::servecore_with_shared_state(router, serve_core_state);
-    router.fallback(api_not_found).with_state(state)
+    router.with_state(state)
 }
 
 async fn api_send(
@@ -3700,6 +3701,34 @@ mod serve_tests {
             .await
             .expect("public request");
         assert_eq!(public.status(), StatusCode::OK);
+        let costs = client
+            .get(format!("http://{addr}/api/costs"))
+            .header("origin", "https://god.buildwithoracle.com")
+            .send()
+            .await
+            .expect("costs request");
+        assert_eq!(costs.status(), StatusCode::OK, "/api/costs");
+        assert_eq!(
+            costs
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
+        let missing = client
+            .get(format!("http://{addr}/api/missing-god-ui-route"))
+            .header("origin", "https://god.buildwithoracle.com")
+            .send()
+            .await
+            .expect("missing request");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
     }
 
     #[tokio::test]
