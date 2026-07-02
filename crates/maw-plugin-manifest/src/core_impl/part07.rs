@@ -114,6 +114,7 @@ pub fn build_js_plugin_dir(dir: &Path, emit_types: bool) -> Result<PluginBuildSu
         .as_object_mut()
         .ok_or_else(|| "plugin.json: manifest root must be an object".to_owned())?;
     object.insert("capabilities".to_owned(), string_array_value(&capabilities));
+    object.insert("entry".to_owned(), Value::String("./index.js".to_owned()));
     object.insert(
         "artifact".to_owned(),
         serde_json::json!({"path":"./index.js","sha256":sha256}),
