@@ -79,6 +79,39 @@ const CLEANUP_WORKTREES_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/clean.json"),
     ExpectedHostCall::new("maw.fs.read", "fs:read:data", "/data/worktrees/ask.json"),
 ];
+const CONTACTS_LIST_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.fs.read",
+    "fs:read:data",
+    "/data/contacts.json",
+)];
+const SIGNALS_TRANSCRIPT: &[ExpectedHostCall] = &[
+    ExpectedHostCall::new("maw.fs.list", "fs:read:data", "/data/ψ/memory/signals"),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/alpha.json",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/beta.json",
+    ),
+    ExpectedHostCall::new(
+        "maw.fs.read",
+        "fs:read:data",
+        "/data/ψ/memory/signals/old.json",
+    ),
+];
+const COSTS_SUMMARY_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.localserver.request",
+    "sdk:localserver",
+    "localserver:/api/costs",
+)];
+const COSTS_DAILY_TRANSCRIPT: &[ExpectedHostCall] = &[ExpectedHostCall::new(
+    "maw.localserver.request",
+    "sdk:localserver",
+    "localserver:/api/costs/daily",
+)];
 
 const FEDERATION_STATUS_TRANSCRIPT: &[ExpectedHostCall] = &[
     ExpectedHostCall::new("maw.config.get", "sdk:config:read", "config"),
@@ -348,6 +381,55 @@ fn golden_parity_consent_read_only_committed_golden_and_wasm_outputs_match_seede
 }
 
 #[test]
+fn golden_parity_contacts_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for args in [&[][..], &["ls"][..]] {
+        run_parity_case(ParityCase {
+            plugin: "contacts",
+            manifest_name: "contacts-parity",
+            args,
+            expected_host_calls: Some(CONTACTS_LIST_TRANSCRIPT.len()),
+            expected_host_transcript: Some(CONTACTS_LIST_TRANSCRIPT),
+        });
+    }
+    run_parity_case(ParityCase {
+        plugin: "contacts",
+        manifest_name: "contacts-parity",
+        args: &["rm"],
+        expected_host_calls: Some(0),
+        expected_host_transcript: None,
+    });
+}
+
+#[test]
+fn golden_parity_signals_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for args in [&[][..], &["--days", "3", "--json"][..]] {
+        run_parity_case(ParityCase {
+            plugin: "signals",
+            manifest_name: "signals-parity",
+            args,
+            expected_host_calls: Some(SIGNALS_TRANSCRIPT.len()),
+            expected_host_transcript: Some(SIGNALS_TRANSCRIPT),
+        });
+    }
+}
+
+#[test]
+fn golden_parity_costs_committed_golden_and_wasm_outputs_match_seeded_host() {
+    for (args, expected_host_transcript) in [
+        (&[][..], COSTS_SUMMARY_TRANSCRIPT),
+        (&["--daily", "--json"][..], COSTS_DAILY_TRANSCRIPT),
+    ] {
+        run_parity_case(ParityCase {
+            plugin: "costs",
+            manifest_name: "costs-parity",
+            args,
+            expected_host_calls: Some(expected_host_transcript.len()),
+            expected_host_transcript: Some(expected_host_transcript),
+        });
+    }
+}
+
+#[test]
 fn config_wasm_denies_secret_like_set_without_host_call() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/config");
@@ -573,6 +655,42 @@ fn cleanup_wasm_declares_only_bounded_fs_caps() {
         wasm_plugin.manifest.capabilities.as_deref(),
         Some(&["fs:read:data".to_owned(), "fs:write:data".to_owned()][..]),
         "cleanup fixture must declare only bounded data read/write caps"
+    );
+}
+
+#[test]
+fn contacts_wasm_declares_only_bounded_data_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/contacts");
+    let wasm_plugin = load_wasm_fixture(&fixture, "contacts-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["fs:read:data".to_owned(), "fs:write:data".to_owned()][..]),
+        "contacts fixture must declare only bounded data read/write caps"
+    );
+}
+
+#[test]
+fn signals_wasm_declares_only_bounded_data_read_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/signals");
+    let wasm_plugin = load_wasm_fixture(&fixture, "signals-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["fs:read:data".to_owned()][..]),
+        "signals fixture must declare only bounded data read caps"
+    );
+}
+
+#[test]
+fn costs_wasm_declares_only_localserver_caps() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wasm-parity/costs");
+    let wasm_plugin = load_wasm_fixture(&fixture, "costs-parity");
+    assert_eq!(
+        wasm_plugin.manifest.capabilities.as_deref(),
+        Some(&["sdk:localserver".to_owned()][..]),
+        "costs fixture must use the host-pinned localserver cap only"
     );
 }
 
