@@ -261,7 +261,51 @@ fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLo
         return;
     }
     if let Some(retro) = retro { let _ = DoneLocal::done_send_text(&target, retro); }
-    if !cwd.is_empty() { let _ = done_git(&["-C".to_owned(), cwd.clone(), "add".to_owned(), "--".to_owned(), ".".to_owned()]); let _ = done_git(&["-C".to_owned(), cwd.clone(), "commit".to_owned(), "-m".to_owned(), "chore: auto-save before done".to_owned()]); let _ = done_git(&["-C".to_owned(), cwd, "push".to_owned()]); }
+    if !cwd.is_empty() {
+        let _ = done_git(&["-C".to_owned(), cwd.clone(), "add".to_owned(), "--".to_owned(), ".".to_owned()]);
+        let _ = done_git(&["-C".to_owned(), cwd.clone(), "commit".to_owned(), "-m".to_owned(), "chore: auto-save before done".to_owned()]);
+        if done_should_push_on_done(std::path::Path::new(&cwd)) {
+            let _ = done_git(&["-C".to_owned(), cwd, "push".to_owned()]);
+        } else {
+            let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m skipped auto-save push (no live remote branch or PR already closed)");
+        }
+    }
+}
+
+fn done_should_push_on_done(cwd: &std::path::Path) -> bool {
+    let branch = done_git(&["-C".to_owned(), cwd.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
+    done_branch_is_pushable(cwd, &branch)
+}
+
+fn done_branch_is_pushable(cwd: &std::path::Path, branch: &str) -> bool {
+    if !done_branch_name_allows_push(branch) { return false; }
+    if done_pr_is_closed_or_merged(cwd, branch) { return false; }
+    done_remote_branch_exists(cwd, branch)
+}
+
+fn done_branch_name_allows_push(branch: &str) -> bool {
+    !branch.is_empty() && branch != "main" && branch != "HEAD"
+}
+
+fn done_remote_branch_exists(cwd: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["-C", &cwd.display().to_string(), "ls-remote", "--exit-code", "--heads", "origin", branch])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn done_pr_is_closed_or_merged(cwd: &std::path::Path, branch: &str) -> bool {
+    let output = std::process::Command::new("gh")
+        .args(["pr", "view", branch, "--repo", ".", "--json", "state", "--jq", ".state"])
+        .current_dir(cwd)
+        .output();
+    let Ok(output) = output else { return false; };
+    if !output.status.success() { return false; }
+    done_pr_state_is_closed_or_merged(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn done_pr_state_is_closed_or_merged(state: &str) -> bool {
+    matches!(state.trim(), "MERGED" | "CLOSED")
 }
 
 fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLocal, stdout: &mut String) {
@@ -424,5 +468,17 @@ mod done_tests {
         assert_eq!(agents.main_path, std::path::PathBuf::from("/tmp/ghq/github.com/org/repo"));
         let dot = done_parse_worktree_path(std::path::Path::new("/tmp/ghq/github.com/org/repo.wt-task"), root).unwrap();
         assert_eq!(dot.main_path, std::path::PathBuf::from("/tmp/ghq/github.com/org/repo"));
+    }
+
+    #[test]
+    fn done_push_guard_blocks_main_head_and_closed_pr_states() {
+        assert!(!done_branch_name_allows_push(""));
+        assert!(!done_branch_name_allows_push("main"));
+        assert!(!done_branch_name_allows_push("HEAD"));
+        assert!(done_branch_name_allows_push("wind/fork-patch-migration"));
+        assert!(done_pr_state_is_closed_or_merged("MERGED"));
+        assert!(done_pr_state_is_closed_or_merged("CLOSED\n"));
+        assert!(!done_pr_state_is_closed_or_merged("OPEN"));
+        assert!(!done_pr_state_is_closed_or_merged(""));
     }
 }

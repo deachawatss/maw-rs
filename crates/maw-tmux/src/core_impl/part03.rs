@@ -2,13 +2,28 @@ fn clamp_pty(value: u32, max: u32) -> u32 {
     value.clamp(1, max)
 }
 
-/// Strip common ANSI CSI sequences that tmux captures from pane output.
+/// Strip common terminal control sequences that tmux captures from pane output.
 #[must_use]
 pub fn strip_tmux_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b']') {
+            index += 2;
+            while index < bytes.len() {
+                if bytes[index] == 0x07 {
+                    index += 1;
+                    break;
+                }
+                if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                    index += 2;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
         if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
             index += 2;
             while index < bytes.len() && (bytes[index].is_ascii_digit() || bytes[index] == b';') {
@@ -38,7 +53,11 @@ pub fn pane_input_pending_from_capture(content: &str) -> bool {
         return false;
     };
     let clean = strip_tmux_ansi(last).replace('\r', "");
-    prompt_has_input(&clean)
+    codex_pasted_content_pending(&clean) || prompt_has_input(&clean)
+}
+
+fn codex_pasted_content_pending(line: &str) -> bool {
+    line.contains("[Pasted Content") && line.contains("chars]")
 }
 
 fn prompt_has_input(line: &str) -> bool {
