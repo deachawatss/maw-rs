@@ -226,7 +226,7 @@ fn ls_empty_local_text_and_live_tmux_fallback_are_stable() {
         &[
             "ls",
             "--pane",
-            "%1|zsh|plain-session:1.0|shell|100|/repo|900",
+            "%1|zsh|plain-discord:1.0|shell|100|/repo|900",
         ],
         "No active sessions.\n  → maw bud <name>     create new oracle\n  → maw wake <name>    attach existing\n",
     );

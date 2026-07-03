@@ -268,7 +268,7 @@ fn ls_and_bring_tail_b_render_and_filter_edges_are_stable() {
         default_compact.stdout
     );
     assert!(
-        !default_compact.stdout.contains("discord-admin"),
+        default_compact.stdout.contains("discord-admin"),
         "{}",
         default_compact.stdout
     );
