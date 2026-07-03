@@ -170,7 +170,7 @@ fn resume_new_session_args(session: &str, window: &ResumeWindow) -> Vec<String> 
 }
 
 fn resume_new_window_args(session: &str, window: &ResumeWindow) -> Vec<String> {
-    let mut args = vec!["-t".to_owned(), session.to_owned(), "-n".to_owned(), window.name.clone()];
+    let mut args = vec!["-t".to_owned(), format!("{session}:"), "-n".to_owned(), window.name.clone()];
     resume_append_cwd_args(&mut args, window);
     args
 }
@@ -445,6 +445,17 @@ mod resume_tests {
                 "-d".to_owned(),
                 "-s".to_owned(),
                 "01-wish".to_owned(),
+                "-n".to_owned(),
+                "wish".to_owned(),
+                "-c".to_owned(),
+                ghq_root().join("github.com/tonkmac/wish").display().to_string(),
+            ]
+        );
+        assert_eq!(
+            resume_new_window_args("01-wish", &window),
+            vec![
+                "-t".to_owned(),
+                "01-wish:".to_owned(),
                 "-n".to_owned(),
                 "wish".to_owned(),
                 "-c".to_owned(),

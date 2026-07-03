@@ -138,7 +138,7 @@ fn broadcast_native_registers_team_fleet_and_blocks_option_injection() {
         .output()
         .expect("run guard");
     assert!(!guarded.status.success());
-    assert_eq!(String::from_utf8(guarded.stderr).expect("stderr"), "--session requires a value\nusage: maw broadcast <message> [--session <name>] [--team <name>] [--fleet <name>]\n");
+    assert_eq!(String::from_utf8(guarded.stderr).expect("stderr"), "--session requires a value\nusage: maw broadcast [--dry-run] [--session <name>] [--team <name>] [--fleet <name>] [--] <message>\n");
     let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(!log.contains("-Sbad"), "guarded target reached tmux: {log}");
     let _ = std::fs::remove_dir_all(root);

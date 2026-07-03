@@ -1,9 +1,11 @@
 name: CI
 
+# Per-push/PR CI disabled 2026-07-03 (Nat): gating happens locally (Rust builds on m5);
+# CI runs on a 4-hour schedule as a safety net, plus manual dispatch.
 on:
-  push:
-    branches: [main, alpha]
-  pull_request:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read

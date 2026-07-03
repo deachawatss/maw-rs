@@ -109,6 +109,7 @@ fn team_reassign_success_golden_and_ordering() {
         .exists());
     let tmux = fs::read_to_string(root.join("tmux.jsonl")).expect("tmux");
     assert!(tmux.contains(r#""args":["new-window","-c","#));
+    assert!(tmux.contains(r#""-t","alpha:","-n","builder"]"#));
     assert!(tmux
         .contains(r#""send-keys","-t","alpha:builder","-l","--","'/fake/maw' 'wake' 'builder'"#));
     assert!(tmux.contains("[EXTERNAL CONTENT"));

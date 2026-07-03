@@ -191,10 +191,11 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         return Ok(());
     }
 
+    let session_target = format!("{session}:");
     workon_tmux_run(
         runner,
         "new-window",
-        &["-t", session, "-n", window_name, "-c", workon_path_str(target_path)?],
+        &["-t", &session_target, "-n", window_name, "-c", workon_path_str(target_path)?],
     )?;
     workon_send_window_command(runner, session, window_name, target_path)?;
 
