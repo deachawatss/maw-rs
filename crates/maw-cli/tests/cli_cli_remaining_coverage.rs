@@ -116,7 +116,10 @@ fn ls_text_rendering_remaining_status_and_duration_branches_are_stable() {
         "%3|bash|52-mawjs:1.0|hours|102|/repo|192800",
     ]);
     assert_eq!(verbose.code, 0, "{}", verbose.stderr);
-    assert!(verbose.stdout.contains("TARGET CMD AGE TITLE"));
+    assert!(verbose.stdout.contains("50-mawjs"), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("51-mawjs"), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("52-mawjs"), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("\n  "), "{}", verbose.stdout);
     assert!(verbose.stdout.contains("5s"), "{}", verbose.stdout);
     assert!(verbose.stdout.contains("2m"), "{}", verbose.stdout);
     assert!(verbose.stdout.contains("2h"), "{}", verbose.stdout);

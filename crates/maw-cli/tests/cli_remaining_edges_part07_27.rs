@@ -352,7 +352,9 @@ fn ls_and_bring_render_remaining_edges_are_stable() {
         "--pane",
         "%1|bash|active:1.0|agent|1|/repo|999",
     ]);
-    assert!(verbose.stdout.contains("TARGET CMD AGE TITLE"));
+    assert!(verbose.stdout.contains("active"), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("\n  "), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("1.0"), "{}", verbose.stdout);
 
     usage(&["ls", "--unknown"], "ls: unknown argument --unknown");
     usage(&["bring"], "bring: missing oracle");
