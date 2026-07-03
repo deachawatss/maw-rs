@@ -1,12 +1,12 @@
 const DISPATCH_55: &[DispatcherEntry] = &[ DispatcherEntry { command: "broadcast", handler: Handler::Sync(run_broadcast_command) } ];
 
-const BROADCAST_USAGE: &str = "usage: maw broadcast <message> [--session <name>] [--team <name>] [--fleet <name>]";
+const BROADCAST_USAGE: &str = "usage: maw broadcast [--dry-run] [--session <name>] [--team <name>] [--fleet <name>] [--] <message>";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BroadcastScope { session: Option<String>, team: Option<String>, fleet: Option<String> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BroadcastOptions { message: String, scope: BroadcastScope }
+struct BroadcastOptions { message: String, scope: BroadcastScope, dry_run: bool }
 
 trait BroadcastTmux {
     fn broadcast_current_window(&mut self) -> Option<String>;
@@ -39,6 +39,9 @@ impl BroadcastTmux for BroadcastLocalTmux {
 }
 
 fn run_broadcast_command(argv: &[String]) -> CliOutput {
+    if broadcast_has_help_flag(argv) {
+        return CliOutput { code: 0, stdout: format!("{BROADCAST_USAGE}\n"), stderr: String::new() };
+    }
     let options = match broadcast_parse_args(argv) {
         Ok(options) => options,
         Err(message) => return CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
@@ -49,13 +52,27 @@ fn run_broadcast_command(argv: &[String]) -> CliOutput {
     }
 }
 
+fn broadcast_has_help_flag(argv: &[String]) -> bool {
+    for arg in argv {
+        if arg == "--" { return false; }
+        if matches!(arg.as_str(), "--help" | "-h") { return true; }
+    }
+    false
+}
+
 fn broadcast_parse_args(argv: &[String]) -> Result<BroadcastOptions, String> {
     let mut scope = BroadcastScope::default();
+    let mut dry_run = false;
     let mut message_parts = Vec::new();
+    let mut parse_flags = true;
     let mut index = 0;
     while index < argv.len() {
         let arg = &argv[index];
-        if matches!(arg.as_str(), "--session" | "--team" | "--fleet") {
+        if parse_flags && arg == "--" {
+            parse_flags = false;
+        } else if parse_flags && arg == "--dry-run" {
+            dry_run = true;
+        } else if parse_flags && matches!(arg.as_str(), "--session" | "--team" | "--fleet") {
             index += 1;
             let Some(value) = argv.get(index) else { return Err(format!("{arg} requires a value\n{BROADCAST_USAGE}")); };
             broadcast_validate_scope_value(value).map_err(|_| format!("{arg} requires a value\n{BROADCAST_USAGE}"))?;
@@ -65,6 +82,8 @@ fn broadcast_parse_args(argv: &[String]) -> Result<BroadcastOptions, String> {
                 "--fleet" => scope.fleet = Some(value.clone()),
                 _ => unreachable!(),
             }
+        } else if parse_flags && arg.starts_with('-') {
+            return Err(format!("broadcast: unknown flag or dash-prefixed message {arg}\n{BROADCAST_USAGE}"));
         } else {
             message_parts.push(arg.clone());
         }
@@ -72,7 +91,7 @@ fn broadcast_parse_args(argv: &[String]) -> Result<BroadcastOptions, String> {
     }
     let message = message_parts.join(" ").trim().to_owned();
     if message.is_empty() { return Err(BROADCAST_USAGE.to_owned()); }
-    Ok(BroadcastOptions { message, scope })
+    Ok(BroadcastOptions { message, scope, dry_run })
 }
 
 fn broadcast_run<T: BroadcastTmux>(options: &BroadcastOptions, tmux: &mut T) -> Result<String, String> {
@@ -96,7 +115,10 @@ fn broadcast_run<T: BroadcastTmux>(options: &BroadcastOptions, tmux: &mut T) -> 
             broadcast_validate_tmux_target(&target)?;
             match tmux.broadcast_pane_command(&target) {
                 Ok(command) if broadcast_is_agent_command(&command) => {
-                    if tmux.broadcast_send_text(&target, &message).is_ok() {
+                    if options.dry_run {
+                        let _ = writeln!(out, "would send → {target}");
+                        sent += 1;
+                    } else if tmux.broadcast_send_text(&target, &message).is_ok() {
                         let _ = writeln!(out, "\x1b[32msent\x1b[0m → {}:{}", session.name, window.name);
                         sent += 1;
                     } else {
@@ -109,7 +131,8 @@ fn broadcast_run<T: BroadcastTmux>(options: &BroadcastOptions, tmux: &mut T) -> 
             }
         }
     }
-    let _ = writeln!(out, "\n\x1b[32m✓\x1b[0m Broadcast to {sent} windows ({skipped} skipped) [scope: {}]", broadcast_scope_description(&options.scope));
+    let action = if options.dry_run { "Dry-run broadcast to" } else { "Broadcast to" };
+    let _ = writeln!(out, "\n\x1b[32m✓\x1b[0m {action} {sent} windows ({skipped} skipped) [scope: {}]", broadcast_scope_description(&options.scope));
     if skipped > 0 {
         out.push_str("  \x1b[90mskipped breakdown:\x1b[0m\n");
         for (reason, count) in reasons { let _ = writeln!(out, "    \x1b[90m{reason}: {count}\x1b[0m"); }
@@ -219,19 +242,78 @@ mod broadcast_tests {
 
     fn broadcast_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
 
+    fn broadcast_session(name: &str, windows: &[(u32, &str)]) -> TmuxSession {
+        TmuxSession {
+            name: name.to_owned(),
+            windows: windows
+                .iter()
+                .map(|(index, name)| maw_tmux::TmuxWindow {
+                    index: *index,
+                    name: (*name).to_owned(),
+                    active: false,
+                    cwd: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn broadcast_help_exits_before_tmux() {
+        let output = run_broadcast_command(&broadcast_strings(&["--help"]));
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains(BROADCAST_USAGE));
+        assert!(output.stdout.contains("--dry-run"));
+        assert!(output.stderr.is_empty());
+
+        let short = run_broadcast_command(&broadcast_strings(&["-h"]));
+        assert_eq!(short.code, 0);
+        assert!(short.stdout.contains(BROADCAST_USAGE));
+    }
+
     #[test]
     fn broadcast_parser_matches_plugin_flags_and_guards_scope_values() {
-        let parsed = broadcast_parse_args(&broadcast_strings(&["hello", "fleet", "--session", "alpha", "--team", "tk", "--fleet", "all"])).expect("parse");
+        let parsed = broadcast_parse_args(&broadcast_strings(&["--dry-run", "hello", "fleet", "--session", "alpha", "--team", "tk", "--fleet", "all"])).expect("parse");
         assert_eq!(parsed.message, "hello fleet");
         assert_eq!(parsed.scope.session.as_deref(), Some("alpha"));
+        assert!(parsed.dry_run);
         assert!(broadcast_parse_args(&broadcast_strings(&["hello", "--session", "-Sbad"])).expect_err("guard").contains(BROADCAST_USAGE));
+        assert!(broadcast_parse_args(&broadcast_strings(&["-starts-with-dash"])).expect_err("guard").contains(BROADCAST_USAGE));
+
+        let literal = broadcast_parse_args(&broadcast_strings(&["--dry-run", "--", "-starts-with-dash"])).expect("literal dash message");
+        assert_eq!(literal.message, "-starts-with-dash");
+        assert!(literal.dry_run);
     }
 
     #[test]
     fn broadcast_run_sends_to_agents_and_reports_skips() {
-        let mut tmux = BroadcastMockTmux { sessions: vec![TmuxSession { name: "alpha".to_owned(), windows: vec![maw_tmux::TmuxWindow { index: 0, name: "agent".to_owned(), active: false, cwd: None }, maw_tmux::TmuxWindow { index: 1, name: "shell".to_owned(), active: false, cwd: None }] }], calls: Vec::new() };
-        let out = broadcast_run(&BroadcastOptions { message: "hi".to_owned(), scope: BroadcastScope { session: Some("alpha".to_owned()), ..BroadcastScope::default() } }, &mut tmux).expect("run");
+        let mut tmux = BroadcastMockTmux { sessions: vec![broadcast_session("alpha", &[(0, "agent"), (1, "shell")])], calls: Vec::new() };
+        let out = broadcast_run(&BroadcastOptions { message: "hi".to_owned(), scope: BroadcastScope { session: Some("alpha".to_owned()), ..BroadcastScope::default() }, dry_run: false }, &mut tmux).expect("run");
         assert!(out.contains("Broadcast to 1 windows (1 skipped) [scope: session=alpha]"));
         assert!(tmux.calls.iter().any(|call| call.1.contains("[broadcast from sender] hi")));
+    }
+
+    #[test]
+    fn broadcast_dry_run_lists_targets_without_sending() {
+        let mut tmux = BroadcastMockTmux { sessions: vec![broadcast_session("alpha", &[(0, "agent"), (1, "shell")])], calls: Vec::new() };
+        let out = broadcast_run(&BroadcastOptions { message: "hi".to_owned(), scope: BroadcastScope::default(), dry_run: true }, &mut tmux).expect("run");
+        assert!(out.contains("would send → alpha:0"), "{out}");
+        assert!(out.contains("Dry-run broadcast to 1 windows (1 skipped)"), "{out}");
+        assert!(out.contains("non-agent-pane: 1"), "{out}");
+        assert!(!tmux.calls.iter().any(|(kind, _)| kind == "send"), "{:?}", tmux.calls);
+    }
+
+    #[test]
+    fn broadcast_session_filter_is_exact() {
+        let mut tmux = BroadcastMockTmux {
+            sessions: vec![
+                broadcast_session("alpha", &[(0, "agent")]),
+                broadcast_session("alpha-extra", &[(0, "agent")]),
+            ],
+            calls: Vec::new(),
+        };
+        let out = broadcast_run(&BroadcastOptions { message: "hi".to_owned(), scope: BroadcastScope { session: Some("alpha".to_owned()), ..BroadcastScope::default() }, dry_run: true }, &mut tmux).expect("run");
+        assert!(out.contains("would send → alpha:0"), "{out}");
+        assert!(!out.contains("alpha-extra"), "{out}");
+        assert_eq!(tmux.calls, vec![("cmd".to_owned(), "alpha:0".to_owned())]);
     }
 }
