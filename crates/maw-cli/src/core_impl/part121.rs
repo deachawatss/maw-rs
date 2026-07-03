@@ -3,7 +3,7 @@ const DISPATCH_121: &[DispatcherEntry] = &[
     DispatcherEntry { command: "buddy", handler: Handler::Sync(bud_run_command) },
 ];
 
-const BUD_USAGE: &str = "usage: maw bud <name> [--from <oracle>] [--root] [--seed] [--org <org>] [--repo org/repo] [--issue N] [--issue-repo owner/repo] [--note <text>] [--nickname <pretty>] [--fast] [--split] [--scaffold-only] [--dry-run]\n       Or: maw bud --from-repo <path|url> --stem <stem> [--pr] [--from <parent>] [--seed] [--sync-peers] [--force] [--track-vault] [--dry-run]";
+const BUD_USAGE: &str = "usage: maw bud <name> [--from <oracle>] [--root] [--seed] [--org <org>] [--repo org/repo] [--issue N] [--issue-repo owner/repo] [--note <text>] [--nickname <pretty>] [--engine <name>|-e <name>] [--fast] [--split] [--scaffold-only] [--dry-run]\n       Or: maw bud --from-repo <path|url> --stem <stem> [--pr] [--from <parent>] [--seed] [--sync-peers] [--force] [--track-vault] [--dry-run]";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -18,6 +18,7 @@ struct BudOptions {
     issue_repo: Option<String>,
     note: Option<String>,
     nickname: Option<String>,
+    engine: Option<String>,
     fast: bool,
     root: bool,
     dry_run: bool,
@@ -202,7 +203,7 @@ fn bud_parse(argv: &[String]) -> Result<BudOptions, String> {
             "--force" => options.force = true,
             "--track-vault" => options.track_vault = true,
             "--sync-peers" => options.sync_peers = true,
-            flag @ ("--from" | "--from-repo" | "--stem" | "--org" | "--repo" | "--issue" | "--issue-repo" | "--note" | "--nickname" | "--parent" | "--parent-session-id" | "--session-id") => { bud_assign_value(&mut options, flag, &bud_take_value(argv, &mut index, flag)?)?; }
+            flag @ ("--from" | "--from-repo" | "--stem" | "--org" | "--repo" | "--issue" | "--issue-repo" | "--note" | "--nickname" | "--engine" | "-e" | "--parent" | "--parent-session-id" | "--session-id") => { bud_assign_value(&mut options, flag, &bud_take_value(argv, &mut index, flag)?)?; }
             value if value.starts_with('-') => return Err(bud_flag_like(value)),
             value => bud_set_name(&mut options, value)?,
         }
@@ -221,6 +222,7 @@ fn bud_assign_value(options: &mut BudOptions, flag: &str, value: &str) -> Result
         "--issue" => options.issue = Some(bud_validate_issue(value)?),
         "--note" => options.note = Some(bud_validate_text(value, "--note")?),
         "--nickname" => options.nickname = Some(bud_validate_text(value, "--nickname")?),
+        "--engine" | "-e" => options.engine = Some(bud_validate_id(value, flag)?),
         "--parent" | "--parent-session-id" => options.parent_session_id = Some(bud_validate_id(value, flag)?),
         "--session-id" => options.session_id = Some(bud_validate_id(value, flag)?),
         _ => return Err(format!("bud: unknown flag {flag}")),
@@ -308,7 +310,13 @@ fn bud_dry_run(ctx: &BudContext, options: &BudOptions) -> String {
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would init ψ/ vault at: {}", ctx.repo_path.display());
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would generate CLAUDE.md");
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would create fleet config");
-    if options.scaffold_only { let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] scaffold-only: would stop before git commit/push, wake, attach, parent sync_peers, and /awaken"); } else { let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {}", ctx.stem); }
+    if options.scaffold_only {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] scaffold-only: would stop before git commit/push, wake, attach, parent sync_peers, and /awaken");
+    } else if let Some(engine) = &options.engine {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {} with engine {engine}", ctx.stem);
+    } else {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {}", ctx.stem);
+    }
     out.push('\n');
     out
 }
@@ -433,6 +441,7 @@ fn bud_update_parent_peers(ctx: &BudContext, fs: &mut impl BudFs, out: &mut Stri
 
 fn bud_wake(ctx: &BudContext, options: &BudOptions, wake: &mut impl BudWakeRunner, out: &mut String) {
     let mut args = vec!["wake".to_owned(), ctx.stem.clone(), "--no-attach".to_owned(), "--repo-path".to_owned(), path_string(&ctx.repo_path)];
+    if let Some(engine) = &options.engine { args.extend(["-e".to_owned(), engine.clone()]); }
     if let Some(id) = &options.parent_session_id { args.extend(["--parent-session-id".to_owned(), id.clone()]); }
     if let Some(id) = &options.session_id { args.extend(["--session-id".to_owned(), id.clone()]); }
     match wake.bud_wake(&args) { Ok(_) => { let _ = writeln!(out, "  \x1b[32m✓\x1b[0m {} is alive", ctx.stem); } Err(error) => { let _ = writeln!(out, "  \x1b[33m⚠\x1b[0m wake failed: {}", error.trim()); } }
@@ -649,5 +658,37 @@ mod bud_tests {
         let mut wake = FakeWake::default(); let ctx = BudContext { stem: "sprout".to_owned(), org: "Org".to_owned(), parent: None, repo_name: "sprout-oracle".to_owned(), slug: "Org/sprout-oracle".to_owned(), repo_path: "/tmp/sprout".into() };
         bud_wake(&ctx, &BudOptions::default(), &mut wake, &mut String::new());
         assert_eq!(wake.calls[0][0], "wake"); assert!(wake.calls[0].contains(&"--repo-path".to_owned()));
+        assert!(!wake.calls[0].contains(&"-e".to_owned()));
+    }
+
+    #[test]
+    fn bud_engine_flag_passes_through_to_wake_and_dry_run() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _restore_home = EnvVarRestore::capture("HOME");
+        std::env::set_var("GHQ_ROOT", ".");
+        std::env::remove_var("HOME");
+
+        let options = bud_parse(&bud_args(&["sprout", "-e", "codex"])).unwrap();
+        let ctx = bud_context(&options).unwrap();
+        let mut wake = FakeWake::default();
+        bud_wake(&ctx, &options, &mut wake, &mut String::new());
+        assert!(wake.calls[0]
+            .windows(2)
+            .any(|args| args[0] == "-e" && args[1] == "codex"));
+
+        let mut gh = FakeGh::default();
+        let mut fs = FakeFs::default();
+        let mut wake = FakeWake::default();
+        let mut http = FakeHttp::default();
+        let out = bud_run_with(
+            &bud_args(&["sprout", "--dry-run", "-e", "codex"]),
+            &mut gh,
+            &mut fs,
+            &mut wake,
+            &mut http,
+        );
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("would wake sprout with engine codex"));
     }
 }
