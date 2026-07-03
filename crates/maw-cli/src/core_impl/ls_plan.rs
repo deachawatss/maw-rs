@@ -365,7 +365,11 @@ fn render_ls_json(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
         fields.push(format!("\"recentLimit\":{limit}"));
     }
     if options.mode == LsMode::Verbose {
-        fields.push(format!("\"panes\":{}", render_ls_panes_json(panes)));
+        let annotations = ls_annotation_context();
+        fields.push(format!(
+            "\"panes\":{}",
+            render_ls_panes_json(panes, &annotations)
+        ));
     } else {
         fields.push(format!(
             "\"sessions\":{}",
@@ -375,12 +379,13 @@ fn render_ls_json(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
     format!("{{{}}}\n", fields.join(","))
 }
 
-fn render_ls_panes_json(panes: &[LsPanePlan]) -> String {
+fn render_ls_panes_json(panes: &[LsPanePlan], annotations: &LsAnnotationContext) -> String {
     let rows = panes
         .iter()
         .map(|pane| {
+            let annotation = ls_pane_annotation(pane, annotations);
             format!(
-                "{{\"id\":{},\"target\":{},\"session\":{},\"command\":{},\"title\":{},\"status\":{},\"ageSec\":{},\"agent\":{}}}",
+                "{{\"id\":{},\"target\":{},\"session\":{},\"command\":{},\"title\":{},\"status\":{},\"ageSec\":{},\"agent\":{},\"annotation\":{}}}",
                 json_string(&pane.id),
                 json_string(&pane.target),
                 json_string(&pane.session),
@@ -388,7 +393,8 @@ fn render_ls_panes_json(panes: &[LsPanePlan]) -> String {
                 json_string(&pane.title),
                 json_string(pane.status),
                 pane.age_sec,
-                pane.agent
+                pane.agent,
+                json_string(&annotation)
             )
         })
         .collect::<Vec<_>>();
@@ -477,6 +483,21 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
     }
     if options.mode == LsMode::Verbose {
         let mut out = String::new();
+        let annotations = ls_annotation_context();
+        let target_width = panes
+            .iter()
+            .map(|pane| ls_visible_len(ls_pane_target(&pane.target)))
+            .max()
+            .unwrap_or(0)
+            .max(28);
+        let header = format!(
+            "  {} {} {} {} TITLE",
+            ls_pad("TARGET", target_width),
+            ls_pad("CMD", 10),
+            ls_pad("AGE", 6),
+            ls_pad("ANNOTATION", 30)
+        );
+        let _ = writeln!(out, "{}", ls_color("36;1", &header));
         for (session, panes) in group_ls_sessions(panes) {
             let status = ls_best_status(&panes);
             let dot = ls_status_dot(status);
@@ -488,30 +509,24 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
             let _ = writeln!(out, "{dot} {session}{oracle_label}");
 
             let ordered = ls_oracle_first_panes(&panes, oracle);
-            let window_width = ordered
-                .iter()
-                .map(|pane| ls_pane_target(&pane.target).len())
-                .max()
-                .unwrap_or(0);
-            let command_width = ordered
-                .iter()
-                .map(|pane| pane.command.len())
-                .max()
-                .unwrap_or(0);
             for pane in ordered {
-                let target = format!("{:<window_width$}", ls_pane_target(&pane.target));
-                let command = format!("{:<command_width$}", pane.command);
+                let target = ls_pad(ls_pane_target(&pane.target), target_width);
+                let command = ls_pad(&pane.command, 10);
+                let age = ls_pad(&format_ls_duration(pane.age_sec), 6);
+                let annotation = ls_pane_annotation(pane, &annotations);
+                let annotation = ls_render_annotation(&annotation);
                 let title = if pane.title.is_empty() {
                     String::new()
                 } else {
-                    format!("  {}", pane.title)
+                    ls_color("2", &pane.title)
                 };
                 let _ = writeln!(
                     out,
-                    "  {}  {}  {}{}",
+                    "  {} {} {} {} {}",
                     ls_color("36", &target),
                     ls_color("2", &command),
-                    ls_color("2", &format_ls_duration(pane.age_sec)),
+                    ls_color("2", &age),
+                    annotation,
                     title
                 );
             }
@@ -560,6 +575,113 @@ fn ls_oracle_window_name<'a>(panes: &[&'a LsPanePlan]) -> Option<&'a str> {
         .find(|window| window.ends_with("-oracle"))
 }
 
+#[derive(Debug, Default)]
+struct LsAnnotationContext {
+    fleet_sessions: BTreeSet<String>,
+    team_by_pane: BTreeMap<String, String>,
+}
+
+fn ls_annotation_context() -> LsAnnotationContext {
+    LsAnnotationContext {
+        fleet_sessions: ls_fleet_sessions_for_annotation(),
+        team_by_pane: ls_team_by_pane_for_annotation(),
+    }
+}
+
+fn ls_fleet_sessions_for_annotation() -> BTreeSet<String> {
+    let mut sessions = BTreeSet::new();
+    for entry in fleet_load_entries() {
+        let stem = entry.file.strip_suffix(".json").unwrap_or(&entry.file);
+        if !stem.is_empty() {
+            sessions.insert(stem.to_owned());
+        }
+        if !entry.session.name.is_empty() {
+            sessions.insert(entry.session.name);
+        }
+    }
+    sessions
+}
+
+fn ls_team_by_pane_for_annotation() -> BTreeMap<String, String> {
+    let mut teams = BTreeMap::new();
+    let root = team_home_dir().join(".claude").join("teams");
+    for (team, config) in team_read_tool_teams(&root) {
+        for member in config.members {
+            let Some(pane_id) = member
+                .tmux_pane_id
+                .filter(|pane| !pane.is_empty() && pane != "in-process")
+            else {
+                continue;
+            };
+            teams.insert(pane_id, format!("{} @ {team}", member.name));
+        }
+    }
+    teams
+}
+
+fn ls_pane_annotation(pane: &LsPanePlan, annotations: &LsAnnotationContext) -> String {
+    let pane_ref = maw_tmux::TmuxLsPaneRef {
+        id: pane.id.clone(),
+        target: pane.target.clone(),
+        command: Some(pane.command.clone()),
+    };
+    let annotation = maw_tmux::annotate_pane(
+        &pane_ref,
+        &annotations.fleet_sessions,
+        &annotations.team_by_pane,
+    );
+    if annotation.is_empty() && ls_is_orphan_list_session(&pane.session, &annotations.fleet_sessions)
+    {
+        "orphan".to_owned()
+    } else {
+        annotation
+    }
+}
+
+fn ls_is_fleet_list_session(session: &str, fleet_sessions: &BTreeSet<String>) -> bool {
+    if session.split_once('-').is_some_and(|(prefix, suffix)| {
+        prefix.chars().all(|ch| ch.is_ascii_digit()) && !suffix.starts_with('-')
+    }) {
+        return true;
+    }
+    fleet_sessions.contains(session)
+}
+
+fn ls_is_orphan_list_session(session: &str, fleet_sessions: &BTreeSet<String>) -> bool {
+    if ls_is_fleet_list_session(session, fleet_sessions) {
+        return false;
+    }
+    !(session == "maw-view" || session.ends_with("-view"))
+}
+
+fn ls_annotation_display(annotation: &str) -> &str {
+    if annotation == "orphan" {
+        "[orphan]"
+    } else {
+        annotation
+    }
+}
+
+fn ls_render_annotation(annotation: &str) -> String {
+    let display = ls_annotation_display(annotation);
+    if display.is_empty() {
+        return " ".repeat(30);
+    }
+    let padding = " ".repeat(30usize.saturating_sub(ls_visible_len(display)));
+    let colored = if annotation.starts_with("team:") {
+        ls_color("36", display)
+    } else if annotation.starts_with("fleet:") {
+        ls_color("32", display)
+    } else if annotation.starts_with("view:") {
+        ls_color("2", display)
+    } else if annotation == "orphan" {
+        ls_color("33", display)
+    } else {
+        display.to_owned()
+    };
+    format!("{colored}{padding}")
+}
+
 fn ls_oracle_first_panes<'a>(
     panes: &[&'a LsPanePlan],
     oracle: Option<&str>,
@@ -593,6 +715,19 @@ fn ls_pane_target(target: &str) -> &str {
     target
         .split_once(':')
         .map_or(target, |(_, window_and_pane)| window_and_pane)
+}
+
+fn ls_visible_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn ls_pad(value: &str, width: usize) -> String {
+    let mut out = value.chars().take(width).collect::<String>();
+    let len = ls_visible_len(&out);
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    }
+    out
 }
 
 fn ls_status_dot(status: &str) -> String {
@@ -1013,7 +1148,8 @@ mod remaining_cli_private_coverage_tests {
         let panes = vec![worker, oracle, other];
 
         let text = render_ls_text(&options, &panes);
-        assert!(!text.contains("TARGET CMD AGE TITLE"));
+        assert_eq!(text.matches("TARGET").count(), 1);
+        assert!(text.contains("ANNOTATION"));
         assert!(text.contains("188-maw-rs"));
         assert!(text.contains(" · "));
         assert!(text.contains("maw-rs-oracle"));
@@ -1033,6 +1169,79 @@ mod remaining_cli_private_coverage_tests {
             render_ls_sessions_json(&panes, false),
             "[{\"session\":\"188-maw-rs\",\"status\":\"active\",\"panes\":2,\"agents\":1,\"oracle\":\"maw-rs-oracle\"},{\"session\":\"200-other\",\"status\":\"active\",\"panes\":1,\"agents\":0}]"
         );
+    }
+
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for inner in chars.by_ref() {
+                    if inner == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn private_ls_verbose_uses_one_global_target_width_and_single_header() {
+        let mut options = ls_test_options();
+        options.mode = LsMode::Verbose;
+
+        let first = ls_test_pane("%1", "880-short:main.0", "880-short", "zsh", false);
+        let second = ls_test_pane(
+            "%2",
+            "881-long:a-very-very-long-window-name.0",
+            "881-long",
+            "bash",
+            false,
+        );
+        let text = strip_ansi(&render_ls_text(&options, &[first, second]));
+
+        assert_eq!(text.matches("TARGET").count(), 1);
+        assert_eq!(text.matches("ANNOTATION").count(), 1);
+        let short = text
+            .lines()
+            .find(|line| line.contains("main.0"))
+            .expect("short row");
+        let long = text
+            .lines()
+            .find(|line| line.contains("a-very-very-long-window-name.0"))
+            .expect("long row");
+        assert_eq!(short.find("zsh"), long.find("bash"));
+    }
+
+    #[test]
+    fn private_ls_annotation_port_handles_team_fleet_view_and_orphan() {
+        let context = LsAnnotationContext {
+            fleet_sessions: BTreeSet::from(["50-mawjs".to_owned()]),
+            team_by_pane: BTreeMap::from([("%team".to_owned(), "builder @ alpha".to_owned())]),
+        };
+
+        let team = ls_test_pane("%team", "scratch:worker.0", "scratch", "codex", true);
+        let fleet = ls_test_pane("%fleet", "50-mawjs:1.0", "50-mawjs", "zsh", false);
+        let view = ls_test_pane("%view", "maw-view:main.0", "maw-view", "zsh", false);
+        let orphan = ls_test_pane("%orphan", "scratch:main.0", "scratch", "zsh", false);
+        let numeric_fleet_shape = ls_test_pane(
+            "%numeric",
+            "51-unregistered:main.0",
+            "51-unregistered",
+            "zsh",
+            false,
+        );
+
+        assert_eq!(ls_pane_annotation(&team, &context), "team: builder @ alpha");
+        assert_eq!(ls_pane_annotation(&fleet, &context), "fleet: mawjs");
+        assert_eq!(ls_pane_annotation(&view, &context), "view: maw-view");
+        assert_eq!(ls_pane_annotation(&orphan, &context), "orphan");
+        assert_eq!(ls_pane_annotation(&numeric_fleet_shape, &context), "");
+        assert!(ls_render_annotation("orphan").contains("[orphan]"));
     }
     include!("attach_private_tests.rs");
 

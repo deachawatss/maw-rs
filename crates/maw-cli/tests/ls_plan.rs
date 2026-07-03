@@ -89,13 +89,13 @@ fn ls_plan_verbose_json_keeps_channels_filter_and_statuses() {
         "--json",
         "--verbose",
         "--channels",
-        "alpha",
+        "zzunique",
         "--now",
         "1700000100",
         "--pane",
         "%1|claude|mawjs-oracle-discord:1.0|chan|100|/repo|1700000090",
         "--pane",
-        "%2|node|alpha-worker:2.0|worker|101|/repo|1700000050",
+        "%2|node|zzunique-scratch:2.0|worker|101|/repo|1700000050",
     ]));
 
     assert_eq!(output.code, 0, "{}", output.stderr);
@@ -103,7 +103,7 @@ fn ls_plan_verbose_json_keeps_channels_filter_and_statuses() {
         output.stdout,
         concat!(
             "{\"command\":\"ls\",\"mode\":\"verbose\",\"scope\":\"local\",\"json\":true,",
-            "\"panes\":[{\"id\":\"%2\",\"target\":\"alpha-worker:2.0\",\"session\":\"alpha-worker\",\"command\":\"node\",\"title\":\"worker\",\"status\":\"idle\",\"ageSec\":50,\"agent\":true}]}
+            "\"panes\":[{\"id\":\"%2\",\"target\":\"zzunique-scratch:2.0\",\"session\":\"zzunique-scratch\",\"command\":\"node\",\"title\":\"worker\",\"status\":\"idle\",\"ageSec\":50,\"agent\":true,\"annotation\":\"orphan\"}]}
 "
         )
     );
