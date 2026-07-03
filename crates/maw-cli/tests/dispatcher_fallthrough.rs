@@ -322,26 +322,14 @@ fn check_tools_extracts_versions_with_argv_only_tool_probes() {
     create_dir_all(&bin_dir).expect("bin dir");
     create_dir_all(&plugins_dir).expect("plugins dir");
     write_maw_shim(&bin_dir, 37);
-    write_tool_shim(&bin_dir, "bun", "#!/bin/sh\nprintf 'bun 1.2.3\\n'\n");
-    write_tool_shim(&bin_dir, "gh", "#!/bin/sh\nprintf 'gh version 2.3.4\\n'\n");
-    write_tool_shim(&bin_dir, "ghq", "#!/bin/sh\nprintf 'ghq 3.4.5\\n'\n");
-    write_tool_shim(
-        &bin_dir,
-        "git",
-        "#!/bin/sh\nprintf 'git version 4.5.6\\n'\n",
-    );
-    write_tool_shim(&bin_dir, "tmux", "#!/bin/sh\nprintf 'tmux 5.6\\n'\n");
-    write_tool_shim(&bin_dir, "uv", "#!/bin/sh\nprintf 'uv 6.7.8\\n'\n");
-    write_tool_shim(
-        &bin_dir,
-        "uvx",
-        "#!/bin/sh\nprintf 'uvx should-not-run\\n'\n",
-    );
-    write_tool_shim(
-        &bin_dir,
-        "which",
-        "#!/bin/sh\nif [ \"$1\" = uvx ]; then printf 'uvx\\n'; exit 0; fi\nexit 1\n",
-    );
+    write_tool_shim(&bin_dir, "bun", "#!/bin/echo bun 1.2.3\n");
+    write_tool_shim(&bin_dir, "gh", "#!/bin/echo gh version 2.3.4\n");
+    write_tool_shim(&bin_dir, "ghq", "#!/bin/echo ghq 3.4.5\n");
+    write_tool_shim(&bin_dir, "git", "#!/bin/echo git version 4.5.6\n");
+    write_tool_shim(&bin_dir, "tmux", "#!/bin/echo tmux 5.6\n");
+    write_tool_shim(&bin_dir, "uv", "#!/bin/echo uv 6.7.8\n");
+    write_tool_shim(&bin_dir, "uvx", "#!/bin/echo uvx should-not-run\n");
+    write_tool_shim(&bin_dir, "which", "#!/bin/echo uvx\n");
     std::env::set_var("PATH", &bin_dir);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::remove_var("MAW_FROM_RS");
