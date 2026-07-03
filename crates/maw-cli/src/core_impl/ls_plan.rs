@@ -343,17 +343,47 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
         };
     }
     if options.mode == LsMode::Verbose {
-        let mut lines = vec!["TARGET CMD AGE TITLE".to_owned()];
-        for pane in panes {
-            lines.push(format!(
-                "{} {} {} {}",
-                ls_color("36", &pane.target),
-                ls_color("2", &pane.command),
-                ls_color("2", &format_ls_duration(pane.age_sec)),
-                pane.title
-            ));
+        let mut out = String::new();
+        for (session, panes) in group_ls_sessions(panes) {
+            let status = ls_best_status(&panes);
+            let dot = ls_status_dot(status);
+            let oracle = ls_oracle_window_name(&panes);
+            let oracle_label = oracle
+                .map(|window| format!(" · {}", ls_color("2", window)))
+                .unwrap_or_default();
+            let session = ls_color("36", &session);
+            let _ = writeln!(out, "{dot} {session}{oracle_label}");
+
+            let ordered = ls_oracle_first_panes(&panes, oracle);
+            let window_width = ordered
+                .iter()
+                .map(|pane| ls_pane_target(&pane.target).len())
+                .max()
+                .unwrap_or(0);
+            let command_width = ordered
+                .iter()
+                .map(|pane| pane.command.len())
+                .max()
+                .unwrap_or(0);
+            for pane in ordered {
+                let target = format!("{:<window_width$}", ls_pane_target(&pane.target));
+                let command = format!("{:<command_width$}", pane.command);
+                let title = if pane.title.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", pane.title)
+                };
+                let _ = writeln!(
+                    out,
+                    "  {}  {}  {}{}",
+                    ls_color("36", &target),
+                    ls_color("2", &command),
+                    ls_color("2", &format_ls_duration(pane.age_sec)),
+                    title
+                );
+            }
         }
-        lines.join("\n") + "\n"
+        out
     } else {
         let mut out = String::new();
         for (session, panes) in group_ls_sessions(panes) {
@@ -383,7 +413,7 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
             } else {
                 String::new()
             };
-            let _ = writeln!(out, "{dot} {session}{oracle}  {pane_count}{agent_count}");
+            let _ = writeln!(out, "  {dot} {session}{oracle}  {pane_count}{agent_count}");
         }
         let _ = writeln!(out, "\n  {}", ls_color("2", "→ maw ls -v    full detail"));
         out
@@ -397,6 +427,26 @@ fn ls_oracle_window_name<'a>(panes: &[&'a LsPanePlan]) -> Option<&'a str> {
         .find(|window| window.ends_with("-oracle"))
 }
 
+fn ls_oracle_first_panes<'a>(
+    panes: &[&'a LsPanePlan],
+    oracle: Option<&str>,
+) -> Vec<&'a LsPanePlan> {
+    let Some(oracle) = oracle else {
+        return panes.to_vec();
+    };
+    panes
+        .iter()
+        .copied()
+        .filter(|pane| ls_window_name(&pane.target) == oracle)
+        .chain(
+            panes
+                .iter()
+                .copied()
+                .filter(|pane| ls_window_name(&pane.target) != oracle),
+        )
+        .collect()
+}
+
 fn ls_window_name(target: &str) -> &str {
     let window = target
         .split_once(':')
@@ -404,6 +454,12 @@ fn ls_window_name(target: &str) -> &str {
     window
         .rsplit_once('.')
         .map_or(window, |(window, _pane)| window)
+}
+
+fn ls_pane_target(target: &str) -> &str {
+    target
+        .split_once(':')
+        .map_or(target, |(_, window_and_pane)| window_and_pane)
 }
 
 fn ls_status_dot(status: &str) -> String {
@@ -704,6 +760,7 @@ mod remaining_cli_private_coverage_tests {
         ];
 
         let text = render_ls_text(&options, &panes);
+        assert!(text.starts_with("  "));
         assert_eq!(text.matches("maw-rs-oracle").count(), 1);
         assert!(text.contains(" · "));
         assert!(text.contains("2 panes"));
@@ -721,7 +778,7 @@ mod remaining_cli_private_coverage_tests {
 
         let text = render_ls_text(&options, std::slice::from_ref(&pane));
         let expected = format!(
-            "{} {}  {}\n\n  {}\n",
+            "  {} {}  {}\n\n  {}\n",
             ls_status_dot("active"),
             ls_color("36", "199-scratch"),
             ls_color("2", "1 pane"),
@@ -731,6 +788,56 @@ mod remaining_cli_private_coverage_tests {
 
         let json = render_ls_sessions_json(&[pane], false);
         assert!(!json.contains("\"oracle\""));
+    }
+
+    #[test]
+    fn private_ls_verbose_groups_sessions_with_oracle_pane_first_and_json_unchanged() {
+        let mut options = ls_test_options();
+        options.mode = LsMode::Verbose;
+
+        let mut worker = ls_test_pane(
+            "%2",
+            "188-maw-rs:maw-rs-codex-1.0",
+            "188-maw-rs",
+            "codex",
+            true,
+        );
+        worker.title = "worker".to_owned();
+        worker.age_sec = 120;
+        let mut oracle = ls_test_pane(
+            "%1",
+            "188-maw-rs:maw-rs-oracle.0",
+            "188-maw-rs",
+            "2.1.198",
+            false,
+        );
+        oracle.title = "main".to_owned();
+        let mut other = ls_test_pane("%3", "200-other:main.0", "200-other", "zsh", false);
+        other.title = "shell".to_owned();
+        other.age_sec = 5;
+        let panes = vec![worker, oracle, other];
+
+        let text = render_ls_text(&options, &panes);
+        assert!(!text.contains("TARGET CMD AGE TITLE"));
+        assert!(text.contains("188-maw-rs"));
+        assert!(text.contains(" · "));
+        assert!(text.contains("maw-rs-oracle"));
+        assert!(text.contains("200-other"));
+        assert!(text.lines().any(|line| {
+            line.starts_with("  ") && line.contains("maw-rs-oracle.0") && line.contains("main")
+        }));
+        assert!(text.lines().any(|line| {
+            line.starts_with("  ") && line.contains("maw-rs-codex-1.0") && line.contains("2m")
+        }));
+        assert!(
+            text.find("maw-rs-oracle.0").expect("oracle member")
+                < text.find("maw-rs-codex-1.0").expect("worker member")
+        );
+
+        assert_eq!(
+            render_ls_sessions_json(&panes, false),
+            "[{\"session\":\"188-maw-rs\",\"status\":\"active\",\"panes\":2,\"agents\":1,\"oracle\":\"maw-rs-oracle\"},{\"session\":\"200-other\",\"status\":\"active\",\"panes\":1,\"agents\":0}]"
+        );
     }
     include!("attach_private_tests.rs");
 
