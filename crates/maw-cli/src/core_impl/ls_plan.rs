@@ -19,23 +19,6 @@ fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
 }
 
 fn render_ls_plan(options: &LsPlanOptions) -> CliOutput {
-    if let Some(peer) = &options.peer {
-        if !options.federation {
-            return CliOutput {
-                code: 0,
-                stdout: if options.json {
-                    format!(
-                        "{{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":{},\"sessions\":[]}}\n",
-                        json_string(peer)
-                    )
-                } else {
-                    format!("ls peer {peer}: no fake sessions\n")
-                },
-                stderr: String::new(),
-            };
-        }
-    }
-
     let mut live_options;
     let effective_options = if options.panes.is_empty() {
         let mut client = TmuxClient::local();
@@ -511,7 +494,6 @@ fn ls_help_ok() -> CliOutput {
             "Usage:",
             "  maw ls                  list live local sessions (default)",
             "  maw ls <filter>         filter local sessions",
-            "  maw ls <peer>           list sessions on a federation peer (legacy)",
             "  maw ls --federation     list local + peer sessions",
             "  maw ls --federation <peer>  drill into one peer",
             "  maw ls --federation --node <node>  filter the federated view",
@@ -522,7 +504,7 @@ fn ls_help_ok() -> CliOutput {
             "  maw ls --verify         include worktree-bind diagnostics",
             "  maw ls --fix            prune orphaned worktrees (local only)",
             "",
-            "Peer aliases are resolved from the maw state peers store (see: maw peers list).",
+            "Federation peer aliases are resolved from the maw state peers store (see: maw peers list).",
             "For registered fleet config, use maw fleet ls.",
         ]
         .join("\n")

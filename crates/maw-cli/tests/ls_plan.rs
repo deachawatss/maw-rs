@@ -53,6 +53,36 @@ fn ls_plan_compact_default_shows_all_sessions_and_fleet_only_filters_shape() {
 }
 
 #[test]
+fn ls_plan_positional_filters_local_sessions_without_peer_stub() {
+    let output = run_cli(&args(&[
+        "ls",
+        "maw-rs",
+        "--plan-json",
+        "--now",
+        "1700000100",
+        "--pane",
+        "%1|codex|maw-rs:1.0|agent|100|/repo|1700000090",
+        "--pane",
+        "%2|codex|188-maw-rs:1.0|agent|101|/repo|1700000080",
+        "--pane",
+        "%3|zsh|scratch:1.0|scratch|102|/tmp|1700000070",
+    ]));
+
+    assert_eq!(output.code, 0, "{}", output.stderr);
+    assert_eq!(
+        output.stdout,
+        concat!(
+            "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,",
+            "\"sessions\":[",
+            "{\"session\":\"188-maw-rs\",\"status\":\"active\",\"panes\":1,\"agents\":1},",
+            "{\"session\":\"maw-rs\",\"status\":\"active\",\"panes\":1,\"agents\":1}]}\n"
+        )
+    );
+    assert!(!output.stdout.contains("scratch"));
+    assert!(!output.stdout.contains("no fake sessions"));
+}
+
+#[test]
 fn ls_plan_verbose_json_keeps_channels_filter_and_statuses() {
     let output = run_cli(&args(&[
         "ls",
@@ -114,7 +144,9 @@ fn ls_plan_active_recent_and_help_match_maw_js_surface() {
     let help = run_cli(&args(&["ls", "--help"]));
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("maw ls --active [30m]"));
-    assert!(help.stdout.contains("maw ls <peer>"));
+    assert!(help.stdout.contains("maw ls <filter>"));
+    assert!(help.stdout.contains("maw ls --federation <peer>"));
+    assert!(!help.stdout.contains("maw ls <peer>"));
 }
 
 #[test]

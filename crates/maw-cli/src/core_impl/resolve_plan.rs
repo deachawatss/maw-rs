@@ -547,7 +547,7 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
     }
 
     if let Some(first) = positionals.first() {
-        if options.federation || (!options.active && options.panes.is_empty()) {
+        if options.federation {
             options.peer = Some(first.clone());
         } else {
             options.filter = Some(first.clone());

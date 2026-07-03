@@ -307,10 +307,20 @@ fn route_worktree_calver_and_normalize_tails_are_stable() {
 
 #[test]
 fn ls_and_bring_render_remaining_edges_are_stable() {
-    let peer_json = ok(&["ls", "remote", "--json"]);
+    let peer_json = ok(&[
+        "ls",
+        "remote",
+        "--json",
+        "--now",
+        "1000",
+        "--pane",
+        "%1|codex|remote:1.0|agent|100|/repo|990",
+        "--pane",
+        "%2|zsh|other:1.0|other|101|/repo|990",
+    ]);
     assert_eq!(
         peer_json.stdout,
-        "{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":\"remote\",\"sessions\":[]}\n"
+        "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,\"sessions\":[{\"session\":\"remote\",\"status\":\"active\",\"panes\":1,\"agents\":1}]}\n"
     );
 
     assert_eq!(
