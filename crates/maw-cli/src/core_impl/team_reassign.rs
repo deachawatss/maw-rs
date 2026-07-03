@@ -169,7 +169,8 @@ fn reassign_wake(selected: &TeamReassignSelection129, issue: u64, prompt: &str, 
     let args = reassign_wake_args(selected, issue, prompt, session, repo_slug)?;
     let mut runner = TeamT5bTmuxRunner128::new();
     let target = format!("{session}:{}", selected.target);
-    runner.run(&team_t5b_strings(&["new-window", "-c", &repo.display().to_string(), "-t", session, "-n", &selected.target]))?;
+    let session_target = format!("{session}:");
+    runner.run(&team_t5b_strings(&["new-window", "-c", &repo.display().to_string(), "-t", &session_target, "-n", &selected.target]))?;
     team_t5b_send_fixed_maw(&mut runner, &target, &args)?;
     reassign_record_fake("wake", &selected.target)
 }

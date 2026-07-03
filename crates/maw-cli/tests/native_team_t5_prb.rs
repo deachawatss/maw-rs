@@ -54,6 +54,20 @@ members:
 }
 
 fn run(args: &[&str], root: &Path, log: Option<&Path>) -> std::process::Output {
+    run_with_panes(
+        args,
+        root,
+        log,
+        "alpha|reviewer|bash|/repo/agents/reviewer|%2\nalpha|live|codex|/repo/live|%3",
+    )
+}
+
+fn run_with_panes(
+    args: &[&str],
+    root: &Path,
+    log: Option<&Path>,
+    panes: &str,
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .current_dir(root)
@@ -62,10 +76,7 @@ fn run(args: &[&str], root: &Path, log: Option<&Path>) -> std::process::Output {
         .env("MAW_RS_TEAM_PSI", root.join("psi"))
         .env("MAW_JS_REF_DIR", "/nonexistent")
         .env("MAW_RS_SELF_BIN", "/fake/maw")
-        .env(
-            "MAW_RS_TEAM_TMUX_PANES",
-            "alpha|reviewer|bash|/repo/agents/reviewer|%2\nalpha|live|codex|/repo/live|%3",
-        );
+        .env("MAW_RS_TEAM_TMUX_PANES", panes);
     if let Some(log) = log {
         cmd.env("MAW_RS_TEAM_FAKE_TMUX_LOG", log);
     }
@@ -117,10 +128,35 @@ fn team_t5b_up_exec_uses_fixed_maw_send_keys_literal_and_resume_sequence() {
         &root,
         fs::read_to_string(&log).expect("tmux log").into_bytes(),
     );
-    assert!(log_text.contains(r#""args":["new-window","-t","alpha","-n","builder"]"#));
+    assert!(log_text.contains(r#""args":["new-window","-t","alpha:","-n","builder"]"#));
     assert!(log_text.contains(r#""args":["send-keys","-t","%2","C-u"]"#));
     assert!(log_text.contains(r#""send-keys","-t","%2","-l","--","'/fake/maw' 'wake' 'reviewer'"#));
     assert!(log_text.contains(r#""send-keys","-t","%2","Enter"]"#));
+}
+
+#[test]
+fn team_t5b_up_new_window_targets_exact_session_when_names_prefix_overlap() {
+    let root = temp_dir("prefix");
+    let log = root.join("tmux.jsonl");
+    let output = run_with_panes(
+        &["team", "up", "alpha", "--session", "188-maw-rs"],
+        &root,
+        Some(&log),
+        "maw-rs|maw-rs-oracle|codex|/repo/maw-rs|%9\n188-maw-rs|reviewer|bash|/repo/agents/reviewer|%2",
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log_text = normalize(
+        &root,
+        fs::read_to_string(&log).expect("tmux log").into_bytes(),
+    );
+    assert!(log_text.contains(r#""args":["new-window","-t","188-maw-rs:","-n","builder"]"#));
+    assert!(!log_text.contains(r#""args":["new-window","-t","188-maw-rs","-n","builder"]"#));
+    assert!(log_text.contains(r#""send-keys","-t","188-maw-rs:builder""#));
 }
 
 #[test]

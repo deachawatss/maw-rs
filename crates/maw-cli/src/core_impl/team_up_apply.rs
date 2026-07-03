@@ -86,7 +86,8 @@ impl TeamT5bTmuxRunner128 {
 fn team_t5b_wake_window(runner: &mut TeamT5bTmuxRunner128, item: &TeamRosterItem124, opts: &TeamT3Options124, session: &str) -> Result<(), String> {
     team_t5b_validate_item(item)?;
     let target = format!("{session}:{}", item.identity);
-    runner.run(&team_t5b_strings(&["new-window", "-t", session, "-n", &item.identity]))?;
+    let session_target = format!("{session}:");
+    runner.run(&team_t5b_strings(&["new-window", "-t", &session_target, "-n", &item.identity]))?;
     team_t5b_send_fixed_maw(runner, &target, &team_t5b_maw_wake_args(item, opts, session)?)
 }
 
