@@ -1,5 +1,8 @@
 use super::ServecoreModuleRegistration;
-use crate::serve_core::ServecoreLifecycleModule;
+use crate::serve_core::{
+    servecore_mount_ws_registry_with_config, ServecoreLifecycleModule, ServecoreWsKind,
+    ServecoreWsRegistry,
+};
 use axum::Router;
 use std::time::Duration;
 
@@ -62,7 +65,25 @@ pub fn ws_mount<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    router
+    ws_mount_with_config(router, WsConfig::ws_from_process_env())
+}
+
+pub fn ws_mount_with_config<S>(router: Router<S>, config: WsConfig) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    servecore_mount_ws_registry_with_config(router, &ws_registry(), config)
+}
+
+fn ws_registry() -> ServecoreWsRegistry {
+    let mut registry = ServecoreWsRegistry::default();
+    registry
+        .servecore_register_ws_kind("/ws/pty", ServecoreWsKind::Pty)
+        .expect("pty ws route");
+    registry
+        .servecore_register_ws_kind("/ws/tmux", ServecoreWsKind::Tmux)
+        .expect("tmux ws route");
+    registry
 }
 
 /// Validates an optional tmux/pty target before any transport spawn/attach work.
@@ -115,5 +136,18 @@ mod tests {
         assert!(ws_validate_target(Some("--")).is_err());
         assert!(ws_validate_target(Some("bad\nname")).is_err());
         assert!(ws_validate_target(Some("bad;name")).is_err());
+    }
+
+    #[test]
+    fn ws_registry_owns_non_ui_websocket_routes() {
+        let registry = ws_registry();
+        assert_eq!(registry.servecore_paths(), vec!["/ws/pty", "/ws/tmux"]);
+        assert_eq!(
+            registry.servecore_handlers(),
+            vec![
+                ("/ws/pty".to_owned(), ServecoreWsKind::Pty),
+                ("/ws/tmux".to_owned(), ServecoreWsKind::Tmux),
+            ]
+        );
     }
 }

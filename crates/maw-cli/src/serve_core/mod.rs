@@ -16,7 +16,7 @@ use axum::{
     Extension, Json, Router,
 };
 use maw_hub::WorkspaceConfig;
-use maw_tmux::{TmuxClient, TmuxPane};
+use maw_tmux::{TmuxClient, TmuxPane, TmuxSession};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -101,6 +101,7 @@ pub struct ServecoreSharedState {
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
+    pub tmux_sessions_snapshot: Option<Arc<Vec<TmuxSession>>>,
     pub auth_workspace_key: Option<String>,
     pub auth_cached_pubkey: Option<String>,
     pub auth_ed25519_pins: maw_auth::Ed25519TofuPins,
@@ -118,6 +119,7 @@ impl Default for ServecoreSharedState {
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
             agents_snapshot: None,
+            tmux_sessions_snapshot: None,
             auth_workspace_key: None,
             auth_cached_pubkey: None,
             auth_ed25519_pins: Arc::new(Mutex::new(maw_auth::Ed25519TofuStore::default())),
@@ -146,6 +148,12 @@ impl ServecoreSharedState {
     }
 
     #[must_use]
+    pub fn servecore_with_tmux_sessions_snapshot(mut self, sessions: Vec<TmuxSession>) -> Self {
+        self.tmux_sessions_snapshot = Some(Arc::new(sessions));
+        self
+    }
+
+    #[must_use]
     pub fn servecore_agents_panes(&self) -> Vec<ServecoreAgentPane> {
         if let Some(snapshot) = &self.agents_snapshot {
             return snapshot.as_ref().clone();
@@ -155,6 +163,15 @@ impl ServecoreSharedState {
             .into_iter()
             .map(ServecoreAgentPane::from)
             .collect()
+    }
+
+    #[must_use]
+    pub fn servecore_tmux_sessions(&self) -> Vec<TmuxSession> {
+        if let Some(snapshot) = &self.tmux_sessions_snapshot {
+            return snapshot.as_ref().clone();
+        }
+        let mut tmux = TmuxClient::local();
+        tmux.list_all()
     }
 
     #[must_use]
@@ -1341,7 +1358,7 @@ pub fn servecore_mount_ws_routes<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    servecore_mount_ws_routes_with_config(router, modules::ws::WsConfig::ws_from_process_env())
+    modules::ws::ws_mount(router)
 }
 
 pub fn servecore_mount_ws_routes_with_config<S>(
@@ -1351,8 +1368,19 @@ pub fn servecore_mount_ws_routes_with_config<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let registry = servecore_default_ws_registry();
-    servecore_mount_ws_registry(router, &registry).layer(Extension(config))
+    modules::ws::ws_mount_with_config(router, config)
+}
+
+pub fn servecore_mount_ws_registry_with_config<S>(
+    router: Router<S>,
+    registry: &ServecoreWsRegistry,
+    config: modules::ws::WsConfig,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let ws_routes = servecore_mount_ws_registry(Router::new(), registry).layer(Extension(config));
+    router.merge(ws_routes)
 }
 
 pub fn servecore_mount_ws_registry<S>(
@@ -1368,20 +1396,6 @@ where
         .fold(router, |router, (path, kind)| {
             router.route(&path, get(servecore_ws_upgrade).layer(Extension(kind)))
         })
-}
-
-fn servecore_default_ws_registry() -> ServecoreWsRegistry {
-    let mut registry = ServecoreWsRegistry::default();
-    registry
-        .servecore_register_ws_kind("/ws", ServecoreWsKind::Engine)
-        .expect("default ws route");
-    registry
-        .servecore_register_ws_kind("/ws/pty", ServecoreWsKind::Pty)
-        .expect("default pty ws route");
-    registry
-        .servecore_register_ws_kind("/ws/tmux", ServecoreWsKind::Tmux)
-        .expect("default tmux ws route");
-    registry
 }
 
 pub fn servecore_mount_registry_stub<S>(
@@ -1682,7 +1696,7 @@ async fn servecore_ws_upgrade(
         )
             .into_response();
     }
-    if SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed) >= config.max_connections {
+    if servecore_ws_connection_limit_reached(config.max_connections) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"ws_connection_limit"})),
@@ -1745,7 +1759,23 @@ async fn servecore_ws_stream(
     state.engine.servecore_ws_close(kind, target.as_deref());
 }
 
-async fn servecore_ws_handle_frame(
+pub(crate) async fn servecore_ws_send_text_frames(
+    socket: &mut WebSocket,
+    frames: Vec<String>,
+    config: &modules::ws::WsConfig,
+) -> bool {
+    for frame in frames {
+        if servecore_ws_send(socket, Message::Text(frame), config.send_timeout)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) async fn servecore_ws_handle_frame(
     socket: &mut WebSocket,
     state: &ServecoreSharedState,
     kind: ServecoreWsKind,
@@ -1793,7 +1823,7 @@ async fn servecore_ws_handle_frame(
     }
 }
 
-async fn servecore_ws_send(
+pub(crate) async fn servecore_ws_send(
     socket: &mut WebSocket,
     message: Message,
     timeout: Duration,
@@ -1804,14 +1834,20 @@ async fn servecore_ws_send(
         .map_err(|_| ())
 }
 
-fn servecore_ws_target(query: Option<&str>) -> Option<&str> {
+pub(crate) fn servecore_ws_target(query: Option<&str>) -> Option<&str> {
     query?
         .split('&')
         .filter_map(|part| part.split_once('='))
         .find_map(|(key, value)| (key == "target" || key == "session").then_some(value))
 }
 
-fn servecore_ws_connection_guard(max_connections: usize) -> Option<ServecoreWsConnectionGuard> {
+pub(crate) fn servecore_ws_connection_limit_reached(max_connections: usize) -> bool {
+    SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed) >= max_connections
+}
+
+pub(crate) fn servecore_ws_connection_guard(
+    max_connections: usize,
+) -> Option<ServecoreWsConnectionGuard> {
     let mut current = SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed);
     loop {
         if current >= max_connections {
@@ -1829,7 +1865,7 @@ fn servecore_ws_connection_guard(max_connections: usize) -> Option<ServecoreWsCo
     }
 }
 
-struct ServecoreWsConnectionGuard;
+pub(crate) struct ServecoreWsConnectionGuard;
 
 impl Drop for ServecoreWsConnectionGuard {
     fn drop(&mut self) {
@@ -2492,7 +2528,7 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let router = servecore_mount_core_routes(Router::new());
-        let router = servecore_mount_ws_routes_with_config(router, config);
+        let router = modules::ws::ws_mount_with_config(router, config);
         let router = servecore_with_shared_state(router, state);
         let app = servecore_apply_pipeline_with_views_config(
             router,
@@ -2964,7 +3000,7 @@ mod tests {
             max_connections: 8,
         };
         let addr = servecore_spawn_ws_test_server(ServecoreSharedState::default(), config).await;
-        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/tmux"))
             .await
             .expect("connect websocket");
         let close = tokio::time::timeout(Duration::from_secs(2), async {
