@@ -1,23 +1,24 @@
-<<<<<<< HEAD
-# Config Parity Report
+# maw-rs Migration Reports
 
-## Status
+## Config Parity Report
+
+### Status
 - Done: implementation committed and required validation passed.
 
-## Findings
+### Findings
 - maw-js `origin/alpha` discovers `maw.config.<N>.json` and `maw.config.<N>.local.json`, sorts by weight, scope rank, local flag, then path, and deep-merges layers.
 - Deep merge semantics: objects recurse, scalars and arrays replace, and `null` deletes an inherited key.
 - maw-js also inherits singleton XDG config when `MAW_HOME` is set and `MAW_CONFIG_DIR` is not set, so per-instance config can override the base config.
 - maw-rs direct readers currently include the wake/workon engine command paths called out by the mission, plus other config readers under `crates/maw-cli/src/core_impl`.
 
-## Changes
+### Changes
 - Added shared layered config discovery and deep merge to `maw-xdg`.
 - Added config layer fixtures covering maw-js sort order, recursive object merge, array/scalar replacement, `null` deletion, weighted-only config, and `MAW_HOME` instance override behavior.
 - Rewired runtime config readers in `maw-cli` to use the merged config object instead of reading only `maw.config.json`.
 - Updated `wake` and `workon` command alias tests to cover weighted-only `maw.config.50.json` command maps.
 - Reused the shared discovery/merge implementation for `maw config` diagnostics and changed `maw on` read-modify-write target selection to the existing weighted target when present.
 
-## Validation
+### Validation
 - `cargo fmt --check` passed.
 - `cargo test -p maw-xdg` passed.
 - `cargo test -p maw-cli wake_short_e_flag_and_config_commands_engine_resolution` passed.
@@ -25,13 +26,12 @@
 - `cargo clippy --all-targets` passed.
 - `cargo test -p maw-cli -p maw-xdg` passed.
 
-## Open Questions
+### Open Questions
 - None currently.
-=======
-# rs-plugins PR-4 report
 
-## Survey
+## rs-plugins PR-4 report
 
+### Survey
 - Worktree: `agents/plugin-wasm` off `origin/alpha`.
 - Reference checkout: `/opt/Code/github.com/Soul-Brews-Studio/maw-js`, fetched `origin/alpha` before survey.
 - Current reference count: 95 plugin manifests under `src/commands/plugins/` and `src/vendor/mpr-plugins/`.
@@ -51,8 +51,7 @@ Ranking principles:
 - Skip or defer serve/daemon/long-running/session-spawning flows for this wave.
 - Prefer conversions with small, deterministic parity fixtures.
 
-## Ranked unconverted list
-
+### Ranked unconverted list
 1. `contacts` - daily coordination primitive; bounded `psi/contacts.json` read/write. Converted in this pass.
 2. `signals` - daily situational awareness; bounded signal-directory read. Converted in this pass.
 3. `costs` - daily resource check; bounded localserver read-only API. Converted in this pass.
@@ -136,8 +135,7 @@ Per-oracle plugin note:
 - A per-oracle plugin pattern should convert as one manifest per oracle/plugin slug with the same `entry` export and a narrow capability set derived from that oracle's actual operations. Shared helper logic can stay in the AssemblyScript SDK/example source, but each per-oracle fixture should keep its own manifest, host-state transcript, and golden cases so capability drift is visible.
 - I did not touch athena's files.
 
-## Conversions
-
+### Conversions
 - `contacts` converted as an AssemblyScript WASM parity fixture:
   - Source: `examples/wasm-parity/contacts/src/plugin.ts`
   - Fixture: `crates/maw-plugin-manifest/tests/fixtures/wasm-parity/contacts/`
@@ -154,8 +152,7 @@ Per-oracle plugin note:
   - Covered CLI cases: no args and `--daily --json`.
   - Capabilities: `sdk:localserver`.
 
-## Test evidence
-
+### Test evidence
 - `npm run build:contacts` from `packages/wasm-sdk` passed; rebuilt wasm matched the committed fixture bytes with `cmp`.
 - `cargo test -p maw-plugin-manifest contacts` passed: 2 contacts parity/capability tests.
 - `npm run build:signals` from `packages/wasm-sdk` passed.
@@ -166,8 +163,6 @@ Per-oracle plugin note:
 - Before `93fd199b` (`signals`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 - Before `b002f650` (`costs`): `cargo fmt --check`, `cargo test -p maw-plugin-manifest`, and `cargo clippy --all-targets` passed.
 
-## Blockers / risks
-
+### Blockers / risks
 - No hard blocker yet.
 - `cargo clippy --all-targets` may be expensive for the full workspace; it remains required before each plugin commit.
->>>>>>> origin/alpha

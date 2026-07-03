@@ -445,9 +445,16 @@
         assert!(pane_input_pending_from_capture(
             "\u{1b}[32m❯\u{1b}[0m cargo test"
         ));
+        assert!(pane_input_pending_from_capture(
+            "› [Pasted Content 12345 chars]"
+        ));
         assert!(!pane_input_pending_from_capture("old\n$ "));
         assert!(!pane_input_pending_from_capture("command output only"));
         assert_eq!(strip_tmux_ansi("a\u{1b}[31mred\u{1b}[0m"), "ared");
+        assert_eq!(
+            strip_tmux_ansi("x\u{1b}]8;id=1;https://example.test\u{7}link\u{1b}]8;;\u{1b}\\y"),
+            "xlinky"
+        );
     }
 
     #[test]
