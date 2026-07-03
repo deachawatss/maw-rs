@@ -403,16 +403,114 @@ fn godui_read_team(
     object
         .entry("name".to_owned())
         .or_insert_with(|| Value::String(name.clone()));
-    let tasks = godui_read_tasks(&tasks_root.join(&name));
-    let alive = godui_team_alive(object.get("members"), live_pane_ids, home, now_ms);
-    object.insert("tasks".to_owned(), Value::Array(tasks));
-    object.insert("alive".to_owned(), Value::Bool(alive));
-    let sort_name = object
+    let team_name = object
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or(&name)
         .to_owned();
-    Some((sort_name, Value::Object(object)))
+    godui_normalize_team_members(&team_name, &mut object);
+    let tasks = godui_read_tasks(&tasks_root.join(&name));
+    let alive = godui_team_alive(object.get("members"), live_pane_ids, home, now_ms);
+    object.insert("tasks".to_owned(), Value::Array(tasks));
+    object.insert("alive".to_owned(), Value::Bool(alive));
+    Some((team_name, Value::Object(object)))
+}
+
+fn godui_normalize_team_members(team_name: &str, object: &mut Map<String, Value>) {
+    let lead_agent_id = format!("team-lead@{team_name}");
+    object.insert(
+        "leadAgentId".to_owned(),
+        Value::String(lead_agent_id.clone()),
+    );
+    let created_at = object
+        .get("createdAt")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let lead_repo = godui_field_str(object, "leadRepo")
+        .unwrap_or_default()
+        .to_owned();
+    let members = match object.remove("members") {
+        Some(Value::Array(members)) => members,
+        _ => Vec::new(),
+    };
+    let members = members
+        .into_iter()
+        .map(|member| {
+            godui_normalize_team_member(team_name, &lead_agent_id, created_at, &lead_repo, member)
+        })
+        .collect();
+    object.insert("members".to_owned(), Value::Array(members));
+}
+
+fn godui_normalize_team_member(
+    team_name: &str,
+    lead_agent_id: &str,
+    created_at: u64,
+    lead_repo: &str,
+    member: Value,
+) -> Value {
+    let mut object = match member {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    let name = godui_field_str(&object, "name")
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            godui_field_str(&object, "agentId")
+                .and_then(|agent_id| agent_id.split_once('@').map(|(name, _)| name.to_owned()))
+        })
+        .unwrap_or_else(|| "member".to_owned());
+    object.insert("name".to_owned(), Value::String(name.clone()));
+
+    let agent_id = godui_field_str(&object, "agentId")
+        .filter(|agent_id| !agent_id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{name}@{team_name}"));
+    object.insert("agentId".to_owned(), Value::String(agent_id.clone()));
+
+    let agent_type = godui_field_str(&object, "agentType")
+        .filter(|agent_type| !agent_type.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if agent_id == lead_agent_id || name == "team-lead" || name == "lead" {
+                "lead".to_owned()
+            } else {
+                "member".to_owned()
+            }
+        });
+    object.insert("agentType".to_owned(), Value::String(agent_type));
+
+    if object.get("joinedAt").and_then(Value::as_u64).is_none() {
+        object.insert("joinedAt".to_owned(), Value::from(created_at));
+    }
+    if godui_field_str(&object, "tmuxPaneId").is_none() {
+        object.insert("tmuxPaneId".to_owned(), Value::String(String::new()));
+    }
+    let cwd = godui_field_str(&object, "cwd")
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            godui_field_str(&object, "repo")
+                .filter(|repo| !repo.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| (!lead_repo.is_empty()).then(|| lead_repo.to_owned()))
+        .unwrap_or_default();
+    object.insert("cwd".to_owned(), Value::String(cwd));
+    if !object
+        .get("subscriptions")
+        .is_some_and(|subscriptions| subscriptions.is_array())
+    {
+        object.insert("subscriptions".to_owned(), Value::Array(Vec::new()));
+    }
+    if godui_field_str(&object, "backendType").is_none() {
+        object.insert(
+            "backendType".to_owned(),
+            Value::String("in-process".to_owned()),
+        );
+    }
+    Value::Object(object)
 }
 
 fn godui_read_tasks(tasks_dir: &Path) -> Vec<Value> {
@@ -719,6 +817,58 @@ mod tests {
         assert_eq!(teams[0]["name"], "alpha");
         assert_eq!(teams[0]["tasks"][0]["id"], 1);
         assert_eq!(teams[0]["alive"], true);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn godui_scan_teams_normalizes_bare_members_for_team_panel() {
+        let root = godui_test_root("bare-members");
+        let home = root.join("home");
+        let teams_dir = home.join(".claude/teams");
+        let tasks_root = home.join(".claude/tasks");
+        fs::create_dir_all(teams_dir.join("alpha")).expect("team dir");
+        fs::write(
+            teams_dir.join("alpha/config.json"),
+            json!({
+                "name": "alpha",
+                "createdAt": 42,
+                "leadRepo": "/opt/alpha",
+                "members": [
+                    {"model": "sonnet", "name": "builder"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("config");
+
+        let teams = godui_scan_teams(&teams_dir, &tasks_root, &home, &[], 1_000);
+
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0]["leadAgentId"], "team-lead@alpha");
+        let serialized = serde_json::to_string(&teams[0]["members"][0]).expect("member serializes");
+        let member: Value = serde_json::from_str(&serialized).expect("member json");
+        let member = member.as_object().expect("member object");
+        for key in [
+            "agentId",
+            "name",
+            "agentType",
+            "joinedAt",
+            "tmuxPaneId",
+            "cwd",
+            "subscriptions",
+            "backendType",
+        ] {
+            assert!(member.contains_key(key), "{key}");
+        }
+        assert_eq!(member["agentId"], "builder@alpha");
+        assert_eq!(member["name"], "builder");
+        assert_eq!(member["agentType"], "member");
+        assert_eq!(member["joinedAt"], 42);
+        assert_eq!(member["tmuxPaneId"], "");
+        assert_eq!(member["cwd"], "/opt/alpha");
+        assert_eq!(member["subscriptions"], json!([]));
+        assert_eq!(member["backendType"], "in-process");
+        assert_eq!(member["model"], "sonnet");
         fs::remove_dir_all(root).ok();
     }
 
