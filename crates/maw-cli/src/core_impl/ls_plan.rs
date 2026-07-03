@@ -305,6 +305,7 @@ fn render_ls_sessions_json(panes: &[LsPanePlan], include_recent: bool) -> String
                 format!("\"panes\":{}", panes.len()),
                 format!("\"agents\":{agents}"),
             ];
+            push_json_opt(&mut fields, "oracle", ls_oracle_window_name(&panes));
             if let Some(created) = panes.first().and_then(|pane| pane.session_created) {
                 fields.push(format!("\"created\":{created}"));
             }
@@ -365,6 +366,9 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
             let agents = panes.iter().filter(|pane| pane.agent).count();
             let status = ls_best_status(&panes);
             let dot = ls_status_dot(status);
+            let oracle = ls_oracle_window_name(&panes)
+                .map(|window| format!(" · {}", ls_color("2", window)))
+                .unwrap_or_default();
             let session = ls_color("36", &session);
             let pane_count = ls_color(
                 "2",
@@ -385,11 +389,27 @@ fn render_ls_text(options: &LsPlanOptions, panes: &[LsPanePlan]) -> String {
             } else {
                 String::new()
             };
-            let _ = writeln!(out, "{dot} {session}  {pane_count}{agent_count}");
+            let _ = writeln!(out, "{dot} {session}{oracle}  {pane_count}{agent_count}");
         }
         let _ = writeln!(out, "\n  {}", ls_color("2", "→ maw ls -v    full detail"));
         out
     }
+}
+
+fn ls_oracle_window_name<'a>(panes: &[&'a LsPanePlan]) -> Option<&'a str> {
+    panes
+        .iter()
+        .map(|pane| ls_window_name(&pane.target))
+        .find(|window| window.ends_with("-oracle"))
+}
+
+fn ls_window_name(target: &str) -> &str {
+    let window = target
+        .split_once(':')
+        .map_or(target, |(_, window_and_pane)| window_and_pane);
+    window
+        .rsplit_once('.')
+        .map_or(window, |(window, _pane)| window)
 }
 
 fn ls_status_dot(status: &str) -> String {
@@ -563,6 +583,52 @@ fn json_string(value: &str) -> String {
 mod remaining_cli_private_coverage_tests {
     use super::*;
 
+    fn ls_test_options() -> LsPlanOptions {
+        LsPlanOptions {
+            json: false,
+            mode: LsMode::Compact,
+            all: true,
+            channels: false,
+            active: false,
+            active_threshold_sec: None,
+            recent: false,
+            recent_limit: None,
+            filter: None,
+            peer: None,
+            federation: false,
+            node: None,
+            fleet_only: false,
+            teams: true,
+            verify: false,
+            fix: false,
+            now: None,
+            panes: Vec::new(),
+            session_created: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn ls_test_pane(
+        id: &str,
+        target: &str,
+        session: &str,
+        command: &str,
+        agent: bool,
+    ) -> LsPanePlan {
+        LsPanePlan {
+            id: id.to_owned(),
+            target: target.to_owned(),
+            session: session.to_owned(),
+            command: command.to_owned(),
+            title: String::new(),
+            source: None,
+            last_activity: None,
+            session_created: None,
+            status: "active",
+            age_sec: 0,
+            agent,
+        }
+    }
+
     #[test]
     fn private_pair_code_store_consumed_state_is_renderable() {
         let result = PairCodeStorePlanResult::Lookup(LookupResult::Consumed);
@@ -613,6 +679,64 @@ mod remaining_cli_private_coverage_tests {
         let rendered = render_ls_sessions_json(&[pane], true);
         assert!(rendered.contains("\"status\":\"unknown\""));
         assert!(!rendered.contains("lastActivityAgeSec"));
+    }
+
+    #[test]
+    fn private_ls_oracle_window_name_renders_compact_text_and_json() {
+        assert_eq!(
+            ls_window_name("188-maw-rs:maw-rs-oracle.0"),
+            "maw-rs-oracle"
+        );
+        assert_eq!(ls_window_name("188-maw-rs:maw-rs-oracle"), "maw-rs-oracle");
+        assert_eq!(ls_window_name("maw-rs-oracle.0"), "maw-rs-oracle");
+        assert_eq!(ls_window_name("maw-rs-oracle"), "maw-rs-oracle");
+
+        let options = ls_test_options();
+        let panes = vec![
+            ls_test_pane(
+                "%1",
+                "188-maw-rs:maw-rs-oracle.0",
+                "188-maw-rs",
+                "zsh",
+                false,
+            ),
+            ls_test_pane(
+                "%2",
+                "188-maw-rs:maw-rs-codex-1.0",
+                "188-maw-rs",
+                "codex",
+                true,
+            ),
+        ];
+
+        let text = render_ls_text(&options, &panes);
+        assert_eq!(text.matches("maw-rs-oracle").count(), 1);
+        assert!(text.contains(" · "));
+        assert!(text.contains("2 panes"));
+        assert!(text.contains("1 agent"));
+
+        let json = render_ls_sessions_json(&panes, false);
+        assert_eq!(json.matches("maw-rs-oracle").count(), 1);
+        assert!(json.contains("\"oracle\":\"maw-rs-oracle\""));
+    }
+
+    #[test]
+    fn private_ls_compact_without_oracle_window_keeps_original_row_shape() {
+        let options = ls_test_options();
+        let pane = ls_test_pane("%3", "199-scratch:main.0", "199-scratch", "zsh", false);
+
+        let text = render_ls_text(&options, std::slice::from_ref(&pane));
+        let expected = format!(
+            "{} {}  {}\n\n  {}\n",
+            ls_status_dot("active"),
+            ls_color("36", "199-scratch"),
+            ls_color("2", "1 pane"),
+            ls_color("2", "→ maw ls -v    full detail")
+        );
+        assert_eq!(text, expected);
+
+        let json = render_ls_sessions_json(&[pane], false);
+        assert!(!json.contains("\"oracle\""));
     }
     include!("attach_private_tests.rs");
 
