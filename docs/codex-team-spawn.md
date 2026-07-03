@@ -42,9 +42,13 @@ maw hey <session>:<FULL-window-name> "<task + done-criteria>"  # 4. dispatch (v2
 | #48 | fleet-dir divergence (fixed) | loader reads both `~/.maw/fleet` + state dir |
 
 ## Preflight
-`maw team preflight` **verb exists**, but the full crew-up 33-gotcha checklist (charter-schema reject,
-trust/pool-auth check, worktree-exists-before-window, `.maw-engine` wake) is **not fully ported yet**
-(tracked: maw-rs#43). Not yet a full canary gate.
+`maw team preflight <team.yaml|team.json>` now runs the issue #43 crew-up gate offline: charter schema,
+session/worktree ordering, `.maw-engine` command resolution, pool `access_token` expiry, actual
+`CODEX_HOME` trust, CODEX_HOME isolation, and nested worktree collision checks.
+
+The post-spawn boot verification remains a manual helper in the preflight output: run
+`maw peek <session>:<window>` for each member and confirm the pane shows the engine idle prompt,
+not a shell, trust prompt, or update prompt.
 
 ## Charter
 `ψ/teams/<team>.yaml` (or `.maw/teams/`): `name`, `session`, `members[]` each with `role`, `name`,
