@@ -2381,6 +2381,7 @@ mod serve_tests {
                 index,
                 name: window.to_owned(),
                 active: true,
+                kind: None,
             }],
         }
     }
