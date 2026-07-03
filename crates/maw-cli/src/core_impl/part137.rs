@@ -3,6 +3,8 @@ const DISPATCH_137: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(run_check_command),
 }];
 
+const CHECK_TOOL_PROBE_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckToolCategory133 {
     Required,
@@ -91,7 +93,8 @@ fn check_run_tool_probe(program: &str, args: &[&str]) -> CheckToolProbe133 {
         return CheckToolProbe133 { present: false, output: String::new() };
     };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(CHECK_TOOL_PROBE_TIMEOUT_SECS);
     loop {
         match child.try_wait() {
             Ok(Some(_status)) => {
