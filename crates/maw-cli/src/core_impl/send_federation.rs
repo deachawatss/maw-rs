@@ -382,18 +382,11 @@ fn send_local_message(
     from: Option<&str>,
 ) -> CliOutput {
     let outbound = format_local_hey_message(text, config, from);
-    if let Err(error) = tmux.send_keys_literal(target, &outbound) {
+    if let Err(error) = tmux.send_text(target, &outbound) {
         return CliOutput {
             code: 1,
             stdout: String::new(),
-            stderr: format!("{command}: tmux send-keys failed: {error}\n"),
-        };
-    }
-    if let Err(error) = tmux.send_enter(target) {
-        return CliOutput {
-            code: 1,
-            stdout: String::new(),
-            stderr: format!("{command}: tmux send-enter failed: {error}\n"),
+            stderr: format!("{command}: tmux send-text failed: {error}\n"),
         };
     }
     CliOutput {

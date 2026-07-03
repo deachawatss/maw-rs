@@ -278,12 +278,22 @@ where
 
     /// Smart text sending: buffer for multiline/long payloads, literal send otherwise, then submit-confirm.
     ///
-    /// This is the synchronous maw-rs port of maw-js `sendText`; callers own any real-time settle delay.
-    ///
     /// # Errors
     ///
     /// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
     pub fn send_text(&mut self, target: &str, text: &str) -> Result<SendTextReport, TmuxError> {
+        self.send_text_with_sleeper(target, text, std::thread::sleep)
+    }
+
+    fn send_text_with_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        mut sleep: F,
+    ) -> Result<SendTextReport, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
         self.exit_mode_if_needed(target)?;
         let used_buffer = text.contains('\n') || text.len() > 500;
         if used_buffer {
@@ -292,7 +302,8 @@ where
         } else {
             self.send_keys_literal(target, text)?;
         }
-        let (enter_attempts, warned_pending) = self.submit_with_confirm(target)?;
+        sleep(std::time::Duration::from_millis(SEND_SETTLE_MS));
+        let (enter_attempts, warned_pending) = self.submit_with_confirm(target, &mut sleep)?;
         Ok(SendTextReport {
             used_buffer,
             enter_attempts,
@@ -300,9 +311,17 @@ where
         })
     }
 
-    fn submit_with_confirm(&mut self, target: &str) -> Result<(u32, bool), TmuxError> {
+    fn submit_with_confirm<F>(
+        &mut self,
+        target: &str,
+        sleep: &mut F,
+    ) -> Result<(u32, bool), TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
         for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
-            self.send_keys(target, &["Enter".to_owned()])?;
+            self.send_enter(target)?;
+            sleep(std::time::Duration::from_millis(SUBMIT_CONFIRM_MS));
             if !self.pane_input_pending(target) {
                 return Ok((attempt, false));
             }

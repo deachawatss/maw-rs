@@ -116,8 +116,7 @@ impl ServeDelivery for ServeSystemDelivery {
 
     fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
         let mut tmux = TmuxClient::local();
-        tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
-        tmux.send_enter(target).map_err(|error| error.to_string())
+        tmux.send_text(target, text).map(|_| ()).map_err(|error| error.to_string())
     }
 
     fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {

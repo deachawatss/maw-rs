@@ -307,8 +307,9 @@
             Ok("\u{1b}[32m❯\u{1b}[0m \r"),
         ]);
         let mut client = TmuxClient::new(runner);
+        let mut sleeps = Vec::new();
         let report = client
-            .send_text("sess:oracle.0", "deploy now")
+            .send_text_with_sleeper("sess:oracle.0", "deploy now", |duration| sleeps.push(duration))
             .expect("send text ok");
         assert_eq!(
             report,
@@ -317,6 +318,14 @@
                 enter_attempts: 2,
                 warned_pending: false,
             }
+        );
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(SEND_SETTLE_MS),
+                std::time::Duration::from_millis(SUBMIT_CONFIRM_MS),
+                std::time::Duration::from_millis(SUBMIT_CONFIRM_MS),
+            ]
         );
         assert_eq!(client.runner.calls[0].0, "display-message");
         assert_eq!(
@@ -340,11 +349,19 @@
         let long_text = "x".repeat(501);
         let runner = FakeRunner::with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok(""), Ok("$ \r")]);
         let mut client = TmuxClient::new(runner);
+        let mut sleeps = Vec::new();
         let report = client
-            .send_text("sess:oracle.0", &long_text)
+            .send_text_with_sleeper("sess:oracle.0", &long_text, |duration| sleeps.push(duration))
             .expect("send text ok");
         assert!(report.used_buffer);
         assert_eq!(report.enter_attempts, 1);
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(SEND_SETTLE_MS),
+                std::time::Duration::from_millis(SUBMIT_CONFIRM_MS),
+            ]
+        );
         assert_eq!(
             client.runner.stdin_calls,
             vec![("load-buffer".to_owned(), vec!["-".to_owned()], long_text,)]
@@ -367,11 +384,17 @@
             Ok("$ deploy"),
         ]);
         let mut client = TmuxClient::new(runner);
+        let mut sleeps = Vec::new();
         let report = client
-            .send_text("sess:oracle.0", "deploy")
+            .send_text_with_sleeper("sess:oracle.0", "deploy", |duration| sleeps.push(duration))
             .expect("send text ok");
         assert_eq!(report.enter_attempts, 4);
         assert!(report.warned_pending);
+        assert_eq!(sleeps.len(), 5);
+        assert_eq!(sleeps[0], std::time::Duration::from_millis(SEND_SETTLE_MS));
+        assert!(sleeps[1..]
+            .iter()
+            .all(|duration| *duration == std::time::Duration::from_millis(SUBMIT_CONFIRM_MS)));
         assert_eq!(
             client
                 .runner
@@ -494,4 +517,3 @@
         assert_eq!(client.runner.calls[4].0, "has-session");
         assert_eq!(client.runner.calls[5].0, "has-session");
     }
-

@@ -24,19 +24,36 @@ fn sendtext_with_runner<R: maw_tmux::TmuxRunner>(
     argv: &[String],
     runner: &mut R,
 ) -> Result<CliOutput, String> {
+    sendtext_with_runner_and_sleeper(argv, runner, std::thread::sleep)
+}
+
+fn sendtext_with_runner_and_sleeper<R, F>(
+    argv: &[String],
+    runner: &mut R,
+    sleep: F,
+) -> Result<CliOutput, String>
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+{
     let options = sendtext_parse_args(argv)?;
     sendtext_validate_tmux_target(&options.target)?;
     sendtext_validate_text(&options.text)?;
-    let report = sendtext_send_text(runner, &options.target, &options.text)
+    let report = sendtext_send_text(runner, &options.target, &options.text, sleep)
         .map_err(|error| format!("send-text failed: {}", error.message))?;
     Ok(sendtext_success_output(&options.target, &report))
 }
 
-fn sendtext_send_text<R: maw_tmux::TmuxRunner>(
+fn sendtext_send_text<R, F>(
     runner: &mut R,
     target: &str,
     text: &str,
-) -> Result<maw_tmux::SendTextReport, maw_tmux::TmuxError> {
+    mut sleep: F,
+) -> Result<maw_tmux::SendTextReport, maw_tmux::TmuxError>
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+{
     sendtext_exit_mode_if_needed(runner, target)?;
     let used_buffer = text.contains('\n') || text.len() > 500;
     if used_buffer {
@@ -45,7 +62,8 @@ fn sendtext_send_text<R: maw_tmux::TmuxRunner>(
     } else {
         runner.run("send-keys", &maw_tmux::tmux_send_keys_literal_args(target, text))?;
     }
-    let (enter_attempts, warned_pending) = sendtext_submit_with_confirm(runner, target)?;
+    sleep(std::time::Duration::from_millis(maw_tmux::SEND_SETTLE_MS));
+    let (enter_attempts, warned_pending) = sendtext_submit_with_confirm(runner, target, &mut sleep)?;
     Ok(maw_tmux::SendTextReport {
         used_buffer,
         enter_attempts,
@@ -85,17 +103,23 @@ fn sendtext_exit_mode_if_needed<R: maw_tmux::TmuxRunner>(
     }
 }
 
-fn sendtext_submit_with_confirm<R: maw_tmux::TmuxRunner>(
+fn sendtext_submit_with_confirm<R, F>(
     runner: &mut R,
     target: &str,
-) -> Result<(u32, bool), maw_tmux::TmuxError> {
-    for attempt in 1..=4 {
+    sleep: &mut F,
+) -> Result<(u32, bool), maw_tmux::TmuxError>
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+{
+    for attempt in 1..=maw_tmux::MAX_SUBMIT_ATTEMPTS {
         runner.run("send-keys", &maw_tmux::tmux_send_enter_args(target))?;
+        sleep(std::time::Duration::from_millis(maw_tmux::SUBMIT_CONFIRM_MS));
         if !sendtext_pane_input_pending(runner, target) {
             return Ok((attempt, false));
         }
     }
-    Ok((4, true))
+    Ok((maw_tmux::MAX_SUBMIT_ATTEMPTS, true))
 }
 
 fn sendtext_pane_input_pending<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> bool {
@@ -267,6 +291,13 @@ mod sendtext_tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn sendtext_with_no_sleep(
+        argv: &[String],
+        runner: &mut impl maw_tmux::TmuxRunner,
+    ) -> Result<CliOutput, String> {
+        sendtext_with_runner_and_sleeper(argv, runner, |_| {})
+    }
+
     #[test]
     fn sendtext_dispatch_registers_send_text() {
         assert_eq!(DISPATCH_84.len(), 1);
@@ -280,7 +311,7 @@ mod sendtext_tests {
         let mut tmux =
             SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r")]);
 
-        let output = sendtext_with_runner(&sendtext_strings(&["sess:1.0", "hello", "world"]), &mut tmux)
+        let output = sendtext_with_no_sleep(&sendtext_strings(&["sess:1.0", "hello", "world"]), &mut tmux)
             .expect("send");
 
         assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m sent text to sess:1.0 (literal)\n");
@@ -298,7 +329,7 @@ mod sendtext_tests {
         let mut tmux =
             SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r")]);
 
-        let output = sendtext_with_runner(&[String::from("sess:1.0"), long_text.clone()], &mut tmux)
+        let output = sendtext_with_no_sleep(&[String::from("sess:1.0"), long_text.clone()], &mut tmux)
             .expect("send");
 
         assert!(output.stdout.contains("(buffer)"));
@@ -312,9 +343,9 @@ mod sendtext_tests {
     #[test]
     fn sendtext_rejects_separator_and_leading_dash_before_tmux() {
         let mut tmux = SendtextMockTmux::default();
-        let err = sendtext_with_runner(&sendtext_strings(&["--", "hi"]), &mut tmux).expect_err("target");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["--", "hi"]), &mut tmux).expect_err("target");
         assert!(err.contains("-- separator"));
-        let err = sendtext_with_runner(&sendtext_strings(&["sess:1", "-oops"]), &mut tmux).expect_err("text");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["sess:1", "-oops"]), &mut tmux).expect_err("text");
         assert!(err.contains("not start with '-'"));
         assert!(tmux.calls.is_empty());
     }
@@ -322,9 +353,9 @@ mod sendtext_tests {
     #[test]
     fn sendtext_rejects_bad_targets_before_tmux() {
         let mut tmux = SendtextMockTmux::default();
-        let err = sendtext_with_runner(&sendtext_strings(&["bad target", "hi"]), &mut tmux).expect_err("target");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["bad target", "hi"]), &mut tmux).expect_err("target");
         assert!(err.contains("must not contain whitespace"));
-        let err = sendtext_with_runner(&sendtext_strings(&["-Sbad", "hi"]), &mut tmux).expect_err("target");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["-Sbad", "hi"]), &mut tmux).expect_err("target");
         assert!(err.contains("looks like a flag"));
         assert!(tmux.calls.is_empty());
     }
@@ -347,7 +378,7 @@ mod sendtext_tests {
         ]);
 
         let output =
-            sendtext_with_runner(&sendtext_strings(&["sess:1", "deploy"]), &mut tmux).expect("send");
+            sendtext_with_no_sleep(&sendtext_strings(&["sess:1", "deploy"]), &mut tmux).expect("send");
 
         assert!(output.stdout.contains("pending input after Enter retries"));
         assert_eq!(
@@ -365,7 +396,7 @@ mod sendtext_tests {
         let _env = SendtextEnvGuard::sendtext_new();
         let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Err("no pane")]);
 
-        let err = sendtext_with_runner(&sendtext_strings(&["sess:1", "hi"]), &mut tmux).expect_err("tmux");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["sess:1", "hi"]), &mut tmux).expect_err("tmux");
 
         assert!(err.contains("send-text failed: no pane"));
     }
