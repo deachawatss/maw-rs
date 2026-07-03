@@ -27,10 +27,21 @@ struct EnvRestore {
     maw_rs_talkto_fallback: Option<OsString>,
     maw_rs_talkto_no_thread: Option<OsString>,
     path: Option<OsString>,
+    check_tool_probes: Vec<(&'static str, Option<OsString>)>,
 }
 
 impl EnvRestore {
     fn capture() -> Self {
+        const CHECK_TOOL_PROBES: &[&str] = &[
+            "MAW_RS_CHECK_TOOL_PROBE_BUN",
+            "MAW_RS_CHECK_TOOL_PROBE_GH",
+            "MAW_RS_CHECK_TOOL_PROBE_GHQ",
+            "MAW_RS_CHECK_TOOL_PROBE_GIT",
+            "MAW_RS_CHECK_TOOL_PROBE_TMUX",
+            "MAW_RS_CHECK_TOOL_PROBE_UV",
+            "MAW_RS_CHECK_TOOL_PROBE_UVX",
+            "MAW_RS_CHECK_TOOL_PROBE_WHICH",
+        ];
         Self {
             maw_from_rs: std::env::var_os("MAW_FROM_RS"),
             home: std::env::var_os("HOME"),
@@ -42,6 +53,10 @@ impl EnvRestore {
             maw_rs_talkto_fallback: std::env::var_os("MAW_RS_TALKTO_FALLBACK"),
             maw_rs_talkto_no_thread: std::env::var_os("MAW_RS_TALKTO_NO_THREAD"),
             path: std::env::var_os("PATH"),
+            check_tool_probes: CHECK_TOOL_PROBES
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
         }
     }
 }
@@ -61,6 +76,9 @@ impl Drop for EnvRestore {
             self.maw_rs_talkto_no_thread.take(),
         );
         restore_env("PATH", self.path.take());
+        for (key, value) in self.check_tool_probes.drain(..) {
+            restore_env(key, value);
+        }
     }
 }
 
@@ -322,14 +340,33 @@ fn check_tools_extracts_versions_with_argv_only_tool_probes() {
     create_dir_all(&bin_dir).expect("bin dir");
     create_dir_all(&plugins_dir).expect("plugins dir");
     write_maw_shim(&bin_dir, 37);
-    write_tool_shim(&bin_dir, "bun", "#!/bin/echo bun 1.2.3\n");
-    write_tool_shim(&bin_dir, "gh", "#!/bin/echo gh version 2.3.4\n");
-    write_tool_shim(&bin_dir, "ghq", "#!/bin/echo ghq 3.4.5\n");
-    write_tool_shim(&bin_dir, "git", "#!/bin/echo git version 4.5.6\n");
-    write_tool_shim(&bin_dir, "tmux", "#!/bin/echo tmux 5.6\n");
-    write_tool_shim(&bin_dir, "uv", "#!/bin/echo uv 6.7.8\n");
-    write_tool_shim(&bin_dir, "uvx", "#!/bin/echo uvx should-not-run\n");
-    write_tool_shim(&bin_dir, "which", "#!/bin/echo uvx\n");
+    write_tool_shim(&bin_dir, "bun", "#!/bin/sh\nprintf 'bun 1.2.3\\n'\n");
+    write_tool_shim(&bin_dir, "gh", "#!/bin/sh\nprintf 'gh version 2.3.4\\n'\n");
+    write_tool_shim(&bin_dir, "ghq", "#!/bin/sh\nprintf 'ghq 3.4.5\\n'\n");
+    write_tool_shim(
+        &bin_dir,
+        "git",
+        "#!/bin/sh\nprintf 'git version 4.5.6\\n'\n",
+    );
+    write_tool_shim(&bin_dir, "tmux", "#!/bin/sh\nprintf 'tmux 5.6\\n'\n");
+    write_tool_shim(&bin_dir, "uv", "#!/bin/sh\nprintf 'uv 6.7.8\\n'\n");
+    write_tool_shim(
+        &bin_dir,
+        "uvx",
+        "#!/bin/sh\nprintf 'uvx should-not-run\\n'\n",
+    );
+    write_tool_shim(
+        &bin_dir,
+        "which",
+        "#!/bin/sh\nif [ \"$1\" = uvx ]; then printf 'uvx\\n'; exit 0; fi\nexit 1\n",
+    );
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_BUN", "bun 1.2.3\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_GH", "gh version 2.3.4\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_GHQ", "ghq 3.4.5\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_GIT", "git version 4.5.6\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_TMUX", "tmux 5.6\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_UV", "uv 6.7.8\n");
+    std::env::set_var("MAW_RS_CHECK_TOOL_PROBE_WHICH", "uvx\n");
     std::env::set_var("PATH", &bin_dir);
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
     std::env::remove_var("MAW_FROM_RS");
