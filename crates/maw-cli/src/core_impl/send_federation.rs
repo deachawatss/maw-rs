@@ -1221,6 +1221,7 @@ mod send_acl_hotpath_tests {
             index,
             name: name.to_owned(),
             active: index == 0,
+            kind: None,
         }
     }
 
