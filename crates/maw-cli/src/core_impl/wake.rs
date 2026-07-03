@@ -560,7 +560,11 @@ fn wake_registry_windows(
         .map_or_else(Vec::new, |session| fleet_registry_windows_from_tmux(&session.windows, None));
     if !windows.iter().any(|window| window.name == resolved.window) {
         if let Some(repo) = fleet_repo_slug_from_path(&resolved.repo_path, None) {
-            windows.push(FleetWindowSummary { name: resolved.window.clone(), repo });
+            windows.push(FleetWindowSummary {
+                name: resolved.window.clone(),
+                repo,
+                kind: Some(fleet_kind_from_window_name(&resolved.window)),
+            });
         }
     }
     windows
@@ -813,6 +817,7 @@ mod wake_tests {
             assert_eq!(first["windows"].as_array().expect("windows").len(), 1);
             assert_eq!(first["windows"][0]["name"], "neo");
             assert_eq!(first["windows"][0]["repo"], "github.com/acme/neo-oracle");
+            assert_eq!(first["windows"][0]["kind"], "project");
 
             let (code, stdout) = wake_run(&wake_strings(&["neo", "--task", "issue-90", "--no-attach"]), &mut tmux).expect("task wake");
             assert_eq!(code, 0, "{stdout}");
@@ -821,6 +826,7 @@ mod wake_tests {
             assert_eq!(windows.len(), 2);
             assert!(windows.iter().any(|window| window["name"] == "neo"));
             assert!(windows.iter().any(|window| window["name"] == "neo-issue-90"));
+            assert!(windows.iter().all(|window| window["kind"] == "project"));
             assert_eq!(updated["created_at"], "2026-07-03T02:03:04.000Z");
         });
     }

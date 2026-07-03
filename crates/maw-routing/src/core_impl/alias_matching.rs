@@ -31,7 +31,7 @@ fn resolve_session_alias_window_target(
     writable: &[Session],
     route_type: RouteType,
 ) -> Option<ResolveResult> {
-    if query.trim().to_lowercase().ends_with("-oracle") {
+    if alias_query_is_oracle(query, writable) {
         return None;
     }
 
@@ -154,6 +154,37 @@ fn fleet_window_candidate_names(query: &str) -> Vec<String> {
         names.push(format!("{stripped_unnumbered}-oracle"));
     }
     unique_strings(names)
+}
+
+fn alias_query_is_oracle(query: &str, sessions: &[Session]) -> bool {
+    if !query.trim().to_lowercase().ends_with("-oracle") {
+        return false;
+    }
+    match declared_alias_kind(query, sessions) {
+        Some(RepoKind::Project) => false,
+        Some(RepoKind::Oracle) | None => true,
+    }
+}
+
+fn declared_alias_kind(query: &str, sessions: &[Session]) -> Option<RepoKind> {
+    let candidates = fleet_window_candidate_names(query);
+    let mut found = None;
+    for session in sessions {
+        let session_matches = session_alias_names(&session.name)
+            .iter()
+            .any(|name| candidates.iter().any(|candidate| candidate.eq_ignore_ascii_case(name)));
+        for window in &session.windows {
+            let window_matches = candidates.iter().any(|candidate| candidate.eq_ignore_ascii_case(&window.name));
+            if (session_matches || window_matches) && window.kind.is_some() {
+                let kind = window.kind;
+                if found.is_some() && found != kind {
+                    return None;
+                }
+                found = kind;
+            }
+        }
+    }
+    found
 }
 
 fn session_alias_names(name: &str) -> Vec<String> {
@@ -376,6 +407,16 @@ mod coverage_gap_tests {
             index,
             name: name.to_owned(),
             active: index == 0,
+            kind: None,
+        }
+    }
+
+    fn window_with_kind(index: u32, name: &str, kind: RepoKind) -> Window {
+        Window {
+            index,
+            name: name.to_owned(),
+            active: index == 0,
+            kind: Some(kind),
         }
     }
 
@@ -638,6 +679,34 @@ mod coverage_gap_tests {
         let sessions = vec![session("mawjs", vec![window(0, "mawjs")])];
         assert!(
             resolve_session_alias_window_target("mawjs-oracle", &sessions, RouteType::Local)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn declared_project_window_overrides_oracle_suffix_alias_guard() {
+        let sessions = vec![session(
+            "bar-oracle",
+            vec![window_with_kind(0, "bar-oracle", RepoKind::Project)],
+        )];
+
+        assert_eq!(
+            resolve_session_alias_window_target("bar-oracle", &sessions, RouteType::Local),
+            Some(ResolveResult::Local {
+                target: "bar-oracle:0".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn declared_oracle_window_without_suffix_keeps_oracle_suffix_guard() {
+        let sessions = vec![session(
+            "foo",
+            vec![window_with_kind(0, "foo", RepoKind::Oracle)],
+        )];
+
+        assert!(
+            resolve_session_alias_window_target("foo-oracle", &sessions, RouteType::Local)
                 .is_none()
         );
     }

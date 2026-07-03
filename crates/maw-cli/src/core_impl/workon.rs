@@ -139,7 +139,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
             }
         }
         window_name = format!("{}-{task}", repo.repo_name);
-    } else if repo.repo_name.ends_with("-oracle") {
+    } else if native_repo_path_is_oracle(&repo.repo_path, &repo.repo_name) {
         taskless_oracle = true;
     }
 

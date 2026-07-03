@@ -663,6 +663,7 @@ fn route_sessions_from_tmux(
                     index: window.index,
                     name: window.name,
                     active: window.active,
+                    kind: None,
                 })
                 .collect(),
         })

@@ -11,6 +11,7 @@ pub struct Window {
     pub index: u32,
     pub name: String,
     pub active: bool,
+    pub kind: Option<RepoKind>,
 }
 
 /// Tmux session metadata. `source` is `None`/`local` for writable local sessions.
@@ -19,6 +20,13 @@ pub struct Session {
     pub name: String,
     pub windows: Vec<Window>,
     pub source: Option<String>,
+}
+
+/// Declared repository kind for a routeable window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoKind {
+    Oracle,
+    Project,
 }
 
 /// Named peer config entry.
@@ -592,4 +600,3 @@ pub fn resolve_target(query: &str, config: &MawConfig, sessions: &[Session]) -> 
         Some("check: maw ls"),
     )
 }
-
