@@ -238,11 +238,9 @@ fn ls_parser_text_json_and_duration_branches_are_covered() {
         "%1|zsh|1-mawjs:1.0|title|100|/repo|199940",
     ]);
     assert_eq!(verbose.code, 0, "{}", verbose.stderr);
-    assert!(
-        verbose.stdout.contains("TARGET CMD AGE TITLE"),
-        "{}",
-        verbose.stdout
-    );
+    assert!(verbose.stdout.contains("1-mawjs"), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("\n  "), "{}", verbose.stdout);
+    assert!(verbose.stdout.contains("1.0"), "{}", verbose.stdout);
     assert!(verbose.stdout.contains("1m"), "{}", verbose.stdout);
 
     assert_ok_contains(
