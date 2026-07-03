@@ -339,7 +339,7 @@ fn usage_text() -> String {
         "  a|attach <target> [--print] [--readonly|-r]   attach to a tmux session\n",
         "  run <target> <cmd...>                         type text and press Enter\n",
         "  send-enter <target> [--N <count>]             send Enter to a tmux target\n",
-        "  ls [--compact|-c] [--verbose|-v] [--json]     list live local sessions\n",
+        "  ls [--compact|-c] [--verbose|-v] [--json] [--watch[=secs]]  list live local sessions\n",
         "  plugin ls [-v|--verbose]                      list installed plugins\n",
         "  bring|b <oracle> [--to <session[:window]>]    plan a wake split target\n",
         "  feed active|parse-line|describe                inspect local activity feed data\n",
@@ -390,13 +390,19 @@ struct LsPlanOptions {
     teams: bool,
     verify: bool,
     fix: bool,
+    watch_interval_sec: Option<u64>,
     now: Option<u64>,
     panes: Vec<TmuxPane>,
     session_created: BTreeMap<String, u64>,
 }
 
-fn run_ls_plan(argv: &[String]) -> CliOutput {
+fn run_ls_plan_async(argv: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
+    Box::pin(async move { run_ls_plan_async_impl(&argv).await })
+}
+
+async fn run_ls_plan_async_impl(argv: &[String]) -> CliOutput {
     match parse_ls_plan_options(argv) {
+        Ok(options) if options.watch_interval_sec.is_some() => run_ls_watch_plan(&options).await,
         Ok(options) => render_ls_plan(&options),
         Err(output) => output,
     }
@@ -421,6 +427,7 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
         teams: true,
         verify: false,
         fix: false,
+        watch_interval_sec: None,
         now: None,
         panes: Vec::new(),
         session_created: BTreeMap::new(),
@@ -432,6 +439,14 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
         match argv[index].as_str() {
             "--help" | "-h" => return Err(ls_help_ok()),
             "--json" | "--plan-json" => options.json = true,
+            "--watch" => options.watch_interval_sec = Some(LS_WATCH_DEFAULT_SECS),
+            arg if arg.starts_with("--watch=") => {
+                let raw = &arg["--watch=".len()..];
+                let Some(seconds) = parse_ls_watch_seconds(raw) else {
+                    return Err(ls_usage_error("maw ls: invalid --watch seconds"));
+                };
+                options.watch_interval_sec = Some(seconds);
+            }
             "--all" => options.all = true,
             "--compact" | "-c" => options.mode = LsMode::Compact,
             "--verbose" | "-v" => options.mode = LsMode::Verbose,
@@ -560,6 +575,10 @@ fn parse_ls_plan_options(argv: &[String]) -> Result<LsPlanOptions, CliOutput> {
 
     if options.federation {
         options.all = true;
+    }
+
+    if options.watch_interval_sec.is_some() && options.json {
+        return Err(ls_usage_error("maw ls: --watch cannot be combined with --json"));
     }
 
     Ok(options)

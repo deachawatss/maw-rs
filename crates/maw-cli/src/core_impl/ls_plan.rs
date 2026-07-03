@@ -1,5 +1,15 @@
+const LS_WATCH_DEFAULT_SECS: u64 = 2;
+const LS_WATCH_ENTER: &str = "\x1b[?1049h\x1b[?25l";
+const LS_WATCH_REPAINT: &str = "\x1b[H\x1b[2J";
+const LS_WATCH_RESTORE: &str = "\x1b[?25h\x1b[?1049l";
+
 fn parse_ls_pane(value: &str) -> Result<TmuxPane, String> {
     parse_discover_pane(value).map_err(|message| message.replacen("discover:", "ls:", 1))
+}
+
+fn parse_ls_watch_seconds(raw: &str) -> Option<u64> {
+    let value = raw.trim().parse::<u64>().ok()?;
+    (value > 0).then_some(value)
 }
 
 fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
@@ -16,6 +26,146 @@ fn parse_ls_duration_seconds(raw: &str) -> Option<u64> {
         return None;
     }
     Some(value * multiplier)
+}
+
+async fn run_ls_watch_plan(options: &LsPlanOptions) -> CliOutput {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return ls_usage_error("maw ls: --watch requires a TTY stdout");
+    }
+
+    let live_options = ls_watch_live_options(options);
+    let mut stdout = std::io::stdout();
+    ls_watch_loop_with_hooks(
+        &live_options,
+        &mut stdout,
+        render_ls_plan,
+        ls_watch_current_hms,
+        ls_watch_wait_next,
+    )
+    .await
+}
+
+fn ls_watch_live_options(options: &LsPlanOptions) -> LsPlanOptions {
+    let mut live_options = options.clone();
+    live_options.panes.clear();
+    live_options.now = None;
+    live_options.session_created.clear();
+    live_options
+}
+
+async fn ls_watch_loop_with_hooks<W, Collect, Clock, Wait>(
+    options: &LsPlanOptions,
+    writer: &mut W,
+    mut collect: Collect,
+    mut clock: Clock,
+    mut wait_next: Wait,
+) -> CliOutput
+where
+    W: std::io::Write,
+    Collect: FnMut(&LsPlanOptions) -> CliOutput,
+    Clock: FnMut() -> String,
+    Wait: FnMut(u64) -> Pin<Box<dyn Future<Output = bool> + Send>>,
+{
+    let interval = options.watch_interval_sec.unwrap_or(LS_WATCH_DEFAULT_SECS);
+    if let Err(message) = ls_watch_enter(writer) {
+        return ls_watch_error(&message);
+    }
+
+    let mut result = CliOutput {
+        code: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    loop {
+        let output = collect(options);
+        let body = if output.code == 0 {
+            output.stdout.as_str()
+        } else {
+            output.stderr.as_str()
+        };
+        if let Err(message) = ls_watch_write_frame(writer, body, interval, &clock()) {
+            result = ls_watch_error(&message);
+            break;
+        }
+        if output.code != 0 {
+            result = output;
+            result.stdout.clear();
+            break;
+        }
+        if !wait_next(interval).await {
+            break;
+        }
+    }
+
+    if let Err(message) = ls_watch_restore(writer) {
+        if result.code == 0 {
+            return ls_watch_error(&message);
+        }
+        if !result.stderr.is_empty() {
+            result.stderr.push('\n');
+        }
+        result.stderr.push_str(&message);
+        result.stderr.push('\n');
+    }
+    result
+}
+
+fn ls_watch_wait_next(seconds: u64) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async move {
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(seconds)) => true,
+            _ = tokio::signal::ctrl_c() => false,
+        }
+    })
+}
+
+fn ls_watch_current_hms() -> String {
+    let seconds = current_epoch_seconds() % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    )
+}
+
+fn ls_watch_enter(writer: &mut impl std::io::Write) -> Result<(), String> {
+    ls_watch_write_raw(writer, LS_WATCH_ENTER)
+}
+
+fn ls_watch_restore(writer: &mut impl std::io::Write) -> Result<(), String> {
+    ls_watch_write_raw(writer, LS_WATCH_RESTORE)
+}
+
+fn ls_watch_write_frame(
+    writer: &mut impl std::io::Write,
+    body: &str,
+    interval: u64,
+    hms: &str,
+) -> Result<(), String> {
+    ls_watch_write_raw(writer, LS_WATCH_REPAINT)?;
+    std::io::Write::write_all(writer, body.as_bytes())
+        .map_err(|error| format!("maw ls: --watch terminal write failed: {error}"))?;
+    if !body.ends_with('\n') {
+        std::io::Write::write_all(writer, b"\n")
+            .map_err(|error| format!("maw ls: --watch terminal write failed: {error}"))?;
+    }
+    let footer = format!("\x1b[2mwatching · {interval}s · ctrl-c to exit · {hms}\x1b[0m\n");
+    ls_watch_write_raw(writer, &footer)
+}
+
+fn ls_watch_write_raw(writer: &mut impl std::io::Write, value: &str) -> Result<(), String> {
+    std::io::Write::write_all(writer, value.as_bytes())
+        .and_then(|()| std::io::Write::flush(writer))
+        .map_err(|error| format!("maw ls: --watch terminal write failed: {error}"))
+}
+
+fn ls_watch_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 1,
+        stdout: String::new(),
+        stderr: format!("{message}\n"),
+    }
 }
 
 fn render_ls_plan(options: &LsPlanOptions) -> CliOutput {
@@ -498,6 +648,7 @@ fn ls_help_ok() -> CliOutput {
             "  maw ls --federation <peer>  drill into one peer",
             "  maw ls --federation --node <node>  filter the federated view",
             "  maw ls --json           emit JSON",
+            "  maw ls --watch[=secs]   repaint live local sessions in a TTY (default 2s; not for pipes)",
             "  maw ls --active [30m]   local sessions touched within a recent threshold",
             "  maw ls --fleet-only     hide orphan/ad hoc tmux sessions (legacy filter)",
             "  maw ls --no-teams       hide L2 Claude Code teams from ~/.claude/teams",
@@ -518,7 +669,7 @@ fn ls_usage_error(message: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!(
-            "{message}\nusage: maw-rs ls [<filter>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--recent|-r [N]] [--active [30m|1h]] [--federation] [--fleet-only] [--node <node>] [--verify] [--fix] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n"
+            "{message}\nusage: maw-rs ls [<filter>] [--all] [--json|--plan-json] [--compact|-c] [--verbose|-v] [--watch[=secs]] [--recent|-r [N]] [--active [30m|1h]] [--federation] [--fleet-only] [--node <node>] [--verify] [--fix] [--channels] [--pane <id|command|target|title|pid|cwd|last_activity>]...\n"
         ),
     }
 }
@@ -633,6 +784,7 @@ mod remaining_cli_private_coverage_tests {
             teams: true,
             verify: false,
             fix: false,
+            watch_interval_sec: None,
             now: None,
             panes: Vec::new(),
             session_created: std::collections::BTreeMap::new(),
@@ -688,7 +840,68 @@ mod remaining_cli_private_coverage_tests {
             Err("calver: missing hour in --now".to_owned())
         );
         assert_eq!(parse_ls_duration_seconds("2m"), Some(120));
+        assert_eq!(parse_ls_watch_seconds("5"), Some(5));
+        assert_eq!(parse_ls_watch_seconds("0"), None);
         assert_eq!(parse_ls_duration_seconds("7w"), None);
+    }
+
+    #[test]
+    fn private_ls_watch_flags_parse_and_reject_json() {
+        let default_watch = parse_ls_plan_options(&["--watch".to_owned()]).expect("default watch");
+        assert_eq!(
+            default_watch.watch_interval_sec,
+            Some(LS_WATCH_DEFAULT_SECS)
+        );
+
+        let explicit_watch =
+            parse_ls_plan_options(&["--watch=5".to_owned()]).expect("explicit watch");
+        assert_eq!(explicit_watch.watch_interval_sec, Some(5));
+
+        let json_watch =
+            parse_ls_plan_options(&["--watch".to_owned(), "--json".to_owned()]).expect_err("json watch");
+        assert_eq!(json_watch.code, 2);
+        assert!(json_watch
+            .stderr
+            .contains("maw ls: --watch cannot be combined with --json"));
+    }
+
+    #[tokio::test]
+    async fn private_ls_watch_loop_repaints_and_restores_with_injected_hooks() {
+        let mut options = ls_test_options();
+        options.watch_interval_sec = Some(5);
+        let mut buffer = Vec::<u8>::new();
+        let mut renders = 0usize;
+        let mut sleeps = Vec::<u64>::new();
+
+        let output = ls_watch_loop_with_hooks(
+            &options,
+            &mut buffer,
+            |_| {
+                renders += 1;
+                CliOutput {
+                    code: 0,
+                    stdout: format!("frame {renders}\n"),
+                    stderr: String::new(),
+                }
+            },
+            || "01:02:03".to_owned(),
+            |seconds| {
+                sleeps.push(seconds);
+                Box::pin(std::future::ready(sleeps.len() < 3))
+            },
+        )
+        .await;
+
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        assert_eq!(renders, 3);
+        assert_eq!(sleeps, vec![5, 5, 5]);
+        let text = String::from_utf8(buffer).expect("utf8 watch output");
+        assert!(text.starts_with(LS_WATCH_ENTER), "{text:?}");
+        assert!(text.ends_with(LS_WATCH_RESTORE), "{text:?}");
+        assert_eq!(text.matches(LS_WATCH_REPAINT).count(), 3);
+        assert!(text.contains("frame 1\n"));
+        assert!(text.contains("frame 3\n"));
+        assert!(text.contains("watching · 5s · ctrl-c to exit · 01:02:03"));
     }
 
     #[test]
