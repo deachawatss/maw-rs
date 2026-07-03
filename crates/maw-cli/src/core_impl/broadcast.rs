@@ -34,9 +34,7 @@ impl BroadcastTmux for BroadcastLocalTmux {
 
     fn broadcast_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         broadcast_validate_tmux_target(target)?;
-        maw_tmux::TmuxRunner::run(&mut self.runner, "send-keys", &maw_tmux::tmux_send_keys_literal_args(target, text)).map_err(|error| error.message)?;
-        maw_tmux::TmuxRunner::run(&mut self.runner, "send-keys", &maw_tmux::tmux_send_enter_args(target)).map_err(|error| error.message)?;
-        Ok(())
+        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.message)
     }
 }
 

@@ -474,9 +474,8 @@ impl ServecorePaneRunner for ServecoreTmuxPaneRunner {
         let mut tmux = TmuxClient::local();
         tmux.send_keys(pane, &["C-u".to_owned()])
             .map_err(|_| "serve-orchestration: tmux send failed".to_owned())?;
-        tmux.send_keys_literal(pane, line)
-            .map_err(|_| "serve-orchestration: tmux send failed".to_owned())?;
-        tmux.send_enter(pane)
+        tmux.send_text(pane, line)
+            .map(|_| ())
             .map_err(|_| "serve-orchestration: tmux send failed".to_owned())
     }
 }

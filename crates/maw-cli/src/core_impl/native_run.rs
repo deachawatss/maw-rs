@@ -39,7 +39,7 @@ struct RunPeerDeps<'a, P: RunPeerTransport> {
 
 trait RunTmux {
     fn run_sessions(&mut self) -> Vec<RouteSession>;
-    fn run_send_literal(&mut self, target: &str, text: &str) -> Result<(), String>;
+    fn run_send_text(&mut self, target: &str, text: &str) -> Result<(), String>;
     fn run_send_enter(&mut self, target: &str) -> Result<(), String>;
 }
 
@@ -70,10 +70,10 @@ impl RunTmux for RunSystemTmux {
             .collect()
     }
 
-    fn run_send_literal(&mut self, target: &str, text: &str) -> Result<(), String> {
+    fn run_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         run_validate_tmux_target(target)?;
         run_validate_command_text(text)?;
-        self.client.send_keys_literal(target, text).map_err(|error| error.to_string())
+        self.client.send_text(target, text).map(|_| ()).map_err(|error| error.to_string())
     }
 
     fn run_send_enter(&mut self, target: &str) -> Result<(), String> {
@@ -169,8 +169,9 @@ fn run_run_with_from(
 fn run_local(target: &str, text: &str, tmux: &mut impl RunTmux) -> Result<String, (i32, String)> {
     run_validate_tmux_target(target).map_err(|message| (2, message))?;
     if !text.is_empty() {
-        tmux.run_send_literal(target, text)
+        tmux.run_send_text(target, text)
             .map_err(|error| (1, format!("tmux send-keys failed: {error}")))?;
+        return Ok(format!("\x1b[32mran\x1b[0m → {target}: {}\n", run_truncate(text, 200)));
     }
     tmux.run_send_enter(target)
         .map_err(|error| (1, format!("tmux send-keys failed: {error}")))?;
@@ -430,7 +431,7 @@ mod run_tests {
             self.sessions.clone()
         }
 
-        fn run_send_literal(&mut self, target: &str, text: &str) -> Result<(), String> {
+        fn run_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
             run_validate_tmux_target(target)?;
             run_validate_command_text(text)?;
             self.sends.push((target.to_owned(), text.to_owned()));
@@ -511,7 +512,7 @@ mod run_tests {
     }
 
     #[test]
-    fn run_local_sends_literal_then_enter() {
+    fn run_local_sends_text_with_confirmed_submit() {
         let mut tmux = RunFakeTmux {
             sessions: vec![run_session("work", vec![run_window(0, "shell")])],
             ..RunFakeTmux::default()
@@ -521,7 +522,7 @@ mod run_tests {
             .expect("run");
         assert!(output.contains("ran"));
         assert_eq!(tmux.sends, vec![("work:0".to_owned(), "ls -la".to_owned())]);
-        assert_eq!(tmux.enters, vec!["work:0".to_owned()]);
+        assert!(tmux.enters.is_empty());
         assert!(peer.requests.is_empty());
     }
 

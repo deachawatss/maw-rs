@@ -43,9 +43,17 @@ case "$1" in
       *) echo "unexpected list-panes args: $*" >&2; exit 9 ;;
     esac
     ;;
+  display-message)
+    printf '%s\n' '0'
+    ;;
+  capture-pane)
+    printf '%s\n' '$ '
+    ;;
+  load-buffer|paste-buffer)
+    ;;
   send-keys)
     ;;
-  display-message|split-window|select-layout|kill-pane|notify-send|osascript|curl|ssh)
+  split-window|select-layout|kill-pane|notify-send|osascript|curl|ssh)
     echo "unexpected mutating transport/notifier command: $*" >&2
     exit 44
     ;;
@@ -136,11 +144,10 @@ fn talkto_native_local_thread_notification_sends_to_guarded_pane() {
         log.contains("list-panes -t %42 -F #{pane_current_command}"),
         "{log}"
     );
-    assert!(
-        log.contains("send-keys -t %42 -l 💬 channel:local:nova (#1)"),
-        "{log}"
-    );
+    assert!(log.contains("load-buffer -"), "{log}");
+    assert!(log.contains("paste-buffer -t %42"), "{log}");
     assert!(log.contains("send-keys -t %42 Enter"), "{log}");
+    assert!(log.contains("capture-pane -t %42 -e -p -S -5"), "{log}");
     let state_log =
         std::fs::read_to_string(root.join("home/.maw/maw-log.jsonl")).expect("state log");
     assert!(state_log.contains(r#""ch":"thread:1""#), "{state_log}");
