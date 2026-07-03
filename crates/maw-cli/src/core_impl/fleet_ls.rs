@@ -1,5 +1,5 @@
 const DISPATCH_151: &[DispatcherEntry] = &[
-    DispatcherEntry { command: "ls", handler: Handler::Sync(run_ls_plan) },
+    DispatcherEntry { command: "ls", handler: Handler::Async(run_ls_plan_async) },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
