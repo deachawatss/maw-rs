@@ -182,7 +182,35 @@ fn find_window(sessions: &[Session], query: &str) -> Option<String> {
                 if let Some(window) = session.windows.first() {
                     return Some(format!("{}:{}", session.name, window.index));
                 }
-            } else if let Some(window) = session
+                return Some(format!("{}:", session.name));
+            }
+
+            let numeric_window = numeric_window_or_pane(raw_win_part);
+            if numeric_window {
+                if let Ok(window_index) = win_part.parse::<u32>() {
+                    if let Some(window) = session
+                        .windows
+                        .iter()
+                        .find(|window| window.index == window_index)
+                    {
+                        return Some(format!("{}:{}{pane_suffix}", session.name, window.index));
+                    }
+                }
+            }
+
+            if let Some(window) = session
+                .windows
+                .iter()
+                .find(|window| window.name.eq_ignore_ascii_case(win_part))
+            {
+                return Some(format!("{}:{}{pane_suffix}", session.name, window.index));
+            }
+
+            if numeric_window {
+                return Some(format!("{}:{}{}", session.name, win_part, pane_suffix));
+            }
+
+            if let Some(window) = session
                 .windows
                 .iter()
                 .find(|window| window.name.to_lowercase().contains(win_part))
@@ -243,19 +271,6 @@ fn find_window(sessions: &[Session], query: &str) -> Option<String> {
     if substring_matches.len() > 1 {
         return None;
     }
-
-    if query.contains(':') {
-        let lower_query = query.to_lowercase();
-        let (sess_part, win_part) = lower_query.split_once(':').unwrap_or(("", ""));
-        let session_exists = match_session(sessions, sess_part, true).is_some();
-        if !session_exists {
-            return None;
-        }
-        if win_part.is_empty() || numeric_window_or_pane(win_part) {
-            return Some(query.to_owned());
-        }
-    }
-
     None
 }
 
@@ -481,6 +496,52 @@ mod coverage_gap_tests {
         assert_eq!(
             find_window(&sessions, "dev:4.2"),
             Some("dev:4.2".to_owned())
+        );
+    }
+
+    #[test]
+    fn find_window_prefers_colon_index_over_numeric_window_name_suffix() {
+        let sessions = vec![session(
+            "188-maw-rs",
+            vec![
+                window(1, "maw-rs-oracle"),
+                window(2, "maw-rs-codex-1"),
+            ],
+        )];
+
+        assert_eq!(
+            resolve_target("188-maw-rs:1", &MawConfig::default(), &sessions),
+            ResolveResult::Local {
+                target: "188-maw-rs:1".to_owned()
+            }
+        );
+        assert_eq!(
+            resolve_target("maw-rs:1", &MawConfig::default(), &sessions),
+            ResolveResult::Local {
+                target: "188-maw-rs:1".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn find_window_prefers_exact_full_window_name_over_substring() {
+        let sessions = vec![session(
+            "188-maw-rs",
+            vec![
+                window(2, "maw-rs-codex-10"),
+                window(1, "maw-rs-codex-1"),
+            ],
+        )];
+
+        assert_eq!(
+            resolve_target(
+                "188-maw-rs:maw-rs-codex-1",
+                &MawConfig::default(),
+                &sessions
+            ),
+            ResolveResult::Local {
+                target: "188-maw-rs:1".to_owned()
+            }
         );
     }
 
