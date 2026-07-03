@@ -95,12 +95,6 @@ fn project_ls_panes(options: &LsPlanOptions) -> Vec<LsPanePlan> {
             if !options.channels && is_ls_channel_session(session) {
                 return None;
             }
-            if !options.all
-                && options.mode == LsMode::Compact
-                && !is_default_ls_oracle_session(session)
-            {
-                return None;
-            }
             if options.fleet_only && !is_default_ls_oracle_session(session) {
                 return None;
             }

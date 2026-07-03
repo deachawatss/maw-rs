@@ -5,14 +5,16 @@ fn args(values: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn ls_plan_defaults_to_compact_live_oracle_roster() {
+fn ls_plan_compact_default_shows_all_sessions_and_fleet_only_filters_shape() {
     let output = run_cli(&args(&[
         "ls",
         "--plan-json",
         "--pane",
         "%1|claude|50-mawjs:1.0|mawjs|100|/repo|1700000000",
         "--pane",
-        "%2|zsh|scratch:1.0|scratch|101|/tmp|1699999700",
+        "%2|codex|maw-rs:1.0|maw-rs|101|/repo|1699999980",
+        "--pane",
+        "%3|zsh|scratch:1.0|scratch|102|/tmp|1699999700",
     ]));
 
     assert_eq!(output.code, 0, "{}", output.stderr);
@@ -20,6 +22,30 @@ fn ls_plan_defaults_to_compact_live_oracle_roster() {
         output.stdout,
         concat!(
             "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,",
+            "\"sessions\":[",
+            "{\"session\":\"50-mawjs\",\"status\":\"stale\",\"panes\":1,\"agents\":1},",
+            "{\"session\":\"maw-rs\",\"status\":\"stale\",\"panes\":1,\"agents\":1},",
+            "{\"session\":\"scratch\",\"status\":\"stale\",\"panes\":1,\"agents\":0}]}
+"
+        )
+    );
+
+    let fleet_only = run_cli(&args(&[
+        "ls",
+        "--plan-json",
+        "--fleet-only",
+        "--pane",
+        "%1|claude|50-mawjs:1.0|mawjs|100|/repo|1700000000",
+        "--pane",
+        "%2|codex|maw-rs:1.0|maw-rs|101|/repo|1699999980",
+    ]));
+
+    assert_eq!(fleet_only.code, 0, "{}", fleet_only.stderr);
+    assert_eq!(
+        fleet_only.stdout,
+        concat!(
+            "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,",
+            "\"fleetOnly\":true,",
             "\"sessions\":[{\"session\":\"50-mawjs\",\"status\":\"stale\",\"panes\":1,\"agents\":1}]}
 "
         )
