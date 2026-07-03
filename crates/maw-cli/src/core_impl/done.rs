@@ -178,6 +178,11 @@ impl DoneLocal {
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
         maw_tmux::TmuxRunner::run(&mut self.runner, command, args).map_err(|error| error.message)
     }
+
+    fn done_send_text(target: &str, text: &str) -> Result<(), String> {
+        done_validate_tmux_target(target)?;
+        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.message)
+    }
 }
 
 fn done_parse_window_line(line: &str) -> Option<DoneWindow> {
@@ -255,7 +260,7 @@ fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLo
         stdout.push_str("  \x1b[36m⬡\x1b[0m [dry-run] would remove worktree + fleet config\n\n");
         return;
     }
-    if let Some(retro) = retro { let _ = local.done_tmux("send-keys", &maw_tmux::tmux_send_keys_literal_args(&target, retro)); let _ = local.done_tmux("send-keys", &maw_tmux::tmux_send_enter_args(&target)); }
+    if let Some(retro) = retro { let _ = DoneLocal::done_send_text(&target, retro); }
     if !cwd.is_empty() { let _ = done_git(&["-C".to_owned(), cwd.clone(), "add".to_owned(), "--".to_owned(), ".".to_owned()]); let _ = done_git(&["-C".to_owned(), cwd.clone(), "commit".to_owned(), "-m".to_owned(), "chore: auto-save before done".to_owned()]); let _ = done_git(&["-C".to_owned(), cwd, "push".to_owned()]); }
 }
 

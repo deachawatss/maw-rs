@@ -215,11 +215,14 @@ fn workon_send_window_command<R: maw_tmux::TmuxRunner>(
     target_path: &std::path::Path,
 ) -> Result<(), String> {
     let command = workon_build_command_in_dir(window_name, target_path);
-    let send_text_args = maw_tmux::tmux_send_keys_literal_args(&format!("{session}:{window_name}"), &command);
-    workon_tmux_run_owned(runner, "send-keys", &send_text_args)?;
-    let send_enter_args = maw_tmux::tmux_send_enter_args(&format!("{session}:{window_name}"));
-    workon_tmux_run_owned(runner, "send-keys", &send_enter_args)?;
-    Ok(())
+    let target = format!("{session}:{window_name}");
+    #[cfg(test)]
+    let sleeper = |_| {};
+    #[cfg(not(test))]
+    let sleeper = std::thread::sleep;
+    sendtext_send_text(runner, &target, &command, sleeper)
+        .map(|_| ())
+        .map_err(|error| error.message)
 }
 
 fn workon_resolve_repo(repo: &str) -> Result<WorkonRepo, String> {
@@ -339,17 +342,6 @@ fn workon_list_windows<R: maw_tmux::TmuxRunner>(runner: &mut R, session: &str) -
     Ok(raw.lines().map(str::to_owned).filter(|line| !line.is_empty()).collect())
 }
 
-fn workon_tmux_run_owned<R: maw_tmux::TmuxRunner>(
-    runner: &mut R,
-    subcommand: &str,
-    args: &[String],
-) -> Result<String, String> {
-    runner
-        .run(subcommand, args)
-        .map(|out| out.trim().to_owned())
-        .map_err(|error| error.message)
-}
-
 fn workon_build_command_in_dir(agent_name: &str, cwd: &std::path::Path) -> String {
     merged_config_value_in_dir(cwd)
         .get("commands")
@@ -432,7 +424,7 @@ mod workon_tests {
                 "has-session" => {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
-                "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
+                "new-window" | "new-session" | "send-keys" | "select-window" | "capture-pane" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
         }
@@ -491,9 +483,11 @@ mod workon_tests {
         assert_eq!(runner.calls[1].0, "new-session");
         assert_eq!(&runner.calls[1].1[..3], &workon_strings(&["-d", "-s", "demo"])[..]);
         assert_eq!(&runner.calls[1].1[5..], &workon_strings(&["-n", "demo"])[..]);
-        assert_eq!(runner.calls[2].0, "send-keys");
+        assert_eq!(runner.calls[2].0, "display-message");
         assert_eq!(runner.calls[3].0, "send-keys");
-        assert_eq!(runner.calls.len(), 4);
+        assert_eq!(runner.calls[4].0, "send-keys");
+        assert_eq!(runner.calls[5].0, "capture-pane");
+        assert_eq!(runner.calls.len(), 6);
     }
 
     #[test]

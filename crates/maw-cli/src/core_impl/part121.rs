@@ -3,7 +3,7 @@ const DISPATCH_121: &[DispatcherEntry] = &[
     DispatcherEntry { command: "buddy", handler: Handler::Sync(bud_run_command) },
 ];
 
-const BUD_USAGE: &str = "usage: maw bud <name> [--from <oracle>] [--root] [--seed] [--org <org>] [--repo org/repo] [--issue N] [--issue-repo owner/repo] [--note <text>] [--nickname <pretty>] [--fast] [--split] [--scaffold-only] [--dry-run]\n       Or: maw bud --from-repo <path|url> --stem <stem> [--pr] [--from <parent>] [--seed] [--sync-peers] [--force] [--track-vault] [--dry-run]";
+const BUD_USAGE: &str = "usage: maw bud <name> [--from <oracle>] [--root] [--seed] [--org <org>] [--repo org/repo] [--issue N] [--issue-repo owner/repo] [--note <text>] [--nickname <pretty>] [--engine <name>|-e <name>] [--fast] [--split] [--scaffold-only] [--dry-run]\n       Or: maw bud --from-repo <path|url> --stem <stem> [--pr] [--from <parent>] [--seed] [--sync-peers] [--force] [--track-vault] [--dry-run]";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -18,6 +18,7 @@ struct BudOptions {
     issue_repo: Option<String>,
     note: Option<String>,
     nickname: Option<String>,
+    engine: Option<String>,
     fast: bool,
     root: bool,
     dry_run: bool,
@@ -202,7 +203,7 @@ fn bud_parse(argv: &[String]) -> Result<BudOptions, String> {
             "--force" => options.force = true,
             "--track-vault" => options.track_vault = true,
             "--sync-peers" => options.sync_peers = true,
-            flag @ ("--from" | "--from-repo" | "--stem" | "--org" | "--repo" | "--issue" | "--issue-repo" | "--note" | "--nickname" | "--parent" | "--parent-session-id" | "--session-id") => { bud_assign_value(&mut options, flag, &bud_take_value(argv, &mut index, flag)?)?; }
+            flag @ ("--from" | "--from-repo" | "--stem" | "--org" | "--repo" | "--issue" | "--issue-repo" | "--note" | "--nickname" | "--engine" | "-e" | "--parent" | "--parent-session-id" | "--session-id") => { bud_assign_value(&mut options, flag, &bud_take_value(argv, &mut index, flag)?)?; }
             value if value.starts_with('-') => return Err(bud_flag_like(value)),
             value => bud_set_name(&mut options, value)?,
         }
@@ -221,6 +222,7 @@ fn bud_assign_value(options: &mut BudOptions, flag: &str, value: &str) -> Result
         "--issue" => options.issue = Some(bud_validate_issue(value)?),
         "--note" => options.note = Some(bud_validate_text(value, "--note")?),
         "--nickname" => options.nickname = Some(bud_validate_text(value, "--nickname")?),
+        "--engine" | "-e" => options.engine = Some(bud_validate_id(value, flag)?),
         "--parent" | "--parent-session-id" => options.parent_session_id = Some(bud_validate_id(value, flag)?),
         "--session-id" => options.session_id = Some(bud_validate_id(value, flag)?),
         _ => return Err(format!("bud: unknown flag {flag}")),
@@ -258,7 +260,7 @@ fn bud_validate_options(options: BudOptions) -> Result<BudOptions, String> {
 
 fn bud_run_options(options: &BudOptions, gh: &mut impl BudGhGitRunner, fs: &mut impl BudFs, wake: &mut impl BudWakeRunner, http: &mut impl BudHttpClient) -> Result<String, String> {
     if options.from_repo.is_some() { return bud_from_repo(options, gh, fs); }
-    let ctx = bud_context(options)?;
+    let ctx = bud_context(options, gh)?;
     if options.dry_run { return Ok(bud_dry_run(&ctx, options)); }
     bud_create_repo(&ctx, gh, fs)?;
     bud_write_skeleton(&ctx, options, fs)?;
@@ -267,14 +269,14 @@ fn bud_run_options(options: &BudOptions, gh: &mut impl BudGhGitRunner, fs: &mut 
     Ok(bud_finalize(&ctx, options, gh, fs, wake))
 }
 
-fn bud_context(options: &BudOptions) -> Result<BudContext, String> {
+fn bud_context(options: &BudOptions, gh: &mut impl BudGhGitRunner) -> Result<BudContext, String> {
     let stem = options.name.clone().ok_or_else(|| BUD_USAGE.to_owned())?;
     let org = options.org.clone().unwrap_or_else(|| std::env::var("MAW_BUD_OWNER").unwrap_or_else(|_| "Soul-Brews-Studio".to_owned()));
     let org = bud_validate_org(&org)?;
     let repo_name = format!("{stem}-oracle");
     bud_validate_repo_name(&repo_name)?;
     let slug = format!("{org}/{repo_name}");
-    let repo_path = bud_repos_root().join(&org).join(&repo_name);
+    let repo_path = bud_repos_root(gh).join(&org).join(&repo_name);
     Ok(BudContext { stem, org, parent: options.from.clone().filter(|_| !options.root), repo_name, slug, repo_path })
 }
 
@@ -308,7 +310,13 @@ fn bud_dry_run(ctx: &BudContext, options: &BudOptions) -> String {
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would init ψ/ vault at: {}", ctx.repo_path.display());
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would generate CLAUDE.md");
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would create fleet config");
-    if options.scaffold_only { let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] scaffold-only: would stop before git commit/push, wake, attach, parent sync_peers, and /awaken"); } else { let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {}", ctx.stem); }
+    if options.scaffold_only {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] scaffold-only: would stop before git commit/push, wake, attach, parent sync_peers, and /awaken");
+    } else if let Some(engine) = &options.engine {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {} with engine {engine}", ctx.stem);
+    } else {
+        let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m [dry-run] would wake {}", ctx.stem);
+    }
     out.push('\n');
     out
 }
@@ -406,7 +414,7 @@ fn bud_finalize(ctx: &BudContext, options: &BudOptions, gh: &mut impl BudGhGitRu
     bud_git_commit(ctx, gh, &mut out);
     let _ = bud_update_parent_peers(ctx, fs, &mut out);
     bud_wake(ctx, options, wake, &mut out);
-    if options.signal_on_birth { let _ = bud_birth_signal(ctx, fs, &mut out); }
+    if options.signal_on_birth { let _ = bud_birth_signal(ctx, gh, fs, &mut out); }
     let _ = writeln!(out, "\n  \x1b[32m{} complete!\x1b[0m {}", if ctx.parent.is_some() { "🧬 Bud" } else { "🌱 Root bud" }, ctx.stem);
     out
 }
@@ -433,15 +441,16 @@ fn bud_update_parent_peers(ctx: &BudContext, fs: &mut impl BudFs, out: &mut Stri
 
 fn bud_wake(ctx: &BudContext, options: &BudOptions, wake: &mut impl BudWakeRunner, out: &mut String) {
     let mut args = vec!["wake".to_owned(), ctx.stem.clone(), "--no-attach".to_owned(), "--repo-path".to_owned(), path_string(&ctx.repo_path)];
+    if let Some(engine) = &options.engine { args.extend(["-e".to_owned(), engine.clone()]); }
     if let Some(id) = &options.parent_session_id { args.extend(["--parent-session-id".to_owned(), id.clone()]); }
     if let Some(id) = &options.session_id { args.extend(["--session-id".to_owned(), id.clone()]); }
     match wake.bud_wake(&args) { Ok(_) => { let _ = writeln!(out, "  \x1b[32m✓\x1b[0m {} is alive", ctx.stem); } Err(error) => { let _ = writeln!(out, "  \x1b[33m⚠\x1b[0m wake failed: {}", error.trim()); } }
     if options.split && std::env::var_os("TMUX").is_some() { let _ = wake.bud_split(&ctx.stem); }
 }
 
-fn bud_birth_signal(ctx: &BudContext, fs: &mut impl BudFs, out: &mut String) -> Result<(), String> {
+fn bud_birth_signal(ctx: &BudContext, gh: &mut impl BudGhGitRunner, fs: &mut impl BudFs, out: &mut String) -> Result<(), String> {
     let Some(parent) = &ctx.parent else { return Ok(()); };
-    let path = bud_repos_root().join(&ctx.org).join(format!("{parent}-oracle/ψ/memory/signals/{}_{}_birth.json", bud_date(), ctx.stem));
+    let path = bud_repos_root(gh).join(&ctx.org).join(format!("{parent}-oracle/ψ/memory/signals/{}_{}_birth.json", bud_date(), ctx.stem));
     if let Some(dir) = path.parent() { fs.bud_create_dir_all(dir)?; }
     fs.bud_write_atomic(&path, format!("{}\n", serde_json::json!({"kind":"info","message":format!("bud born: {}", ctx.stem),"context":{"budRepoSlug":ctx.slug}})).as_bytes())?;
     let _ = writeln!(out, "  \x1b[36m⬡\x1b[0m signal dropped → {parent}'s ψ/memory/signals/");
@@ -525,16 +534,24 @@ fn bud_validate_pathish(value: &str, label: &str) -> Result<String, String> {
 }
 
 fn bud_flag_like(value: &str) -> String { format!("\"{value}\" looks like a flag, not an oracle name.\n  {BUD_USAGE}") }
-fn bud_repos_root() -> std::path::PathBuf {
-    let root = std::env::var_os("GHQ_ROOT").map_or_else(
-        || {
-            std::env::var_os("HOME").map_or_else(
-                || std::path::PathBuf::from(".").join("Code/github.com"),
-                |home| std::path::PathBuf::from(home).join("Code/github.com"),
-            )
-        },
-        std::path::PathBuf::from,
-    );
+fn bud_repos_root(gh: &mut impl BudGhGitRunner) -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("GHQ_ROOT") {
+        return bud_normalize_repos_root(std::path::PathBuf::from(root));
+    }
+    let root = gh.bud_run("ghq", &["root".to_owned()]);
+    if root.ok {
+        let stdout = root.stdout.trim();
+        if !stdout.is_empty() {
+            return bud_normalize_repos_root(std::path::PathBuf::from(stdout));
+        }
+    }
+    bud_normalize_repos_root(std::env::var_os("HOME").map_or_else(
+        || std::path::PathBuf::from(".").join("Code/github.com"),
+        |home| std::path::PathBuf::from(home).join("Code/github.com"),
+    ))
+}
+
+fn bud_normalize_repos_root(root: std::path::PathBuf) -> std::path::PathBuf {
     if root.file_name().is_some_and(|name| name == "github.com") { root } else { root.join("github.com") }
 }
 fn bud_looks_like_url(value: &str) -> bool { value.starts_with("http://") || value.starts_with("https://") || value.starts_with("git@") || (!value.starts_with('/') && value.matches('/').count() == 1) }
@@ -550,11 +567,19 @@ mod bud_tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     #[derive(Default)]
-    struct FakeGh { calls: Vec<(String, Vec<String>)>, fail: BTreeSet<String>, ok_view: bool }
+    struct FakeGh { calls: Vec<(String, Vec<String>)>, fail: BTreeSet<String>, ok_view: bool, ghq_root: Option<String> }
     impl BudGhGitRunner for FakeGh {
         fn bud_run(&mut self, program: &str, args: &[String]) -> BudCmdOutput {
             self.calls.push((program.to_owned(), args.to_vec()));
             let key = format!("{program} {}", args.first().cloned().unwrap_or_default());
+            if program == "ghq" && args.len() == 1 && args[0] == "root" {
+                let ok = !self.fail.contains(&key);
+                return BudCmdOutput {
+                    ok,
+                    stdout: if ok { self.ghq_root.clone().unwrap_or_default() } else { String::new() },
+                    stderr: if ok { String::new() } else { "fake failure".to_owned() },
+                };
+            }
             let ok = if program == "gh" && args.get(1).is_some_and(|arg| arg == "view") { self.ok_view } else { !self.fail.contains(&key) };
             BudCmdOutput { ok, stdout: String::new(), stderr: if ok { String::new() } else { "fake failure".to_owned() } }
         }
@@ -606,7 +631,7 @@ mod bud_tests {
     fn bud_gh_is_idempotent_and_argv_only() {
         let mut gh = FakeGh { ok_view: true, ..Default::default() };
         let fs = FakeFs::default();
-        let ctx = bud_context(&bud_parse(&bud_args(&["sprout", "--org", "Soul-Brews-Studio"])).unwrap()).unwrap();
+        let ctx = bud_context(&bud_parse(&bud_args(&["sprout", "--org", "Soul-Brews-Studio"])).unwrap(), &mut gh).unwrap();
         bud_create_repo(&ctx, &mut gh, &fs).unwrap();
         assert!(gh.calls.iter().any(|(p, a)| p == "gh" && a == &["repo", "view", "Soul-Brews-Studio/sprout-oracle", "--json", "name"].map(str::to_owned)));
         assert!(!gh.calls.iter().any(|(_, a)| a.iter().any(|arg| arg.contains(';'))));
@@ -645,9 +670,89 @@ mod bud_tests {
     }
 
     #[test]
+    fn bud_repos_root_uses_ghq_root_before_home_fallback() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _restore_home = EnvVarRestore::capture("HOME");
+        std::env::remove_var("GHQ_ROOT");
+        std::env::set_var("HOME", "/home/fallback");
+
+        let mut gh = FakeGh { ghq_root: Some("/opt/Code\n".to_owned()), ..Default::default() };
+        let options = bud_parse(&bud_args(&["sprout", "--org", "Org"])).unwrap();
+        let ctx = bud_context(&options, &mut gh).unwrap();
+
+        assert_eq!(ctx.repo_path, std::path::PathBuf::from("/opt/Code/github.com/Org/sprout-oracle"));
+        assert!(gh.calls.iter().any(|(program, args)| program == "ghq" && args == &["root".to_owned()]));
+    }
+
+    #[test]
+    fn bud_repos_root_env_wins_over_ghq_root_command() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _restore_home = EnvVarRestore::capture("HOME");
+        std::env::set_var("GHQ_ROOT", "/env/Code");
+        std::env::set_var("HOME", "/home/fallback");
+
+        let mut gh = FakeGh { ghq_root: Some("/opt/Code".to_owned()), ..Default::default() };
+        let options = bud_parse(&bud_args(&["sprout", "--org", "Org"])).unwrap();
+        let ctx = bud_context(&options, &mut gh).unwrap();
+
+        assert_eq!(ctx.repo_path, std::path::PathBuf::from("/env/Code/github.com/Org/sprout-oracle"));
+        assert!(!gh.calls.iter().any(|(program, args)| program == "ghq" && args == &["root".to_owned()]));
+    }
+
+    #[test]
+    fn bud_repos_root_falls_back_to_home_when_ghq_root_fails() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _restore_home = EnvVarRestore::capture("HOME");
+        std::env::remove_var("GHQ_ROOT");
+        std::env::set_var("HOME", "/home/fallback");
+
+        let mut gh = FakeGh { fail: ["ghq root".to_owned()].into(), ..Default::default() };
+        let options = bud_parse(&bud_args(&["sprout", "--org", "Org"])).unwrap();
+        let ctx = bud_context(&options, &mut gh).unwrap();
+
+        assert_eq!(ctx.repo_path, std::path::PathBuf::from("/home/fallback/Code/github.com/Org/sprout-oracle"));
+    }
+
+    #[test]
     fn bud_wake_uses_self_argv_shape() {
         let mut wake = FakeWake::default(); let ctx = BudContext { stem: "sprout".to_owned(), org: "Org".to_owned(), parent: None, repo_name: "sprout-oracle".to_owned(), slug: "Org/sprout-oracle".to_owned(), repo_path: "/tmp/sprout".into() };
         bud_wake(&ctx, &BudOptions::default(), &mut wake, &mut String::new());
         assert_eq!(wake.calls[0][0], "wake"); assert!(wake.calls[0].contains(&"--repo-path".to_owned()));
+        assert!(!wake.calls[0].contains(&"-e".to_owned()));
+    }
+
+    #[test]
+    fn bud_engine_flag_passes_through_to_wake_and_dry_run() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore_ghq = EnvVarRestore::capture("GHQ_ROOT");
+        let _restore_home = EnvVarRestore::capture("HOME");
+        std::env::set_var("GHQ_ROOT", ".");
+        std::env::remove_var("HOME");
+
+        let options = bud_parse(&bud_args(&["sprout", "-e", "codex"])).unwrap();
+        let mut gh = FakeGh::default();
+        let ctx = bud_context(&options, &mut gh).unwrap();
+        let mut wake = FakeWake::default();
+        bud_wake(&ctx, &options, &mut wake, &mut String::new());
+        assert!(wake.calls[0]
+            .windows(2)
+            .any(|args| args[0] == "-e" && args[1] == "codex"));
+
+        let mut gh = FakeGh::default();
+        let mut fs = FakeFs::default();
+        let mut wake = FakeWake::default();
+        let mut http = FakeHttp::default();
+        let out = bud_run_with(
+            &bud_args(&["sprout", "--dry-run", "-e", "codex"]),
+            &mut gh,
+            &mut fs,
+            &mut wake,
+            &mut http,
+        );
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("would wake sprout with engine codex"));
     }
 }

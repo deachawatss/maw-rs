@@ -225,7 +225,14 @@ fn native_workon_outside_tmux_creates_session_and_prints_attach_plan() {
         tmux_log.contains("send-keys -t demo:demo -l echo launch"),
         "{tmux_log}"
     );
-    assert!(!tmux_log.contains("display-message"), "{tmux_log}");
+    assert!(
+        tmux_log.contains("display-message -t demo:demo -p #{pane_in_mode}"),
+        "{tmux_log}"
+    );
+    assert!(
+        tmux_log.contains("capture-pane -t demo:demo -e -p -S -5"),
+        "{tmux_log}"
+    );
 }
 
 #[test]

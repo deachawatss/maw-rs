@@ -35,9 +35,45 @@ impl TeamEnterTmux240 {
         self.team_tmux_run240("send-keys", &maw_tmux::tmux_send_keys_literal_args(pane_id, text)).map(|_| ())
     }
 
+    fn team_send_text(&mut self, pane_id: &str, text: &str) -> Result<(), String> {
+        self.team_send_literal(pane_id, text)?;
+        self.team_sleep240(maw_tmux::SEND_SETTLE_MS);
+        for _ in 1..=maw_tmux::MAX_SUBMIT_ATTEMPTS {
+            self.team_send_enter(pane_id)?;
+            self.team_sleep240(maw_tmux::SUBMIT_CONFIRM_MS);
+            if !self.team_pane_input_pending(pane_id) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn team_send_enter(&mut self, pane_id: &str) -> Result<(), String> {
         team_validate_pane_id240(pane_id)?;
         self.team_tmux_run240("send-keys", &maw_tmux::tmux_send_enter_args(pane_id)).map(|_| ())
+    }
+
+    fn team_pane_input_pending(&mut self, pane_id: &str) -> bool {
+        team_validate_pane_id240(pane_id).is_ok()
+            && self
+                .team_tmux_run240(
+                    "capture-pane",
+                    &[
+                        "-t".to_owned(),
+                        pane_id.to_owned(),
+                        "-e".to_owned(),
+                        "-p".to_owned(),
+                        "-S".to_owned(),
+                        "-5".to_owned(),
+                    ],
+                )
+                .is_ok_and(|content| maw_tmux::pane_input_pending_from_capture(&content))
+    }
+
+    fn team_sleep240(&self, millis: u64) {
+        if self.fake_log.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(millis));
+        }
     }
 
     fn team_probe_pane(&mut self, pane_id: &str) -> Result<(String, String), String> {
@@ -136,8 +172,7 @@ fn team_enter_run240(opts: &TeamEnterOptions240, members: &[TeamEnterMember240],
     let mut out = String::new();
     for member in members {
         team_validate_member_pane_belongs240(&opts.team, member, tmux)?;
-        if let Some(text) = &opts.text { tmux.team_send_literal(&member.pane_id, text)?; }
-        tmux.team_send_enter(&member.pane_id)?;
+        if let Some(text) = &opts.text { tmux.team_send_text(&member.pane_id, text)?; } else { tmux.team_send_enter(&member.pane_id)?; }
         writeln!(out, "\x1b[36m↵\x1b[0m enter sent to {}", member.display).expect("write string");
     }
     Ok(out)

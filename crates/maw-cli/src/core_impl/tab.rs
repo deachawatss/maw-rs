@@ -167,21 +167,27 @@ fn tab_send_message<R: maw_tmux::TmuxRunner>(
         }
     }
 
-    runner
-        .run(
-            "send-keys",
-            &maw_tmux::tmux_send_keys_literal_args(target, message),
-        )
-        .map_err(|error| (1, format!("tab: {}", error.message)))?;
-    runner
-        .run("send-keys", &maw_tmux::tmux_send_enter_args(target))
-        .map_err(|error| (1, format!("tab: {}", error.message)))?;
+    tab_send_text_confirmed(runner, target, message)?;
     let verb = if talk { "talk" } else { "sent" };
     Ok(CliOutput {
         code: 0,
         stdout: format!("\x1b[32m{verb}\x1b[0m → {target}: {message}\n"),
         stderr: String::new(),
     })
+}
+
+fn tab_send_text_confirmed<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    target: &str,
+    message: &str,
+) -> Result<(), (i32, String)> {
+    #[cfg(test)]
+    let sleeper = |_| {};
+    #[cfg(not(test))]
+    let sleeper = std::thread::sleep;
+    sendtext_send_text(runner, target, message, sleeper)
+        .map(|_| ())
+        .map_err(|error| (1, format!("tab: {}", error.message)))
 }
 
 fn tab_is_agent_command(command: &str) -> bool {
@@ -311,8 +317,10 @@ mod tab_tests {
             .expect("send");
 
         assert_eq!(output.stdout, "\x1b[32mtalk\x1b[0m → work: hi there\n");
-        assert_eq!(runner.calls[2], ("send-keys".to_owned(), strings(&["-t", "work", "-l", "hi there"])));
-        assert_eq!(runner.calls[3], ("send-keys".to_owned(), strings(&["-t", "work", "Enter"])));
+        assert_eq!(runner.calls[2], ("display-message".to_owned(), strings(&["-t", "work", "-p", "#{pane_in_mode}"])));
+        assert_eq!(runner.calls[3], ("send-keys".to_owned(), strings(&["-t", "work", "-l", "hi there"])));
+        assert_eq!(runner.calls[4], ("send-keys".to_owned(), strings(&["-t", "work", "Enter"])));
+        assert_eq!(runner.calls[5].0, "capture-pane");
     }
 
     #[test]

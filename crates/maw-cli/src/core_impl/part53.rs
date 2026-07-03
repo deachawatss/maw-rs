@@ -293,6 +293,7 @@ fn incubate_bud_options(stem: &str, options: &IncubateOptions) -> Result<BudOpti
         issue_repo: None,
         note: options.note.clone(),
         nickname: options.nickname.clone(),
+        engine: None,
         fast: options.fast,
         root: options.root,
         dry_run: options.dry_run,

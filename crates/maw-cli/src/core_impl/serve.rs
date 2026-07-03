@@ -116,8 +116,7 @@ impl ServeDelivery for ServeSystemDelivery {
 
     fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
         let mut tmux = TmuxClient::local();
-        tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
-        tmux.send_enter(target).map_err(|error| error.to_string())
+        tmux.send_text(target, text).map(|_| ()).map_err(|error| error.to_string())
     }
 
     fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
@@ -324,7 +323,6 @@ fn serve_router(state: ServeState) -> Router {
     let state = Arc::new(state);
     let router = Router::new();
     let router = crate::serve_core::servecore_mount_core_routes(router);
-    let router = crate::serve_core::servecore_mount_ws_routes(router);
     let router = crate::serve_core::modules::servecore_mount_modules(router, &[]);
     let router = router
         .route("/api/send", post(api_send))
@@ -352,9 +350,10 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/workspace/:id/status", get(api_workspace_status))
         .route("/api/workspace/:id/feed", get(api_workspace_feed))
         .route("/api/workspace/:id/message", post(api_workspace_message));
+    let router = router.fallback(api_not_found);
     let router = crate::serve_core::servecore_apply_pipeline(router);
     let router = crate::serve_core::servecore_with_shared_state(router, serve_core_state);
-    router.fallback(api_not_found).with_state(state)
+    router.with_state(state)
 }
 
 async fn api_send(
@@ -2296,6 +2295,7 @@ mod serve_tests {
     use axum::body::Body;
     use futures_util::{SinkExt, StreamExt};
     use maw_auth::{build_legacy_from_sign_payload, hash_body, sign_headers_v3_at, sign_hmac_sig};
+    use std::time::Duration;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
 
@@ -3700,6 +3700,34 @@ mod serve_tests {
             .await
             .expect("public request");
         assert_eq!(public.status(), StatusCode::OK);
+        let costs = client
+            .get(format!("http://{addr}/api/costs"))
+            .header("origin", "https://god.buildwithoracle.com")
+            .send()
+            .await
+            .expect("costs request");
+        assert_eq!(costs.status(), StatusCode::OK, "/api/costs");
+        assert_eq!(
+            costs
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
+        let missing = client
+            .get(format!("http://{addr}/api/missing-god-ui-route"))
+            .header("origin", "https://god.buildwithoracle.com")
+            .send()
+            .await
+            .expect("missing request");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://god.buildwithoracle.com")
+        );
     }
 
     #[tokio::test]
@@ -3781,15 +3809,22 @@ mod serve_tests {
         .await
         .expect("send websocket text");
 
-        let received = ws
-            .next()
-            .await
-            .expect("websocket should yield a frame")
-            .expect("frame should be ok");
-        assert_eq!(
-            received,
-            tokio_tungstenite::tungstenite::Message::Text("relay-check".to_owned())
-        );
+        let echo = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = ws
+                    .next()
+                    .await
+                    .expect("websocket should yield a frame")
+                    .expect("frame should be ok");
+                if received
+                    == tokio_tungstenite::tungstenite::Message::Text("relay-check".to_owned())
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(echo.is_ok(), "websocket should echo text after stream frames");
     }
 
     #[tokio::test]

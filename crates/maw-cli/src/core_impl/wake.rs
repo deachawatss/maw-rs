@@ -440,9 +440,24 @@ fn wake_resolve_engine_command(engine: &str) -> String {
         .unwrap_or_else(|| engine.to_owned())
 }
 
+fn wake_default_engine(options: &WakeOptionsNative) -> String {
+    if let Some(engine) = &options.engine {
+        return engine.clone();
+    }
+    if options.resume {
+        return "codex".to_owned();
+    }
+    merged_config_value()
+        .get("commands")
+        .and_then(|commands| commands.get("default"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(|| "codex".to_owned(), |_| "default".to_owned())
+}
+
 fn wake_command(window: &str, cwd: &std::path::Path, options: &WakeOptionsNative) -> String {
-    let engine = options.engine.as_deref().unwrap_or("codex");
-    let resolved = wake_resolve_engine_command(engine);
+    let engine = wake_default_engine(options);
+    let resolved = wake_resolve_engine_command(&engine);
     let mut command = format!("cd {} && {resolved}", wake_shell_quote(&cwd.display().to_string()));
     if options.resume { command.push_str(" resume"); }
     if options.channels { command.push_str(" --channels plugin:discord@claude-plugins-official"); }
@@ -599,6 +614,32 @@ mod wake_tests {
                 "bun codex-setup.ts 1 && CODEX_HOME=$PWD/.codex omx --direct --madmax"
             );
             assert_eq!(wake_resolve_engine_command("codex"), "codex");
+        });
+    }
+
+    #[test]
+    fn wake_fresh_default_uses_config_default_but_explicit_and_resume_keep_codex() {
+        wake_with_fixture(|_| {
+            let dir = active_config_dir();
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(dir.join("maw.config.50.json"), r#"{"commands":{"default":"claude"}}"#)
+                .expect("write config");
+
+            let mut tmux = WakeMockTmux::default();
+            let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach"]), &mut tmux).expect("fresh");
+            let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
+            assert!(send.contains("&& claude"), "{send}");
+            assert!(!send.contains("&& codex"), "{send}");
+
+            let mut tmux = WakeMockTmux::default();
+            let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach", "-e", "codex"]), &mut tmux).expect("explicit");
+            let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
+            assert!(send.contains("&& codex"), "{send}");
+
+            let mut tmux = WakeMockTmux::default();
+            let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach", "--resume"]), &mut tmux).expect("resume");
+            let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
+            assert!(send.contains("&& codex resume"), "{send}");
         });
     }
 
