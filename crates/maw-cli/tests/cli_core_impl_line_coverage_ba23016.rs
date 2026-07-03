@@ -389,8 +389,18 @@ fn calver_normalize_pair_api_and_ls_edge_parsers_are_stable() {
         "ls: session-created epoch must be an integer",
     );
     assert_ok_contains(
-        &["ls", "remote-peer"],
-        "ls peer remote-peer: no fake sessions",
+        &[
+            "ls",
+            "remote-peer",
+            "--json",
+            "--now",
+            "1000",
+            "--pane",
+            "%1|codex|remote-peer:1.0|agent|100|/repo|990",
+            "--pane",
+            "%2|zsh|other:1.0|other|101|/repo|990",
+        ],
+        "\"session\":\"remote-peer\"",
     );
     assert_ok_contains(
         &[
