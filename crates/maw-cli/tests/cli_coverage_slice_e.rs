@@ -167,13 +167,37 @@ fn ls_parser_text_json_and_duration_branches_are_covered() {
         assert_usage(args, expected);
     }
 
-    assert_ok_exact(
-        &["ls", "remote-node"],
-        "ls peer remote-node: no fake sessions\n",
+    let filtered = run(&[
+        "ls",
+        "remote-node",
+        "--now",
+        "200000",
+        "--pane",
+        "%1|codex|remote-node:1.0|agent|100|/repo|199990",
+        "--pane",
+        "%2|zsh|other:1.0|other|101|/repo|199990",
+    ]);
+    assert_eq!(filtered.code, 0, "{}", filtered.stderr);
+    assert!(
+        filtered.stdout.contains("remote-node"),
+        "{}",
+        filtered.stdout
     );
+    assert!(!filtered.stdout.contains("other"), "{}", filtered.stdout);
+    assert!(!filtered.stdout.contains("no fake sessions"));
     assert_ok_exact(
-        &["ls", "remote-node", "--json"],
-        "{\"command\":\"ls\",\"scope\":\"peer\",\"peer\":\"remote-node\",\"sessions\":[]}\n",
+        &[
+            "ls",
+            "remote-node",
+            "--json",
+            "--now",
+            "200000",
+            "--pane",
+            "%1|codex|remote-node:1.0|agent|100|/repo|199990",
+            "--pane",
+            "%2|zsh|other:1.0|other|101|/repo|199990",
+        ],
+        "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,\"sessions\":[{\"session\":\"remote-node\",\"status\":\"active\",\"panes\":1,\"agents\":1}]}\n",
     );
     assert_ok_exact(
         &[

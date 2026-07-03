@@ -67,10 +67,23 @@ fn ls_active_equals_recent_and_peer_text_branches_are_stable() {
         )
     );
 
-    let peer = run(&["ls", "remote-oracle"]);
-    assert_eq!(peer.code, 0, "{}", peer.stderr);
-    assert_eq!(peer.stdout, "ls peer remote-oracle: no fake sessions\n");
-    assert!(peer.stderr.is_empty());
+    let filtered = run(&[
+        "ls",
+        "remote-oracle",
+        "--plan-json",
+        "--now",
+        "1700000000",
+        "--pane",
+        "%1|codex|remote-oracle:1.0|agent|100|/repo|1699999995",
+        "--pane",
+        "%2|zsh|other:1.0|other|101|/repo|1699999995",
+    ]);
+    assert_eq!(filtered.code, 0, "{}", filtered.stderr);
+    assert_eq!(
+        filtered.stdout,
+        "{\"command\":\"ls\",\"mode\":\"compact\",\"scope\":\"local\",\"json\":true,\"sessions\":[{\"session\":\"remote-oracle\",\"status\":\"active\",\"panes\":1,\"agents\":1}]}\n"
+    );
+    assert!(filtered.stderr.is_empty());
 }
 
 #[test]
