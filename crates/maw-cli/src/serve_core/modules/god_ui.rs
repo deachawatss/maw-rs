@@ -465,20 +465,21 @@ fn godui_normalize_team_member(
 
     let agent_id = godui_field_str(&object, "agentId")
         .filter(|agent_id| !agent_id.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("{name}@{team_name}"));
+        .map_or_else(|| format!("{name}@{team_name}"), str::to_owned);
     object.insert("agentId".to_owned(), Value::String(agent_id.clone()));
 
     let agent_type = godui_field_str(&object, "agentType")
         .filter(|agent_type| !agent_type.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if agent_id == lead_agent_id || name == "team-lead" || name == "lead" {
-                "lead".to_owned()
-            } else {
-                "member".to_owned()
-            }
-        });
+        .map_or_else(
+            || {
+                if agent_id == lead_agent_id || name == "team-lead" || name == "lead" {
+                    "lead".to_owned()
+                } else {
+                    "member".to_owned()
+                }
+            },
+            str::to_owned,
+        );
     object.insert("agentType".to_owned(), Value::String(agent_type));
 
     if object.get("joinedAt").and_then(Value::as_u64).is_none() {
@@ -498,10 +499,7 @@ fn godui_normalize_team_member(
         .or_else(|| (!lead_repo.is_empty()).then(|| lead_repo.to_owned()))
         .unwrap_or_default();
     object.insert("cwd".to_owned(), Value::String(cwd));
-    if !object
-        .get("subscriptions")
-        .is_some_and(|subscriptions| subscriptions.is_array())
-    {
+    if !object.get("subscriptions").is_some_and(Value::is_array) {
         object.insert("subscriptions".to_owned(), Value::Array(Vec::new()));
     }
     if godui_field_str(&object, "backendType").is_none() {
