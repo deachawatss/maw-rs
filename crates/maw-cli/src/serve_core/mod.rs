@@ -101,7 +101,7 @@ pub struct ServecoreSharedState {
     pub hub_workspaces: Arc<Vec<WorkspaceConfig>>,
     pub agents_node: Option<String>,
     pub agents_snapshot: Option<Arc<Vec<ServecoreAgentPane>>>,
-    pub godui_sessions_snapshot: Option<Arc<Vec<TmuxSession>>>,
+    pub tmux_sessions_snapshot: Option<Arc<Vec<TmuxSession>>>,
     pub auth_workspace_key: Option<String>,
     pub auth_cached_pubkey: Option<String>,
     pub auth_ed25519_pins: maw_auth::Ed25519TofuPins,
@@ -119,7 +119,7 @@ impl Default for ServecoreSharedState {
             hub_workspaces: Arc::new(Vec::new()),
             agents_node: None,
             agents_snapshot: None,
-            godui_sessions_snapshot: None,
+            tmux_sessions_snapshot: None,
             auth_workspace_key: None,
             auth_cached_pubkey: None,
             auth_ed25519_pins: Arc::new(Mutex::new(maw_auth::Ed25519TofuStore::default())),
@@ -148,8 +148,8 @@ impl ServecoreSharedState {
     }
 
     #[must_use]
-    pub fn servecore_with_godui_sessions_snapshot(mut self, sessions: Vec<TmuxSession>) -> Self {
-        self.godui_sessions_snapshot = Some(Arc::new(sessions));
+    pub fn servecore_with_tmux_sessions_snapshot(mut self, sessions: Vec<TmuxSession>) -> Self {
+        self.tmux_sessions_snapshot = Some(Arc::new(sessions));
         self
     }
 
@@ -166,8 +166,8 @@ impl ServecoreSharedState {
     }
 
     #[must_use]
-    pub fn servecore_godui_sessions(&self) -> Vec<TmuxSession> {
-        if let Some(snapshot) = &self.godui_sessions_snapshot {
+    pub fn servecore_tmux_sessions(&self) -> Vec<TmuxSession> {
+        if let Some(snapshot) = &self.tmux_sessions_snapshot {
             return snapshot.as_ref().clone();
         }
         let mut tmux = TmuxClient::local();
@@ -1358,7 +1358,7 @@ pub fn servecore_mount_ws_routes<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    servecore_mount_ws_routes_with_config(router, modules::ws::WsConfig::ws_from_process_env())
+    modules::ws::ws_mount(router)
 }
 
 pub fn servecore_mount_ws_routes_with_config<S>(
@@ -1368,8 +1368,19 @@ pub fn servecore_mount_ws_routes_with_config<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let registry = servecore_default_ws_registry();
-    servecore_mount_ws_registry(router, &registry).layer(Extension(config))
+    modules::ws::ws_mount_with_config(router, config)
+}
+
+pub fn servecore_mount_ws_registry_with_config<S>(
+    router: Router<S>,
+    registry: &ServecoreWsRegistry,
+    config: modules::ws::WsConfig,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let routes = servecore_mount_ws_registry(Router::new(), registry).layer(Extension(config));
+    router.merge(routes)
 }
 
 pub fn servecore_mount_ws_registry<S>(
@@ -1385,20 +1396,6 @@ where
         .fold(router, |router, (path, kind)| {
             router.route(&path, get(servecore_ws_upgrade).layer(Extension(kind)))
         })
-}
-
-fn servecore_default_ws_registry() -> ServecoreWsRegistry {
-    let mut registry = ServecoreWsRegistry::default();
-    registry
-        .servecore_register_ws_kind("/ws", ServecoreWsKind::Engine)
-        .expect("default ws route");
-    registry
-        .servecore_register_ws_kind("/ws/pty", ServecoreWsKind::Pty)
-        .expect("default pty ws route");
-    registry
-        .servecore_register_ws_kind("/ws/tmux", ServecoreWsKind::Tmux)
-        .expect("default tmux ws route");
-    registry
 }
 
 pub fn servecore_mount_registry_stub<S>(
@@ -1699,7 +1696,7 @@ async fn servecore_ws_upgrade(
         )
             .into_response();
     }
-    if SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed) >= config.max_connections {
+    if servecore_ws_connection_limit_reached(config.max_connections) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":"ws_connection_limit"})),
@@ -1726,30 +1723,14 @@ async fn servecore_ws_stream(
             .await;
         return;
     };
-    if kind == ServecoreWsKind::Engine
-        && !servecore_ws_send_godui_initial(&mut socket, &state, &config).await
-    {
-        state.engine.servecore_ws_close(kind, target.as_deref());
-        return;
-    }
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + config.heartbeat_interval,
         config.heartbeat_interval,
-    );
-    let mut godui_refresh = tokio::time::interval_at(
-        tokio::time::Instant::now() + Duration::from_secs(2),
-        Duration::from_secs(2),
     );
     let idle_timer = tokio::time::sleep(config.idle_timeout);
     tokio::pin!(idle_timer);
     loop {
         tokio::select! {
-            _ = godui_refresh.tick(), if kind == ServecoreWsKind::Engine => {
-                if !servecore_ws_send_godui_session_recent(&mut socket, &state, &config).await {
-                    break;
-                }
-                idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
-            }
             _ = heartbeat.tick() => {
                 if servecore_ws_send(&mut socket, Message::Ping(Vec::new()), config.send_timeout).await.is_err() {
                     break;
@@ -1778,33 +1759,7 @@ async fn servecore_ws_stream(
     state.engine.servecore_ws_close(kind, target.as_deref());
 }
 
-async fn servecore_ws_send_godui_initial(
-    socket: &mut WebSocket,
-    state: &ServecoreSharedState,
-    config: &modules::ws::WsConfig,
-) -> bool {
-    servecore_ws_send_text_frames(
-        socket,
-        modules::god_ui::godui_ws_initial_frames(state.servecore_godui_sessions()),
-        config,
-    )
-    .await
-}
-
-async fn servecore_ws_send_godui_session_recent(
-    socket: &mut WebSocket,
-    state: &ServecoreSharedState,
-    config: &modules::ws::WsConfig,
-) -> bool {
-    servecore_ws_send_text_frames(
-        socket,
-        modules::god_ui::godui_ws_session_recent_frames(state.servecore_godui_sessions()),
-        config,
-    )
-    .await
-}
-
-async fn servecore_ws_send_text_frames(
+pub(crate) async fn servecore_ws_send_text_frames(
     socket: &mut WebSocket,
     frames: Vec<String>,
     config: &modules::ws::WsConfig,
@@ -1820,7 +1775,7 @@ async fn servecore_ws_send_text_frames(
     true
 }
 
-async fn servecore_ws_handle_frame(
+pub(crate) async fn servecore_ws_handle_frame(
     socket: &mut WebSocket,
     state: &ServecoreSharedState,
     kind: ServecoreWsKind,
@@ -1868,7 +1823,7 @@ async fn servecore_ws_handle_frame(
     }
 }
 
-async fn servecore_ws_send(
+pub(crate) async fn servecore_ws_send(
     socket: &mut WebSocket,
     message: Message,
     timeout: Duration,
@@ -1879,14 +1834,20 @@ async fn servecore_ws_send(
         .map_err(|_| ())
 }
 
-fn servecore_ws_target(query: Option<&str>) -> Option<&str> {
+pub(crate) fn servecore_ws_target(query: Option<&str>) -> Option<&str> {
     query?
         .split('&')
         .filter_map(|part| part.split_once('='))
         .find_map(|(key, value)| (key == "target" || key == "session").then_some(value))
 }
 
-fn servecore_ws_connection_guard(max_connections: usize) -> Option<ServecoreWsConnectionGuard> {
+pub(crate) fn servecore_ws_connection_limit_reached(max_connections: usize) -> bool {
+    SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed) >= max_connections
+}
+
+pub(crate) fn servecore_ws_connection_guard(
+    max_connections: usize,
+) -> Option<ServecoreWsConnectionGuard> {
     let mut current = SERVECORE_WS_CONNECTIONS.load(Ordering::Relaxed);
     loop {
         if current >= max_connections {
@@ -1904,7 +1865,7 @@ fn servecore_ws_connection_guard(max_connections: usize) -> Option<ServecoreWsCo
     }
 }
 
-struct ServecoreWsConnectionGuard;
+pub(crate) struct ServecoreWsConnectionGuard;
 
 impl Drop for ServecoreWsConnectionGuard {
     fn drop(&mut self) {
@@ -2567,7 +2528,7 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let router = servecore_mount_core_routes(Router::new());
-        let router = servecore_mount_ws_routes_with_config(router, config);
+        let router = modules::ws::ws_mount_with_config(router, config);
         let router = servecore_with_shared_state(router, state);
         let app = servecore_apply_pipeline_with_views_config(
             router,
@@ -3014,54 +2975,6 @@ mod tests {
             .await
             .expect("protected");
         assert_eq!(protected.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn servecore_ws_engine_sends_godui_sessions_on_connect() {
-        let state = ServecoreSharedState::default().servecore_with_godui_sessions_snapshot(vec![
-            TmuxSession {
-                name: "142-athena".to_owned(),
-                windows: vec![
-                    maw_tmux::TmuxWindow {
-                        index: 1,
-                        name: "athena-oracle".to_owned(),
-                        active: true,
-                        cwd: Some("/opt/athena".to_owned()),
-                    },
-                    maw_tmux::TmuxWindow {
-                        index: 2,
-                        name: "athena-codex-1".to_owned(),
-                        active: false,
-                        cwd: None,
-                    },
-                ],
-            },
-        ]);
-        let addr = servecore_spawn_ws_test_server(state, modules::ws::WsConfig::default()).await;
-        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-            .await
-            .expect("connect websocket");
-        let mut frames = Vec::new();
-        while frames.len() < 3 {
-            let received = ws.next().await.expect("frame").expect("frame ok");
-            if let tokio_tungstenite::tungstenite::Message::Text(text) = received {
-                frames.push(serde_json::from_str::<serde_json::Value>(&text).expect("json frame"));
-            }
-        }
-
-        assert_eq!(frames[0]["type"], "feed-history");
-        assert_eq!(frames[0]["events"], json!([]));
-        assert_eq!(frames[1]["type"], "sessions");
-        assert_eq!(frames[1]["sessions"][0]["name"], "142-athena");
-        assert_eq!(frames[1]["sessions"][0]["windows"][0]["cwd"], "/opt/athena");
-        assert_eq!(frames[2]["type"], "recent");
-        assert_eq!(
-            frames[2]["agents"],
-            json!([
-                {"target": "142-athena:1", "name": "athena-oracle", "session": "142-athena"},
-                {"target": "142-athena:2", "name": "athena-codex-1", "session": "142-athena"}
-            ])
-        );
     }
 
     #[tokio::test]

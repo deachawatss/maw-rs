@@ -1,8 +1,14 @@
 use super::ServecoreModuleRegistration;
-use crate::serve_core::{ServecoreAgentPane, ServecoreLifecycleModule, ServecoreSharedState};
+use crate::serve_core::{
+    servecore_ws_connection_guard, servecore_ws_connection_limit_reached,
+    servecore_ws_handle_frame, servecore_ws_send, servecore_ws_send_text_frames,
+    servecore_ws_target, ServecoreAgentPane, ServecoreLifecycleModule, ServecoreSharedState,
+    ServecoreWsKind,
+};
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+    http::{Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -15,7 +21,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const GODUI_TEAM_RECENT_MS: u64 = 2 * 60 * 60 * 1_000;
@@ -53,6 +59,10 @@ where
         )
         .route("/api/asks", get(godui_asks_get).post(godui_asks_post))
         .route("/api/pin-info", get(godui_pin_info_get))
+        .route(
+            "/ws",
+            get(godui_ws_upgrade).layer(Extension(super::ws::WsConfig::ws_from_process_env())),
+        )
 }
 
 async fn godui_costs_get() -> impl IntoResponse {
@@ -83,6 +93,144 @@ async fn godui_asks_post(req: Request<Body>) -> Response {
 
 async fn godui_pin_info_get() -> impl IntoResponse {
     Json(godui_pin_info_payload()).into_response()
+}
+
+async fn godui_ws_upgrade(
+    ws: WebSocketUpgrade,
+    uri: Uri,
+    Extension(state): Extension<Arc<ServecoreSharedState>>,
+    Extension(config): Extension<super::ws::WsConfig>,
+) -> Response {
+    let target = match super::ws::ws_validate_target(servecore_ws_target(uri.query())) {
+        Ok(target) => target,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response()
+        }
+    };
+    if state
+        .engine
+        .servecore_ws_open(ServecoreWsKind::Engine, target.as_deref())
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ws_engine_unavailable"})),
+        )
+            .into_response();
+    }
+    if servecore_ws_connection_limit_reached(config.max_connections) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"ws_connection_limit"})),
+        )
+            .into_response();
+    }
+    ws.on_upgrade(move |socket| godui_ws_stream(socket, state, target, config))
+        .into_response()
+}
+
+async fn godui_ws_stream(
+    mut socket: WebSocket,
+    state: Arc<ServecoreSharedState>,
+    target: Option<String>,
+    config: super::ws::WsConfig,
+) {
+    let Some(_guard) = servecore_ws_connection_guard(config.max_connections) else {
+        let _ = socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1013,
+                reason: "ws connection limit".into(),
+            })))
+            .await;
+        return;
+    };
+    if !godui_ws_send_initial(&mut socket, &state, &config).await {
+        state
+            .engine
+            .servecore_ws_close(ServecoreWsKind::Engine, target.as_deref());
+        return;
+    }
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.heartbeat_interval,
+        config.heartbeat_interval,
+    );
+    let mut refresh = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+    let idle_timer = tokio::time::sleep(config.idle_timeout);
+    tokio::pin!(idle_timer);
+    loop {
+        tokio::select! {
+            _ = refresh.tick() => {
+                if !godui_ws_send_session_recent(&mut socket, &state, &config).await {
+                    break;
+                }
+                idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+            }
+            _ = heartbeat.tick() => {
+                if servecore_ws_send(&mut socket, Message::Ping(Vec::new()), config.send_timeout).await.is_err() {
+                    break;
+                }
+            }
+            () = &mut idle_timer => {
+                let _ = servecore_ws_send(&mut socket, Message::Close(None), config.send_timeout).await;
+                break;
+            }
+            frame = socket.recv() => {
+                match frame {
+                    Some(Ok(frame)) => {
+                        let resets_idle = !matches!(frame, Message::Pong(_));
+                        if resets_idle {
+                            idle_timer.as_mut().reset(tokio::time::Instant::now() + config.idle_timeout);
+                        }
+                        if !servecore_ws_handle_frame(
+                            &mut socket,
+                            state.as_ref(),
+                            ServecoreWsKind::Engine,
+                            target.as_deref(),
+                            &config,
+                            frame,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+    }
+    state
+        .engine
+        .servecore_ws_close(ServecoreWsKind::Engine, target.as_deref());
+}
+
+async fn godui_ws_send_initial(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    config: &super::ws::WsConfig,
+) -> bool {
+    servecore_ws_send_text_frames(
+        socket,
+        godui_ws_initial_frames(state.servecore_tmux_sessions()),
+        config,
+    )
+    .await
+}
+
+async fn godui_ws_send_session_recent(
+    socket: &mut WebSocket,
+    state: &ServecoreSharedState,
+    config: &super::ws::WsConfig,
+) -> bool {
+    servecore_ws_send_text_frames(
+        socket,
+        godui_ws_session_recent_frames(state.servecore_tmux_sessions()),
+        config,
+    )
+    .await
 }
 
 fn godui_costs_payload() -> Value {
@@ -423,8 +571,14 @@ mod tests {
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode},
+        Router,
     };
-    use std::time::Duration;
+    use futures_util::StreamExt;
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
+    use tokio::sync::oneshot;
     use tower::ServiceExt;
 
     #[test]
@@ -469,6 +623,54 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(godui_ws_recent_agents(&sessions)).expect("recent json"),
+            json!([
+                {"target": "142-athena:1", "name": "athena-oracle", "session": "142-athena"},
+                {"target": "142-athena:2", "name": "athena-codex-1", "session": "142-athena"}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn godui_ws_route_streams_sessions_and_recent_from_module() {
+        let state = ServecoreSharedState::default().servecore_with_tmux_sessions_snapshot(vec![
+            TmuxSession {
+                name: "142-athena".to_owned(),
+                windows: vec![
+                    maw_tmux::TmuxWindow {
+                        index: 1,
+                        name: "athena-oracle".to_owned(),
+                        active: true,
+                        cwd: Some("/opt/athena".to_owned()),
+                    },
+                    maw_tmux::TmuxWindow {
+                        index: 2,
+                        name: "athena-codex-1".to_owned(),
+                        active: false,
+                        cwd: None,
+                    },
+                ],
+            },
+        ]);
+        let addr = godui_spawn_test_server(state).await;
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect websocket");
+        let mut frames = Vec::new();
+        while frames.len() < 3 {
+            let received = ws.next().await.expect("frame").expect("frame ok");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = received {
+                frames.push(serde_json::from_str::<serde_json::Value>(&text).expect("json frame"));
+            }
+        }
+
+        assert_eq!(frames[0]["type"], "feed-history");
+        assert_eq!(frames[0]["events"], json!([]));
+        assert_eq!(frames[1]["type"], "sessions");
+        assert_eq!(frames[1]["sessions"][0]["name"], "142-athena");
+        assert_eq!(frames[1]["sessions"][0]["windows"][0]["cwd"], "/opt/athena");
+        assert_eq!(frames[2]["type"], "recent");
+        assert_eq!(
+            frames[2]["agents"],
             json!([
                 {"target": "142-athena:1", "name": "athena-oracle", "session": "142-athena"},
                 {"target": "142-athena:2", "name": "athena-codex-1", "session": "142-athena"}
@@ -619,5 +821,29 @@ mod tests {
             "maw-rs-god-ui-{name}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    async fn godui_spawn_test_server(state: ServecoreSharedState) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let router = servecore_mount_core_routes(Router::new());
+        let router = servecore_mount_modules(router, &["god-ui".to_owned()]);
+        let router = servecore_with_shared_state(router, state);
+        let app = servecore_apply_pipeline(router);
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let server = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            });
+            server.await.expect("server");
+        });
+        std::mem::forget(tx);
+        addr
     }
 }

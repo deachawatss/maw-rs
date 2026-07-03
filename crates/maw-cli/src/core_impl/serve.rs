@@ -324,7 +324,6 @@ fn serve_router(state: ServeState) -> Router {
     let state = Arc::new(state);
     let router = Router::new();
     let router = crate::serve_core::servecore_mount_core_routes(router);
-    let router = crate::serve_core::servecore_mount_ws_routes(router);
     let router = crate::serve_core::modules::servecore_mount_modules(router, &[]);
     let router = router
         .route("/api/send", post(api_send))
@@ -2297,6 +2296,7 @@ mod serve_tests {
     use axum::body::Body;
     use futures_util::{SinkExt, StreamExt};
     use maw_auth::{build_legacy_from_sign_payload, hash_body, sign_headers_v3_at, sign_hmac_sig};
+    use std::time::Duration;
     use tokio::sync::oneshot;
     use tower::ServiceExt;
 
@@ -3810,15 +3810,22 @@ mod serve_tests {
         .await
         .expect("send websocket text");
 
-        let received = ws
-            .next()
-            .await
-            .expect("websocket should yield a frame")
-            .expect("frame should be ok");
-        assert_eq!(
-            received,
-            tokio_tungstenite::tungstenite::Message::Text("relay-check".to_owned())
-        );
+        let echo = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = ws
+                    .next()
+                    .await
+                    .expect("websocket should yield a frame")
+                    .expect("frame should be ok");
+                if received
+                    == tokio_tungstenite::tungstenite::Message::Text("relay-check".to_owned())
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(echo.is_ok(), "websocket should echo text after stream frames");
     }
 
     #[tokio::test]
