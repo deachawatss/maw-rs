@@ -1379,8 +1379,8 @@ pub fn servecore_mount_ws_registry_with_config<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    let routes = servecore_mount_ws_registry(Router::new(), registry).layer(Extension(config));
-    router.merge(routes)
+    let ws_routes = servecore_mount_ws_registry(Router::new(), registry).layer(Extension(config));
+    router.merge(ws_routes)
 }
 
 pub fn servecore_mount_ws_registry<S>(
