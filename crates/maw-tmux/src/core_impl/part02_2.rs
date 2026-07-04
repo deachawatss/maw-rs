@@ -280,15 +280,123 @@ where
     ///
     /// # Errors
     ///
-    /// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
+    /// Returns the first tmux error from readiness polling, mode exit, text placement, paste, or
+    /// Enter send.
     pub fn send_text(&mut self, target: &str, text: &str) -> Result<SendTextReport, TmuxError> {
-        self.send_text_with_sleeper(target, text, std::thread::sleep)
+        let config = self.submit_config_for_target(target);
+        self.send_text_with_config_and_sleeper(target, text, config, std::thread::sleep)
     }
 
+    /// Smart text sending with explicit engine timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first tmux error from readiness polling, mode exit, text placement, paste, or
+    /// Enter send.
+    pub fn send_text_with_config(
+        &mut self,
+        target: &str,
+        text: &str,
+        config: SubmitConfig,
+    ) -> Result<SendTextReport, TmuxError> {
+        self.send_text_with_config_and_sleeper(target, text, config, std::thread::sleep)
+    }
+
+    /// Smart text sending with explicit timing and injected sleep.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first tmux error from readiness polling, mode exit, text placement, paste, or
+    /// Enter send.
+    #[doc(hidden)]
+    pub fn send_text_with_config_and_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        config: SubmitConfig,
+        mut sleep: F,
+    ) -> Result<SendTextReport, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
+        match self.readiness_gate(target, config, &mut sleep)? {
+            ReadinessResult::Ready => self.send_text_body_with_sleeper(target, text, config, sleep),
+            ReadinessResult::Timeout => Err(TmuxError::new(format!(
+                "pane '{target}' did not show a prompt before readiness timeout"
+            ))),
+            ReadinessResult::Busy => Err(TmuxError::new(format!(
+                "pane '{target}' is busy; prompt is not visible"
+            ))),
+        }
+    }
+
+    /// Poll a pane until its last non-empty captured line shows a prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot capture the target pane.
+    pub fn readiness_gate<F>(
+        &mut self,
+        target: &str,
+        config: SubmitConfig,
+        mut sleep: F,
+    ) -> Result<ReadinessResult, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
+        let mut waited_ms = 0;
+        let poll_ms = config.readiness_poll_ms.max(1);
+        loop {
+            let content = self.capture(target, Some(5))?;
+            if pane_prompt_ready_from_capture(&content) {
+                return Ok(ReadinessResult::Ready);
+            }
+            if waited_ms >= config.readiness_timeout_ms {
+                return Ok(if pane_capture_has_active_output(&content) {
+                    ReadinessResult::Busy
+                } else {
+                    ReadinessResult::Timeout
+                });
+            }
+            let remaining_ms = config.readiness_timeout_ms - waited_ms;
+            let sleep_ms = poll_ms.min(remaining_ms);
+            sleep(std::time::Duration::from_millis(sleep_ms));
+            waited_ms += sleep_ms;
+        }
+    }
+
+    /// Probe the current pane capture once and return a send throttle when no prompt is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot capture the target pane.
+    pub fn busy_guard(&mut self, target: &str) -> Result<SendThrottle, TmuxError> {
+        let content = self.capture(target, Some(5))?;
+        if pane_capture_has_active_output(&content) {
+            Ok(SendThrottle::Busy)
+        } else {
+            Ok(SendThrottle::Allowed)
+        }
+    }
+
+    #[cfg(test)]
     fn send_text_with_sleeper<F>(
         &mut self,
         target: &str,
         text: &str,
+        sleep: F,
+    ) -> Result<SendTextReport, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
+        self.send_text_body_with_sleeper(target, text, SubmitConfig::claude(), sleep)
+    }
+
+    fn send_text_body_with_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        config: SubmitConfig,
         mut sleep: F,
     ) -> Result<SendTextReport, TmuxError>
     where
@@ -303,7 +411,8 @@ where
             self.send_keys_literal(target, text)?;
         }
         sleep(std::time::Duration::from_millis(SEND_SETTLE_MS));
-        let (enter_attempts, warned_pending) = self.submit_with_confirm(target, &mut sleep)?;
+        let (enter_attempts, warned_pending) =
+            self.submit_with_confirm_config(target, &mut sleep, config)?;
         Ok(SendTextReport {
             used_buffer,
             enter_attempts,
@@ -311,22 +420,30 @@ where
         })
     }
 
-    fn submit_with_confirm<F>(
+    fn submit_with_confirm_config<F>(
         &mut self,
         target: &str,
         sleep: &mut F,
+        config: SubmitConfig,
     ) -> Result<(u32, bool), TmuxError>
     where
         F: FnMut(std::time::Duration),
     {
         for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
             self.send_enter(target)?;
-            sleep(std::time::Duration::from_millis(SUBMIT_CONFIRM_MS));
+            sleep(std::time::Duration::from_millis(config.confirm_interval_ms));
             if !self.pane_input_pending(target) {
                 return Ok((attempt, false));
             }
         }
         Ok((MAX_SUBMIT_ATTEMPTS, true))
+    }
+
+    fn submit_config_for_target(&mut self, target: &str) -> SubmitConfig {
+        self.display_pane_current_command(target)
+            .map_or_else(|_| SubmitConfig::claude(), |command| {
+                SubmitConfig::for_engine_name(&command)
+            })
     }
 
     /// Capture recent pane contents using `tmux capture-pane`.
@@ -382,6 +499,25 @@ where
             ],
         );
     }
+}
+
+fn pane_prompt_ready_from_capture(content: &str) -> bool {
+    last_clean_non_empty_capture_line(content).is_some_and(|line| {
+        let trimmed = line.trim_end();
+        trimmed.ends_with('$') || trimmed.ends_with('❯') || trimmed.ends_with('>')
+    })
+}
+
+fn pane_capture_has_active_output(content: &str) -> bool {
+    last_clean_non_empty_capture_line(content)
+        .is_some_and(|line| !pane_prompt_ready_from_capture(line.as_str()))
+}
+
+fn last_clean_non_empty_capture_line(content: &str) -> Option<String> {
+    content
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .map(|line| strip_tmux_ansi(line).replace('\r', ""))
 }
 
 fn write_pane_title(

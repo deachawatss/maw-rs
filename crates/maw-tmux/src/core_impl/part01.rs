@@ -20,7 +20,12 @@ const DEFAULT_PTY_COLS_LIMIT: u32 = 500;
 const DEFAULT_PTY_ROWS_LIMIT: u32 = 200;
 pub const SEND_SETTLE_MS: u64 = 1_500;
 pub const SUBMIT_CONFIRM_MS: u64 = 700;
+pub const CODEX_SUBMIT_CONFIRM_MS: u64 = 200;
 pub const MAX_SUBMIT_ATTEMPTS: u32 = 4;
+pub const CLAUDE_READINESS_TIMEOUT_MS: u64 = 45_000;
+pub const CLAUDE_READINESS_POLL_MS: u64 = 1_000;
+pub const CODEX_READINESS_TIMEOUT_MS: u64 = 8_000;
+pub const CODEX_READINESS_POLL_MS: u64 = 500;
 const COOLDOWN_MS: u64 = 500;
 const QUOTA_PER_MINUTE: u32 = 100;
 const QUOTA_WINDOW_MS: u64 = 60_000;
@@ -118,6 +123,70 @@ pub struct SendTextReport {
     pub warned_pending: bool,
 }
 
+/// Agent family used to select send readiness and submit-confirm timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitEngine {
+    Claude,
+    Codex,
+}
+
+/// Timing knobs for readiness polling and Enter submit verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitConfig {
+    pub readiness_timeout_ms: u64,
+    pub readiness_poll_ms: u64,
+    pub confirm_interval_ms: u64,
+}
+
+impl SubmitConfig {
+    /// Claude-compatible submit timings.
+    #[must_use]
+    pub const fn claude() -> Self {
+        Self {
+            readiness_timeout_ms: CLAUDE_READINESS_TIMEOUT_MS,
+            readiness_poll_ms: CLAUDE_READINESS_POLL_MS,
+            confirm_interval_ms: SUBMIT_CONFIRM_MS,
+        }
+    }
+
+    /// Codex-compatible submit timings.
+    #[must_use]
+    pub const fn codex() -> Self {
+        Self {
+            readiness_timeout_ms: CODEX_READINESS_TIMEOUT_MS,
+            readiness_poll_ms: CODEX_READINESS_POLL_MS,
+            confirm_interval_ms: CODEX_SUBMIT_CONFIRM_MS,
+        }
+    }
+
+    /// Return the timing profile for an engine.
+    #[must_use]
+    pub const fn for_engine(engine: SubmitEngine) -> Self {
+        match engine {
+            SubmitEngine::Claude => Self::claude(),
+            SubmitEngine::Codex => Self::codex(),
+        }
+    }
+
+    /// Infer a timing profile from a pane command or label.
+    #[must_use]
+    pub fn for_engine_name(name: &str) -> Self {
+        if name.to_lowercase().contains("codex") {
+            Self::codex()
+        } else {
+            Self::claude()
+        }
+    }
+}
+
+/// Result of polling a pane before text submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessResult {
+    Ready,
+    Timeout,
+    Busy,
+}
+
 /// Options for lock-protected `split-window` construction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SplitWindowLockedOptions {
@@ -186,6 +255,7 @@ pub struct SendTrackerEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendThrottle {
     Allowed,
+    Busy,
     Cooldown { cooldown_ms: u64 },
     Quota { quota_per_minute: u32 },
 }
