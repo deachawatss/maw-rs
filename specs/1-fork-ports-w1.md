@@ -86,6 +86,33 @@ Each cluster has one primary test seam — all pure-logic, no live tmux/git:
 - `engine_warn_untrusted_repo` — config says engine=codex, repo not in trust list, assert warning emitted
 - `engine_resolution_fallback_chain` — test per-agent → default → "claude" priority
 
+## Consolidated Fork Surface (BINDING)
+
+Wind directive — supersedes any per-worker file layout that predates this section.
+
+### Module tree
+
+ALL fork logic lives in ONE module tree: `crates/maw-cli/src/wind/` (a single `mod wind;` hook in `lib.rs`; per-concern files inside: `done.rs`, `team.rs`, `workon.rs`; each ≤250 lines). maw-tmux fork logic stays in `crates/maw-tmux/src/core_impl/wind_delivery.rs` since it belongs to a different crate.
+
+### Test file
+
+Exactly ONE test file: `crates/maw-cli/tests/fork_divergence.rs`. Every worker's assertions merge into it at aggregation, exercising maw-tmux-level behavior through maw-cli's dependency on maw-tmux. Use `mod <concern>_hardening { ... }` scoping inside the file. Per-worker test files (`hey_submit_hardening.rs`, `native_done_hardening.rs`, `team_harden_spawn.rs`, `native_workon_hardening.rs`) are TEMPORARY scaffolding — they MUST be deleted after their asserts move into `fork_divergence.rs`.
+
+### Upstream hooks
+
+Upstream-owned files (`core_impl/done.rs`, `core_impl/team_core.rs`, `core_impl/workon.rs`) keep maximum 1-3-line hooks that call into `wind::*`. No fork logic inline.
+
+### Inventory
+
+ONE inventory doc: `docs/maw-js-fork-patch-migration.md`.
+
+### Aggregation gate
+
+Before `.maw/aggregate-verified`, verify:
+- `ls crates/maw-cli/src/wind/` is non-empty (fork module tree exists)
+- `test -f crates/maw-cli/tests/fork_divergence.rs` (consolidated test exists)
+- ZERO leftover per-worker test files in `crates/maw-cli/tests/` or `crates/maw-tmux/tests/` beyond `fork_divergence.rs` and `hey_submit_hardening.rs` (maw-tmux tests stay in maw-tmux)
+
 ## Success Criteria
 
 - [ ] `cargo test --workspace` green with all new regression tests
