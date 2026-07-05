@@ -14,6 +14,8 @@ struct TeamConfig122 {
     created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lead_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_pane: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -143,7 +145,7 @@ fn team_create(argv: &[String]) -> Result<String, String> {
     if paths.vault_manifest.exists() { return Err(format!("team '{name}' already exists at {}", paths.vault_dir.display())); }
     let created_at = team_now_millis();
     let manifest = serde_json::json!({"name":name,"createdAt":created_at,"members":[],"description":description,"leadSessionId":team_current_session_id()});
-    let config = TeamConfig122 { name: name.to_owned(), description, members: Vec::new(), created_at, lead_session_id: team_current_session_id() };
+    let config = TeamConfig122 { name: name.to_owned(), description, members: Vec::new(), created_at, lead_session_id: team_current_session_id(), caller_pane: team_caller_pane() };
     team_write_json_atomic_0600(&paths.vault_manifest, &manifest)?;
     team_write_json_atomic_0600(&paths.tool_config, &config)?;
     Ok(format!("\x1b[32m✓\x1b[0m team '{name}' created\n  \x1b[90m{}/manifest.json\x1b[0m\n", paths.vault_dir.display()))
@@ -244,6 +246,157 @@ fn team_psi_dir() -> std::path::PathBuf {
 
 fn team_current_session_id() -> Option<String> {
     ["CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "OMX_SESSION_ID", "ATUIN_SESSION"].iter().find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+}
+
+/// Return the current tmux caller pane from `TMUX_PANE` when it is a safe pane id.
+#[must_use]
+pub fn team_caller_pane() -> Option<String> {
+    std::env::var("TMUX_PANE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| team_is_valid_pane_id(value))
+}
+
+/// Resolve the tmux `split-window -t` target for team worker pane creation.
+#[must_use]
+pub fn team_spawn_pane_target(caller_pane: Option<String>) -> String {
+    caller_pane
+        .filter(|value| team_is_valid_pane_id(value))
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+/// Send a persisted OMX spawn prompt into a tmux pane with the local tmux runner.
+///
+/// # Errors
+///
+/// Returns an error when the pane id is unsafe, the prompt cannot be read, the
+/// prompt is invalid, or tmux rejects the send.
+pub fn team_omx_auto_kickoff(
+    pane_id: &str,
+    prompt_path: impl AsRef<std::path::Path>,
+) -> Result<(), String> {
+    let mut runner = maw_tmux::CommandTmuxRunner::default();
+    team_omx_auto_kickoff_with(&mut runner, pane_id, prompt_path)
+}
+
+/// Send a persisted OMX spawn prompt through an injected tmux runner.
+///
+/// # Errors
+///
+/// Returns an error when the pane id is unsafe, the prompt cannot be read, the
+/// prompt is invalid, or the injected runner rejects the send.
+pub fn team_omx_auto_kickoff_with<R>(
+    runner: &mut R,
+    pane_id: &str,
+    prompt_path: impl AsRef<std::path::Path>,
+) -> Result<(), String>
+where
+    R: maw_tmux::TmuxRunner,
+{
+    team_validate_public_pane_id(pane_id)?;
+    let path = prompt_path.as_ref();
+    let prompt = std::fs::read_to_string(path)
+        .map_err(|error| format!("team omx kickoff: read {} failed: {error}", path.display()))?;
+    team_validate_kickoff_prompt(&prompt)?;
+    runner
+        .run("send-keys", &maw_tmux::tmux_send_keys_literal_args(pane_id, &prompt))
+        .map_err(|error| format!("team omx kickoff: send prompt failed: {error}"))?;
+    runner
+        .run("send-keys", &maw_tmux::tmux_send_enter_args(pane_id))
+        .map_err(|error| format!("team omx kickoff: send enter failed: {error}"))?;
+    Ok(())
+}
+
+/// Return team member pane ids whose tmux PID is missing or no longer alive.
+#[must_use]
+pub fn team_orphan_sweep_from_pids(
+    member_pane_ids: &[String],
+    pane_pids: &[(String, u32)],
+    mut is_pid_alive: impl FnMut(u32) -> bool,
+) -> Vec<String> {
+    let pane_to_pid = pane_pids.iter().cloned().collect::<std::collections::BTreeMap<_, _>>();
+    member_pane_ids
+        .iter()
+        .filter(|pane_id| pane_to_pid.get(*pane_id).is_none_or(|pid| !is_pid_alive(*pid)))
+        .cloned()
+        .collect()
+}
+
+/// Return zombie pane ids for the named team using live tmux pane PID data.
+///
+/// # Errors
+///
+/// Returns an error when the team name is unsafe, the team config cannot be
+/// found, or tmux pane PID discovery fails.
+pub fn team_orphan_sweep(team_name: &str) -> Result<Vec<String>, String> {
+    team_validate_name(team_name)?;
+    let config = team_read_json::<TeamConfig122>(&team_paths(team_name).tool_config)
+        .ok_or_else(|| format!("team orphan sweep: team '{team_name}' not found"))?;
+    let member_panes = team_member_pane_ids(&config);
+    let pane_pids = team_pane_pids()?;
+    Ok(team_orphan_sweep_from_pids(&member_panes, &pane_pids, team_pid_alive))
+}
+
+fn team_member_pane_ids(config: &TeamConfig122) -> Vec<String> {
+    config
+        .members
+        .iter()
+        .filter(|member| member.agent_type.as_deref() != Some("team-lead"))
+        .filter_map(|member| member.tmux_pane_id.as_deref())
+        .filter(|pane_id| team_is_valid_pane_id(pane_id))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn team_pane_pids() -> Result<Vec<(String, u32)>, String> {
+    if let Ok(raw) = std::env::var("MAW_RS_TEAM_PANE_PIDS") {
+        return Ok(raw.lines().filter_map(team_parse_pane_pid).collect());
+    }
+    let mut runner = maw_tmux::CommandTmuxRunner::default();
+    let raw = maw_tmux::TmuxRunner::run(
+        &mut runner,
+        "list-panes",
+        &["-a".to_owned(), "-F".to_owned(), "#{pane_id}|#{pane_pid}".to_owned()],
+    )
+    .map_err(|error| format!("team orphan sweep: list-panes failed: {error}"))?;
+    Ok(raw.lines().filter_map(team_parse_pane_pid).collect())
+}
+
+fn team_parse_pane_pid(line: &str) -> Option<(String, u32)> {
+    let (pane_id, pid) = line.split_once('|')?;
+    if !team_is_valid_pane_id(pane_id) {
+        return None;
+    }
+    Some((pane_id.to_owned(), pid.parse().ok()?))
+}
+
+fn team_pid_alive(pid: u32) -> bool {
+    std::path::Path::new("/proc").join(pid.to_string()).exists()
+}
+
+fn team_validate_kickoff_prompt(prompt: &str) -> Result<(), String> {
+    if prompt.is_empty() {
+        return Err("team omx kickoff: prompt is empty".to_owned());
+    }
+    if prompt.chars().any(|ch| ch == '\0') {
+        return Err("team omx kickoff: prompt contains NUL".to_owned());
+    }
+    Ok(())
+}
+
+fn team_validate_public_pane_id(pane_id: &str) -> Result<(), String> {
+    if team_is_valid_pane_id(pane_id) {
+        Ok(())
+    } else {
+        Err(format!("invalid pane id {pane_id:?}: expected tmux %pane id"))
+    }
+}
+
+fn team_is_valid_pane_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.starts_with('%')
+        && !value.starts_with("%-")
+        && !value.chars().any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
 }
 
 fn team_now_millis() -> u64 {
@@ -365,13 +518,22 @@ fn team_push_status(out: &mut String, name: &str) {
     use std::fmt::Write as _;
     let Some(config) = team_read_json::<TeamConfig122>(&team_paths(name).tool_config) else { writeln!(out, "\x1b[33m⚠\x1b[0m team not found: {name}").expect("write string"); return; };
     let members: Vec<_> = config.members.iter().filter(|m| m.agent_type.as_deref() != Some("team-lead")).collect();
-    writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len()).expect("write string");
+    let zombies = team_orphan_sweep(name).unwrap_or_default();
+    if zombies.is_empty() {
+        writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len()).expect("write string");
+    } else {
+        writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents, {} zombies)\n", members.len(), zombies.len()).expect("write string");
+    }
     writeln!(out, "  Agent           Status    Task                          Pane").expect("write string");
     writeln!(out, "  ─────────────── ───────── ───────────────────────────── ────────").expect("write string");
     for member in &members { writeln!(out, "  {:<15} \x1b[90midle\x1b[0m      {:<29} {}", member.name, "-", member.tmux_pane_id.as_deref().unwrap_or("-" )).expect("write string"); }
     let tasks = team_read_tasks(name);
     let done = tasks.iter().filter(|task| task.status == "completed").count();
-    writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len()).expect("write string");
+    if zombies.is_empty() {
+        writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len()).expect("write string");
+    } else {
+        writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle | Zombies: {}\x1b[0m", tasks.len(), members.len(), zombies.len()).expect("write string");
+    }
 }
 
 fn team_read_tasks(team: &str) -> Vec<TeamTask122> {
@@ -546,7 +708,7 @@ fn team_load_charter_no_spawn(charter: &TeamCharter122) -> Result<String, String
     if !collisions.is_empty() { return Err(format!("team '{}' already exists; refusing to overwrite {}", charter.name, collisions.join(", "))); }
     let created_at = team_now_millis();
     let members: Vec<_> = charter.members.iter().map(team_config_member_from_charter).collect();
-    let config = TeamConfig122 { name: charter.name.clone(), description: charter.description.clone(), members, created_at, lead_session_id: None };
+    let config = TeamConfig122 { name: charter.name.clone(), description: charter.description.clone(), members, created_at, lead_session_id: None, caller_pane: team_caller_pane() };
     let manifest = serde_json::json!({"name":charter.name,"createdAt":created_at,"description":charter.description,"goal":charter.goal,"members":charter.members.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),"source":"team-charter"});
     team_write_json_atomic_0600(&paths.tool_config, &config)?;
     for member in &charter.members { team_write_json_atomic_0600(&paths.tool_dir.join("inboxes").join(format!("{}.json", member.role)), &serde_json::json!([]))?; }
