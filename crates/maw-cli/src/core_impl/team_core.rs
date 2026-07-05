@@ -14,6 +14,8 @@ struct TeamConfig122 {
     created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lead_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_pane: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -143,7 +145,7 @@ fn team_create(argv: &[String]) -> Result<String, String> {
     if paths.vault_manifest.exists() { return Err(format!("team '{name}' already exists at {}", paths.vault_dir.display())); }
     let created_at = team_now_millis();
     let manifest = serde_json::json!({"name":name,"createdAt":created_at,"members":[],"description":description,"leadSessionId":team_current_session_id()});
-    let config = TeamConfig122 { name: name.to_owned(), description, members: Vec::new(), created_at, lead_session_id: team_current_session_id() };
+    let config = TeamConfig122 { name: name.to_owned(), description, members: Vec::new(), created_at, lead_session_id: team_current_session_id(), caller_pane: crate::wind::team::caller_pane() };
     team_write_json_atomic_0600(&paths.vault_manifest, &manifest)?;
     team_write_json_atomic_0600(&paths.tool_config, &config)?;
     Ok(format!("\x1b[32m✓\x1b[0m team '{name}' created\n  \x1b[90m{}/manifest.json\x1b[0m\n", paths.vault_dir.display()))
@@ -365,13 +367,22 @@ fn team_push_status(out: &mut String, name: &str) {
     use std::fmt::Write as _;
     let Some(config) = team_read_json::<TeamConfig122>(&team_paths(name).tool_config) else { writeln!(out, "\x1b[33m⚠\x1b[0m team not found: {name}").expect("write string"); return; };
     let members: Vec<_> = config.members.iter().filter(|m| m.agent_type.as_deref() != Some("team-lead")).collect();
-    writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len()).expect("write string");
+    let zombies = crate::wind::team::orphan_sweep(&team_paths(name).tool_config).unwrap_or_default();
+    if zombies.is_empty() {
+        writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents)\n", members.len()).expect("write string");
+    } else {
+        writeln!(out, "\n\x1b[36;1mTeam: {name}\x1b[0m ({} agents, {} zombies)\n", members.len(), zombies.len()).expect("write string");
+    }
     writeln!(out, "  Agent           Status    Task                          Pane").expect("write string");
     writeln!(out, "  ─────────────── ───────── ───────────────────────────── ────────").expect("write string");
     for member in &members { writeln!(out, "  {:<15} \x1b[90midle\x1b[0m      {:<29} {}", member.name, "-", member.tmux_pane_id.as_deref().unwrap_or("-" )).expect("write string"); }
     let tasks = team_read_tasks(name);
     let done = tasks.iter().filter(|task| task.status == "completed").count();
-    writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len()).expect("write string");
+    if zombies.is_empty() {
+        writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle\x1b[0m", tasks.len(), members.len()).expect("write string");
+    } else {
+        writeln!(out, "\n  \x1b[90mTasks: {done}/{} done | Agents: 0 working, {} idle | Zombies: {}\x1b[0m", tasks.len(), members.len(), zombies.len()).expect("write string");
+    }
 }
 
 fn team_read_tasks(team: &str) -> Vec<TeamTask122> {
@@ -546,7 +557,7 @@ fn team_load_charter_no_spawn(charter: &TeamCharter122) -> Result<String, String
     if !collisions.is_empty() { return Err(format!("team '{}' already exists; refusing to overwrite {}", charter.name, collisions.join(", "))); }
     let created_at = team_now_millis();
     let members: Vec<_> = charter.members.iter().map(team_config_member_from_charter).collect();
-    let config = TeamConfig122 { name: charter.name.clone(), description: charter.description.clone(), members, created_at, lead_session_id: None };
+    let config = TeamConfig122 { name: charter.name.clone(), description: charter.description.clone(), members, created_at, lead_session_id: None, caller_pane: crate::wind::team::caller_pane() };
     let manifest = serde_json::json!({"name":charter.name,"createdAt":created_at,"description":charter.description,"goal":charter.goal,"members":charter.members.iter().map(|m| m.role.clone()).collect::<Vec<_>>(),"source":"team-charter"});
     team_write_json_atomic_0600(&paths.tool_config, &config)?;
     for member in &charter.members { team_write_json_atomic_0600(&paths.tool_dir.join("inboxes").join(format!("{}.json", member.role)), &serde_json::json!([]))?; }
