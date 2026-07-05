@@ -25,6 +25,12 @@ const COOLDOWN_MS: u64 = 500;
 const QUOTA_PER_MINUTE: u32 = 100;
 const QUOTA_WINDOW_MS: u64 = 60_000;
 
+pub use wind_delivery::{
+    ReadinessGate, ReadinessResult, SubmitConfig, SubmitEngine, CLAUDE_READINESS_POLL_MS,
+    CLAUDE_READINESS_TIMEOUT_MS, CODEX_READINESS_POLL_MS, CODEX_READINESS_TIMEOUT_MS,
+    CODEX_SUBMIT_CONFIRM_MS,
+};
+
 const VALID_LAYOUTS: [&str; 5] = [
     "even-horizontal",
     "even-vertical",
@@ -186,6 +192,7 @@ pub struct SendTrackerEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendThrottle {
     Allowed,
+    Busy,
     Cooldown { cooldown_ms: u64 },
     Quota { quota_per_minute: u32 },
 }

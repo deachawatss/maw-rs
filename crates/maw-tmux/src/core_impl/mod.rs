@@ -1,3 +1,4 @@
+pub mod wind_delivery;
 include!("part01.rs");
 include!("part02_1.rs");
 include!("part02_2.rs");

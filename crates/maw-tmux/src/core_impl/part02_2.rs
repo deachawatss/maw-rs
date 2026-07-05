@@ -280,53 +280,79 @@ where
     ///
     /// # Errors
     ///
-    /// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
+    /// Returns the first tmux error from readiness polling, mode exit, text placement, paste, or
+    /// Enter send.
     pub fn send_text(&mut self, target: &str, text: &str) -> Result<SendTextReport, TmuxError> {
-        self.send_text_with_sleeper(target, text, std::thread::sleep)
+        let config = wind_delivery::submit_config_for_target(self, target);
+        self.send_text_with_config_and_sleeper(target, text, config, std::thread::sleep)
     }
 
-    fn send_text_with_sleeper<F>(
+    /// Smart text sending with explicit engine timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first tmux error from readiness polling, mode exit, text placement, paste, or
+    /// Enter send.
+    pub fn send_text_with_config(
         &mut self,
         target: &str,
         text: &str,
-        mut sleep: F,
+        config: SubmitConfig,
+    ) -> Result<SendTextReport, TmuxError> {
+        self.send_text_with_config_and_sleeper(target, text, config, std::thread::sleep)
+    }
+
+    #[doc(hidden)]
+    pub fn send_text_with_config_and_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        config: SubmitConfig,
+        sleep: F,
     ) -> Result<SendTextReport, TmuxError>
     where
         F: FnMut(std::time::Duration),
     {
-        self.exit_mode_if_needed(target)?;
-        let used_buffer = text.contains('\n') || text.len() > 500;
-        if used_buffer {
-            self.load_buffer(text)?;
-            self.paste_buffer(target)?;
-        } else {
-            self.send_keys_literal(target, text)?;
-        }
-        sleep(std::time::Duration::from_millis(SEND_SETTLE_MS));
-        let (enter_attempts, warned_pending) = self.submit_with_confirm(target, &mut sleep)?;
-        Ok(SendTextReport {
-            used_buffer,
-            enter_attempts,
-            warned_pending,
-        })
+        wind_delivery::send_text_with_config_and_sleeper(self, target, text, config, sleep)
     }
 
-    fn submit_with_confirm<F>(
+    /// Poll a pane until its last non-empty captured line shows a prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot capture the target pane.
+    pub fn readiness_gate<F>(
         &mut self,
         target: &str,
-        sleep: &mut F,
-    ) -> Result<(u32, bool), TmuxError>
+        config: SubmitConfig,
+        sleep: F,
+    ) -> Result<ReadinessResult, TmuxError>
     where
         F: FnMut(std::time::Duration),
     {
-        for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
-            self.send_enter(target)?;
-            sleep(std::time::Duration::from_millis(SUBMIT_CONFIRM_MS));
-            if !self.pane_input_pending(target) {
-                return Ok((attempt, false));
-            }
-        }
-        Ok((MAX_SUBMIT_ATTEMPTS, true))
+        wind_delivery::readiness_gate(self, target, config, sleep)
+    }
+
+    /// Probe the current pane capture once and return a send throttle when no prompt is visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the runner error when tmux cannot capture the target pane.
+    pub fn busy_guard(&mut self, target: &str) -> Result<SendThrottle, TmuxError> {
+        wind_delivery::busy_probe(self, target)
+    }
+
+    #[cfg(test)]
+    fn send_text_with_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        sleep: F,
+    ) -> Result<SendTextReport, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
+        wind_delivery::send_text_body_with_sleeper(self, target, text, SubmitConfig::claude(), sleep)
     }
 
     /// Capture recent pane contents using `tmux capture-pane`.
