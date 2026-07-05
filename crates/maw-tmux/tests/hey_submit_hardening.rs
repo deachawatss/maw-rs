@@ -130,7 +130,7 @@ fn busy_guard_blocks_send_during_active_output() {
 }
 
 #[test]
-fn verify_submit_uses_engine_specific_intervals() {
+fn verify_submit_retries_with_engine_specific_intervals() {
     let claude_sleeps = submit_sleeps_for(SubmitConfig::claude());
     assert_eq!(
         claude_sleeps,

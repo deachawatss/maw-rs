@@ -27,7 +27,7 @@ Fork-patch map:
 | maw-js patch | Wind module | Hook site | Proof test |
 |---|---|---|---|
 | `comm-send.ts` #14/#15 readiness + busy guard | `crates/maw-tmux/src/core_impl/wind_delivery.rs` | `TmuxClient::send_text_with_config_and_sleeper` / `TmuxClient::busy_guard` in `part02_2.rs` | `readiness_gate_polls_until_prompt_visible`, `busy_guard_blocks_send_during_active_output` |
-| `comm-send.ts` #21 verify-submit retry intervals | `crates/maw-tmux/src/core_impl/wind_delivery.rs` | `TmuxClient::send_text` config selection in `part02_2.rs` | `verify_submit_uses_engine_specific_intervals` |
+| `comm-send.ts` #21 verify-submit retry intervals | `crates/maw-tmux/src/core_impl/wind_delivery.rs` | `TmuxClient::send_text` config selection in `part02_2.rs` | `verify_submit_retries_with_engine_specific_intervals` |
 | fork/upstream divergence guard | `crates/maw-tmux/src/core_impl/wind_delivery.rs` | Wind hook calls retained in `part02_2.rs` | `fork_divergence_hook_keeps_wind_delivery_at_submit_site` |
 
 Proof tests:
@@ -35,7 +35,7 @@ Proof tests:
 - `cargo test -p maw-tmux pending_input_detection_matches_maw_js_prompt_heuristic`
 - `cargo test -p maw-tmux readiness_gate_polls_until_prompt_visible`
 - `cargo test -p maw-tmux busy_guard_blocks_send_during_active_output`
-- `cargo test -p maw-tmux verify_submit_uses_engine_specific_intervals`
+- `cargo test -p maw-tmux verify_submit_retries_with_engine_specific_intervals`
 - `cargo test -p maw-tmux fork_divergence_hook_keeps_wind_delivery_at_submit_site`
 
 ### done hardening
@@ -90,7 +90,7 @@ cargo fmt --all -- --check
 cargo test -p maw-tmux pending_input_detection_matches_maw_js_prompt_heuristic
 cargo test -p maw-tmux readiness_gate_polls_until_prompt_visible
 cargo test -p maw-tmux busy_guard_blocks_send_during_active_output
-cargo test -p maw-tmux verify_submit_uses_engine_specific_intervals
+cargo test -p maw-tmux verify_submit_retries_with_engine_specific_intervals
 cargo test -p maw-tmux fork_divergence_hook_keeps_wind_delivery_at_submit_site
 cargo test -p maw-cli done_push_guard_blocks_main_head_and_closed_pr_states
 cargo test --workspace
