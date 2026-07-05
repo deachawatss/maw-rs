@@ -152,6 +152,15 @@ fn verify_submit_uses_engine_specific_intervals() {
     );
 }
 
+#[test]
+fn fork_divergence_hook_keeps_wind_delivery_at_submit_site() {
+    let source = include_str!("../src/core_impl/part02_2.rs");
+
+    assert!(source.contains("wind_delivery::submit_config_for_target(self, target)"));
+    assert!(source.contains("wind_delivery::send_text_with_config_and_sleeper("));
+    assert!(source.contains("wind_delivery::busy_probe(self, target)"));
+}
+
 fn submit_sleeps_for(config: SubmitConfig) -> Vec<Duration> {
     let runner = SharedRunner::with_responses(vec![
         Ok("$ \r"),
