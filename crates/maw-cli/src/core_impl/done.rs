@@ -199,9 +199,14 @@ fn done_find_window(windows: &[DoneWindow], target_lower: &str, session_filter: 
 }
 
 fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], local: &mut DoneLocal, stdout: &mut String) -> Result<(), String> {
+    let current = local.done_current_identity();
+    if let Some(message) = crate::wind::done::self_invocation_message(current.as_ref(), &window.session, window.index, &window.name) {
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        stdout.push_str("  \x1b[90m  run maw done from the lead/parent pane after the DONE ping\x1b[0m\n");
+        return Err(message);
+    }
     let Some(lead) = done_lead_window(windows, &window.session) else { return Ok(()); };
     if lead.index != window.index { return Ok(()); }
-    if let Some((current_session, current_index)) = local.done_current_identity() { if current_session == window.session && current_index == lead.index { return Ok(()); } }
     let message = format!("refusing to done lead window '{}' in session '{}' from a non-lead context", window.name, window.session);
     let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
     stdout.push_str("  \x1b[90m  run from the lead window, or target a non-lead agent window\x1b[0m\n");
@@ -260,7 +265,18 @@ fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLo
         stdout.push_str("  \x1b[36m⬡\x1b[0m [dry-run] would remove worktree + fleet config\n\n");
         return;
     }
-    if let Some(retro) = retro { let _ = DoneLocal::done_send_text(&target, retro); }
+    if let Some(retro) = retro {
+        match DoneLocal::done_send_text(&target, retro) {
+            Ok(()) => crate::wind::done::wait_for_retrospective_prompt(
+                || local.done_tmux("capture-pane", &["-t".to_owned(), target.clone(), "-p".to_owned(), "-S".to_owned(), "-40".to_owned()]),
+                std::thread::sleep,
+                stdout,
+            ),
+            Err(error) => {
+                let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not send {retro} to {target}: {error}");
+            }
+        }
+    }
     if !cwd.is_empty() {
         let _ = done_git(&["-C".to_owned(), cwd.clone(), "add".to_owned(), "--".to_owned(), ".".to_owned()]);
         let _ = done_git(&["-C".to_owned(), cwd.clone(), "commit".to_owned(), "-m".to_owned(), "chore: auto-save before done".to_owned()]);
@@ -346,6 +362,10 @@ fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, stdout: 
     done_validate_exec_path(&worktree.main_path)?;
     done_validate_exec_path(&worktree.full_path)?;
     let branch = done_git(&["-C".to_owned(), worktree.full_path.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
+    let rescued = crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path)?;
+    if !rescued.is_empty() {
+        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m rescued {} ψ/ file(s)", rescued.len());
+    }
     done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "remove".to_owned(), "--force".to_owned(), "--".to_owned(), worktree.full_path.display().to_string()])?;
     done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "prune".to_owned()])?;
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m removed worktree {}", worktree.label);
