@@ -199,13 +199,11 @@ fn done_find_window(windows: &[DoneWindow], target_lower: &str, session_filter: 
 }
 
 fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], local: &mut DoneLocal, stdout: &mut String) -> Result<(), String> {
-    if let Some((current_session, current_index)) = local.done_current_identity() {
-        if current_session == window.session && current_index == window.index {
-            let message = format!("refusing to done current window '{}' in session '{}'", window.name, window.session);
-            let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
-            stdout.push_str("  \x1b[90m  run maw done from the lead/parent pane after the DONE ping\x1b[0m\n");
-            return Err(message);
-        }
+    let current = local.done_current_identity();
+    if let Some(message) = crate::wind::done::self_invocation_message(current.as_ref(), &window.session, window.index, &window.name) {
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        stdout.push_str("  \x1b[90m  run maw done from the lead/parent pane after the DONE ping\x1b[0m\n");
+        return Err(message);
     }
     let Some(lead) = done_lead_window(windows, &window.session) else { return Ok(()); };
     if lead.index != window.index { return Ok(()); }
@@ -269,7 +267,11 @@ fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut DoneLo
     }
     if let Some(retro) = retro {
         match DoneLocal::done_send_text(&target, retro) {
-            Ok(()) => done_wait_for_rrr_prompt(&target, local, stdout),
+            Ok(()) => crate::wind::done::wait_for_retrospective_prompt(
+                || local.done_tmux("capture-pane", &["-t".to_owned(), target.clone(), "-p".to_owned(), "-S".to_owned(), "-40".to_owned()]),
+                std::thread::sleep,
+                stdout,
+            ),
             Err(error) => {
                 let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not send {retro} to {target}: {error}");
             }
@@ -333,52 +335,6 @@ fn done_retrospective_command(command: &str) -> Option<&'static str> {
     if lower.contains("omx") || lower.contains("oh-my-codex") { Some("$rrr") } else if lower.is_empty() || lower.contains("codex") || lower.contains("aider") || lower.contains("opencode") { None } else { Some("/rrr") }
 }
 
-const DONE_RRR_WAIT_MAX_POLLS: usize = 16;
-const DONE_RRR_WAIT_INTERVAL_SECS: u64 = 2;
-
-fn done_wait_for_rrr_prompt(target: &str, local: &mut DoneLocal, stdout: &mut String) {
-    let result = done_wait_for_prompt_with(
-        || local.done_tmux("capture-pane", &["-t".to_owned(), target.to_owned(), "-p".to_owned(), "-S".to_owned(), "-40".to_owned()]),
-        std::thread::sleep,
-        DONE_RRR_WAIT_MAX_POLLS,
-        std::time::Duration::from_secs(DONE_RRR_WAIT_INTERVAL_SECS),
-    );
-    match result {
-        Ok(polls) => {
-            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m retrospective prompt returned after {polls} poll(s)");
-        }
-        Err(error) => {
-            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m retrospective completion unconfirmed: {error}");
-        }
-    }
-}
-
-fn done_wait_for_prompt_with<C, S>(mut capture: C, mut sleep: S, max_polls: usize, interval: std::time::Duration) -> Result<usize, String>
-where
-    C: FnMut() -> Result<String, String>,
-    S: FnMut(std::time::Duration),
-{
-    if max_polls == 0 { return Err("no prompt polls configured".to_owned()); }
-    for poll in 1..=max_polls {
-        let content = capture()?;
-        if done_capture_has_prompt(&content) { return Ok(poll); }
-        if poll < max_polls { sleep(interval); }
-    }
-    let polls = u64::try_from(max_polls).unwrap_or(u64::MAX);
-    Err(format!("prompt did not return within {}s", polls.saturating_mul(interval.as_secs())))
-}
-
-fn done_capture_has_prompt(content: &str) -> bool {
-    content.lines().rev().find(|line| !line.trim().is_empty()).is_some_and(done_line_looks_like_prompt)
-}
-
-fn done_line_looks_like_prompt(line: &str) -> bool {
-    let clean = maw_tmux::strip_tmux_ansi(line).replace('\r', "");
-    let trimmed = clean.trim_end();
-    if trimmed.is_empty() || trimmed.len() > 120 { return false; }
-    matches!(trimmed, "$" | "#" | "%" | ">" | "❯" | "»") || trimmed.ends_with(['$', '#', '%', '>', '❯', '»'])
-}
-
 fn done_remove_worktree_via_config(window_lower: &str, context: &DoneContext, options: &DoneOptions, stdout: &mut String) -> Result<bool, String> {
     for file in done_fleet_config_files(context) {
         let Ok(raw) = std::fs::read_to_string(&file) else { continue; };
@@ -406,7 +362,7 @@ fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, stdout: 
     done_validate_exec_path(&worktree.main_path)?;
     done_validate_exec_path(&worktree.full_path)?;
     let branch = done_git(&["-C".to_owned(), worktree.full_path.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
-    let rescued = done_rescue_psi(&worktree.full_path, &worktree.main_path)?;
+    let rescued = crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path)?;
     if !rescued.is_empty() {
         let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m rescued {} ψ/ file(s)", rescued.len());
     }
@@ -458,110 +414,6 @@ fn done_parse_worktree_path(full_path: &std::path::Path, repos_root: &std::path:
         return Some(DoneWorktree { main_path, full_path: full_path.to_path_buf(), label: parts[1].clone() });
     }
     None
-}
-
-/// Rescue uncommitted `ψ/` files from a worktree into the owning main checkout.
-///
-/// Existing destination files are never overwritten; collisions receive a timestamp suffix.
-///
-/// # Errors
-///
-/// Returns an error when git status fails or when a rescue copy cannot be completed.
-#[doc(hidden)]
-pub fn done_rescue_psi(worktree_path: &std::path::Path, main_path: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
-    let status = done_git(&["-C".to_owned(), worktree_path.display().to_string(), "-c".to_owned(), "core.quotePath=false".to_owned(), "status".to_owned(), "--porcelain".to_owned(), "--".to_owned(), "ψ/".to_owned()])?;
-    let sources = done_uncommitted_psi_sources(worktree_path, &status)?;
-    if sources.is_empty() { return Ok(Vec::new()); }
-    let main_root = done_rescue_main_path(worktree_path, main_path);
-    let main_psi = main_root.join("ψ");
-    let timestamp = done_unix_timestamp();
-    let mut rescued = Vec::new();
-    for source in sources {
-        let destination = done_rescue_destination(worktree_path, &main_psi, &source, timestamp)?;
-        done_copy_without_overwrite(&source, &destination)?;
-        rescued.push(destination);
-    }
-    Ok(rescued)
-}
-
-fn done_rescue_main_path(worktree_path: &std::path::Path, fallback: &std::path::Path) -> std::path::PathBuf {
-    let common_dir = done_git(&["-C".to_owned(), worktree_path.display().to_string(), "rev-parse".to_owned(), "--git-common-dir".to_owned()]).unwrap_or_default();
-    let common_dir = common_dir.trim();
-    if common_dir.is_empty() { return fallback.to_path_buf(); }
-    let path = std::path::PathBuf::from(common_dir);
-    let absolute = if path.is_absolute() { path } else { worktree_path.join(path) };
-    absolute.parent().filter(|parent| !parent.as_os_str().is_empty()).map_or_else(|| fallback.to_path_buf(), std::path::Path::to_path_buf)
-}
-
-fn done_uncommitted_psi_sources(worktree_path: &std::path::Path, status: &str) -> Result<Vec<std::path::PathBuf>, String> {
-    let mut sources = Vec::new();
-    for relative in status.lines().filter_map(done_status_psi_path) {
-        done_collect_psi_source(&worktree_path.join(relative), &mut sources)?;
-    }
-    sources.sort();
-    sources.dedup();
-    Ok(sources)
-}
-
-fn done_status_psi_path(line: &str) -> Option<std::path::PathBuf> {
-    let path = line.get(3..)?.trim();
-    let path = path.rsplit_once(" -> ").map_or(path, |(_, destination)| destination.trim());
-    let path = path.trim_matches('"');
-    if path == "ψ" || path.starts_with("ψ/") { Some(std::path::PathBuf::from(path)) } else { None }
-}
-
-fn done_collect_psi_source(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
-    if path.is_file() {
-        out.push(path.to_path_buf());
-        return Ok(());
-    }
-    if !path.is_dir() { return Ok(()); }
-    let entries = std::fs::read_dir(path).map_err(|error| format!("read ψ rescue dir '{}': {error}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("read ψ rescue entry '{}': {error}", path.display()))?;
-        done_collect_psi_source(&entry.path(), out)?;
-    }
-    Ok(())
-}
-
-fn done_rescue_destination(worktree_path: &std::path::Path, main_psi: &std::path::Path, source: &std::path::Path, timestamp: u64) -> Result<std::path::PathBuf, String> {
-    let psi_root = worktree_path.join("ψ");
-    let relative = source.strip_prefix(&psi_root).map_err(|_| format!("ψ rescue source escaped ψ/: {}", source.display()))?;
-    Ok(done_available_destination(&main_psi.join(relative), timestamp))
-}
-
-fn done_available_destination(path: &std::path::Path, timestamp: u64) -> std::path::PathBuf {
-    if !path.exists() { return path.to_path_buf(); }
-    for attempt in 0_u32..1000 {
-        let candidate = done_collision_destination(path, timestamp, attempt);
-        if !candidate.exists() { return candidate; }
-    }
-    done_collision_destination(path, timestamp, std::process::id())
-}
-
-fn done_collision_destination(path: &std::path::Path, timestamp: u64, attempt: u32) -> std::path::PathBuf {
-    let suffix = if attempt == 0 { format!("-{timestamp}") } else { format!("-{timestamp}-{attempt}") };
-    let file_stem = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("psi");
-    let file_name = if let Some(extension) = path.extension().and_then(std::ffi::OsStr::to_str) { format!("{file_stem}{suffix}.{extension}") } else { format!("{file_stem}{suffix}") };
-    path.with_file_name(file_name)
-}
-
-fn done_copy_without_overwrite(source: &std::path::Path, destination: &std::path::Path) -> Result<(), String> {
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("create ψ rescue dir '{}': {error}", parent.display()))?;
-    }
-    let mut input = std::fs::File::open(source).map_err(|error| format!("open ψ rescue source '{}': {error}", source.display()))?;
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| format!("create ψ rescue destination '{}': {error}", destination.display()))?;
-    std::io::copy(&mut input, &mut output).map_err(|error| format!("copy ψ rescue '{}' -> '{}': {error}", source.display(), destination.display()))?;
-    Ok(())
-}
-
-fn done_unix_timestamp() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs())
 }
 
 fn done_remove_from_fleet_config(window_lower: &str, context: &DoneContext, stdout: &mut String) -> bool {
