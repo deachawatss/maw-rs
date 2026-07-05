@@ -109,7 +109,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut taskless_oracle = false;
 
     if let Some(task) = &options.task {
-        let task = workon_sanitize_task_slug(task);
+        let task = workon_sanitize_task_slug(task)?;
         let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
         match maw_matcher::resolve_worktree_target(&task, &worktrees) {
             ResolveResult::Exact { matched } | ResolveResult::Fuzzy { matched } => {
@@ -134,6 +134,10 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                         .map_err(|error| format!("workon: create agents dir: {error}"))?;
                 }
                 workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(&wt_path)?, "-b", &branch])?;
+                let cleaned = workon_sanitize_fresh_worktree(&repo.repo_path, &wt_path)?;
+                if !cleaned.is_empty() {
+                    let _ = writeln!(stdout, "\x1b[90mcleaned fresh worktree: {}\x1b[0m", cleaned.join(", "));
+                }
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch})", wt_path.display());
                 target_path = wt_path;
             }
@@ -160,7 +164,9 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
             "new-session",
             &["-d", "-s", &session, "-c", workon_path_str(&target_path)?, "-n", &window_name],
         )?;
-        workon_send_window_command(runner, &session, &window_name, &target_path)?;
+        let engine = workon_prepare_engine(&window_name, &target_path)?;
+        workon_note_engine_warning(&mut stdout, &engine);
+        workon_send_window_command(runner, &session, &window_name, &engine.command)?;
         if taskless_oracle {
             if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m fleet registered {session}:{window_name}");
@@ -197,7 +203,9 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         "new-window",
         &["-t", &session_target, "-n", window_name, "-c", workon_path_str(target_path)?],
     )?;
-    workon_send_window_command(runner, session, window_name, target_path)?;
+    let engine = workon_prepare_engine(window_name, target_path)?;
+    workon_note_engine_warning(stdout, &engine);
+    workon_send_window_command(runner, session, window_name, &engine.command)?;
 
     if taskless_oracle {
         if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(session, window_name, target_path)? {
@@ -213,15 +221,14 @@ fn workon_send_window_command<R: maw_tmux::TmuxRunner>(
     runner: &mut R,
     session: &str,
     window_name: &str,
-    target_path: &std::path::Path,
+    command: &str,
 ) -> Result<(), String> {
-    let command = workon_build_command_in_dir(window_name, target_path);
     let target = format!("{session}:{window_name}");
     #[cfg(test)]
     let sleeper = |_| {};
     #[cfg(not(test))]
     let sleeper = std::thread::sleep;
-    sendtext_send_text(runner, &target, &command, sleeper)
+    sendtext_send_text(runner, &target, command, sleeper)
         .map(|_| ())
         .map_err(|error| error.message)
 }
@@ -288,7 +295,11 @@ fn workon_find_worktrees(parent_dir: &std::path::Path, repo_name: &str) -> Vec<W
     out
 }
 
-fn workon_sanitize_task_slug(task: &str) -> String { task.replace('/', "-") }
+fn workon_sanitize_task_slug(task: &str) -> Result<String, String> { crate::wind::workon::sanitize_task_slug(task) }
+
+fn workon_sanitize_fresh_worktree(repo_path: &std::path::Path, wt_path: &std::path::Path) -> Result<Vec<String>, String> {
+    crate::wind::workon::sanitize_fresh_worktree(repo_path, wt_path)
+}
 
 fn workon_next_worktree_number(worktrees: &[WorkonWorktree]) -> i32 {
     worktrees.iter().filter_map(|wt| workon_parse_js_i32_prefix(&wt.name)).max().unwrap_or(0) + 1
@@ -343,16 +354,12 @@ fn workon_list_windows<R: maw_tmux::TmuxRunner>(runner: &mut R, session: &str) -
     Ok(raw.lines().map(str::to_owned).filter(|line| !line.is_empty()).collect())
 }
 
-fn workon_build_command_in_dir(agent_name: &str, cwd: &std::path::Path) -> String {
-    merged_config_value_in_dir(cwd)
-        .get("commands")
-        .cloned()
-        .and_then(|commands| {
-            commands.get(agent_name).and_then(serde_json::Value::as_str)
-                .or_else(|| commands.get("default").and_then(serde_json::Value::as_str))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "claude".to_owned())
+fn workon_prepare_engine(window_name: &str, cwd: &std::path::Path) -> Result<crate::wind::workon::EngineResolution, String> {
+    crate::wind::workon::prepare_engine(window_name, cwd)
+}
+
+fn workon_note_engine_warning(stdout: &mut String, engine: &crate::wind::workon::EngineResolution) {
+    if let Some(warning) = &engine.warning { let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {warning}"); }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -433,14 +440,6 @@ mod workon_tests {
 
     fn workon_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
 
-    fn workon_temp_root(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("maw-rs-workon-{label}-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("temp root");
-        path
-    }
 
     #[test]
     fn workon_parse_layout_and_usage() {
@@ -547,24 +546,4 @@ mod workon_tests {
         assert_eq!(runner.calls.len(), 1);
     }
 
-    #[test]
-    fn workon_build_command_resolves_weighted_only_commands_config() {
-        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _home = EnvVarRestore::capture("MAW_HOME");
-        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
-        let root = workon_temp_root("commands");
-        std::env::remove_var("MAW_HOME");
-        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
-        std::fs::create_dir_all(root.join("config")).expect("config dir");
-        std::fs::write(
-            root.join("config/maw.config.50.json"),
-            r#"{"commands":{"omx":"CODEX_HOME=$PWD/.codex omx --direct","default":"claude --continue"}}"#,
-        )
-        .expect("config");
-
-        assert!(!root.join("config/maw.config.json").exists());
-        assert_eq!(workon_build_command_in_dir("omx", &root), "CODEX_HOME=$PWD/.codex omx --direct");
-        assert_eq!(workon_build_command_in_dir("unknown", &root), "claude --continue");
-        let _ = std::fs::remove_dir_all(root);
-    }
 }
