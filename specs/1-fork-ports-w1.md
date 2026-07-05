@@ -106,12 +106,17 @@ Upstream-owned files (`core_impl/done.rs`, `core_impl/team_core.rs`, `core_impl/
 
 ONE inventory doc: `docs/maw-js-fork-patch-migration.md`.
 
+### Merge-drop red line (BINDING)
+
+`crates/maw-cli/tests/fork_divergence.rs` is the ONE canonical merge-drop checklist. Every merge-exposed fork behavior — including W1's submit/readiness gate in maw-tmux — MUST have its divergence assert in this file, exercised through maw-cli's dependency on maw-tmux. If an upstream merge drops any hook, `fork_divergence.rs` alone must go red. `hey_submit_hardening.rs` may keep crate-local unit tests of `wind_delivery` internals, but those are NOT the merge-drop signal.
+
 ### Aggregation gate
 
 Before `.maw/aggregate-verified`, verify:
 - `ls crates/maw-cli/src/wind/` is non-empty (fork module tree exists)
 - `test -f crates/maw-cli/tests/fork_divergence.rs` (consolidated test exists)
-- ZERO leftover per-worker test files in `crates/maw-cli/tests/` or `crates/maw-tmux/tests/` beyond `fork_divergence.rs` and `hey_submit_hardening.rs` (maw-tmux tests stay in maw-tmux)
+- `fork_divergence.rs` contains divergence asserts for ALL 4 clusters (W1-W4)
+- ZERO leftover per-worker test files in `crates/maw-cli/tests/` beyond `fork_divergence.rs`
 
 ## Success Criteria
 
