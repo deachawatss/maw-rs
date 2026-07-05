@@ -134,7 +134,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                         .map_err(|error| format!("workon: create agents dir: {error}"))?;
                 }
                 workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(&wt_path)?, "-b", &branch])?;
-                let cleaned = workon_sanitize_fresh_worktree(&wt_path)?;
+                let cleaned = workon_sanitize_fresh_worktree(&repo.repo_path, &wt_path)?;
                 if !cleaned.is_empty() {
                     let _ = writeln!(stdout, "\x1b[90mcleaned fresh worktree: {}\x1b[0m", cleaned.join(", "));
                 }
@@ -165,6 +165,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
             &["-d", "-s", &session, "-c", workon_path_str(&target_path)?, "-n", &window_name],
         )?;
         let engine = workon_prepare_engine(&window_name, &target_path)?;
+        workon_note_engine_warning(&mut stdout, &engine);
         workon_send_window_command(runner, &session, &window_name, &engine.command)?;
         if taskless_oracle {
             if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
@@ -190,7 +191,6 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     workon_validate_tmux_target(&format!("{session}:{window_name}"))?;
 
     let windows = workon_list_windows(runner, session)?;
-    let engine = workon_prepare_engine(window_name, target_path)?;
     if windows.iter().any(|name| name == window_name) {
         workon_tmux_run(runner, "select-window", &["-t", &format!("{session}:{window_name}")])?;
         let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing existing window '{window_name}' in {session}");
@@ -203,6 +203,8 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         "new-window",
         &["-t", &session_target, "-n", window_name, "-c", workon_path_str(target_path)?],
     )?;
+    let engine = workon_prepare_engine(window_name, target_path)?;
+    workon_note_engine_warning(stdout, &engine);
     workon_send_window_command(runner, session, window_name, &engine.command)?;
 
     if taskless_oracle {
@@ -293,65 +295,10 @@ fn workon_find_worktrees(parent_dir: &std::path::Path, repo_name: &str) -> Vec<W
     out
 }
 
-fn workon_sanitize_task_slug(task: &str) -> Result<String, String> {
-    let slug = task
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .map(|ch| if ch == '/' { '-' } else { ch })
-        .collect::<String>();
-    if slug.is_empty() || slug.starts_with('.') {
-        Err("workon: task slug must not be empty or start with '.'".to_owned())
-    } else {
-        Ok(slug)
-    }
-}
+fn workon_sanitize_task_slug(task: &str) -> Result<String, String> { crate::wind::workon::sanitize_task_slug(task) }
 
-fn workon_sanitize_fresh_worktree(wt_path: &std::path::Path) -> Result<Vec<String>, String> {
-    let mut cleaned = Vec::new();
-    for relative in [
-        ".maw/phase.json",
-        ".maw/strategy.json",
-        ".maw/solo-justified",
-        ".maw/aggregate-verified",
-        ".maw/done-pinged",
-    ] {
-        if workon_remove_file_if_present(&wt_path.join(relative))? {
-            cleaned.push(relative.to_owned());
-        }
-    }
-    for (label, path) in workon_index_lock_candidates(wt_path) {
-        if workon_remove_file_if_present(&path)? {
-            cleaned.push(label);
-        }
-    }
-    Ok(cleaned)
-}
-
-fn workon_remove_file_if_present(path: &std::path::Path) -> Result<bool, String> {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else { return Ok(false); };
-    if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        return Err(format!("workon: refused to remove non-file stale state: {}", path.display()));
-    }
-    std::fs::remove_file(path).map_err(|error| format!("workon: remove {}: {error}", path.display()))?;
-    Ok(true)
-}
-
-fn workon_index_lock_candidates(wt_path: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
-    let mut candidates = vec![(".git/index.lock".to_owned(), wt_path.join(".git/index.lock"))];
-    let git_file = wt_path.join(".git");
-    let Ok(body) = std::fs::read_to_string(&git_file) else { return candidates; };
-    let Some(git_dir) = body.trim().strip_prefix("gitdir:").map(str::trim) else { return candidates; };
-    if git_dir.is_empty() {
-        return candidates;
-    }
-    let git_dir_path = std::path::Path::new(git_dir);
-    let git_dir_path = if git_dir_path.is_absolute() {
-        git_dir_path.to_path_buf()
-    } else {
-        wt_path.join(git_dir_path)
-    };
-    candidates.push((".git/index.lock".to_owned(), git_dir_path.join("index.lock")));
-    candidates
+fn workon_sanitize_fresh_worktree(repo_path: &std::path::Path, wt_path: &std::path::Path) -> Result<Vec<String>, String> {
+    crate::wind::workon::sanitize_fresh_worktree(repo_path, wt_path)
 }
 
 fn workon_next_worktree_number(worktrees: &[WorkonWorktree]) -> i32 {
@@ -407,83 +354,12 @@ fn workon_list_windows<R: maw_tmux::TmuxRunner>(runner: &mut R, session: &str) -
     Ok(raw.lines().map(str::to_owned).filter(|line| !line.is_empty()).collect())
 }
 
-fn workon_build_command_in_dir(agent_name: &str, cwd: &std::path::Path) -> String {
-    merged_config_value_in_dir(cwd)
-        .get("commands")
-        .cloned()
-        .and_then(|commands| {
-            commands.get(agent_name).and_then(serde_json::Value::as_str)
-                .or_else(|| commands.get("default").and_then(serde_json::Value::as_str))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "claude".to_owned())
+fn workon_prepare_engine(window_name: &str, cwd: &std::path::Path) -> Result<crate::wind::workon::EngineResolution, String> {
+    crate::wind::workon::prepare_engine(window_name, cwd)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EngineResolution {
-    engine: String,
-    command: String,
-    warned: bool,
-}
-
-fn workon_prepare_engine(window_name: &str, cwd: &std::path::Path) -> Result<EngineResolution, String> {
-    let resolution = workon_resolve_engine(window_name, cwd);
-    let _ = workon_record_engine_choice(cwd, &resolution)?;
-    Ok(resolution)
-}
-
-fn workon_resolve_engine(window_name: &str, cwd: &std::path::Path) -> EngineResolution {
-    let command = workon_build_command_in_dir(window_name, cwd);
-    let engine = workon_detect_engine_name(&command);
-    let warned = !matches!(engine.as_str(), "claude" | "omx" | "codex" | "aider");
-    if warned && std::env::var_os("MAW_TEST_MODE").is_none() {
-        eprintln!("workon: warning: unknown engine '{engine}' for window '{window_name}'");
-    }
-    EngineResolution { engine, command, warned }
-}
-
-fn workon_detect_engine_name(command: &str) -> String {
-    command
-        .split_whitespace()
-        .find_map(workon_engine_token)
-        .unwrap_or_else(|| "unknown".to_owned())
-}
-
-fn workon_engine_token(token: &str) -> Option<String> {
-    let token = token.trim_matches(|ch| matches!(ch, '\'' | '"' | ';'));
-    if token.is_empty() || token == "env" || workon_is_env_assignment(token) {
-        return None;
-    }
-    let engine = std::path::Path::new(token)
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or(token)
-        .to_owned();
-    (!engine.is_empty()).then_some(engine)
-}
-
-fn workon_is_env_assignment(token: &str) -> bool {
-    let Some((key, _)) = token.split_once('=') else { return false; };
-    !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-}
-
-fn workon_record_engine_choice(cwd: &std::path::Path, resolution: &EngineResolution) -> Result<bool, String> {
-    let path = cwd.join(".maw/strategy.json");
-    if !path.exists() {
-        return Ok(false);
-    }
-    let body = std::fs::read_to_string(&path).map_err(|error| format!("workon: read {}: {error}", path.display()))?;
-    let mut value = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_else(|_| serde_json::json!({}));
-    if !value.is_object() {
-        value = serde_json::json!({});
-    }
-    let object = value.as_object_mut().ok_or_else(|| "workon: strategy json must be an object".to_owned())?;
-    object.insert("engine".to_owned(), serde_json::Value::String(resolution.engine.clone()));
-    object.insert("engineCommand".to_owned(), serde_json::Value::String(resolution.command.clone()));
-    object.insert("engineWarned".to_owned(), serde_json::Value::Bool(resolution.warned));
-    let rendered = serde_json::to_string_pretty(&value).map_err(|error| format!("workon: render strategy json: {error}"))?;
-    std::fs::write(&path, format!("{rendered}\n")).map_err(|error| format!("workon: write {}: {error}", path.display()))?;
-    Ok(true)
+fn workon_note_engine_warning(stdout: &mut String, engine: &crate::wind::workon::EngineResolution) {
+    if let Some(warning) = &engine.warning { let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {warning}"); }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -564,124 +440,12 @@ mod workon_tests {
 
     fn workon_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
 
-    fn workon_temp_root(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("maw-rs-workon-{label}-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("temp root");
-        path
-    }
-
-    fn workon_write_commands_config(root: &std::path::Path, name: &str, json: &str) {
-        std::fs::create_dir_all(root.join("config")).expect("config dir");
-        std::fs::write(root.join("config").join(name), json).expect("config");
-    }
 
     #[test]
     fn workon_parse_layout_and_usage() {
         assert!(workon_parse_args(&[]).expect_err("usage").contains("usage: maw workon"));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "extra"])).is_err());
         assert!(workon_parse_args(&workon_strings(&["repo", "--layout", "wide"])).expect_err("layout").contains("nested or legacy"));
-    }
-
-    #[test]
-    fn fresh_worktree_cleans_stale_state() {
-        let root = workon_temp_root("fresh-clean");
-        let maw = root.join(".maw");
-        std::fs::create_dir_all(&maw).expect("maw dir");
-        std::fs::write(maw.join("phase.json"), "{}").expect("phase");
-        std::fs::write(maw.join("strategy.json"), "{}").expect("strategy");
-        std::fs::write(maw.join("solo-justified"), "").expect("solo");
-        std::fs::write(root.join("CLAUDE.md"), "keep").expect("claude");
-        std::fs::write(root.join("CONTEXT.md"), "keep").expect("context");
-        std::fs::create_dir_all(root.join(".git")).expect("git dir");
-        std::fs::write(root.join(".git/index.lock"), "").expect("lock");
-
-        let cleaned = workon_sanitize_fresh_worktree(&root).expect("sanitize");
-
-        assert!(cleaned.contains(&".maw/phase.json".to_owned()), "{cleaned:?}");
-        assert!(cleaned.contains(&".maw/strategy.json".to_owned()), "{cleaned:?}");
-        assert!(cleaned.contains(&".maw/solo-justified".to_owned()), "{cleaned:?}");
-        assert!(cleaned.contains(&".git/index.lock".to_owned()), "{cleaned:?}");
-        assert!(!maw.join("phase.json").exists());
-        assert!(!maw.join("strategy.json").exists());
-        assert!(!root.join(".git/index.lock").exists());
-        assert_eq!(std::fs::read_to_string(root.join("CLAUDE.md")).expect("claude"), "keep");
-        assert_eq!(std::fs::read_to_string(root.join("CONTEXT.md")).expect("context"), "keep");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn engine_warn_unknown_engine() {
-        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _home = EnvVarRestore::capture("MAW_HOME");
-        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
-        let root = workon_temp_root("unknown-engine");
-        std::env::remove_var("MAW_HOME");
-        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
-        workon_write_commands_config(
-            &root,
-            "maw.config.json",
-            r#"{"commands":{"demo":"unknown-tool --flag"}}"#,
-        );
-
-        let resolution = workon_resolve_engine("demo", &root);
-
-        assert_eq!(resolution.command, "unknown-tool --flag");
-        assert_eq!(resolution.engine, "unknown-tool");
-        assert!(resolution.warned);
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn engine_resolution_fallback_chain() {
-        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _home = EnvVarRestore::capture("MAW_HOME");
-        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
-        let root = workon_temp_root("engine-chain");
-        std::env::remove_var("MAW_HOME");
-        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
-        workon_write_commands_config(
-            &root,
-            "maw.config.json",
-            r#"{"commands":{"demo-feat":"CODEX_HOME=$PWD/.codex codex exec","default":"claude --continue"}}"#,
-        );
-
-        let specific = workon_resolve_engine("demo-feat", &root);
-        let defaulted = workon_resolve_engine("other", &root);
-        assert_eq!(specific.engine, "codex");
-        assert_eq!(specific.command, "CODEX_HOME=$PWD/.codex codex exec");
-        assert!(!specific.warned);
-        assert_eq!(defaulted.engine, "claude");
-        assert_eq!(defaulted.command, "claude --continue");
-
-        let weighted = workon_temp_root("engine-weighted");
-        std::env::set_var("MAW_CONFIG_DIR", weighted.join("config"));
-        workon_write_commands_config(
-            &weighted,
-            "maw.config.50.json",
-            r#"{"commands":{"omx":"CODEX_HOME=$PWD/.codex omx --direct","default":"aider --yes"}}"#,
-        );
-        assert_eq!(workon_resolve_engine("omx", &weighted).engine, "omx");
-        assert_eq!(workon_resolve_engine("missing", &weighted).engine, "aider");
-
-        let missing = workon_temp_root("engine-missing");
-        std::env::set_var("MAW_CONFIG_DIR", missing.join("config"));
-        let fallback = workon_resolve_engine("missing", &missing);
-        assert_eq!(fallback.engine, "claude");
-        assert_eq!(fallback.command, "claude");
-        assert!(!fallback.warned);
-
-        let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(weighted);
-        let _ = std::fs::remove_dir_all(missing);
-    }
-
-    #[test]
-    fn workon_sanitize_task_slug_extended() {
-        assert_eq!(workon_sanitize_task_slug("path/to feature").expect("slug"), "path-tofeature");
-        assert!(workon_sanitize_task_slug(".hidden").expect_err("dot").contains("start with"));
     }
 
     #[test]
@@ -782,24 +546,4 @@ mod workon_tests {
         assert_eq!(runner.calls.len(), 1);
     }
 
-    #[test]
-    fn workon_build_command_resolves_weighted_only_commands_config() {
-        let _guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _home = EnvVarRestore::capture("MAW_HOME");
-        let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
-        let root = workon_temp_root("commands");
-        std::env::remove_var("MAW_HOME");
-        std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
-        std::fs::create_dir_all(root.join("config")).expect("config dir");
-        std::fs::write(
-            root.join("config/maw.config.50.json"),
-            r#"{"commands":{"omx":"CODEX_HOME=$PWD/.codex omx --direct","default":"claude --continue"}}"#,
-        )
-        .expect("config");
-
-        assert!(!root.join("config/maw.config.json").exists());
-        assert_eq!(workon_build_command_in_dir("omx", &root), "CODEX_HOME=$PWD/.codex omx --direct");
-        assert_eq!(workon_build_command_in_dir("unknown", &root), "claude --continue");
-        let _ = std::fs::remove_dir_all(root);
-    }
 }
