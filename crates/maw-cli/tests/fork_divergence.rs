@@ -55,6 +55,10 @@ case "$*" in
 ' ;;
   *"rev-parse --git-common-dir"*) printf '%s/.git
 ' "$DONE_MAIN" ;;
+  *"rev-parse --show-toplevel"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf '%s
+' "$DONE_WORKTREE"; fi ;;
+  *"worktree list --porcelain"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf 'worktree %s
+' "$DONE_WORKTREE"; fi ;;
   *"status --porcelain -- ψ/"*) if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
 '; fi ;;
   *) exit 0 ;;
@@ -172,6 +176,36 @@ esac
         assert_eq!(
             std::fs::read_to_string(&rescued[0]).expect("rescued file"),
             "worktree copy"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn done_rescues_uncommitted_psi_through_compiled_binary() {
+        // Wiring guard (not the isolated rescue_psi unit test above): the compiled
+        // `maw done` MUST rescue uncommitted ψ/ notes to main BEFORE it removes the
+        // worktree / force-deletes the branch. Drives the real binary end-to-end.
+        let (root, bin, main, worktree) = seed_done_fixture("psi-wire");
+        // Fake git reports ψ/test.md as uncommitted (DONE_STATUS_PSI=test); the
+        // physical file must exist in the worktree for rescue_psi to copy it.
+        write_file(&worktree.join("ψ/test.md"), "worktree note worth keeping");
+        let output = done_command(&root, &bin, &main, &worktree)
+            .env("DONE_STATUS_PSI", "test")
+            .env("DONE_FAKE_WORKTREE", "1")
+            .args(["done", "task-done", "--worktree", worktree.to_str().expect("worktree utf8")])
+            .output()
+            .expect("run done");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("rescued"), "expected rescue line; stdout={stdout}");
+        // main had no ψ/test.md, so it is copied there verbatim before removal.
+        assert_eq!(
+            std::fs::read_to_string(main.join("ψ/test.md")).expect("rescued main file"),
+            "worktree note worth keeping"
         );
         let _ = std::fs::remove_dir_all(root);
     }
