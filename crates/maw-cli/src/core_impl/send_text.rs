@@ -10,6 +10,9 @@ struct SendtextOptions {
 }
 
 fn sendtext_run_command(argv: &[String]) -> CliOutput {
+    if wants_help_before_positionals(argv, &[]) {
+        return help_output(sendtext_usage());
+    }
     match sendtext_with_runner(argv, &mut maw_tmux::CommandTmuxRunner::new()) {
         Ok(output) => output,
         Err(message) => CliOutput {
@@ -37,11 +40,12 @@ where
     F: FnMut(std::time::Duration),
 {
     let options = sendtext_parse_args(argv)?;
-    sendtext_validate_tmux_target(&options.target)?;
+    let target = resolve_local_tmux_runner_target(runner, &options.target, "send-text")?;
+    sendtext_validate_tmux_target(&target)?;
     sendtext_validate_text(&options.text)?;
-    let report = sendtext_send_text(runner, &options.target, &options.text, sleep)
+    let report = sendtext_send_text(runner, &target, &options.text, sleep)
         .map_err(|error| format!("send-text failed: {}", error.message))?;
-    Ok(sendtext_success_output(&options.target, &report))
+    Ok(sendtext_success_output(&target, &report))
 }
 
 fn sendtext_send_text<R, F>(
@@ -63,7 +67,8 @@ where
         runner.run("send-keys", &maw_tmux::tmux_send_keys_literal_args(target, text))?;
     }
     sleep(std::time::Duration::from_millis(maw_tmux::SEND_SETTLE_MS));
-    let (enter_attempts, warned_pending) = sendtext_submit_with_confirm(runner, target, &mut sleep)?;
+    let (enter_attempts, warned_pending) =
+        sendtext_submit_with_confirm(runner, target, text, &mut sleep)?;
     Ok(maw_tmux::SendTextReport {
         used_buffer,
         enter_attempts,
@@ -106,6 +111,7 @@ fn sendtext_exit_mode_if_needed<R: maw_tmux::TmuxRunner>(
 fn sendtext_submit_with_confirm<R, F>(
     runner: &mut R,
     target: &str,
+    text: &str,
     sleep: &mut F,
 ) -> Result<(u32, bool), maw_tmux::TmuxError>
 where
@@ -115,14 +121,46 @@ where
     for attempt in 1..=maw_tmux::MAX_SUBMIT_ATTEMPTS {
         runner.run("send-keys", &maw_tmux::tmux_send_enter_args(target))?;
         sleep(std::time::Duration::from_millis(maw_tmux::SUBMIT_CONFIRM_MS));
-        if !sendtext_pane_input_pending(runner, target) {
-            return Ok((attempt, false));
+        match sendtext_pending_state_after_grace(runner, target, text, sleep) {
+            maw_tmux::PendingInputState::Cleared => return Ok((attempt, false)),
+            maw_tmux::PendingInputState::DifferentInput => return Ok((attempt, true)),
+            maw_tmux::PendingInputState::MatchesSent => {}
         }
     }
     Ok((maw_tmux::MAX_SUBMIT_ATTEMPTS, true))
 }
 
-fn sendtext_pane_input_pending<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> bool {
+fn sendtext_pending_state_after_grace<R, F>(
+    runner: &mut R,
+    target: &str,
+    text: &str,
+    sleep: &mut F,
+) -> maw_tmux::PendingInputState
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+{
+    let _confirm_state = sendtext_pending_input_state(runner, target, text);
+    sleep(std::time::Duration::from_millis(maw_tmux::SUBMIT_GRACE_MS));
+    sendtext_pending_input_state(runner, target, text)
+}
+
+fn sendtext_pending_input_state<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    target: &str,
+    text: &str,
+) -> maw_tmux::PendingInputState {
+    let Some(pending) = sendtext_pending_input(runner, target) else {
+        return maw_tmux::PendingInputState::Cleared;
+    };
+    if maw_tmux::pending_input_matches_sent(&pending, text) {
+        maw_tmux::PendingInputState::MatchesSent
+    } else {
+        maw_tmux::PendingInputState::DifferentInput
+    }
+}
+
+fn sendtext_pending_input<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Option<String> {
     runner
         .run(
             "capture-pane",
@@ -135,7 +173,8 @@ fn sendtext_pane_input_pending<R: maw_tmux::TmuxRunner>(runner: &mut R, target: 
                 "-5".to_owned(),
             ],
         )
-        .is_ok_and(|content| maw_tmux::pane_input_pending_from_capture(&content))
+        .ok()
+        .and_then(|content| maw_tmux::pane_pending_input_from_capture(&content))
 }
 
 fn sendtext_parse_args(argv: &[String]) -> Result<SendtextOptions, String> {
@@ -309,15 +348,15 @@ mod sendtext_tests {
         let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = SendtextEnvGuard::sendtext_new();
         let mut tmux =
-            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r")]);
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
 
-        let output = sendtext_with_no_sleep(&sendtext_strings(&["sess:1.0", "hello", "world"]), &mut tmux)
+        let output = sendtext_with_no_sleep(&sendtext_strings(&["%9", "hello", "world"]), &mut tmux)
             .expect("send");
 
-        assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m sent text to sess:1.0 (literal)\n");
-        assert_eq!(tmux.calls[0], ("display-message".to_owned(), sendtext_strings(&["-t", "sess:1.0", "-p", "#{pane_in_mode}"])));
-        assert_eq!(tmux.calls[1], ("send-keys".to_owned(), sendtext_strings(&["-t", "sess:1.0", "-l", "hello world"])));
-        assert_eq!(tmux.calls[2], ("send-keys".to_owned(), sendtext_strings(&["-t", "sess:1.0", "Enter"])));
+        assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m sent text to %9 (literal)\n");
+        assert_eq!(tmux.calls[0], ("display-message".to_owned(), sendtext_strings(&["-t", "%9", "-p", "#{pane_in_mode}"])));
+        assert_eq!(tmux.calls[1], ("send-keys".to_owned(), sendtext_strings(&["-t", "%9", "-l", "hello world"])));
+        assert_eq!(tmux.calls[2], ("send-keys".to_owned(), sendtext_strings(&["-t", "%9", "Enter"])));
         assert!(tmux.stdin_calls.is_empty());
     }
 
@@ -327,13 +366,13 @@ mod sendtext_tests {
         let _env = SendtextEnvGuard::sendtext_new();
         let long_text = "x".repeat(501);
         let mut tmux =
-            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r")]);
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
 
-        let output = sendtext_with_no_sleep(&[String::from("sess:1.0"), long_text.clone()], &mut tmux)
+        let output = sendtext_with_no_sleep(&[String::from("%9"), long_text.clone()], &mut tmux)
             .expect("send");
 
         assert!(output.stdout.contains("(buffer)"));
-        assert_eq!(tmux.calls[1], ("paste-buffer".to_owned(), sendtext_strings(&["-t", "sess:1.0"])));
+        assert_eq!(tmux.calls[1], ("paste-buffer".to_owned(), sendtext_strings(&["-t", "%9"])));
         assert_eq!(
             tmux.stdin_calls,
             vec![("load-buffer".to_owned(), vec!["-".to_owned()], long_text)]
@@ -369,16 +408,20 @@ mod sendtext_tests {
             Ok(""),
             Ok(""),
             Ok("$ deploy"),
-            Ok(""),
             Ok("$ deploy"),
             Ok(""),
             Ok("$ deploy"),
+            Ok("$ deploy"),
             Ok(""),
+            Ok("$ deploy"),
+            Ok("$ deploy"),
+            Ok(""),
+            Ok("$ deploy"),
             Ok("$ deploy"),
         ]);
 
         let output =
-            sendtext_with_no_sleep(&sendtext_strings(&["sess:1", "deploy"]), &mut tmux).expect("send");
+            sendtext_with_no_sleep(&sendtext_strings(&["%9", "deploy"]), &mut tmux).expect("send");
 
         assert!(output.stdout.contains("pending input after Enter retries"));
         assert_eq!(
@@ -391,13 +434,132 @@ mod sendtext_tests {
     }
 
     #[test]
+    fn sendtext_does_not_retry_non_matching_pending_input() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok("$ deploy"),
+            Ok("$ different queued input"),
+        ]);
+
+        let output =
+            sendtext_with_no_sleep(&sendtext_strings(&["%9", "deploy"]), &mut tmux)
+                .expect("send");
+
+        assert!(output.stdout.contains("pending input after Enter retries"));
+        assert_eq!(
+            tmux.calls
+                .iter()
+                .filter(|(command, args)| command == "send-keys"
+                    && args.last().is_some_and(|arg| arg == "Enter"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn sendtext_grace_recheck_catches_false_negative_before_success() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok("$ "),
+            Ok("$ deploy"),
+            Ok(""),
+            Ok("$ "),
+            Ok("$ "),
+        ]);
+        let mut sleeps = Vec::new();
+
+        let output = sendtext_with_runner_and_sleeper(
+            &sendtext_strings(&["%9", "deploy"]),
+            &mut tmux,
+            |duration| sleeps.push(duration),
+        )
+        .expect("send");
+
+        assert!(!output.stdout.contains("pending input after Enter retries"));
+        assert_eq!(
+            tmux.calls
+                .iter()
+                .filter(|(command, args)| command == "send-keys"
+                    && args.last().is_some_and(|arg| arg == "Enter"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            sleeps,
+            vec![
+                std::time::Duration::from_millis(maw_tmux::SEND_SETTLE_MS),
+                std::time::Duration::from_millis(maw_tmux::SUBMIT_CONFIRM_MS),
+                std::time::Duration::from_millis(maw_tmux::SUBMIT_GRACE_MS),
+                std::time::Duration::from_millis(maw_tmux::SUBMIT_CONFIRM_MS),
+                std::time::Duration::from_millis(maw_tmux::SUBMIT_GRACE_MS),
+            ]
+        );
+    }
+
+    #[test]
     fn sendtext_reports_tmux_failure() {
         let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = SendtextEnvGuard::sendtext_new();
         let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Err("no pane")]);
 
-        let err = sendtext_with_no_sleep(&sendtext_strings(&["sess:1", "hi"]), &mut tmux).expect_err("tmux");
+        let err = sendtext_with_no_sleep(&sendtext_strings(&["%9", "hi"]), &mut tmux).expect_err("tmux");
 
         assert!(err.contains("send-text failed: no pane"));
+    }
+
+    #[test]
+    fn sendtext_explicit_session_window_pins_duplicate_window_names() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![
+            Ok(concat!(
+                "webhook-relay-v3|||2|||codex-1|||1|||\n",
+                "arra-oracle-v3|||4|||codex-1|||0|||\n"
+            )),
+            Ok("0"),
+            Ok(""),
+            Ok(""),
+            Ok("$ \r"),
+            Ok("$ \r"),
+        ]);
+
+        let output = sendtext_with_no_sleep(
+            &sendtext_strings(&["webhook-relay-v3:codex-1", "hello"]),
+            &mut tmux,
+        )
+        .expect("send");
+
+        assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m sent text to webhook-relay-v3:2 (literal)\n");
+        assert_eq!(
+            tmux.calls[2],
+            ("send-keys".to_owned(), sendtext_strings(&["-t", "webhook-relay-v3:2", "-l", "hello"]))
+        );
+    }
+
+    #[test]
+    fn sendtext_explicit_session_window_miss_is_loud_without_cross_session_fallback() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![Ok(concat!(
+            "webhook-relay-v3|||0|||oracle|||1|||\n",
+            "arra-oracle-v3|||4|||codex-1|||0|||\n"
+        ))]);
+
+        let error = sendtext_with_no_sleep(
+            &sendtext_strings(&["webhook-relay-v3:codex-1", "hello"]),
+            &mut tmux,
+        )
+        .expect_err("missing window");
+
+        assert!(error.contains("no window 'codex-1' in session 'webhook-relay-v3'"), "{error}");
+        assert_eq!(tmux.calls.len(), 1, "{:?}", tmux.calls);
     }
 }

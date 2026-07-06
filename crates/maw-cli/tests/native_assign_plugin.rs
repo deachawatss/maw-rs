@@ -64,8 +64,11 @@ case "$1" in
   display-message)
     printf 'detected-oracle-task\n'
     ;;
-  list-windows|capture-pane)
+  list-windows)
     printf ''
+    ;;
+  capture-pane)
+    printf '$ \n'
     ;;
   load-buffer)
     # Real tmux `load-buffer -` consumes stdin. Drain it with a shell builtin

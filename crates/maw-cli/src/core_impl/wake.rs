@@ -47,8 +47,25 @@ struct WakeResolvedNative {
     session: String,
     window: String,
     repo_path: std::path::PathBuf,
+    repo_fuzzy_match: Option<String>,
     command: String,
     target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WakeRepoResolution {
+    path: std::path::PathBuf,
+    fuzzy_match: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WakeRepoCandidate {
+    name: String,
+    path: std::path::PathBuf,
+}
+
+impl maw_matcher::Named for WakeRepoCandidate {
+    fn name(&self) -> &str { &self.name }
 }
 
 trait WakeTmuxNative {
@@ -103,6 +120,9 @@ impl WakeTmuxNative for WakeNativeTmux {
 
 fn wake_async_native(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
     Box::pin(async move {
+        if wants_help(&args, wake_help_value_flags()) {
+            return help_output(wake_usage());
+        }
         match wake_parse_args(&args) {
             Ok(options) if wake_should_use_peer_target(&options) => run_wake_async(args).await,
             Ok(_) => run_wake_command(&args),
@@ -112,6 +132,9 @@ fn wake_async_native(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput
 }
 
 fn run_wake_command(argv: &[String]) -> CliOutput {
+    if wants_help(argv, wake_help_value_flags()) {
+        return help_output(wake_usage());
+    }
     match wake_run(argv, &mut WakeNativeTmux) {
         Ok((code, stdout)) => CliOutput { code, stdout, stderr: String::new() },
         Err(message) => CliOutput { code: 1, stdout: String::new(), stderr: format!("{message}\n") },
@@ -132,6 +155,7 @@ fn wake_run(argv: &[String], tmux: &mut impl WakeTmuxNative) -> Result<(i32, Str
 
 fn wake_should_use_peer_target(options: &WakeOptionsNative) -> bool {
     if options.dry_run || options.list || options.all || options.repo.is_some() || options.incubate.is_some() { return false; }
+    if workon_github_slug(&options.target).is_some() { return false; }
     options.target.contains(':') || options.peer.is_some()
 }
 
@@ -270,6 +294,28 @@ fn wake_usage() -> String {
     "usage: maw wake <target|all> [--task <slug>|--wt <slug>] [--repo <org/repo>] [--prompt <text>] [--all --all-local --attach --no-attach --dry-run --fresh --from-snapshot --kill --layout <nested|legacy> --list --main --new --parent <session> --peer <node> --pick --resume --snapshot <id> --solo --split]".to_owned()
 }
 
+fn wake_help_value_flags() -> &'static [&'static str] {
+    &[
+        "--task",
+        "--wt",
+        "--prompt",
+        "--repo",
+        "--issue",
+        "--pr",
+        "--incubate",
+        "--parent",
+        "--session",
+        "--peer",
+        "--from",
+        "--layout",
+        "--snapshot",
+        "-e",
+        "--engine",
+        "--name",
+        "--repo-path",
+    ]
+}
+
 fn wake_validate_target_value(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.starts_with('-') { return Err(format!("wake: {label} must not start with '-'")); }
     if value.contains('\0') || value.contains('\n') || value.contains('\r') { return Err(format!("wake: invalid {label}")); }
@@ -349,49 +395,124 @@ fn wake_label(options: &WakeOptionsNative) -> String {
 
 fn wake_resolve(options: &WakeOptionsNative, sessions: &[TmuxSession]) -> Result<WakeResolvedNative, String> {
     let oracle = wake_oracle(options)?;
-    let repo_path = wake_repo_path(options, &oracle)?;
+    let repo = wake_repo_path(options, &oracle)?;
+    let repo_path = repo.path;
     let session = options.parent.clone().or_else(|| wake_detect_session(&oracle, sessions)).unwrap_or_else(|| wake_session_name(&oracle));
     let window = wake_window_name(options, &oracle);
     let target = format!("{session}:{window}");
     let command = wake_command(&window, &repo_path, options);
-    Ok(WakeResolvedNative { oracle, session, window, repo_path, command, target })
+    Ok(WakeResolvedNative { oracle, session, window, repo_path, repo_fuzzy_match: repo.fuzzy_match, command, target })
 }
 
 fn wake_oracle(options: &WakeOptionsNative) -> Result<String, String> {
-    let raw = options.name.as_deref().or_else(|| options.target.split('/').next_back()).unwrap_or(&options.target);
+    let slug = workon_github_slug(&options.target);
+    let raw = options
+        .name
+        .as_deref()
+        .or_else(|| slug.as_deref().and_then(|value| value.rsplit('/').next()))
+        .or_else(|| options.target.trim_end_matches('/').split('/').next_back())
+        .unwrap_or(&options.target);
+    let raw = raw.strip_suffix(".git").unwrap_or(raw);
     let oracle = raw.strip_suffix("-oracle").unwrap_or(raw).trim();
     wake_validate_slug(oracle, "oracle")?;
     Ok(oracle.to_owned())
 }
 
-fn wake_repo_path(options: &WakeOptionsNative, oracle: &str) -> Result<std::path::PathBuf, String> {
+fn wake_repo_path(options: &WakeOptionsNative, oracle: &str) -> Result<WakeRepoResolution, String> {
     // `--repo-path <dir>` is an explicit filesystem override (used by `team up`
     // to point at the bound worktree) — it bypasses ghq/fleet resolution.
-    if let Some(repo_path) = &options.repo_path { return Ok(repo_path.clone()); }
-    if let Some(repo) = &options.repo { return Ok(wake_ghq_root().join("github.com").join(repo)); }
-    if let Some(repo) = &options.incubate { return Ok(wake_ghq_root().join("github.com").join(repo)); }
-    if options.target.contains('/') { return Ok(wake_ghq_root().join("github.com").join(&options.target)); }
-    wake_find_repo(oracle).ok_or_else(|| format!("wake: repo not found for {oracle}"))
+    if let Some(repo_path) = &options.repo_path {
+        return wake_normalize_repo_path(repo_path).map(wake_exact_repo_resolution);
+    }
+    if let Some(repo) = &options.repo { return wake_resolve_workon_repo(repo); }
+    if let Some(repo) = &options.incubate { return wake_resolve_workon_repo(repo); }
+    if workon_github_slug(&options.target).is_some()
+        || options.target == "."
+        || options.target.starts_with("./")
+        || options.target.starts_with('/')
+    {
+        return wake_resolve_workon_repo(&options.target);
+    }
+    wake_find_repo(oracle)
+}
+
+fn wake_normalize_repo_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("wake: cannot resolve repo path: {error}"))?
+            .join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
 fn wake_ghq_root() -> std::path::PathBuf { ghq_root() }
 
-fn wake_find_repo(oracle: &str) -> Option<std::path::PathBuf> {
-    let root = wake_ghq_root().join("github.com");
-    let Ok(orgs) = std::fs::read_dir(root) else { return None; };
-    let mut matches = Vec::new();
-    for org in orgs.flatten() { wake_collect_repo_match(&org.path(), oracle, &mut matches); }
-    matches.sort();
-    matches.into_iter().next()
+fn wake_exact_repo_resolution(path: std::path::PathBuf) -> WakeRepoResolution {
+    WakeRepoResolution { path, fuzzy_match: None }
 }
 
-fn wake_collect_repo_match(org_path: &std::path::Path, oracle: &str, matches: &mut Vec<std::path::PathBuf>) {
+fn wake_resolve_workon_repo(input: &str) -> Result<WakeRepoResolution, String> {
+    let repo = workon_resolve_repo(input).map_err(|error| format!("wake: {error}"))?;
+    Ok(wake_exact_repo_resolution(repo.repo_path))
+}
+
+fn wake_find_repo(oracle: &str) -> Result<WakeRepoResolution, String> {
+    let candidates = wake_repo_candidates();
+    if let Some(candidate) = candidates.iter().find(|candidate| wake_repo_name_matches(&candidate.name, oracle)) {
+        return Ok(wake_exact_repo_resolution(candidate.path.clone()));
+    }
+
+    match maw_matcher::resolve_by_name(oracle, &candidates, maw_matcher::ResolveOptions::default()) {
+        maw_matcher::ResolveResult::Exact { matched } | maw_matcher::ResolveResult::Fuzzy { matched } => {
+            Ok(WakeRepoResolution { path: matched.path, fuzzy_match: Some(matched.name) })
+        }
+        maw_matcher::ResolveResult::Ambiguous { candidates } => Err(format!(
+            "wake: ambiguous fuzzy repo for {oracle}: {}",
+            candidates.into_iter().map(|candidate| candidate.name).collect::<Vec<_>>().join(", ")
+        )),
+        maw_matcher::ResolveResult::None { .. } => Err(format!("wake: repo not found for {oracle}")),
+    }
+}
+
+fn wake_repo_candidates() -> Vec<WakeRepoCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    let root = wake_ghq_root().join("github.com");
+    if let Ok(orgs) = std::fs::read_dir(root) {
+        for org in orgs.flatten() { wake_collect_repo_candidates(&org.path(), &mut candidates, &mut seen); }
+    }
+    for entry in fleet_load_entries() {
+        for window in entry.session.windows {
+            let Some(path) = native_fleet_repo_path(&window.repo) else { continue; };
+            wake_push_repo_candidate(path, &mut candidates, &mut seen);
+        }
+    }
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    candidates
+}
+
+fn wake_collect_repo_candidates(
+    org_path: &std::path::Path,
+    candidates: &mut Vec<WakeRepoCandidate>,
+    seen: &mut BTreeSet<std::path::PathBuf>,
+) {
     let Ok(repos) = std::fs::read_dir(org_path) else { return; };
     for repo in repos.flatten() {
         let path = repo.path();
-        let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else { continue; };
-        if path.is_dir() && wake_repo_name_matches(name, oracle) { matches.push(path); }
+        if path.is_dir() { wake_push_repo_candidate(path, candidates, seen); }
     }
+}
+
+fn wake_push_repo_candidate(
+    path: std::path::PathBuf,
+    candidates: &mut Vec<WakeRepoCandidate>,
+    seen: &mut BTreeSet<std::path::PathBuf>,
+) {
+    if !path.is_dir() || !seen.insert(path.clone()) { return; }
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else { return; };
+    candidates.push(WakeRepoCandidate { name: name.to_owned(), path });
 }
 
 fn wake_repo_name_matches(name: &str, oracle: &str) -> bool {
@@ -457,11 +578,15 @@ fn wake_default_engine(options: &WakeOptionsNative) -> String {
 
 fn wake_command(window: &str, cwd: &std::path::Path, options: &WakeOptionsNative) -> String {
     let engine = wake_default_engine(options);
-    let resolved = wake_resolve_engine_command(&engine);
-    let mut command = format!("cd {} && {resolved}", wake_shell_quote(&cwd.display().to_string()));
-    if options.resume { command.push_str(" resume"); }
-    if options.channels { command.push_str(" --channels plugin:discord@claude-plugins-official"); }
-    if let Some(prompt) = &options.prompt { let _ = write!(command, " {}", wake_shell_quote(prompt)); }
+    let mut engine_command = wake_resolve_engine_command(&engine);
+    if options.resume { engine_command.push_str(" resume"); }
+    if options.channels { engine_command.push_str(" --channels plugin:discord@claude-plugins-official"); }
+    if let Some(prompt) = &options.prompt { let _ = write!(engine_command, " {}", wake_shell_quote(prompt)); }
+    let cwd_arg = wake_shell_quote(&cwd.display().to_string());
+    let cwd_label = wake_shell_quote(&cwd.display().to_string());
+    let command = format!(
+        "cd {cwd_arg} && {{ {engine_command}; _maw_wake_status=$?; if [ $_maw_wake_status -ne 0 ]; then printf '\\nmaw wake: engine exited with status %s\\n' \"$_maw_wake_status\" >&2; fi; }} || {{ printf '\\nmaw wake: failed to cd %s; engine not started\\n' {cwd_label} >&2; }}"
+    );
     format!("MAW_SESSION_WINDOW={} {}", wake_shell_quote(window), command)
 }
 
@@ -472,6 +597,9 @@ fn wake_shell_quote(value: &str) -> String {
 
 fn wake_render_dry_run(options: &WakeOptionsNative, resolved: &WakeResolvedNative) -> String {
     let mut out = String::new();
+    if let Some(name) = &resolved.repo_fuzzy_match {
+        let _ = writeln!(out, "\x1b[36m→\x1b[0m fuzzy match: {name}");
+    }
     let _ = writeln!(out, "\x1b[36m→\x1b[0m found \x1b[1m{}\x1b[0m ({})", resolved.oracle, resolved.repo_path.display());
     out.push_str("\x1b[90mdry-run — no tmux sessions/windows will be changed\x1b[0m\n");
     let _ = writeln!(out, "\x1b[32m+\x1b[0m would wake window '{}' in session '{}'", resolved.window, resolved.session);
@@ -488,8 +616,12 @@ fn wake_apply(
     out: &mut String,
 ) -> Result<(), String> {
     if !resolved.repo_path.is_dir() { return Err(format!("wake: repo path missing: {}", resolved.repo_path.display())); }
+    if let Some(name) = &resolved.repo_fuzzy_match {
+        let _ = writeln!(out, "\x1b[36m→\x1b[0m fuzzy match: {name}");
+    }
     let session_exists = tmux.wake_has_session(&resolved.session);
     if session_exists { wake_create_or_reuse_window(options, resolved, tmux, out)?; } else { wake_create_session(resolved, tmux, out)?; }
+    wake_register_fleet_session(resolved, tmux)?;
     if options.attach { tmux.wake_select_window(&resolved.target)?; }
     Ok(())
 }
@@ -518,6 +650,40 @@ fn wake_create_or_reuse_window(
     Ok(())
 }
 
+fn wake_register_fleet_session(
+    resolved: &WakeResolvedNative,
+    tmux: &mut impl WakeTmuxNative,
+) -> Result<(), String> {
+    let windows = wake_registry_windows(resolved, tmux);
+    if windows.is_empty() {
+        return Ok(());
+    }
+    fleet_registry_upsert_session(&resolved.session, &windows, "maw wake")
+        .map(|_| ())
+        .map_err(|error| format!("wake: {error}"))
+}
+
+fn wake_registry_windows(
+    resolved: &WakeResolvedNative,
+    tmux: &mut impl WakeTmuxNative,
+) -> Vec<FleetWindowSummary> {
+    let mut windows = tmux
+        .wake_list()
+        .into_iter()
+        .find(|session| session.name == resolved.session)
+        .map_or_else(Vec::new, |session| fleet_registry_windows_from_tmux(&session.windows, None));
+    if !windows.iter().any(|window| window.name == resolved.window) {
+        if let Some(repo) = fleet_repo_slug_from_path(&resolved.repo_path, None) {
+            windows.push(FleetWindowSummary {
+                name: resolved.window.clone(),
+                repo,
+                kind: Some(fleet_kind_from_window_name(&resolved.window)),
+            });
+        }
+    }
+    windows
+}
+
 #[cfg(test)]
 mod wake_tests {
     use super::*;
@@ -538,6 +704,14 @@ mod wake_tests {
         }
         fn wake_new_window(&mut self, session: &str, window: &str, cwd: &std::path::Path) -> Result<(), String> {
             self.actions.push(format!("new-window {session} {window} {}", cwd.display()));
+            if let Some(existing) = self.sessions.iter_mut().find(|item| item.name == session) {
+                existing.windows.push(maw_tmux::TmuxWindow {
+                    index: u32::try_from(existing.windows.len()).unwrap_or(u32::MAX),
+                    name: window.to_owned(),
+                    active: false,
+                    cwd: Some(cwd.display().to_string()),
+                });
+            }
             Ok(())
         }
         fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
@@ -559,6 +733,24 @@ mod wake_tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp root");
         path
+    }
+
+    struct CwdRestore {
+        previous: std::path::PathBuf,
+    }
+
+    impl CwdRestore {
+        fn enter(path: &std::path::Path) -> Self {
+            let previous = std::env::current_dir().expect("current dir before test");
+            std::env::set_current_dir(path).expect("set test cwd");
+            Self { previous }
+        }
+    }
+
+    impl Drop for CwdRestore {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.previous).expect("restore test cwd");
+        }
     }
 
     fn wake_with_fixture<F>(test: F)
@@ -628,18 +820,18 @@ mod wake_tests {
             let mut tmux = WakeMockTmux::default();
             let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach"]), &mut tmux).expect("fresh");
             let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
-            assert!(send.contains("&& claude"), "{send}");
-            assert!(!send.contains("&& codex"), "{send}");
+            assert!(send.contains("{ claude;"), "{send}");
+            assert!(!send.contains("{ codex;"), "{send}");
 
             let mut tmux = WakeMockTmux::default();
             let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach", "-e", "codex"]), &mut tmux).expect("explicit");
             let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
-            assert!(send.contains("&& codex"), "{send}");
+            assert!(send.contains("{ codex;"), "{send}");
 
             let mut tmux = WakeMockTmux::default();
             let (_code, _stdout) = wake_run(&wake_strings(&["neo", "--no-attach", "--resume"]), &mut tmux).expect("resume");
             let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
-            assert!(send.contains("&& codex resume"), "{send}");
+            assert!(send.contains("{ codex resume;"), "{send}");
         });
     }
 
@@ -653,9 +845,103 @@ mod wake_tests {
         .expect("parse --repo-path");
         assert_eq!(options.repo_path.as_deref(), Some(std::path::Path::new("/tmp/wt/coder-1")));
         assert_eq!(
-            wake_repo_path(&options, "coder-1").expect("resolve"),
+            wake_repo_path(&options, "coder-1").expect("resolve").path,
             std::path::PathBuf::from("/tmp/wt/coder-1")
         );
+    }
+
+    #[test]
+    fn wake_reuses_workon_github_url_resolver_without_double_prefix_or_peer_route() {
+        wake_with_fixture(|root| {
+            let repo = root.join("ghq/github.com/Soul-Brews-Studio/maw-fleetpad");
+            std::fs::create_dir_all(&repo).expect("repo");
+            let args = wake_strings(&[
+                "https://github.com/Soul-Brews-Studio/maw-fleetpad",
+                "--dry-run",
+                "--no-attach",
+            ]);
+            let options = wake_parse_args(&args).expect("parse");
+
+            assert!(!wake_should_use_peer_target(&options));
+            assert_eq!(wake_oracle(&options).expect("oracle"), "maw-fleetpad");
+            assert_eq!(wake_repo_path(&options, "maw-fleetpad").expect("resolve").path, repo);
+
+            let mut tmux = WakeMockTmux::default();
+            let (code, stdout) = wake_run(&args, &mut tmux).expect("run");
+            assert_eq!(code, 0);
+            assert!(stdout.contains("Soul-Brews-Studio/maw-fleetpad"), "{stdout}");
+            assert!(!stdout.contains("github.com/github.com"), "{stdout}");
+            assert!(tmux.actions.is_empty());
+        });
+    }
+
+    #[test]
+    fn wake_reuses_workon_github_host_slug_resolver_without_double_prefix() {
+        wake_with_fixture(|root| {
+            let repo = root.join("ghq/github.com/Soul-Brews-Studio/maw-fleetpad");
+            std::fs::create_dir_all(&repo).expect("repo");
+            let options = wake_parse_args(&wake_strings(&[
+                "github.com/Soul-Brews-Studio/maw-fleetpad",
+                "--dry-run",
+            ]))
+            .expect("parse");
+
+            assert_eq!(wake_repo_path(&options, "maw-fleetpad").expect("resolve").path, repo);
+        });
+    }
+
+    #[test]
+    fn wake_fuzzy_resolves_middle_repo_segment_and_reports_match() {
+        wake_with_fixture(|root| {
+            let repo = root.join("ghq/github.com/laris-co/DustBoy-Phd-Oracle");
+            std::fs::create_dir_all(&repo).expect("repo");
+            let mut tmux = WakeMockTmux::default();
+
+            let (code, stdout) = wake_run(&wake_strings(&["phd-oracle", "--dry-run"]), &mut tmux)
+                .expect("fuzzy wake");
+
+            assert_eq!(code, 0);
+            assert!(stdout.contains("fuzzy match: DustBoy-Phd-Oracle"), "{stdout}");
+            assert!(stdout.contains(&repo.display().to_string()), "{stdout}");
+            assert!(tmux.actions.is_empty());
+        });
+    }
+
+    #[test]
+    fn wake_relative_repo_path_is_absolute_before_send() {
+        wake_with_fixture(|root| {
+            let cwd = root.join("workspace");
+            let repo = cwd.join("agents/1-codex-1");
+            std::fs::create_dir_all(&repo).expect("worktree");
+            let _cwd = CwdRestore::enter(&cwd);
+
+            let mut tmux = WakeMockTmux::default();
+            let (code, stdout) = wake_run(
+                &wake_strings(&[
+                    "coder-1",
+                    "--repo-path",
+                    "agents/1-codex-1",
+                    "-e",
+                    "codex",
+                    "--no-attach",
+                ]),
+                &mut tmux,
+            )
+            .expect("wake");
+            assert_eq!(code, 0);
+            assert!(stdout.contains("created session"));
+
+            let expected = repo.canonicalize().expect("canonical worktree");
+            let new_session = tmux.actions.iter().find(|action| action.starts_with("new-session")).expect("new-session action");
+            assert!(new_session.contains(&expected.display().to_string()), "{new_session}");
+
+            let send = tmux.actions.iter().find(|action| action.starts_with("send ")).expect("send action");
+            assert!(send.contains(&format!("cd {}", expected.display())), "{send}");
+            assert!(!send.contains("cd agents/1-codex-1"), "{send}");
+            assert!(send.contains("maw wake: failed to cd"), "{send}");
+            assert!(send.contains("engine not started"), "{send}");
+            assert!(send.contains("maw wake: engine exited with status"), "{send}");
+        });
     }
 
     #[test]
@@ -680,6 +966,39 @@ mod wake_tests {
             assert!(tmux.actions.iter().any(|action| action.starts_with("new-session")));
             assert!(tmux.actions.iter().any(|action| action.contains(&root.join("ghq/github.com/acme/neo-oracle").display().to_string())));
             assert!(!tmux.actions.iter().any(|action| action.starts_with("select")));
+        });
+    }
+
+    #[test]
+    fn wake_auto_registers_fleet_json_and_merges_new_windows() {
+        wake_with_fixture(|root| {
+            let _now = EnvVarRestore::capture("MAW_RS_FLEET_REGISTRY_NOW");
+            std::env::set_var("MAW_RS_FLEET_REGISTRY_NOW", "2026-07-03T02:03:04.000Z");
+            let mut tmux = WakeMockTmux::default();
+
+            let (code, stdout) = wake_run(&wake_strings(&["neo", "--no-attach"]), &mut tmux).expect("first wake");
+            assert_eq!(code, 0, "{stdout}");
+            let session = tmux.sessions.first().expect("session").name.clone();
+            let path = root.join("home/.maw/fleet").join(format!("{session}.json"));
+            let first: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("registry")).expect("json");
+            assert_eq!(first["name"], session);
+            assert_eq!(first["created_at"], "2026-07-03T02:03:04.000Z");
+            assert_eq!(first["created_by"], "maw wake");
+            assert_eq!(first["auto_registered"], true);
+            assert_eq!(first["windows"].as_array().expect("windows").len(), 1);
+            assert_eq!(first["windows"][0]["name"], "neo");
+            assert_eq!(first["windows"][0]["repo"], "github.com/acme/neo-oracle");
+            assert_eq!(first["windows"][0]["kind"], "project");
+
+            let (code, stdout) = wake_run(&wake_strings(&["neo", "--task", "issue-90", "--no-attach"]), &mut tmux).expect("task wake");
+            assert_eq!(code, 0, "{stdout}");
+            let updated: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).expect("updated registry")).expect("json");
+            let windows = updated["windows"].as_array().expect("windows");
+            assert_eq!(windows.len(), 2);
+            assert!(windows.iter().any(|window| window["name"] == "neo"));
+            assert!(windows.iter().any(|window| window["name"] == "neo-issue-90"));
+            assert!(windows.iter().all(|window| window["kind"] == "project"));
+            assert_eq!(updated["created_at"], "2026-07-03T02:03:04.000Z");
         });
     }
 

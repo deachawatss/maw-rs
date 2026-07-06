@@ -1,7 +1,7 @@
 # maw-rs
 
 Rust port of maw-js — distributed terminal multiplexing & fleet management.
-21 crates in a Cargo workspace, 99.85% test coverage, BUSL-1.1 licensed.
+A Cargo workspace of small, focused crates. BUSL-1.1 licensed.
 
 ## Build Gate
 
@@ -10,118 +10,90 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Both must pass before any PR. No file > 250 lines.
+Both must pass before any PR.
 
 ## Branches
 
-- `main` — stable, protected. Never push/merge directly.
-- `alpha` — integration branch. All PRs target alpha.
-- `agents/*` — codex coder worktree branches.
+- `main` — stable, protected. Never push or merge directly.
+- `alpha` — integration branch. All PRs target `alpha`.
+- `agents/*` — throwaway worktree branches for agent/coder work.
 
-## Team Profiles
+## Releases (CalVer)
 
-Charter files in `ψ/teams/`:
-
-| Profile | Coders | Engine | Usage |
-|---------|--------|--------|-------|
-| `team-codex3` | 3 | codex (headless) | `maw team up team-codex3` |
-| `team-codex5` | 5 | codex | `maw team up team-codex5` |
-| `team-omx5` | 5 | omx | `maw team up team-omx5` |
-
-### Headless Mode (codex exec)
-
-Fire-and-forget dispatch — no TUI, coders `maw hey` back on start/done/blocked:
-
-```bash
-CODEX_HOME=~/.codex-team/N codex exec \
-  --dangerously-bypass-approvals-and-sandbox \
-  -c model="gpt-5.5" \
-  "TASK: <description>
-   First: maw hey 182-maw-rs:maw-rs 'codex-N starting — <task>'
-   Done: maw hey 182-maw-rs:maw-rs 'codex-N done — <task> PR#N'
-   Blocked: maw hey 182-maw-rs:maw-rs 'codex-N blocked — <reason>'" \
-  --json &
-```
-
-### CODEX_HOME Map
-
-| Slot | Path | Used by |
-|------|------|---------|
-| 1 | `~/.codex-team/1` | codex-1 |
-| 2 | `~/.codex-team/2` | (spare) |
-| 3 | `~/.codex-team/3` | codex-2 |
-| 4 | `~/.codex-team/4` | (spare) |
-| 5 | `~/.codex-team/5` | codex-3 |
-
-All slots pre-trusted for this repo.
-
-### Available Codex Models
-
-| Model | Flag | Reasoning | Use for |
-|-------|------|-----------|---------|
-| `gpt-5.5` | `-m gpt-5.5` | No | Default — fast, good for crate porting |
-| `o3` | `-m o3` | Yes | Complex architecture, cross-crate refactor |
-| `o4-mini` | `-m o4-mini` | Yes | Cheaper reasoning, simple logic tasks |
-| `codex-mini` | `-m codex-mini` | No | Fastest, repetitive tasks |
-
-Reasoning effort: `-c model_reasoning_effort="low|medium|high"`
-
-### Headless Dispatch Template
-
-```bash
-# Fire-and-forget with maw hey callback
-CODEX_HOME=~/.codex-team/N codex exec \
-  --dangerously-bypass-approvals-and-sandbox \
-  -m gpt-5.5 \
-  -c model_reasoning_effort="low" \
-  "TASK: <description>
-   REPO: /opt/Code/github.com/Soul-Brews-Studio/maw-rs
-   PROTOCOL:
-     1. maw hey 182-maw-rs:maw-rs 'codex-N starting — <task>'
-     2. implement → cargo build → cargo test → cargo clippy → fix → repeat
-     3. git add + commit + gh pr create --base alpha
-     4. maw hey 182-maw-rs:maw-rs 'codex-N done — <task> PR#N'
-     5. If blocked: maw hey 182-maw-rs:maw-rs 'codex-N blocked — <reason>'" \
-  --json &
-```
-
-Override model per task:
-- Leaf crate port: `-m gpt-5.5` (fast, repetitive)
-- Complex crate: `-m o3 -c model_reasoning_effort="high"` (reasoning)
-- Quick fix: `-m o4-mini` (cheap)
-
-### Skill: `/oracle-team`
+Version scheme (day-based CalVer, decided 2026-07-05; matches `maw-calver`'s
+`compute_version()`):
 
 ```
-/oracle-team up [profile]     # spawn (default: first yaml in ψ/teams/)
-/oracle-team down [1,2,3]     # safe teardown (partial or all)
-/oracle-team lead             # peek → merge → dispatch → nudge
-/oracle-team status           # read-only peek
+stable:  v<YY>.<M>.<DD>                 one per day
+alpha:   v<YY>.<M>.<DD>-alpha.<HMM>     HMM = H×100+M, TZ=Bangkok
+beta:    v<YY>.<M>.<DD>-beta.<HMM>      independent channel
 ```
 
-Loop mode: `/loop 5m /oracle-team lead`
+`HMM` is wall-clock time as a decimal integer with no leading zero (18:30 →
+`1830`, 09:05 → `905`). Every minute is a unique slot — no merge-order
+collisions. If `HMM` ≤ the highest existing suffix for the same base+channel,
+the crate advances to the next calendar day (`next_calendar_base`).
 
-## Crate Dependency Graph
+Transition note: before 2026-07-05 the last number was a per-month release
+*sequence* (SEQ-era `v26.7.2`–`v26.7.7`). Those tags were retired on
+2026-07-05 (notes archived in the vault, commits untouched) and the current
+line restarted day-based at `v26.7.5` (= 2026-07-05, same commit as SEQ-era
+v26.7.7). The exact commit and build time are embedded in the binary
+(`maw --version`) regardless of scheme.
 
-```
-Wave 1 (leaf, 17 crates — no internal deps):
-  maw-auth, maw-auto-wake, maw-bind, maw-bring, maw-calver,
-  maw-feed, maw-fuzzy, maw-hub, maw-identity, maw-matcher,
-  maw-plugin-manifest, maw-plugin-scaffold, maw-policy,
-  maw-routing, maw-split, maw-transport, maw-xdg
+Cut flow: PRs squash-merge into `alpha`; a release promotes `alpha` → `main`
+via a **merge-commit** PR, then tags `v<YY>.<M>.<DD>` (stable) or
+`v<YY>.<M>.<DD>-alpha.<HMM>` (pre-release) and publishes a GitHub release.
+GitHub auto-closes `Fixes #N` only on default-branch merges, so close issues
+by hand when their PR lands on `alpha`.
 
-Wave 2 (mid, 3 crates):
-  maw-peer (→ maw-xdg)
-  maw-tmux (→ maw-matcher, maw-peer)
-  maw-worktree (→ maw-matcher)
+macOS install note: copying a new binary over an installed one can SIGKILL on
+next run (stale code-sign cache on the reused inode) — `rm` first, then `cp`.
 
-Wave 3 (top, 1 crate):
-  maw-cli (→ all 20 crates)
-```
+## Architecture
+
+Layered Cargo workspace:
+
+- **Leaf crates** — self-contained, deterministic, side-effect-free core
+  logic (matching, routing, identity, transport, plugin manifest, …) with no
+  internal dependencies.
+- **Mid crates** — compose the leaf crates (e.g. `maw-peer`, `maw-tmux`,
+  `maw-worktree`).
+- **Top crate** — `maw-cli`, the binary, depends on the rest of the workspace.
+
+Run `cargo tree` for the current, authoritative dependency graph.
 
 ## Conventions
 
-- `forbid(unsafe_code)`, clippy pedantic
-- Edition 2021
-- JSON fixture validation from maw-js test specs
-- Deterministic, side-effect-free core crates (Phase 1)
+- `forbid(unsafe_code)`, clippy pedantic clean.
+- Rust edition 2021.
+- Behavior is validated against maw-js JSON test fixtures.
+- Core crates stay deterministic and side-effect-free.
+- Recursive search in Bash: always `rg` (ripgrep), never bare `grep -rn` —
+  it's parallel and skips `.gitignore`/`target/` automatically. Filter with
+  `rg -g '*.rs' PATTERN`; add `-u` for gitignored files. Never sweep
+  `/opt/Code` with `grep -rn`. (Claude Code's Grep tool already uses ripgrep;
+  this rule is for hand-written Bash.)
+
+## Fleet Intelligence Principles
+
+Oracle intelligence = engine × written memory × asking the right peer.
+
+1. **SEARCH-FIRST** — before guessing, search the vault / oracle MCP, or
+   `maw hey` the oracle that has actually hit the problem.
+2. **WRITE-BACK** — solved something hard? Write the manual/skill immediately.
+   Unwritten knowledge dies at compact; your manual is the next oracle's way out.
+3. **VERIFY-DONE** — never mark done without running it; dogfood your own tools.
+4. **DONE-CRITERIA TEACHING** — dispatch work with explicit gates (tests green,
+   files ≤250). Clear criteria teach the receiver to own the loop.
+5. **HUMILITY-COMPOUND** — model tiers change monthly; the vault compounds
+   forever. The smartest oracle is the one whose peers never relearn a lesson.
+6. **TEACH-DONT-EDIT** — when helping another oracle, teach and hand over the
+   commands; never edit a peer's repo yourself.
+
+## Further Docs
+
+See `docs/` for deeper references — including the parity matrix, wire
+protocol, "adding a command" guide, agent/coder team spawn conventions, and
+the WASM migration design. Shipped fleet plugin artifacts (WASM ship tier,
+sha256 pin lifecycle) live in `fleet-plugins/` — see its README.

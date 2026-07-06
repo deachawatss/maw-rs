@@ -154,7 +154,7 @@ fn verify_submit_retries_with_engine_specific_intervals() {
 
 #[test]
 fn fork_divergence_hook_keeps_wind_delivery_at_submit_site() {
-    let source = include_str!("../src/core_impl/part02_2.rs");
+    let source = include_str!("../src/core_impl/client_pane_send_parts/pane_text_send_methods.rs");
 
     assert!(source.contains("wind_delivery::submit_config_for_target(self, target)"));
     assert!(source.contains("wind_delivery::send_text_with_config_and_sleeper("));
