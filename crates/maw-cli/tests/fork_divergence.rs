@@ -530,6 +530,47 @@ exit 9
     }
 
     #[test]
+    fn fresh_worktree_sanitizes_stale_state() {
+        // Wiring guard: --fresh must scrub the stale .maw session markers the fake
+        // `git worktree add` seeds, proving sanitize_fresh_worktree is wired (was
+        // dead code under #![allow(dead_code)]).
+        let root = temp_dir("fresh-sanitize");
+        let bin_dir = seed_root(&root, Some(r#"{"commands":{"default":"claude"}}"#));
+        let output = run(&root, &bin_dir, &["workon", "demo", "feat", "--fresh"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("sanitized fresh worktree"), "expected sanitize line; stdout={stdout}");
+        assert!(stdout.contains(".maw/phase.json"), "should scrub stale phase.json; stdout={stdout}");
+        assert!(stdout.contains(".git/index.lock"), "should scrub stale index.lock; stdout={stdout}");
+    }
+
+    #[test]
+    fn untrusted_engine_warns_and_trusted_does_not() {
+        // Wiring guard: prepare_engine's trust warning must reach stdout for a
+        // non-Claude engine on an untrusted repo, and stay silent when trusted.
+        let untrusted_root = temp_dir("engine-untrusted");
+        let bin_dir = seed_root(
+            &untrusted_root,
+            Some(r#"{"commands":{"default":"codex exec"},"trustedRepos":["acme/other"]}"#),
+        );
+        let output = run(&untrusted_root, &bin_dir, &["workon", "demo"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("not trusted"), "expected trust warning; stdout={stdout}");
+        assert!(stdout.contains("codex"), "warning names the engine; stdout={stdout}");
+
+        let trusted_root = temp_dir("engine-trusted");
+        let bin_dir = seed_root(
+            &trusted_root,
+            Some(r#"{"commands":{"default":"codex exec"},"trustedRepos":["acme/demo"]}"#),
+        );
+        let output = run(&trusted_root, &bin_dir, &["workon", "demo"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("not trusted"), "trusted repo must not warn; stdout={stdout}");
+    }
+
+    #[test]
     fn engine_resolution_fallback_chain() {
         let root = temp_dir("specific");
         let bin_dir = seed_root(

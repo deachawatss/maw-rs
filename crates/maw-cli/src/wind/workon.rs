@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![allow(dead_code)]
 
 use std::{
     path::{Path, PathBuf},
@@ -11,19 +10,6 @@ pub(crate) struct EngineResolution {
     pub(crate) engine: String,
     pub(crate) command: String,
     pub(crate) warning: Option<String>,
-}
-
-pub(crate) fn sanitize_task_slug(task: &str) -> Result<String, String> {
-    let slug = task
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .map(|ch| if ch == '/' { '-' } else { ch })
-        .collect::<String>();
-    if slug.is_empty() || slug.starts_with('.') {
-        Err("workon: task slug must not be empty or start with '.'".to_owned())
-    } else {
-        Ok(slug)
-    }
 }
 
 pub(crate) fn sanitize_fresh_worktree(
