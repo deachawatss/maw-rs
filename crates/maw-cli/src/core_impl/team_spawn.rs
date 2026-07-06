@@ -199,6 +199,14 @@ fn team_t5_controlled_maw_invocation(opts: &TeamT5SpawnOptions127, engine: &str,
     if let Some(cwd) = cwd { args.extend(["--repo-path".to_owned(), cwd.display().to_string()]); }
     if let Some(id) = &opts.parent_session_id { args.extend(["--parent-session-id".to_owned(), id.clone()]); }
     if let Some(id) = &opts.session_id { args.extend(["--session-id".to_owned(), id.clone()]); }
+    // Deliver the brief to the spawned worker: wake appends --prompt to the engine
+    // command (e.g. `codex '<brief>'`), so the OMX/Claude worker boots WITH its
+    // brief instead of an unread spawn-prompt.md file. This is the TEAM fan-out
+    // auto-kickoff — without it, workers start blank. wake rejects a leading '-'
+    // in --prompt, so guard that edge (fall back to the on-disk spawn-prompt.md).
+    if let Some(prompt) = opts.prompt.as_deref().filter(|p| !p.is_empty() && !p.starts_with('-')) {
+        args.extend(["--prompt".to_owned(), prompt.to_owned()]);
+    }
     args
 }
 

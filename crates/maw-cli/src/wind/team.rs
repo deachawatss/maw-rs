@@ -146,7 +146,22 @@ fn parse_pane_pid(line: &str) -> Option<(String, u32)> {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new("/proc").join(pid.to_string()).exists()
+    // Linux fast path: /proc/<pid> exists iff the process is alive.
+    let proc_root = std::path::Path::new("/proc");
+    if proc_root.is_dir() {
+        return proc_root.join(pid.to_string()).exists();
+    }
+    // Portable fallback (macOS/BSD have no /proc): `kill -0 <pid>` performs
+    // existence/permission checking without sending a signal — exit 0 iff the
+    // process is alive. Without this, orphan-sweep flags every live pane as a
+    // zombie on macOS (the primary fleet host).
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn validate_kickoff_prompt(prompt: &str) -> Result<(), String> {
