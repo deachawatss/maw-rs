@@ -257,10 +257,14 @@ fn dispatch_cli_plugin_runs_import_bearing_wasm_on_extism_runtime() {
     let root = temp_dir("import-bearing-wasm");
     let plugins_dir = root.join("plugins");
     create_dir_all(&plugins_dir).expect("plugins dir");
-    write_ship_tier_wasm_plugin(&plugins_dir, "triggers-demo", "triggers");
+    // NOTE: the demo command must NOT collide with a native verb. `cli.command`
+    // plugins only handle UNKNOWN commands, so a plugin claiming a reserved verb
+    // (e.g. `triggers`) can never fire — the native handler wins first. `shipit`
+    // is deliberately not a native dispatch entry.
+    write_ship_tier_wasm_plugin(&plugins_dir, "shipit-demo", "shipit");
     std::env::set_var("MAW_PLUGINS_DIR", &plugins_dir);
 
-    let dispatched = run_cli(&args(&["triggers"]));
+    let dispatched = run_cli(&args(&["shipit"]));
 
     assert_eq!(dispatched.code, 0, "{}", dispatched.stderr);
     assert!(
