@@ -1,3 +1,8 @@
+const DISPATCH_308: &[DispatcherEntry] = &[
+    DispatcherEntry { command: "resolve", handler: Handler::Sync(run_resolve_plan) },
+    DispatcherEntry { command: "normalize", handler: Handler::Sync(run_normalize_plan) },
+];
+
 fn parse_date_parts(value: &str) -> Result<DateParts, String> {
     let Some((date, time)) = value.split_once('T') else {
         return Err("calver: --now must use YYYY-M-DTHH:MM".to_owned());
@@ -361,7 +366,7 @@ struct LsPanePlan {
     last_activity: Option<u64>,
     session_created: Option<u64>,
     status: &'static str,
-    age_sec: u64,
+    age_sec: Option<u64>,
     agent: bool,
 }
 

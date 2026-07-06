@@ -1,7 +1,7 @@
-pub mod engine;
 pub mod modules;
+pub mod process_engine;
 
-pub use engine::{ServecoreExecRunner, ServecoreNativeEngine, ServecoreProcessRunner};
+pub use process_engine::{ServecoreExecRunner, ServecoreNativeEngine, ServecoreProcessRunner};
 
 use axum::{
     body::{to_bytes, Body},
@@ -717,7 +717,7 @@ fn servecore_shell_quote(value: &str) -> String {
 
 fn servecore_shell_line_for_self(argv: &[String]) -> Result<String, String> {
     let mut parts = vec![servecore_shell_quote(
-        &engine::serveengine_self_bin()?.to_string_lossy(),
+        &process_engine::serveengine_self_bin()?.to_string_lossy(),
     )];
     parts.extend(argv.iter().map(|arg| servecore_shell_quote(arg)));
     Ok(parts.join(" "))
@@ -1357,23 +1357,23 @@ pub fn servecore_mount_ws_routes<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    modules::ws::ws_mount(router)
+    modules::websocket_routes::ws_mount(router)
 }
 
 pub fn servecore_mount_ws_routes_with_config<S>(
     router: Router<S>,
-    config: modules::ws::WsConfig,
+    config: modules::websocket_routes::WsConfig,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    modules::ws::ws_mount_with_config(router, config)
+    modules::websocket_routes::ws_mount_with_config(router, config)
 }
 
 pub fn servecore_mount_ws_registry_with_config<S>(
     router: Router<S>,
     registry: &ServecoreWsRegistry,
-    config: modules::ws::WsConfig,
+    config: modules::websocket_routes::WsConfig,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1415,18 +1415,18 @@ where
 {
     servecore_apply_pipeline_with_views_config(
         router,
-        modules::views::ViewsConfig::views_from_process_env(),
+        modules::static_views::ViewsConfig::views_from_process_env(),
     )
 }
 
 pub fn servecore_apply_pipeline_with_views_config<S>(
     router: Router<S>,
-    views_config: modules::views::ViewsConfig,
+    views_config: modules::static_views::ViewsConfig,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    modules::views::views_apply_fallback_with_config(router, views_config)
+    modules::static_views::views_apply_fallback_with_config(router, views_config)
         .layer(middleware::from_fn(servecore_auth_default_deny))
         .layer(middleware::from_fn(servecore_engine_proxy))
         .layer(middleware::from_fn(servecore_ws_upgrade_gate))
@@ -1483,6 +1483,10 @@ fn servecore_add_cors_headers(
         HeaderValue::from_static("GET, POST, OPTIONS"),
     );
     headers.insert("access-control-allow-headers", allow_headers.clone());
+    headers.insert(
+        "access-control-allow-private-network",
+        HeaderValue::from_static("true"),
+    );
     servecore_add_vary_origin(headers);
 }
 
@@ -1676,14 +1680,15 @@ async fn servecore_ws_upgrade(
     uri: Uri,
     Extension(kind): Extension<ServecoreWsKind>,
     Extension(state): Extension<Arc<ServecoreSharedState>>,
-    Extension(config): Extension<modules::ws::WsConfig>,
+    Extension(config): Extension<modules::websocket_routes::WsConfig>,
 ) -> impl IntoResponse {
-    let target = match modules::ws::ws_validate_target(servecore_ws_target(uri.query())) {
-        Ok(target) => target,
-        Err(error) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response()
-        }
-    };
+    let target =
+        match modules::websocket_routes::ws_validate_target(servecore_ws_target(uri.query())) {
+            Ok(target) => target,
+            Err(error) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error":error}))).into_response()
+            }
+        };
     if state
         .engine
         .servecore_ws_open(kind, target.as_deref())
@@ -1711,7 +1716,7 @@ async fn servecore_ws_stream(
     state: Arc<ServecoreSharedState>,
     kind: ServecoreWsKind,
     target: Option<String>,
-    config: modules::ws::WsConfig,
+    config: modules::websocket_routes::WsConfig,
 ) {
     let Some(_guard) = servecore_ws_connection_guard(config.max_connections) else {
         let _ = socket
@@ -1722,6 +1727,12 @@ async fn servecore_ws_stream(
             .await;
         return;
     };
+    if matches!(kind, ServecoreWsKind::Pty) {
+        process_engine::serveengine_ws_pty_stream(socket, state.clone(), target.clone(), &config)
+            .await;
+        state.engine.servecore_ws_close(kind, target.as_deref());
+        return;
+    }
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + config.heartbeat_interval,
         config.heartbeat_interval,
@@ -1761,7 +1772,7 @@ async fn servecore_ws_stream(
 pub(crate) async fn servecore_ws_send_text_frames(
     socket: &mut WebSocket,
     frames: Vec<String>,
-    config: &modules::ws::WsConfig,
+    config: &modules::websocket_routes::WsConfig,
 ) -> bool {
     for frame in frames {
         if servecore_ws_send(socket, Message::Text(frame), config.send_timeout)
@@ -1779,7 +1790,7 @@ pub(crate) async fn servecore_ws_handle_frame(
     state: &ServecoreSharedState,
     kind: ServecoreWsKind,
     target: Option<&str>,
-    config: &modules::ws::WsConfig,
+    config: &modules::websocket_routes::WsConfig,
     frame: Message,
 ) -> bool {
     match frame {
@@ -1952,6 +1963,25 @@ mod tests {
     use std::{net::Ipv4Addr, time::Duration};
     use tokio::sync::oneshot;
     use tower::ServiceExt;
+
+    struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self(key, old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
 
     #[derive(Default)]
     struct FakeOrchestrator {
@@ -2262,7 +2292,7 @@ mod tests {
         let expected_line = format!(
             "{} 'swarm' 'wish' 'codex' '--tiled'",
             servecore_shell_quote(
-                &engine::serveengine_self_bin()
+                &process_engine::serveengine_self_bin()
                     .expect("self")
                     .to_string_lossy()
             )
@@ -2323,7 +2353,7 @@ mod tests {
         let expected_line = format!(
             "{} 'swarm' 'wish'",
             servecore_shell_quote(
-                &engine::serveengine_self_bin()
+                &process_engine::serveengine_self_bin()
                     .expect("self")
                     .to_string_lossy()
             )
@@ -2520,18 +2550,18 @@ mod tests {
 
     async fn servecore_spawn_ws_test_server(
         state: ServecoreSharedState,
-        config: modules::ws::WsConfig,
+        config: modules::websocket_routes::WsConfig,
     ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
         let router = servecore_mount_core_routes(Router::new());
-        let router = modules::ws::ws_mount_with_config(router, config);
+        let router = modules::websocket_routes::ws_mount_with_config(router, config);
         let router = servecore_with_shared_state(router, state);
         let app = servecore_apply_pipeline_with_views_config(
             router,
-            modules::views::ViewsConfig::views_with_paths(
+            modules::static_views::ViewsConfig::views_with_paths(
                 std::env::temp_dir().join("maw-rs-ws-no-ui"),
                 std::env::temp_dir().join("maw-rs-ws-no-door.html"),
                 std::env::temp_dir().join("maw-rs-ws-no-topology.html"),
@@ -2939,7 +2969,9 @@ mod tests {
     async fn servecore_ws_uses_engine_hook_and_loopback_auth() {
         let engine = Arc::new(TestEngine::default());
         let state = ServecoreSharedState::default().servecore_with_engine(engine.clone());
-        let addr = servecore_spawn_ws_test_server(state, modules::ws::WsConfig::default()).await;
+        let addr =
+            servecore_spawn_ws_test_server(state, modules::websocket_routes::WsConfig::default())
+                .await;
         let url = format!("ws://{addr}/ws/tmux?target=nova:1.0");
         let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
             .await
@@ -2977,10 +3009,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn servecore_ws_pty_attaches_and_bridges_binary_frames() {
+        let _guard = EnvGuard::set("MAW_RS_SERVECORE_PTY_PROGRAM", "/bin/cat");
+        let addr = servecore_spawn_ws_test_server(
+            ServecoreSharedState::default(),
+            modules::websocket_routes::WsConfig {
+                idle_timeout: Duration::from_secs(5),
+                heartbeat_interval: Duration::from_secs(5),
+                send_timeout: Duration::from_secs(2),
+                max_frame_bytes: 1024,
+                max_connections: 8,
+            },
+        )
+        .await;
+        let (mut ws, _response) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/pty"))
+            .await
+            .expect("connect pty websocket");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"attach","target":"demo:1","cols":80,"rows":24}"#.to_owned(),
+        ))
+        .await
+        .expect("attach");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) =
+                    ws.next().await.expect("ack frame").expect("ack ok")
+                {
+                    let value = serde_json::from_str::<serde_json::Value>(&text).expect("json");
+                    if value["type"] == "attached" {
+                        assert_eq!(value["target"], "demo:1");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("attached ack");
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+            b"pty-roundtrip\n".to_vec(),
+        ))
+        .await
+        .expect("binary input");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let tokio_tungstenite::tungstenite::Message::Binary(bytes) =
+                    ws.next().await.expect("pty frame").expect("pty ok")
+                {
+                    if String::from_utf8_lossy(&bytes).contains("pty-roundtrip") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("binary pty output");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            r#"{"type":"detach"}"#.to_owned(),
+        ))
+        .await
+        .expect("detach");
+    }
+
+    #[tokio::test]
     async fn servecore_ws_rejects_bad_tunnel_target_before_upgrade() {
         let addr = servecore_spawn_ws_test_server(
             ServecoreSharedState::default(),
-            modules::ws::WsConfig::default(),
+            modules::websocket_routes::WsConfig::default(),
         )
         .await;
         let err = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/tmux?target=-danger"))
@@ -2991,7 +3085,7 @@ mod tests {
 
     #[tokio::test]
     async fn servecore_ws_idle_timeout_closes_dead_connection() {
-        let config = modules::ws::WsConfig {
+        let config = modules::websocket_routes::WsConfig {
             idle_timeout: Duration::from_millis(80),
             heartbeat_interval: Duration::from_millis(20),
             send_timeout: Duration::from_millis(50),

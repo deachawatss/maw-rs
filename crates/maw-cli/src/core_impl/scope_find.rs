@@ -33,6 +33,15 @@ struct NativeFleetWindow {
     name: String,
     #[serde(default)]
     repo: String,
+    #[serde(default)]
+    kind: Option<NativeRepoKind>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum NativeRepoKind {
+    Oracle,
+    Project,
 }
 
 #[allow(dead_code)]
@@ -498,13 +507,53 @@ fn current_xdg_env() -> MawXdgEnv {
 }
 
 fn ghq_root() -> std::path::PathBuf {
-    std::env::var_os("GHQ_ROOT").map_or_else(|| {
-        std::env::var_os("HOME").map_or_else(|| std::path::PathBuf::from(".").join("Code"), |home| std::path::PathBuf::from(home).join("Code"))
-    }, |value| {
-        let mut path = std::path::PathBuf::from(value);
-        if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("github.com") { path.pop(); }
-        path
-    })
+    ghq_root_resolve(std::env::var_os("GHQ_ROOT"), ghq_root_from_git_config, std::env::var_os("HOME"))
+}
+
+// Resolution order mirrors ghq itself: $GHQ_ROOT env → `git config ghq.root` → ~/Code.
+// Without the git-config step, `maw wake <name>` only works in shells that happen to
+// export GHQ_ROOT (e.g. inside a direnv tree) while `ghq` resolves everywhere (#134).
+fn ghq_root_resolve(
+    env_root: Option<std::ffi::OsString>,
+    git_config_root: impl FnOnce() -> Option<String>,
+    home: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    if let Some(value) = env_root {
+        return ghq_root_strip_host(std::path::PathBuf::from(value));
+    }
+    if let Some(value) = git_config_root() {
+        let expanded = ghq_root_expand_tilde(value.trim(), home.as_deref());
+        if !expanded.as_os_str().is_empty() {
+            return ghq_root_strip_host(expanded);
+        }
+    }
+    home.map_or_else(|| std::path::PathBuf::from(".").join("Code"), |home| std::path::PathBuf::from(home).join("Code"))
+}
+
+fn ghq_root_from_git_config() -> Option<String> {
+    let output = std::process::Command::new("git").args(["config", "--get", "ghq.root"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+}
+
+fn ghq_root_expand_tilde(value: &str, home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(value)
+}
+
+fn ghq_root_strip_host(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("github.com") {
+        path.pop();
+    }
+    path
 }
 
 fn fleet_read_dirs_for_env(env: &MawXdgEnv) -> Vec<std::path::PathBuf> {
@@ -589,7 +638,7 @@ fn fleet_parse_entry(path: &std::path::Path, strict: bool, label: &str) -> Resul
         Err(error) if strict => return Err(format!("{label}: read {}: {error}", path.display())),
         Err(_) => return Ok(None),
     };
-    let session = match serde_json::from_str::<NativeFleetSession>(&text) {
+    let mut session = match serde_json::from_str::<NativeFleetSession>(&text) {
         Ok(session) => session,
         Err(error) if strict => return Err(format!("{label}: parse {}: {error}", path.display())),
         Err(_) => return Ok(None),
@@ -597,12 +646,124 @@ fn fleet_parse_entry(path: &std::path::Path, strict: bool, label: &str) -> Resul
     if session.name.is_empty() {
         return Ok(None);
     }
+    native_fleet_apply_role_markers(&mut session);
     let file = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_owned();
     Ok(Some(NativeFleetEntry { file, path: path.to_path_buf(), session }))
 }
 
 fn load_native_fleet() -> Vec<NativeFleetSession> {
     fleet_load_entries().into_iter().map(|entry| entry.session).collect()
+}
+
+fn native_fleet_apply_role_markers(session: &mut NativeFleetSession) {
+    for window in &mut session.windows {
+        if window.kind.is_none() {
+            window.kind = native_repo_marker_kind_for_slug(&window.repo);
+        }
+    }
+}
+
+fn native_repo_kind_from_role(value: &str) -> Option<NativeRepoKind> {
+    match value.trim() {
+        "oracle" => Some(NativeRepoKind::Oracle),
+        "project" => Some(NativeRepoKind::Project),
+        _ => None,
+    }
+}
+
+fn native_repo_marker_kind(path: &std::path::Path) -> Option<NativeRepoKind> {
+    let text = std::fs::read_to_string(path.join(".maw/role")).ok()?;
+    native_repo_kind_from_role(&text)
+}
+
+fn native_repo_marker_kind_for_slug(repo: &str) -> Option<NativeRepoKind> {
+    let path = native_fleet_repo_path(repo)?;
+    native_repo_marker_kind(&path)
+}
+
+fn native_fleet_repo_path(repo: &str) -> Option<std::path::PathBuf> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return None;
+    }
+    let repo = repo.strip_prefix("github.com/").unwrap_or(repo);
+    Some(ghq_root().join("github.com").join(repo))
+}
+
+fn native_repo_kind_for_path(path: &std::path::Path) -> Option<NativeRepoKind> {
+    let slugs = native_repo_slugs_for_path(path);
+    for entry in fleet_load_entries() {
+        for window in &entry.session.windows {
+            if window.kind.is_some() && native_fleet_window_matches_slugs(window, &slugs) {
+                return window.kind;
+            }
+        }
+    }
+    native_repo_marker_kind(path)
+}
+
+fn native_repo_slugs_for_path(path: &std::path::Path) -> BTreeSet<String> {
+    let mut slugs = BTreeSet::new();
+    let root = ghq_root().join("github.com");
+    if let Ok(rel) = path.strip_prefix(root) {
+        let parts = rel.components().take(2).map(|part| part.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>();
+        if parts.len() == 2 {
+            slugs.insert(format!("{}/{}", parts[0], parts[1]));
+            slugs.insert(format!("github.com/{}/{}", parts[0], parts[1]));
+        }
+    }
+    let mut github_parts = Vec::new();
+    for component in path.components() {
+        let value = component.as_os_str().to_string_lossy();
+        if github_parts.is_empty() {
+            if value == "github.com" {
+                github_parts.push(String::new());
+            }
+            continue;
+        }
+        github_parts.push(value.to_string());
+        if github_parts.len() == 3 {
+            slugs.insert(format!("{}/{}", github_parts[1], github_parts[2]));
+            slugs.insert(format!("github.com/{}/{}", github_parts[1], github_parts[2]));
+            break;
+        }
+    }
+    slugs
+}
+
+fn native_fleet_window_matches_slugs(window: &NativeFleetWindow, slugs: &BTreeSet<String>) -> bool {
+    let repo = window.repo.trim();
+    !repo.is_empty()
+        && (slugs.contains(repo) || repo.strip_prefix("github.com/").is_some_and(|stripped| slugs.contains(stripped)))
+}
+
+fn native_repo_path_is_oracle(path: &std::path::Path, fallback_name: &str) -> bool {
+    match native_repo_kind_for_path(path) {
+        Some(NativeRepoKind::Oracle) => true,
+        Some(NativeRepoKind::Project) => false,
+        None => fallback_name.ends_with("-oracle"),
+    }
+}
+
+fn native_fleet_window_is_oracle(window: &NativeFleetWindow) -> bool {
+    match window.kind {
+        Some(NativeRepoKind::Oracle) => true,
+        Some(NativeRepoKind::Project) => false,
+        None => window.name.ends_with("-oracle"),
+    }
+}
+
+fn native_fleet_window_oracle_name(window: &NativeFleetWindow) -> Option<String> {
+    if !native_fleet_window_is_oracle(window) {
+        return None;
+    }
+    let source = if window.name.trim().is_empty() {
+        window.repo.rsplit('/').next().unwrap_or_default()
+    } else {
+        window.name.trim()
+    };
+    let name = source.strip_suffix("-oracle").unwrap_or(source).trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[cfg(test)]
@@ -635,10 +796,12 @@ mod native_fleet_loader_tests {
         let _maw_config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let _xdg_config = EnvVarRestore::capture("XDG_CONFIG_HOME");
         let _xdg_state = EnvVarRestore::capture("XDG_STATE_HOME");
+        let _ghq = EnvVarRestore::capture("GHQ_ROOT");
 
         std::env::set_var("HOME", root.join("home"));
         std::env::set_var("MAW_STATE_DIR", root.join("state"));
         std::env::set_var("MAW_CONFIG_DIR", root.join("config"));
+        std::env::set_var("GHQ_ROOT", root.join("ghq/github.com"));
         std::env::remove_var("MAW_HOME");
         std::env::remove_var("MAW_XDG");
         std::env::remove_var("XDG_CONFIG_HOME");
@@ -700,6 +863,26 @@ mod native_fleet_loader_tests {
             assert_eq!(entries[1].session.name, "01-alpha");
         });
     }
+
+    #[test]
+    fn native_fleet_loader_parses_kind_and_role_marker_with_json_precedence() {
+        let root = fleet_loader_temp_root("kind");
+        fleet_loader_write(
+            &root.join("state/fleet/01-kind.json"),
+            r#"{"name":"01-kind","windows":[{"name":"plain","repo":"acme/plain","kind":"oracle"},{"name":"legacy","repo":"acme/legacy"},{"name":"marker","repo":"acme/marker"},{"name":"override","repo":"acme/override","kind":"project"}]}"#,
+        );
+        fleet_loader_write(&root.join("ghq/github.com/acme/marker/.maw/role"), "oracle\n");
+        fleet_loader_write(&root.join("ghq/github.com/acme/override/.maw/role"), "oracle\n");
+
+        fleet_loader_env(&root, || {
+            let entries = fleet_load_entries();
+            let windows = &entries[0].session.windows;
+            assert_eq!(windows[0].kind, Some(NativeRepoKind::Oracle));
+            assert_eq!(windows[1].kind, None);
+            assert_eq!(windows[2].kind, Some(NativeRepoKind::Oracle));
+            assert_eq!(windows[3].kind, Some(NativeRepoKind::Project));
+        });
+    }
 }
 
 fn flag_value(argv: &[String], flag: &str) -> Option<String> {
@@ -709,4 +892,71 @@ fn flag_value(argv: &[String], flag: &str) -> Option<String> {
 fn now_iso_utc() -> String {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |duration| duration.as_secs());
     format!("{seconds}")
+}
+
+#[cfg(test)]
+mod scopefind_ghq_root_tests {
+    use super::{ghq_root_expand_tilde, ghq_root_resolve};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    // Shorthand for the injected env-lookup shape; always-Some is the point —
+    // call sites read `os("/opt/Code")` against a `None` alternative.
+    #[allow(clippy::unnecessary_wraps)]
+    fn os(value: &str) -> Option<OsString> {
+        Some(OsString::from(value))
+    }
+
+    #[test]
+    fn env_var_wins_over_git_config() {
+        let root = ghq_root_resolve(os("/opt/Code"), || Some("/elsewhere".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn env_var_github_host_suffix_is_stripped() {
+        let root = ghq_root_resolve(os("/opt/Code/github.com"), || None, os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn git_config_root_used_when_env_unset() {
+        let root = ghq_root_resolve(None, || Some("/opt/Code\n".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn git_config_root_expands_tilde() {
+        let root = ghq_root_resolve(None, || Some("~/ghq".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/Users/nat/ghq"));
+    }
+
+    #[test]
+    fn git_config_github_host_suffix_is_stripped() {
+        let root = ghq_root_resolve(None, || Some("/opt/Code/github.com".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/opt/Code"));
+    }
+
+    #[test]
+    fn empty_git_config_falls_back_to_home_code() {
+        let root = ghq_root_resolve(None, || Some("   ".to_owned()), os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/Users/nat/Code"));
+    }
+
+    #[test]
+    fn no_sources_falls_back_to_home_code() {
+        let root = ghq_root_resolve(None, || None, os("/Users/nat"));
+        assert_eq!(root, PathBuf::from("/Users/nat/Code"));
+    }
+
+    #[test]
+    fn no_home_falls_back_to_relative_code() {
+        let root = ghq_root_resolve(None, || None, None);
+        assert_eq!(root, PathBuf::from(".").join("Code"));
+    }
+
+    #[test]
+    fn tilde_without_home_stays_literal() {
+        assert_eq!(ghq_root_expand_tilde("~/ghq", None), PathBuf::from("~/ghq"));
+    }
 }
