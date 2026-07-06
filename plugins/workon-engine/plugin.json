@@ -1,0 +1,14 @@
+{
+  "name": "workon-engine",
+  "version": "0.1.0",
+  "description": "Fork patch: adds --engine/--codex/--claude flags to maw workon",
+  "sdk": "*",
+  "entry": { "kind": "wasm", "path": "plugin.wasm", "export": "handle" },
+  "capabilities": [
+    "sdk:config:read",
+    "sdk:config:write"
+  ],
+  "hooks": {
+    "gate": ["cmd:workon"]
+  }
+}
