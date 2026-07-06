@@ -154,10 +154,48 @@ fn wake_run(argv: &[String], tmux: &mut impl WakeTmuxNative) -> Result<(i32, Str
     if options.list { return Ok((0, wake_render_list(&options, &sessions))); }
     if options.all { return Ok((0, wake_render_all_plan(&options, &sessions))); }
     let resolved = wake_resolve(&options, &sessions)?;
-    if options.dry_run { return Ok((0, wake_render_dry_run(&options, &resolved))); }
+    let note = wake_unimplemented_note(&options).unwrap_or_default();
+    if options.dry_run {
+        return Ok((0, format!("{}{note}", wake_render_dry_run(&options, &resolved))));
+    }
     let mut out = String::new();
     wake_apply(&options, &resolved, tmux, &mut out)?;
+    out.push_str(&note);
     Ok((0, out))
+}
+
+/// Honest-flag guard: several wake flags are parsed and validated but not yet
+/// honored natively (they were silent no-ops — accepted, then ignored, exit 0).
+/// Rather than lie, surface a warning naming exactly what had no effect so the
+/// caller isn't misled, and point worktree flags at the canonical tool.
+fn wake_unimplemented_note(options: &WakeOptionsNative) -> Option<String> {
+    let mut ignored: Vec<&str> = Vec::new();
+    if options.fresh { ignored.push("--fresh"); }
+    if options.from_snapshot { ignored.push("--from-snapshot"); }
+    if options.kill { ignored.push("--kill"); }
+    if options.pick { ignored.push("--pick"); }
+    if options.split { ignored.push("--split"); }
+    if options.bud { ignored.push("--bud"); }
+    if options.wait { ignored.push("--wait"); }
+    if options.solo && !options.main { ignored.push("--solo"); }
+    if options.main { ignored.push("--main"); }
+    if options.snapshot.is_some() { ignored.push("--snapshot"); }
+    if options.issue.is_some() { ignored.push("--issue"); }
+    if options.pr.is_some() { ignored.push("--pr"); }
+
+    let mut lines = Vec::new();
+    if options.wt.is_some() || options.task.is_some() {
+        lines.push(
+            "\x1b[33m⚠\x1b[0m wake --wt/--task names the window but does not create a git worktree; use `maw workon <repo> --wt <slug>` to create one".to_owned(),
+        );
+    }
+    if !ignored.is_empty() {
+        lines.push(format!(
+            "\x1b[33m⚠\x1b[0m wake: ignoring flag(s) not yet native: {} (parsed but no effect)",
+            ignored.join(", ")
+        ));
+    }
+    (!lines.is_empty()).then(|| format!("{}\n", lines.join("\n")))
 }
 
 fn wake_should_use_peer_target(options: &WakeOptionsNative) -> bool {
@@ -694,6 +732,29 @@ fn wake_registry_windows(
 #[cfg(test)]
 mod wake_tests {
     use super::*;
+
+    #[test]
+    fn wake_unimplemented_note_names_ignored_flags_and_is_silent_when_none() {
+        // No no-op flags → no warning (real wakes must stay quiet).
+        assert!(wake_unimplemented_note(&wake_default_options()).is_none());
+
+        // Ignored bool/value flags are named so wake never silently lies.
+        let mut options = wake_default_options();
+        options.fresh = true;
+        options.kill = true;
+        options.snapshot = Some("s1".to_owned());
+        let note = wake_unimplemented_note(&options).expect("note");
+        assert!(note.contains("--fresh"), "{note}");
+        assert!(note.contains("--kill"), "{note}");
+        assert!(note.contains("--snapshot"), "{note}");
+
+        // --wt/--task get the explicit "no worktree created; use workon" guidance.
+        let mut wt_options = wake_default_options();
+        wt_options.wt = Some("slot".to_owned());
+        let wt_note = wake_unimplemented_note(&wt_options).expect("wt note");
+        assert!(wt_note.contains("does not create a git worktree"), "{wt_note}");
+        assert!(wt_note.contains("maw workon"), "{wt_note}");
+    }
 
     #[derive(Default)]
     struct WakeMockTmux {
