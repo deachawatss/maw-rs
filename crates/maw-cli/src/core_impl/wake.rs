@@ -108,7 +108,14 @@ impl WakeTmuxNative for WakeNativeTmux {
 
     fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         wake_validate_tmux_target(target)?;
-        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.to_string())
+        // wake injects the initial engine command into a freshly created shell
+        // pane — no agent is running yet and there is no prompt to poll for, so
+        // the hardened send_text readiness gate (45s timeout) would hang. Use
+        // raw literal keys + Enter here; the readiness gate belongs on the
+        // hey/send delivery seam to an *active* agent, not wake's first inject.
+        let mut tmux = TmuxClient::local();
+        tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
+        tmux.send_keys(target, &["Enter".to_owned()]).map_err(|error| error.to_string())
     }
 
     fn wake_select_window(&mut self, target: &str) -> Result<(), String> {

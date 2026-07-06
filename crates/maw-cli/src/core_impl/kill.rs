@@ -3,7 +3,7 @@ const DISPATCH_78: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(kill_run_command),
 }];
 
-const KILL_USAGE: &str = "usage: maw kill <target>[:window] [--pane N] [--index N|--all] [--peer <alias>]  (see: maw sleep for graceful stop, maw done for worktrees)";
+const KILL_USAGE: &str = "usage: maw kill <target>[:window] [--pane N] [--index N|--all] [--force|-f] [--peer <alias>]  (whole-session kill needs --force; see: maw sleep for graceful stop, maw done for worktrees)";
 const KILL_WINDOW_FORMAT: &str =
     "#{session_name}|||#{window_index}|||#{window_name}|||#{window_active}|||#{pane_current_path}";
 const KILL_PEER_API_PATH: &str = "/api/kill";
@@ -16,6 +16,7 @@ struct KillOptions {
     pane: Option<u32>,
     index: Option<u32>,
     all: bool,
+    force: bool,
     peer: Option<String>,
 }
 
@@ -33,6 +34,7 @@ struct KillPeerRequest {
     pane: Option<u32>,
     index: Option<u32>,
     all: bool,
+    force: bool,
     from: String,
     peer_key: String,
     timestamp: i64,
@@ -220,6 +222,10 @@ fn kill_parse_arg(
             options.all = true;
             Ok(1)
         }
+        "--force" | "-f" => {
+            options.force = true;
+            Ok(1)
+        }
         "--pane" => kill_parse_value_flag(argv, index, "--pane", |value| {
             options.pane = Some(kill_parse_non_negative(value, "--pane")?);
             Ok(())
@@ -298,6 +304,7 @@ fn kill_peer_forward(
         pane: options.pane,
         index: options.index,
         all: options.all,
+        force: options.force,
         from,
         peer_key: peer_key()?,
         timestamp: now(),
@@ -413,6 +420,7 @@ fn kill_peer_body(request: &KillPeerRequest) -> Result<String, String> {
     if let Some(pane) = request.pane { body.insert("pane".to_owned(), serde_json::Value::from(pane)); }
     if let Some(index) = request.index { body.insert("index".to_owned(), serde_json::Value::from(index)); }
     if request.all { body.insert("all".to_owned(), serde_json::Value::Bool(true)); }
+    if request.force { body.insert("force".to_owned(), serde_json::Value::Bool(true)); }
     serde_json::to_string(&serde_json::Value::Object(body)).map_err(|error| error.to_string())
 }
 
@@ -576,6 +584,17 @@ fn kill_apply_resolved(
         return kill_kill_resolved_pane(tmux, session, indexes.first().copied(), pane);
     }
     if raw_window.is_empty() && options.index.is_none() && !options.all {
+        if !options.force {
+            return Err(format!(
+                "refusing to kill entire session '{}' without --force.\n  \
+                 this destroys every window/pane (and any unsaved agent work) in it.\n  \
+                 → target a window:  maw kill {}:<window>\n  \
+                 → graceful stop:    maw sleep {}\n  \
+                 → finish worktree:  maw done <window>\n  \
+                 → really kill all:  maw kill {} --force",
+                session.name, session.name, session.name, session.name
+            ));
+        }
         tmux.kill_kill_session(&session.name)?;
         return Ok(format!(
             "  \x1b[32m✓\x1b[0m killed session {}\n",
@@ -1041,13 +1060,30 @@ mod kill_tests {
     #[test]
     fn kill_session_resolves_and_validates_before_destructive_call() {
         let mut tmux = kill_fake("07-demo|||0|||main|||1|||/tmp\n");
-        let output = kill_run_fake(&kill_strings(&["demo"]), &mut tmux);
+        let output = kill_run_fake(&kill_strings(&["demo", "--force"]), &mut tmux);
         assert_eq!(output.code, 0);
         assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m killed session 07-demo\n");
         assert_eq!(tmux.calls[0].0, "list-windows");
         assert_eq!(
             tmux.calls[1],
             ("kill-session".to_owned(), kill_strings(&["-t", "07-demo"]))
+        );
+    }
+
+    #[test]
+    fn kill_bare_session_without_force_refuses_and_does_not_kill() {
+        // Data-loss guard: a bare `maw kill <session>` must NOT destroy the whole
+        // session. It lists to resolve (proving the name is real) but then refuses
+        // with guidance instead of calling kill-session.
+        let mut tmux = kill_fake("07-demo|||0|||main|||1|||/tmp\n");
+        let output = kill_run_fake(&kill_strings(&["demo"]), &mut tmux);
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("without --force"), "stderr: {}", output.stderr);
+        assert!(output.stderr.contains("maw kill 07-demo --force"), "stderr: {}", output.stderr);
+        assert!(
+            !tmux.calls.iter().any(|(verb, _)| verb == "kill-session"),
+            "must not call kill-session without --force; calls: {:?}",
+            tmux.calls
         );
     }
 
@@ -1230,6 +1266,7 @@ mod kill_tests {
             pane: Some(1),
             index: Some(2),
             all: true,
+            force: true,
             from: "oracle:node".to_owned(),
             peer_key: "key".to_owned(),
             timestamp: 1,
@@ -1240,6 +1277,7 @@ mod kill_tests {
         assert_eq!(value["pane"], 1);
         assert_eq!(value["index"], 2);
         assert_eq!(value["all"], true);
+        assert_eq!(value["force"], true);
         let headers = sign_headers_v3_at("key", "oracle:node", "POST", KILL_PEER_API_PATH, Some(body.as_bytes()), 1).expect("headers");
         let argv = kill_peer_curl_argv("http://peer/", &headers, &body).expect("argv");
         assert!(argv.iter().any(|arg| arg == "--"));
