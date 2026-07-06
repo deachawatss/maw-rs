@@ -13,7 +13,7 @@ const DISPATCH_291: &[DispatcherEntry] = &[
     },
     DispatcherEntry {
         command: "cleanup",
-        handler: Handler::Sync(run_cleanup_fail_closed_command),
+        handler: Handler::Sync(run_cleanup_command),
     },
 ];
 
@@ -173,18 +173,63 @@ fn run_project_command(argv: &[String]) -> CliOutput {
 // park implementation lives in part292.rs (run_park_command, resolve_park,
 // time_ago_ms, and helpers). All are in scope via include!.
 
-fn run_cleanup_fail_closed_command(_: &[String]) -> CliOutput {
-    missing_cmd_fail_closed("cleanup")
-}
+const CLEANUP_USAGE: &str =
+    "usage: maw cleanup [--zombie-agents] [--teams] [--fix|--yes]  (no scope flag runs both; --fix kills zombie panes, team prune is always safe)";
 
-fn missing_cmd_fail_closed(command: &str) -> CliOutput {
-    CliOutput {
-        code: 1,
-        stdout: String::new(),
-        stderr: format!(
-            "{command} not yet native in maw-rs — port pending; use maw-js for now\n"
-        ),
+/// Fleet-wide cleanup. Delegates to the proven `view --zombie-agents` and
+/// `team prune` handlers so behavior (and their guards) stay in one place:
+///   --zombie-agents  preview orphaned agent panes; with --fix/--yes, kill them
+///   --teams          prune empty/inactive team registry dirs (always safe)
+/// With no scope flag, both run. `maw cleanup --zombie-agents --fix` and
+/// `maw cleanup --teams --yes` are the documented L1 daily-loop invocations.
+fn run_cleanup_command(argv: &[String]) -> CliOutput {
+    let (mut zombie, mut teams, mut apply) = (false, false, false);
+    for arg in argv {
+        match arg.as_str() {
+            "--zombie-agents" | "--zombies" => zombie = true,
+            "--teams" => teams = true,
+            "--fix" | "--yes" | "-y" => apply = true,
+            "--help" | "-h" => {
+                return CliOutput { code: 0, stdout: format!("{CLEANUP_USAGE}\n"), stderr: String::new() };
+            }
+            other => {
+                return CliOutput {
+                    code: 2,
+                    stdout: String::new(),
+                    stderr: format!("cleanup: unexpected argument {other}\n{CLEANUP_USAGE}\n"),
+                };
+            }
+        }
     }
+    if !zombie && !teams {
+        zombie = true;
+        teams = true;
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut code = 0;
+    if zombie {
+        let mut view_args = vec!["--zombie-agents".to_owned()];
+        if apply {
+            view_args.push("--yes".to_owned());
+        }
+        let result = view_run_command(&view_args);
+        stdout.push_str(&result.stdout);
+        stderr.push_str(&result.stderr);
+        if result.code != 0 {
+            code = result.code;
+        }
+    }
+    if teams {
+        let result = team_run_command(&["prune".to_owned()]);
+        stdout.push_str(&result.stdout);
+        stderr.push_str(&result.stderr);
+        if result.code != 0 {
+            code = result.code;
+        }
+    }
+    CliOutput { code, stdout, stderr }
 }
 
 fn learn_parse(argv: &[String]) -> Result<LearnOptions, String> {
@@ -315,14 +360,18 @@ mod missing_cmds_tests291 {
 
     #[test]
     fn cleanup_refuses_nonzero_without_delegation_text() {
-        // cleanup is still fail-closed; project and park are now native.
+        // cleanup is now NATIVE (delegates in-process to view/team, never to
+        // maw-js): an unknown flag is refused with a nonzero usage error, not a
+        // "port pending" stub and never a maw-js delegation.
         let output = run_cli(&args(&["cleanup", "--anything"]));
-        assert_eq!(output.code, 1, "cleanup");
+        assert_eq!(output.code, 2, "cleanup");
         assert!(output.stdout.is_empty(), "cleanup: stdout={}", output.stdout);
-        assert_eq!(
-            output.stderr,
-            "cleanup not yet native in maw-rs — port pending; use maw-js for now\n",
+        assert!(
+            output.stderr.contains("unexpected argument --anything"),
+            "cleanup: stderr={}",
+            output.stderr
         );
+        assert!(!output.stderr.contains("port pending"));
         assert!(!output.stdout.contains("DELEGATED-MAW"));
         assert!(!output.stderr.contains("DELEGATED-MAW"));
         assert!(!output.stdout.contains("bun"));
@@ -538,16 +587,29 @@ mod missing_cmds_tests291 {
         );
         std::env::set_var("MAW_JS_REF_DIR", "/nonexistent");
 
+        // NOTE: `cleanup` is intentionally excluded — it is now native (delegates
+        // in-process to view --zombie-agents + team prune), not a fail-closed stub.
         for argv in [
             args(&["learn", "owner/repo", "--deep"]),
             args(&["project"]),
             args(&["park"]),
-            args(&["cleanup"]),
         ] {
             let output = run_cli(&argv);
             let combined = format!("{}{}", output.stdout, output.stderr);
             assert!(!combined.contains("DELEGATED-MAW"), "argv={argv:?}");
             assert!(!combined.contains("bun"), "argv={argv:?}");
         }
+    }
+
+    #[test]
+    fn cleanup_parses_flags_and_rejects_unknown() {
+        // Hermetic: exercises the arg contract without touching tmux/teams state.
+        let help = run_cleanup_command(&["--help".to_owned()]);
+        assert_eq!(help.code, 0);
+        assert!(help.stdout.contains("usage: maw cleanup"), "{}", help.stdout);
+
+        let bad = run_cleanup_command(&["--bogus".to_owned()]);
+        assert_eq!(bad.code, 2);
+        assert!(bad.stderr.contains("unexpected argument --bogus"), "{}", bad.stderr);
     }
 }

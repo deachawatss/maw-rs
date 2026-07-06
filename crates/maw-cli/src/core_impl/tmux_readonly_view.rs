@@ -34,7 +34,7 @@ struct ViewPaneRef { id: String, command: String, target: String, title: String 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ViewZombiePane { pane_id: String, info: String }
 
-fn view_run_command(argv: &[String]) -> CliOutput {
+pub(crate) fn view_run_command(argv: &[String]) -> CliOutput {
     match view_run_with_runner(argv, &mut maw_tmux::CommandTmuxRunner::new()) {
         Ok(output) | Err(output) => output,
     }
