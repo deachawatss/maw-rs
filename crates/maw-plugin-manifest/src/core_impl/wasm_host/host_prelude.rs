@@ -215,4 +215,6 @@ pub struct MawWasmHost {
     http_resolver_overrides: BTreeMap<String, Vec<IpAddr>>,
     cwd: Option<String>,
     home: Option<String>,
+    vault_root: Option<PathBuf>,
+    config_root: Option<PathBuf>,
 }
