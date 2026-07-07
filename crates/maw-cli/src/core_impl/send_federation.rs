@@ -527,7 +527,7 @@ fn send_local_message(
     from: Option<&str>,
 ) -> CliOutput {
     let outbound = format_local_hey_message(text, config, sender_oracle, from);
-    if let Err(error) = tmux.send_text(target, &outbound) {
+    if let Err(error) = tmux.send_text_ungated(target, &outbound) {
         return CliOutput {
             code: 1,
             stdout: String::new(),

@@ -139,7 +139,7 @@ fn talkto_local(
             return talkto_saved_or_error(&format!("no active Claude session in {pane} (use --force)"), thread);
         }
     }
-    if let Err(error) = tmux.send_text(&pane, notification) { return talkto_send_error(&format!("tmux send-text failed: {error}"), thread); }
+    if let Err(error) = tmux.send_text_ungated(&pane, notification) { return talkto_send_error(&format!("tmux send-text failed: {error}"), thread); }
     let _ = talkto_append_log(&args.recipient, &pane, &args.message, thread);
     CliOutput { code: 0, stdout: format!("✓ thread #{} + sent → {pane}\n", thread.map_or("?".to_owned(), |item| item.id.to_string())), stderr: talkto_thread_stub_warning(thread) }
 }

@@ -113,6 +113,29 @@ where
     }
 }
 
+/// Send text without polling for prompt readiness first.
+///
+/// Use for oracle-to-oracle `maw hey` delivery where the target (Claude Code / Codex)
+/// queues user input even while the model is generating.  Skips the readiness gate
+/// but retains copy-mode exit, buffer/paste mechanics, and submit-confirm.
+///
+/// # Errors
+///
+/// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
+pub fn send_text_ungated_with_sleeper<R, F>(
+    client: &mut TmuxClient<R>,
+    target: &str,
+    text: &str,
+    config: SubmitConfig,
+    sleep: F,
+) -> Result<SendTextReport, TmuxError>
+where
+    R: TmuxRunner,
+    F: FnMut(Duration),
+{
+    send_text_body_with_sleeper(client, target, text, config, sleep)
+}
+
 /// Poll a pane until its last non-empty captured line shows a prompt.
 ///
 /// # Errors

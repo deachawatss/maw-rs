@@ -224,7 +224,7 @@ impl DoneRuntime for DoneLocal {
 
     fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         done_validate_tmux_target(target)?;
-        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.message)
+        TmuxClient::local().send_text_ungated(target, text).map(|_| ()).map_err(|error| error.message)
     }
 
     fn done_git(&mut self, args: &[String]) -> Result<String, String> { done_git(args) }

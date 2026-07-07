@@ -112,6 +112,18 @@ where
         self.send_text_with_config_and_sleeper(target, text, config, std::thread::sleep)
     }
 
+    /// Ungated text sending: skips readiness polling, retains paste + submit-confirm.
+    ///
+    /// Use for `maw hey` local delivery where the target oracle queues input while busy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first tmux error from mode exit, text placement, paste, or Enter send.
+    pub fn send_text_ungated(&mut self, target: &str, text: &str) -> Result<SendTextReport, TmuxError> {
+        let config = wind_delivery::submit_config_for_target(self, target);
+        wind_delivery::send_text_ungated_with_sleeper(self, target, text, config, std::thread::sleep)
+    }
+
     /// Smart text sending with explicit engine timing.
     ///
     /// # Errors

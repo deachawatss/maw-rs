@@ -34,7 +34,7 @@ impl BroadcastTmux for BroadcastLocalTmux {
 
     fn broadcast_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         broadcast_validate_tmux_target(target)?;
-        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.message)
+        TmuxClient::local().send_text_ungated(target, text).map(|_| ()).map_err(|error| error.message)
     }
 }
 
