@@ -464,10 +464,21 @@ fn run_plugin_gate(command: &str, argv: &[String]) -> Option<CliOutput> {
         let ctx = InvokeContext::new(InvokeSource::Cli, argv.to_vec());
         let result = invoke_plugin(plugin, &ctx, &mut runtime);
         if !result.ok {
+            // A gate is fail-closed: if the plugin blocks (or its wasm crashes)
+            // the native command does not run. Always name the plugin so a
+            // bricked verb is diagnosable — a crash can leave `error` empty,
+            // which would otherwise surface as a bare exit-1 with no message.
+            let stderr = match result.error {
+                Some(error) if !error.trim().is_empty() => error,
+                _ => format!(
+                    "maw: '{command}' blocked by gate plugin '{}' (no message; the plugin returned failure or its wasm errored)\n",
+                    plugin.manifest.name
+                ),
+            };
             return Some(CliOutput {
                 code: 1,
                 stdout: result.output.unwrap_or_default(),
-                stderr: result.error.unwrap_or_default(),
+                stderr,
             });
         }
         if let Some(output) = result.output {

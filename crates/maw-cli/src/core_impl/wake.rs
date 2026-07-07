@@ -252,7 +252,7 @@ fn wake_parse_value_arg(argv: &[String], index: usize, options: &mut WakeOptions
         "--peer" | "--from" => { wake_set_peer_or_from(options, arg, &wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--layout" => { options.layout = Some(wake_take_value(argv, index, "--layout", wake_validate_layout)?); 2 }
         "--snapshot" => { options.snapshot = Some(wake_take_value(argv, index, "--snapshot", wake_validate_target_value)?); 2 }
-        "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
+        "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_engine_value)?); 2 }
         "--name" => { options.name = Some(wake_take_value(argv, index, "--name", wake_validate_slug)?); 2 }
         "--repo-path" => { options.repo_path = Some(std::path::PathBuf::from(wake_take_value(argv, index, "--repo-path", wake_validate_target_value)?)); 2 }
         _ => return wake_parse_equals_arg(arg, options),
@@ -284,7 +284,7 @@ fn wake_equals_setters() -> Vec<(&'static str, WakeEqualsSetter)> {
         ("--from=", |o, v| { wake_validate_target_value(v, "--from")?; o.from = Some(v.to_owned()); Ok(()) }),
         ("--layout=", |o, v| { wake_validate_layout(v, "--layout")?; o.layout = Some(v.to_owned()); Ok(()) }),
         ("--snapshot=", |o, v| { wake_validate_target_value(v, "--snapshot")?; o.snapshot = Some(v.to_owned()); Ok(()) }),
-        ("--engine=", |o, v| { wake_validate_target_value(v, "--engine")?; o.engine = Some(v.to_owned()); Ok(()) }),
+        ("--engine=", |o, v| { wake_validate_engine_value(v, "--engine")?; o.engine = Some(v.to_owned()); Ok(()) }),
         ("--name=", |o, v| { wake_validate_slug(v, "--name")?; o.name = Some(v.to_owned()); Ok(()) }),
     ]
 }
@@ -373,6 +373,23 @@ fn wake_help_value_flags() -> &'static [&'static str] {
 fn wake_validate_target_value(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.starts_with('-') { return Err(format!("wake: {label} must not start with '-'")); }
     if value.contains('\0') || value.contains('\n') || value.contains('\r') { return Err(format!("wake: invalid {label}")); }
+    Ok(())
+}
+
+/// Validate an `-e/--engine` value. The engine name is resolved to a shell
+/// command and interpolated UNQUOTED into the pane command in `wake_command`
+/// (config commands may legitimately contain spaces/flags, so the value can't
+/// be blanket-quoted). An engine *name* is always a simple identifier, so
+/// restrict it to `[A-Za-z0-9._:-]` — this blocks `;`, spaces, `$()`, backticks
+/// and other shell metacharacters that would otherwise inject into the pane
+/// (e.g. `maw wake x -e 'codex; touch PWNED'`).
+fn wake_validate_engine_value(value: &str, label: &str) -> Result<(), String> {
+    wake_validate_target_value(value, label)?;
+    if !value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':')) {
+        return Err(format!(
+            "wake: invalid {label} '{value}': engine name resolves to a shell command; only [A-Za-z0-9._:-] allowed"
+        ));
+    }
     Ok(())
 }
 
@@ -884,6 +901,40 @@ mod wake_tests {
             );
             assert_eq!(wake_resolve_engine_command("codex"), "codex");
         });
+    }
+
+    #[test]
+    fn wake_engine_rejects_shell_injection_but_accepts_identifiers() {
+        // The engine name is interpolated UNQUOTED into the pane command in
+        // wake_command; a metacharacter-bearing value would inject. The parser
+        // must reject it (both `-e X` and `--engine=X` forms) while still
+        // accepting real engine identifiers.
+        for good in ["codex", "claude", "omx-1", "default", "gpt.5", "e:1"] {
+            assert_eq!(
+                wake_parse_args(&wake_strings(&["neo", "-e", good]))
+                    .unwrap_or_else(|error| panic!("'{good}' should parse: {error}"))
+                    .engine
+                    .as_deref(),
+                Some(good)
+            );
+        }
+        for evil in [
+            "codex; touch PWNED",
+            "codex && rm -rf x",
+            "codex`id`",
+            "$(id)",
+            "codex|cat",
+            "codex x",
+        ] {
+            let err = wake_parse_args(&wake_strings(&["neo", "-e", evil]))
+                .expect_err(&format!("'{evil}' must be rejected"));
+            assert!(err.contains("engine"), "unexpected error for '{evil}': {err}");
+            let equals = format!("--engine={evil}");
+            assert!(
+                wake_parse_args(&wake_strings(&["neo", &equals])).is_err(),
+                "'{equals}' must be rejected"
+            );
+        }
     }
 
     #[test]

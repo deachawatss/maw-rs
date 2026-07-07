@@ -81,11 +81,23 @@ fn status_psi_path(line: &str) -> Option<PathBuf> {
 }
 
 fn collect_psi_source(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    if path.is_file() {
+    // lstat, never stat: a symlink must NOT be followed. A planted
+    // `ψ/leak -> ~/.ssh/id_rsa` (or any link outside the worktree) would
+    // otherwise be dereferenced and its target's contents copied into the
+    // main repo ψ/ — data exfiltration. Skipping symlinks also removes the
+    // symlink-cycle infinite-recursion risk. ψ/ holds regular memory files.
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Ok(());
+    }
+    if file_type.is_file() {
         out.push(path.to_path_buf());
         return Ok(());
     }
-    if !path.is_dir() {
+    if !file_type.is_dir() {
         return Ok(());
     }
     let entries = std::fs::read_dir(path)

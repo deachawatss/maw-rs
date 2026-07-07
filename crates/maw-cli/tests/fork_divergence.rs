@@ -59,7 +59,11 @@ case "$*" in
 ' "$DONE_WORKTREE"; fi ;;
   *"worktree list --porcelain"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf 'worktree %s
 ' "$DONE_WORKTREE"; fi ;;
-  *"status --porcelain -- ψ/"*) if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
+  *"status --porcelain -- ψ/"*)
+    if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
+'; fi
+    if [ "$DONE_STATUS_PSI" = "symlink" ]; then printf '?? ψ/note.md
+?? ψ/leak.md
 '; fi ;;
   *) exit 0 ;;
 esac
@@ -177,6 +181,56 @@ esac
             std::fs::read_to_string(&rescued[0]).expect("rescued file"),
             "worktree copy"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn psi_rescue_skips_symlinks_and_does_not_exfiltrate() {
+        // Security: a worktree ψ/ symlink pointing outside the worktree (e.g. a
+        // planted `ψ/leak.md -> ~/.ssh/id_rsa`) MUST NOT be dereferenced and its
+        // target's contents copied into the main repo ψ/. Real files are still
+        // rescued; the symlink is skipped.
+        let _guard = env_lock().lock().expect("env lock");
+        let root = unique_root("psi-symlink");
+        let bin = root.join("bin");
+        let main = root.join("main");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        write_fake_git(&bin);
+        write_file(&root.join("secret/id_rsa"), "TOP SECRET KEY MATERIAL");
+        write_file(&worktree.join("ψ/note.md"), "real memory worth keeping");
+        std::os::unix::fs::symlink(root.join("secret/id_rsa"), worktree.join("ψ/leak.md"))
+            .expect("plant symlink");
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("DONE_MAIN", &main);
+        std::env::set_var("DONE_STATUS_PSI", "symlink");
+        std::env::set_var("DONE_GIT_LOG", root.join("git.log"));
+
+        let rescued = rescue_psi(&worktree, &main).expect("rescue ok");
+        let names: Vec<String> = rescued
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned))
+            .collect();
+        assert!(
+            names.iter().any(|name| name.starts_with("note")),
+            "real file must be rescued: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("leak")),
+            "symlink must NOT be rescued: {names:?}"
+        );
+        assert!(
+            !main.join("ψ/leak.md").exists(),
+            "symlink target must not be materialized in main ψ/"
+        );
+        for path in &rescued {
+            assert!(
+                !std::fs::read_to_string(path).unwrap_or_default().contains("TOP SECRET"),
+                "secret content exfiltrated into {}",
+                path.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
