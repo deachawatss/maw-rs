@@ -4,4 +4,4 @@
   [90mmodel: gpt-5.5[0m
   [90mprompt: <ROOT>/psi/memory/mailbox/teams/alpha/builder-spawn-prompt.md[0m
 
-  [36mRun:[0m <BIN> wake builder --no-attach --session alpha -e codex --repo-path <ROOT>/agents/builder
+  [36mRun:[0m <BIN> wake builder --no-attach --session alpha -e codex --repo-path <ROOT>/agents/builder --prompt 'Ship now'

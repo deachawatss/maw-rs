@@ -55,7 +55,15 @@ case "$*" in
 ' ;;
   *"rev-parse --git-common-dir"*) printf '%s/.git
 ' "$DONE_MAIN" ;;
-  *"status --porcelain -- ψ/"*) if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
+  *"rev-parse --show-toplevel"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf '%s
+' "$DONE_WORKTREE"; fi ;;
+  *"worktree list --porcelain"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf 'worktree %s
+' "$DONE_WORKTREE"; fi ;;
+  *"status --porcelain -- ψ/"*)
+    if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
+'; fi
+    if [ "$DONE_STATUS_PSI" = "symlink" ]; then printf '?? ψ/note.md
+?? ψ/leak.md
 '; fi ;;
   *) exit 0 ;;
 esac
@@ -172,6 +180,86 @@ esac
         assert_eq!(
             std::fs::read_to_string(&rescued[0]).expect("rescued file"),
             "worktree copy"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn psi_rescue_skips_symlinks_and_does_not_exfiltrate() {
+        // Security: a worktree ψ/ symlink pointing outside the worktree (e.g. a
+        // planted `ψ/leak.md -> ~/.ssh/id_rsa`) MUST NOT be dereferenced and its
+        // target's contents copied into the main repo ψ/. Real files are still
+        // rescued; the symlink is skipped.
+        let _guard = env_lock().lock().expect("env lock");
+        let root = unique_root("psi-symlink");
+        let bin = root.join("bin");
+        let main = root.join("main");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        write_fake_git(&bin);
+        write_file(&root.join("secret/id_rsa"), "TOP SECRET KEY MATERIAL");
+        write_file(&worktree.join("ψ/note.md"), "real memory worth keeping");
+        std::os::unix::fs::symlink(root.join("secret/id_rsa"), worktree.join("ψ/leak.md"))
+            .expect("plant symlink");
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("DONE_MAIN", &main);
+        std::env::set_var("DONE_STATUS_PSI", "symlink");
+        std::env::set_var("DONE_GIT_LOG", root.join("git.log"));
+
+        let rescued = rescue_psi(&worktree, &main).expect("rescue ok");
+        let names: Vec<String> = rescued
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned))
+            .collect();
+        assert!(
+            names.iter().any(|name| name.starts_with("note")),
+            "real file must be rescued: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.starts_with("leak")),
+            "symlink must NOT be rescued: {names:?}"
+        );
+        assert!(
+            !main.join("ψ/leak.md").exists(),
+            "symlink target must not be materialized in main ψ/"
+        );
+        for path in &rescued {
+            assert!(
+                !std::fs::read_to_string(path).unwrap_or_default().contains("TOP SECRET"),
+                "secret content exfiltrated into {}",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn done_rescues_uncommitted_psi_through_compiled_binary() {
+        // Wiring guard (not the isolated rescue_psi unit test above): the compiled
+        // `maw done` MUST rescue uncommitted ψ/ notes to main BEFORE it removes the
+        // worktree / force-deletes the branch. Drives the real binary end-to-end.
+        let (root, bin, main, worktree) = seed_done_fixture("psi-wire");
+        // Fake git reports ψ/test.md as uncommitted (DONE_STATUS_PSI=test); the
+        // physical file must exist in the worktree for rescue_psi to copy it.
+        write_file(&worktree.join("ψ/test.md"), "worktree note worth keeping");
+        let output = done_command(&root, &bin, &main, &worktree)
+            .env("DONE_STATUS_PSI", "test")
+            .env("DONE_FAKE_WORKTREE", "1")
+            .args(["done", "task-done", "--worktree", worktree.to_str().expect("worktree utf8")])
+            .output()
+            .expect("run done");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("rescued"), "expected rescue line; stdout={stdout}");
+        // main had no ψ/test.md, so it is copied there verbatim before removal.
+        assert_eq!(
+            std::fs::read_to_string(main.join("ψ/test.md")).expect("rescued main file"),
+            "worktree note worth keeping"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -493,6 +581,47 @@ exit 9
 
         assert_success(&output);
         assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo -l codex exec"));
+    }
+
+    #[test]
+    fn fresh_worktree_sanitizes_stale_state() {
+        // Wiring guard: --fresh must scrub the stale .maw session markers the fake
+        // `git worktree add` seeds, proving sanitize_fresh_worktree is wired (was
+        // dead code under #![allow(dead_code)]).
+        let root = temp_dir("fresh-sanitize");
+        let bin_dir = seed_root(&root, Some(r#"{"commands":{"default":"claude"}}"#));
+        let output = run(&root, &bin_dir, &["workon", "demo", "feat", "--fresh"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("sanitized fresh worktree"), "expected sanitize line; stdout={stdout}");
+        assert!(stdout.contains(".maw/phase.json"), "should scrub stale phase.json; stdout={stdout}");
+        assert!(stdout.contains(".git/index.lock"), "should scrub stale index.lock; stdout={stdout}");
+    }
+
+    #[test]
+    fn untrusted_engine_warns_and_trusted_does_not() {
+        // Wiring guard: prepare_engine's trust warning must reach stdout for a
+        // non-Claude engine on an untrusted repo, and stay silent when trusted.
+        let untrusted_root = temp_dir("engine-untrusted");
+        let bin_dir = seed_root(
+            &untrusted_root,
+            Some(r#"{"commands":{"default":"codex exec"},"trustedRepos":["acme/other"]}"#),
+        );
+        let output = run(&untrusted_root, &bin_dir, &["workon", "demo"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("not trusted"), "expected trust warning; stdout={stdout}");
+        assert!(stdout.contains("codex"), "warning names the engine; stdout={stdout}");
+
+        let trusted_root = temp_dir("engine-trusted");
+        let bin_dir = seed_root(
+            &trusted_root,
+            Some(r#"{"commands":{"default":"codex exec"},"trustedRepos":["acme/demo"]}"#),
+        );
+        let output = run(&trusted_root, &bin_dir, &["workon", "demo"]);
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("not trusted"), "trusted repo must not warn; stdout={stdout}");
     }
 
     #[test]

@@ -328,8 +328,18 @@ pub fn run_cli(argv: &[String]) -> CliOutput {
     };
 
     match dispatcher_target(command) {
-        DispatchTarget::Native(handler) => handler(&argv[1..]),
-        DispatchTarget::AsyncNative(handler) => run_async_handler_blocking(handler, &argv[1..]),
+        DispatchTarget::Native(handler) => {
+            if let Some(gate_output) = run_plugin_gate(command, argv) {
+                return gate_output;
+            }
+            handler(&argv[1..])
+        }
+        DispatchTarget::AsyncNative(handler) => {
+            if let Some(gate_output) = run_plugin_gate(command, argv) {
+                return gate_output;
+            }
+            run_async_handler_blocking(handler, &argv[1..])
+        }
         DispatchTarget::UnknownCommand => dispatch_cli_plugin_or_unknown(argv, command),
     }
 }
@@ -346,8 +356,18 @@ pub async fn run_cli_async(argv: &[String]) -> CliOutput {
     };
 
     match dispatcher_target(command) {
-        DispatchTarget::Native(handler) => handler(&argv[1..]),
-        DispatchTarget::AsyncNative(handler) => handler(argv[1..].to_vec()).await,
+        DispatchTarget::Native(handler) => {
+            if let Some(gate_output) = run_plugin_gate(command, argv) {
+                return gate_output;
+            }
+            handler(&argv[1..])
+        }
+        DispatchTarget::AsyncNative(handler) => {
+            if let Some(gate_output) = run_plugin_gate(command, argv) {
+                return gate_output;
+            }
+            handler(argv[1..].to_vec()).await
+        }
         DispatchTarget::UnknownCommand => dispatch_cli_plugin_or_unknown(argv, command),
     }
 }
@@ -409,6 +429,110 @@ fn unknown_command(command: &str) -> CliOutput {
         code: 2,
         stdout: String::new(),
         stderr: format!("maw-rs: unknown command '{command}'\nsee maw-rs --help\n"),
+    }
+}
+
+/// Run plugin gate hooks for a built-in command before its native handler.
+///
+/// Plugins declaring `hooks.gate: ["cmd:<verb>"]` (or `"*"`) in plugin.json can
+/// intercept built-in commands so fork patches live as WASM plugins instead of
+/// core edits — upstream syncs stay clean. Returns `Some(output)` when a gate
+/// plugin intercepts: `ok=false` blocks the command (exit 1); `ok=true` with
+/// non-empty output replaces it (exit 0). Returns `None` (pass-through) when no
+/// gate matches or the plugin returns `ok=true` with no output.
+fn run_plugin_gate(command: &str, argv: &[String]) -> Option<CliOutput> {
+    let options = DiscoverPackagesOptions {
+        runtime_version: "1.0.0".to_owned(),
+        ..DiscoverPackagesOptions::default()
+    };
+    let report = discover_packages(&options);
+    let mut runtime = ExtismWasmInvokeRuntime::default().with_manifest_fs_roots();
+
+    for plugin in report.plugins.iter().filter(|plugin| !plugin.disabled) {
+        let Some(hooks) = &plugin.manifest.hooks else {
+            continue;
+        };
+        let Some(gate_events) = &hooks.gate else {
+            continue;
+        };
+        if !gate_events
+            .iter()
+            .any(|event| plugin_gate_matches(event, command))
+        {
+            continue;
+        }
+        let ctx = InvokeContext::new(InvokeSource::Cli, argv.to_vec());
+        let result = invoke_plugin(plugin, &ctx, &mut runtime);
+        if !result.ok {
+            // A gate is fail-closed: if the plugin blocks (or its wasm crashes)
+            // the native command does not run. Always name the plugin so a
+            // bricked verb is diagnosable — a crash can leave `error` empty,
+            // which would otherwise surface as a bare exit-1 with no message.
+            let stderr = match result.error {
+                Some(error) if !error.trim().is_empty() => error,
+                _ => format!(
+                    "maw: '{command}' blocked by gate plugin '{}' (no message; the plugin returned failure or its wasm errored)\n",
+                    plugin.manifest.name
+                ),
+            };
+            return Some(CliOutput {
+                code: 1,
+                stdout: result.output.unwrap_or_default(),
+                stderr,
+            });
+        }
+        if let Some(output) = result.output {
+            if !output.is_empty() {
+                return Some(CliOutput {
+                    code: 0,
+                    stdout: output,
+                    stderr: result.error.unwrap_or_default(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Match a `hooks.gate` event string against a dispatched command. Supports the
+/// wildcard `"*"`, the `cmd:<verb>` prefix form, and a bare verb name.
+fn plugin_gate_matches(event: &str, command: &str) -> bool {
+    if event == "*" {
+        return true;
+    }
+    if let Some(cmd) = event.strip_prefix("cmd:") {
+        return cmd == command;
+    }
+    event == command
+}
+
+#[cfg(test)]
+mod plugin_gate_tests {
+    use super::plugin_gate_matches;
+
+    #[test]
+    fn wildcard_matches_any_command() {
+        assert!(plugin_gate_matches("*", "workon"));
+        assert!(plugin_gate_matches("*", "done"));
+    }
+
+    #[test]
+    fn cmd_prefix_matches_exact_verb_only() {
+        assert!(plugin_gate_matches("cmd:workon", "workon"));
+        assert!(!plugin_gate_matches("cmd:workon", "workspace"));
+        assert!(!plugin_gate_matches("cmd:workon", "work"));
+    }
+
+    #[test]
+    fn bare_verb_matches_exact_verb_only() {
+        assert!(plugin_gate_matches("done", "done"));
+        assert!(!plugin_gate_matches("done", "done-rescue"));
+    }
+
+    #[test]
+    fn non_matching_events_do_not_match() {
+        assert!(!plugin_gate_matches("cmd:done", "workon"));
+        assert!(!plugin_gate_matches("hey", "workon"));
     }
 }
 

@@ -139,6 +139,11 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
     let pane_info = matched.as_ref().and_then(|window| done_live_pane_info(window, local));
     let selected_worktree = done_select_worktree(target, &target_lower, options, pane_info.as_ref(), local, context, &mut stdout)?;
+    if !options.dry_run {
+        if let Some(worktree) = &selected_worktree {
+            done_rescue_psi_notes(worktree, &mut stdout);
+        }
+    }
     if let Some(window) = &matched {
         if !options.force {
             done_auto_save(window, options, local, pane_info.as_ref(), selected_worktree.as_ref(), &mut stdout);
@@ -497,6 +502,23 @@ fn done_worktree_by_scan(target: &str, repos_root: &std::path::Path, stdout: &mu
     let matches = done_find_worktree_paths(target, repos_root);
     if matches.len() > 1 { let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m refusing to remove worktree '{}' — matches {} repos", target, matches.len()); return None; }
     matches.first().cloned()
+}
+
+fn done_rescue_psi_notes(worktree: &DoneWorktree, stdout: &mut String) {
+    // Copy uncommitted ψ/ brain notes out of the worktree into the owning main
+    // checkout BEFORE auto-save sweeps them into a branch that --clean-branch may
+    // force-delete (git branch -D) before the PR merges — losing the notes to GC.
+    // Never overwrites existing files; best-effort (rescue failure must not block
+    // the rest of `done`).
+    match crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path) {
+        Ok(rescued) if !rescued.is_empty() => {
+            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m rescued {} uncommitted ψ note(s) to main before removal", rescued.len());
+        }
+        Ok(_) => {}
+        Err(error) => {
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m ψ rescue skipped: {error}");
+        }
+    }
 }
 
 fn done_remove_selected_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {

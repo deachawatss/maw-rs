@@ -108,7 +108,23 @@ impl WakeTmuxNative for WakeNativeTmux {
 
     fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         wake_validate_tmux_target(target)?;
-        TmuxClient::local().send_text(target, text).map(|_| ()).map_err(|error| error.to_string())
+        // wake injects the initial engine command into a freshly created shell
+        // pane — no agent is running yet and there is no prompt to poll for, so
+        // the hardened send_text readiness gate (45s timeout) would hang. Keep
+        // the robust delivery shape (bracketed paste-buffer for multi-line/long
+        // briefs so newlines in the engine prompt paste atomically instead of
+        // relying on readline continuation; literal send-keys for short
+        // single-line commands) but submit with a single Enter — no confirm
+        // poll. The readiness gate belongs on the hey/send delivery seam to an
+        // *active* agent, not wake's first inject.
+        let mut tmux = TmuxClient::local();
+        if text.contains('\n') || text.len() > 500 {
+            tmux.load_buffer(text).map_err(|error| error.to_string())?;
+            tmux.paste_buffer(target).map_err(|error| error.to_string())?;
+        } else {
+            tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
+        }
+        tmux.send_enter(target).map_err(|error| error.to_string())
     }
 
     fn wake_select_window(&mut self, target: &str) -> Result<(), String> {
@@ -147,10 +163,48 @@ fn wake_run(argv: &[String], tmux: &mut impl WakeTmuxNative) -> Result<(i32, Str
     if options.list { return Ok((0, wake_render_list(&options, &sessions))); }
     if options.all { return Ok((0, wake_render_all_plan(&options, &sessions))); }
     let resolved = wake_resolve(&options, &sessions)?;
-    if options.dry_run { return Ok((0, wake_render_dry_run(&options, &resolved))); }
+    let note = wake_unimplemented_note(&options).unwrap_or_default();
+    if options.dry_run {
+        return Ok((0, format!("{}{note}", wake_render_dry_run(&options, &resolved))));
+    }
     let mut out = String::new();
     wake_apply(&options, &resolved, tmux, &mut out)?;
+    out.push_str(&note);
     Ok((0, out))
+}
+
+/// Honest-flag guard: several wake flags are parsed and validated but not yet
+/// honored natively (they were silent no-ops — accepted, then ignored, exit 0).
+/// Rather than lie, surface a warning naming exactly what had no effect so the
+/// caller isn't misled, and point worktree flags at the canonical tool.
+fn wake_unimplemented_note(options: &WakeOptionsNative) -> Option<String> {
+    let mut ignored: Vec<&str> = Vec::new();
+    if options.fresh { ignored.push("--fresh"); }
+    if options.from_snapshot { ignored.push("--from-snapshot"); }
+    if options.kill { ignored.push("--kill"); }
+    if options.pick { ignored.push("--pick"); }
+    if options.split { ignored.push("--split"); }
+    if options.bud { ignored.push("--bud"); }
+    if options.wait { ignored.push("--wait"); }
+    if options.solo && !options.main { ignored.push("--solo"); }
+    if options.main { ignored.push("--main"); }
+    if options.snapshot.is_some() { ignored.push("--snapshot"); }
+    if options.issue.is_some() { ignored.push("--issue"); }
+    if options.pr.is_some() { ignored.push("--pr"); }
+
+    let mut lines = Vec::new();
+    if options.wt.is_some() || options.task.is_some() {
+        lines.push(
+            "\x1b[33m⚠\x1b[0m wake --wt/--task names the window but does not create a git worktree; use `maw workon <repo> --wt <slug>` to create one".to_owned(),
+        );
+    }
+    if !ignored.is_empty() {
+        lines.push(format!(
+            "\x1b[33m⚠\x1b[0m wake: ignoring flag(s) not yet native: {} (parsed but no effect)",
+            ignored.join(", ")
+        ));
+    }
+    (!lines.is_empty()).then(|| format!("{}\n", lines.join("\n")))
 }
 
 fn wake_should_use_peer_target(options: &WakeOptionsNative) -> bool {
@@ -198,7 +252,7 @@ fn wake_parse_value_arg(argv: &[String], index: usize, options: &mut WakeOptions
         "--peer" | "--from" => { wake_set_peer_or_from(options, arg, &wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--layout" => { options.layout = Some(wake_take_value(argv, index, "--layout", wake_validate_layout)?); 2 }
         "--snapshot" => { options.snapshot = Some(wake_take_value(argv, index, "--snapshot", wake_validate_target_value)?); 2 }
-        "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
+        "-e" | "--engine" => { options.engine = Some(wake_take_value(argv, index, arg, wake_validate_engine_value)?); 2 }
         "--name" => { options.name = Some(wake_take_value(argv, index, "--name", wake_validate_slug)?); 2 }
         "--repo-path" => { options.repo_path = Some(std::path::PathBuf::from(wake_take_value(argv, index, "--repo-path", wake_validate_target_value)?)); 2 }
         _ => return wake_parse_equals_arg(arg, options),
@@ -230,7 +284,7 @@ fn wake_equals_setters() -> Vec<(&'static str, WakeEqualsSetter)> {
         ("--from=", |o, v| { wake_validate_target_value(v, "--from")?; o.from = Some(v.to_owned()); Ok(()) }),
         ("--layout=", |o, v| { wake_validate_layout(v, "--layout")?; o.layout = Some(v.to_owned()); Ok(()) }),
         ("--snapshot=", |o, v| { wake_validate_target_value(v, "--snapshot")?; o.snapshot = Some(v.to_owned()); Ok(()) }),
-        ("--engine=", |o, v| { wake_validate_target_value(v, "--engine")?; o.engine = Some(v.to_owned()); Ok(()) }),
+        ("--engine=", |o, v| { wake_validate_engine_value(v, "--engine")?; o.engine = Some(v.to_owned()); Ok(()) }),
         ("--name=", |o, v| { wake_validate_slug(v, "--name")?; o.name = Some(v.to_owned()); Ok(()) }),
     ]
 }
@@ -319,6 +373,23 @@ fn wake_help_value_flags() -> &'static [&'static str] {
 fn wake_validate_target_value(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() || value.starts_with('-') { return Err(format!("wake: {label} must not start with '-'")); }
     if value.contains('\0') || value.contains('\n') || value.contains('\r') { return Err(format!("wake: invalid {label}")); }
+    Ok(())
+}
+
+/// Validate an `-e/--engine` value. The engine name is resolved to a shell
+/// command and interpolated UNQUOTED into the pane command in `wake_command`
+/// (config commands may legitimately contain spaces/flags, so the value can't
+/// be blanket-quoted). An engine *name* is always a simple identifier, so
+/// restrict it to `[A-Za-z0-9._:-]` — this blocks `;`, spaces, `$()`, backticks
+/// and other shell metacharacters that would otherwise inject into the pane
+/// (e.g. `maw wake x -e 'codex; touch PWNED'`).
+fn wake_validate_engine_value(value: &str, label: &str) -> Result<(), String> {
+    wake_validate_target_value(value, label)?;
+    if !value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | ':')) {
+        return Err(format!(
+            "wake: invalid {label} '{value}': engine name resolves to a shell command; only [A-Za-z0-9._:-] allowed"
+        ));
+    }
     Ok(())
 }
 
@@ -688,6 +759,29 @@ fn wake_registry_windows(
 mod wake_tests {
     use super::*;
 
+    #[test]
+    fn wake_unimplemented_note_names_ignored_flags_and_is_silent_when_none() {
+        // No no-op flags → no warning (real wakes must stay quiet).
+        assert!(wake_unimplemented_note(&wake_default_options()).is_none());
+
+        // Ignored bool/value flags are named so wake never silently lies.
+        let mut options = wake_default_options();
+        options.fresh = true;
+        options.kill = true;
+        options.snapshot = Some("s1".to_owned());
+        let note = wake_unimplemented_note(&options).expect("note");
+        assert!(note.contains("--fresh"), "{note}");
+        assert!(note.contains("--kill"), "{note}");
+        assert!(note.contains("--snapshot"), "{note}");
+
+        // --wt/--task get the explicit "no worktree created; use workon" guidance.
+        let mut wt_options = wake_default_options();
+        wt_options.wt = Some("slot".to_owned());
+        let wt_note = wake_unimplemented_note(&wt_options).expect("wt note");
+        assert!(wt_note.contains("does not create a git worktree"), "{wt_note}");
+        assert!(wt_note.contains("maw workon"), "{wt_note}");
+    }
+
     #[derive(Default)]
     struct WakeMockTmux {
         sessions: Vec<TmuxSession>,
@@ -807,6 +901,40 @@ mod wake_tests {
             );
             assert_eq!(wake_resolve_engine_command("codex"), "codex");
         });
+    }
+
+    #[test]
+    fn wake_engine_rejects_shell_injection_but_accepts_identifiers() {
+        // The engine name is interpolated UNQUOTED into the pane command in
+        // wake_command; a metacharacter-bearing value would inject. The parser
+        // must reject it (both `-e X` and `--engine=X` forms) while still
+        // accepting real engine identifiers.
+        for good in ["codex", "claude", "omx-1", "default", "gpt.5", "e:1"] {
+            assert_eq!(
+                wake_parse_args(&wake_strings(&["neo", "-e", good]))
+                    .unwrap_or_else(|error| panic!("'{good}' should parse: {error}"))
+                    .engine
+                    .as_deref(),
+                Some(good)
+            );
+        }
+        for evil in [
+            "codex; touch PWNED",
+            "codex && rm -rf x",
+            "codex`id`",
+            "$(id)",
+            "codex|cat",
+            "codex x",
+        ] {
+            let err = wake_parse_args(&wake_strings(&["neo", "-e", evil]))
+                .expect_err(&format!("'{evil}' must be rejected"));
+            assert!(err.contains("engine"), "unexpected error for '{evil}': {err}");
+            let equals = format!("--engine={evil}");
+            assert!(
+                wake_parse_args(&wake_strings(&["neo", &equals])).is_err(),
+                "'{equals}' must be rejected"
+            );
+        }
     }
 
     #[test]

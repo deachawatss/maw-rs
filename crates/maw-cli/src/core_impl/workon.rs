@@ -141,6 +141,14 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
                 engine = Some(value.to_owned());
                 index += 1;
             }
+            "--codex" => {
+                engine = Some("codex".to_owned());
+                index += 1;
+            }
+            "--claude" => {
+                engine = Some("claude".to_owned());
+                index += 1;
+            }
             value if value.starts_with('-') => return Err(workon_usage()),
             value => {
                 positional.push(value.to_owned());
@@ -170,7 +178,7 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>] [--layout nested|legacy]".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--layout nested|legacy]".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
@@ -222,12 +230,39 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.layout)?;
                 let suffix = if branch_exists { ", reused branch" } else { "" };
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
+                // --fresh: scrub stale .maw session state + index.lock + git-clean
+                // untracked cruft so a reused branch doesn't inherit a prior
+                // session's phase/strategy/done markers, and seed CLAUDE.md.
+                if options.fresh {
+                    match crate::wind::workon::sanitize_fresh_worktree(&repo.repo_path, &wt_path) {
+                        Ok(cleaned) if !cleaned.is_empty() => {
+                            let _ = writeln!(stdout, "\x1b[32m+\x1b[0m sanitized fresh worktree ({})", cleaned.join(", "));
+                        }
+                        Ok(_) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 target_path = wt_path;
             }
         }
         window_name = format!("{}-{}", repo.repo_name, request.slug);
     } else if native_repo_path_is_oracle(&repo.repo_path, &repo.repo_name) {
         taskless_oracle = true;
+    }
+
+    // Engine trust gate: resolve the engine that will actually run in this window
+    // and warn when a non-Claude engine is used on an untrusted repo (Claude hook
+    // gates may not apply), recording the choice into .maw/strategy.json when a
+    // strategy record exists. Best-effort — never block workon on it.
+    match crate::wind::workon::prepare_engine(&window_name, &target_path) {
+        Ok(resolution) => {
+            if let Some(warning) = resolution.warning {
+                let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {warning}");
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: engine trust check skipped: {error}");
+        }
     }
 
     if std::env::var_os("TMUX").is_some() {
@@ -909,6 +944,24 @@ mod workon_tests {
         assert!(parsed.fresh);
         assert_eq!(parsed.engine.as_deref(), Some("codex"));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "--wt", "other"])).is_err());
+    }
+
+    #[test]
+    fn workon_engine_flags_resolve_shorthands_and_explicit() {
+        // --codex / --claude shorthands map to the engine name (native ownership
+        // of engine resolution; the workon-engine WASM plugin is a reference only).
+        let codex = workon_parse_args(&workon_strings(&["repo", "--wt", "--codex"])).expect("codex");
+        assert_eq!(codex.engine.as_deref(), Some("codex"));
+        let claude = workon_parse_args(&workon_strings(&["repo", "--wt", "--claude"])).expect("claude");
+        assert_eq!(claude.engine.as_deref(), Some("claude"));
+        // Explicit -e/--engine forms still work and equal the shorthand result.
+        let explicit = workon_parse_args(&workon_strings(&["repo", "--wt", "--engine", "codex"])).expect("explicit");
+        assert_eq!(explicit.engine.as_deref(), Some("codex"));
+        let eq = workon_parse_args(&workon_strings(&["repo", "--wt", "--engine=claude"])).expect("eq");
+        assert_eq!(eq.engine.as_deref(), Some("claude"));
+        // Usage advertises the shorthands.
+        assert!(workon_usage().contains("--codex"));
+        assert!(workon_usage().contains("--claude"));
     }
 
     #[test]

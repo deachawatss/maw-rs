@@ -176,6 +176,49 @@ fn team_t5_spawn_exec_uses_fake_spawn_runner_no_shell_shape() {
 }
 
 #[test]
+fn team_t5_spawn_exec_delivers_prompt_to_worker_via_wake() {
+    // Wiring guard: the TEAM fan-out brief MUST reach the spawned worker. This
+    // asserts the compiled `maw team spawn ... --exec --prompt` forwards --prompt
+    // to the wake child (which delivers it as the engine command arg), not just
+    // that a pure helper builds the right vec. Without the wiring, workers boot
+    // blank with the brief unread on disk.
+    let root = temp_dir("spawn-exec-prompt");
+    fs::create_dir_all(root.join("agents/builder")).expect("builder dir");
+    create_team(&root, "alpha");
+    let log = root.join("spawn.jsonl");
+    let output = run_fake_exec(
+        &[
+            "team", "spawn", "alpha", "builder", "--engine", "codex", "--cwd",
+            "agents/builder", "--exec", "--prompt", "Issue #42: ship the widget",
+        ],
+        &root,
+        &log,
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = fs::read_to_string(&log).expect("spawn log");
+    let json: serde_json::Value = serde_json::from_str(line.trim()).expect("json log");
+    let args: Vec<&str> = json["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    let prompt_pos = args
+        .iter()
+        .position(|v| *v == "--prompt")
+        .expect("wake invocation must carry --prompt");
+    assert_eq!(
+        args.get(prompt_pos + 1).copied(),
+        Some("Issue #42: ship the widget"),
+        "brief must be delivered verbatim to the worker; args={args:?}"
+    );
+}
+
+#[test]
 fn team_t5_spawn_from_governance_blocks_then_approved_execs() {
     let root = temp_dir("spawn-from");
     let charter = write_charter(&root);

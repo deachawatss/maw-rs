@@ -92,7 +92,7 @@ struct TeamCharterMember122 {
     branch: Option<String>,
 }
 
-fn team_run_command(argv: &[String]) -> CliOutput {
+pub(crate) fn team_run_command(argv: &[String]) -> CliOutput {
     if wants_help_before_positionals(argv, &[]) {
         return help_output(TEAM_USAGE);
     }

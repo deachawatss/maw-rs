@@ -1,7 +1,7 @@
 {
   "name": "workon-engine",
   "version": "0.1.0",
-  "description": "Fork patch: adds --engine/--codex/--claude flags to maw workon",
+  "description": "Reference gate plugin — demonstrates the hooks.gate CLI-interception contract (block/replace/passthrough). Engine resolution for workon is owned natively; this is an example only.",
   "sdk": "*",
   "entry": { "kind": "wasm", "path": "plugin.wasm", "export": "handle" },
   "capabilities": [
