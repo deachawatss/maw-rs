@@ -143,6 +143,7 @@ fn token_dispatch(argv: &[String], runner: &mut dyn TokenRunner) -> Result<Token
         "save" => token_cmd_save(&parsed, runner),
         "load" => token_cmd_load(&parsed, runner),
         "scan" => token_cmd_scan(runner).map(token_ok),
+        _ if parsed.positionals.len() == 1 => token_cmd_use_name(sub, &parsed, runner),
         _ => Ok(TokenCommandResult { ok: false, stdout: format!("{}\n", token_help()) }),
     }
 }
@@ -206,6 +207,10 @@ fn token_cmd_use(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Token
         let list = token_cmd_list(runner)?;
         return Ok(token_ok(format!("{list}Usage: maw token use <name> [--no-team]\n")));
     };
+    token_cmd_use_name(name, args, runner)
+}
+
+fn token_cmd_use_name(name: &str, args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
     token_validate_name("token name", name)?;
     let pass_path = format!("{TOKEN_TOKEN_PREFIX}{name}");
     if !token_pass_exists(runner, &pass_path) { return Err(format!("token \"{name}\" not found in pass ({pass_path})")); }
@@ -274,7 +279,7 @@ fn token_error(message: &str) -> CliOutput {
 }
 
 fn token_help() -> &'static str {
-    "usage: maw token <list|use|current|save|load|scan> [...]\n  list                                  — list vault tokens + saved .envrcs (active marked)\n  use <name> [--no-team]                — switch active Claude token in local .envrc\n  current                               — print active token name (for statuslines)\n  save [name] [-f|--force]              — save .envrc to pass vault (default name = cwd basename)\n  load [name] [-f|--force]              — restore .envrc from pass vault + direnv allow\n  scan                                  — scan ghq repos, map tokens to oracles\n\naliases:\n  tokens                                — same as `list`\n  ls                                    — same as `list`\n\nsecurity: token values are never printed, logged, or stored outside\n          memory. See README.md for the full threat model."
+    "usage: maw token [<name>|<list|use|current|save|load|scan>] [...]\n  <name> [--no-team]                    — shortcut for `use <name>`\n  list                                  — list vault tokens + saved .envrcs (active marked)\n  use <name> [--no-team]                — switch active Claude token in local .envrc\n  current                               — print active token name (for statuslines)\n  save [name] [-f|--force]              — save .envrc to pass vault (default name = cwd basename)\n  load [name] [-f|--force]              — restore .envrc from pass vault + direnv allow\n  scan                                  — scan ghq repos, map tokens to oracles\n\naliases:\n  tokens                                — same as `list`\n  ls                                    — same as `list`\n\nsecurity: token values are never printed, logged, or stored outside\n          memory. See README.md for the full threat model."
 }
 
 fn token_current() -> Option<String> {

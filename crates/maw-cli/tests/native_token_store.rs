@@ -103,6 +103,34 @@ fn epic55_token_use_writes_reference_atomically_without_value() {
 }
 
 #[test]
+fn epic55_token_name_shorthand_switches_active_account() {
+    let root = epic55_temp_dir("shorthand");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(&cwd).expect("cwd");
+    fs::write(cwd.join(".envrc"), "export KEEP_ME=1\n").expect("old envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "pym", "--no-team"]);
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout"),
+        include_str!("fixtures/epic55/token-use.stdout")
+    );
+    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+    let envrc = fs::read_to_string(cwd.join(".envrc")).expect("envrc");
+    assert!(envrc.contains("export KEEP_ME=1"));
+    assert!(envrc.contains("export CLAUDE_TOKEN_NAME=\"pym\""));
+    assert!(envrc.contains("export CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-pym)\""));
+    assert!(!envrc.contains(SECRET_VALUE));
+    assert!(!envrc.contains("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"));
+}
+
+#[test]
 fn epic55_token_save_transits_envrc_via_pass_stdin_and_hides_pass_failures() {
     let root = epic55_temp_dir("save");
     epic55_seed_fake_pass(&root);
