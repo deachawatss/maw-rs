@@ -1,2 +1,3 @@
 [32m+[0m worktree: <ROOT>/ghq/github.com/acme/demo/agents/feat (agents/feat)
+[33m⚠[0m non-Claude engine 'echo' is not trusted for acme/demo; Claude hook gates may not apply
 [32m✅[0m workon 'demo-feat' in 50-mawjs → <ROOT>/ghq/github.com/acme/demo/agents/feat

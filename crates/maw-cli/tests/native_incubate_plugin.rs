@@ -69,11 +69,18 @@ case "$1" in
   list-windows)
     printf 'widgets|||0|||main|||1|||/tmp\n'
     ;;
-  send-keys)
+  send-keys|load-buffer|paste-buffer)
     exit 0
     ;;
   capture-pane)
-    printf '\n'
+    printf 'user@host ~ $\n'
+    ;;
+  display-message)
+    case "$*" in
+      *pane_in_mode*) printf '0\n' ;;
+      *pane_current_command*) printf 'codex\n' ;;
+      *) printf '\n' ;;
+    esac
     ;;
   *)
     exit 0

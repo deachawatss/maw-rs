@@ -52,17 +52,24 @@ fn broadcast_seed(name: &str) -> (PathBuf, PathBuf, PathBuf) {
 printf '%s\n' "$*" >> "$BROADCAST_TMUX_LOG"
 case "$1" in
   display-message)
-    if [ "$2" = "-p" ]; then printf 'sender-window\n'; exit 0; fi
-    case "$3" in
-      01-alpha:0) printf 'codex\n' ;;
-      01-alpha:1) printf 'bash\n' ;;
-      *) exit 7 ;;
+    case "$*" in
+      *window_name*) printf 'sender-window\n' ;;
+      *pane_in_mode*) printf '0\n' ;;
+      *01-alpha:0*pane_current_command*) printf 'codex\n' ;;
+      *01-alpha:1*pane_current_command*) printf 'bash\n' ;;
+      *) printf 'unknown\n' ;;
     esac
     ;;
   list-windows)
     printf '01-alpha|||0|||neo-oracle|||1|||/tmp\n01-alpha|||1|||shell|||0|||/tmp\n02-beta|||0|||beta-oracle|||0|||/tmp\n99-overview|||0|||watch|||0|||/tmp\n'
     ;;
-  send-keys)
+  list-sessions)
+    printf '01-alpha\n02-beta\n99-overview\n'
+    ;;
+  capture-pane)
+    printf 'user@host ~ $\n'
+    ;;
+  send-keys|load-buffer|paste-buffer)
     exit 0
     ;;
   *) exit 64 ;;

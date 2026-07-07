@@ -31,7 +31,10 @@ fn forwarderror_install_fake_tmux(root: &Path) {
 printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
   capture-pane)
-    printf '%s\n' 'line 1' 'error: boom'
+    case "$*" in
+      *-t\ *) printf '%s\n' 'user@host ~ $' ;;
+      *) printf '%s\n' 'line 1' 'error: boom' ;;
+    esac
     ;;
   list-sessions)
     printf '%s\n' '13-nova'
@@ -39,9 +42,16 @@ case "$1" in
   list-windows)
     printf '%s\n' '13-nova|||0|||nova-oracle|||1|||/tmp'
     ;;
-  send-keys)
+  display-message)
+    case "$*" in
+      *pane_in_mode*) printf '0\n' ;;
+      *pane_current_command*) printf 'codex\n' ;;
+      *) printf '\n' ;;
+    esac
     ;;
-  display-message|split-window|select-layout|kill-pane|notify-send|osascript|curl|ssh)
+  send-keys|load-buffer|paste-buffer)
+    ;;
+  split-window|select-layout|kill-pane|notify-send|osascript|curl|ssh)
     echo "unexpected mutating transport/notifier command: $*" >&2
     exit 44
     ;;
