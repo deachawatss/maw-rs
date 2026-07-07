@@ -165,11 +165,11 @@ fn fork_divergence_hook_keeps_wind_delivery_at_submit_site() {
 #[test]
 fn ungated_send_delivers_even_when_pane_is_busy() {
     let runner = SharedRunner::with_responses(vec![
-        Ok("node"),       // display-message: submit_config_for_target (pane_current_command)
-        Ok("0"),          // display-message: exit_mode_if_needed (pane_in_mode)
-        Ok(""),           // send-keys: literal text
-        Ok(""),           // send-keys: Enter (submit attempt 1)
-        Ok("$ \r"),       // capture-pane: pane_input_pending (submit-confirm — cleared)
+        Ok("node"), // display-message: submit_config_for_target (pane_current_command)
+        Ok("0"),    // display-message: exit_mode_if_needed (pane_in_mode)
+        Ok(""),     // send-keys: literal text
+        Ok(""),     // send-keys: Enter (submit attempt 1)
+        Ok("$ \r"), // capture-pane: pane_input_pending (submit-confirm — cleared)
     ]);
     let state = Rc::clone(&runner.state);
     let mut client = TmuxClient::new(runner);
@@ -182,9 +182,9 @@ fn ungated_send_delivers_even_when_pane_is_busy() {
     assert_eq!(report.enter_attempts, 1);
     let calls = &state.borrow().calls;
     let first_capture = calls.iter().position(|(cmd, _)| cmd == "capture-pane");
-    let first_send = calls.iter().position(|(cmd, args)| {
-        cmd == "send-keys" && args.iter().any(|a| a.contains("hello"))
-    });
+    let first_send = calls
+        .iter()
+        .position(|(cmd, args)| cmd == "send-keys" && args.iter().any(|a| a.contains("hello")));
     assert!(
         first_send.is_some_and(|s| first_capture.is_none_or(|c| s < c)),
         "ungated: text must be sent BEFORE any capture-pane (no readiness polling)"
@@ -210,15 +210,18 @@ fn gated_send_blocks_on_busy_but_ungated_succeeds() {
     assert!(gated_result.is_err(), "gated send must fail on busy pane");
 
     let ungated_runner = SharedRunner::with_responses(vec![
-        Ok("node"),             // display-message: pane_current_command
-        Ok("0"),                // display-message: pane_in_mode
-        Ok(""),                 // send-keys: literal text
-        Ok(""),                 // send-keys: Enter
-        Ok("$ \r"),             // capture-pane: submit-confirm
+        Ok("node"), // display-message: pane_current_command
+        Ok("0"),    // display-message: pane_in_mode
+        Ok(""),     // send-keys: literal text
+        Ok(""),     // send-keys: Enter
+        Ok("$ \r"), // capture-pane: submit-confirm
     ]);
     let mut ungated_client = TmuxClient::new(ungated_runner);
     let ungated_result = ungated_client.send_text_ungated("%busy", "hello");
-    assert!(ungated_result.is_ok(), "ungated send must succeed regardless of pane state");
+    assert!(
+        ungated_result.is_ok(),
+        "ungated send must succeed regardless of pane state"
+    );
 }
 
 fn submit_sleeps_for(config: SubmitConfig) -> Vec<Duration> {

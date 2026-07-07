@@ -210,7 +210,11 @@ esac
         let rescued = rescue_psi(&worktree, &main).expect("rescue ok");
         let names: Vec<String> = rescued
             .iter()
-            .filter_map(|path| path.file_name().and_then(|name| name.to_str()).map(str::to_owned))
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
             .collect();
         assert!(
             names.iter().any(|name| name.starts_with("note")),
@@ -226,7 +230,9 @@ esac
         );
         for path in &rescued {
             assert!(
-                !std::fs::read_to_string(path).unwrap_or_default().contains("TOP SECRET"),
+                !std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .contains("TOP SECRET"),
                 "secret content exfiltrated into {}",
                 path.display()
             );
@@ -246,7 +252,12 @@ esac
         let output = done_command(&root, &bin, &main, &worktree)
             .env("DONE_STATUS_PSI", "test")
             .env("DONE_FAKE_WORKTREE", "1")
-            .args(["done", "task-done", "--worktree", worktree.to_str().expect("worktree utf8")])
+            .args([
+                "done",
+                "task-done",
+                "--worktree",
+                worktree.to_str().expect("worktree utf8"),
+            ])
             .output()
             .expect("run done");
         assert!(
@@ -255,7 +266,10 @@ esac
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("rescued"), "expected rescue line; stdout={stdout}");
+        assert!(
+            stdout.contains("rescued"),
+            "expected rescue line; stdout={stdout}"
+        );
         // main had no ψ/test.md, so it is copied there verbatim before removal.
         assert_eq!(
             std::fs::read_to_string(main.join("ψ/test.md")).expect("rescued main file"),
@@ -593,9 +607,18 @@ exit 9
         let output = run(&root, &bin_dir, &["workon", "demo", "feat", "--fresh"]);
         assert_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("sanitized fresh worktree"), "expected sanitize line; stdout={stdout}");
-        assert!(stdout.contains(".maw/phase.json"), "should scrub stale phase.json; stdout={stdout}");
-        assert!(stdout.contains(".git/index.lock"), "should scrub stale index.lock; stdout={stdout}");
+        assert!(
+            stdout.contains("sanitized fresh worktree"),
+            "expected sanitize line; stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(".maw/phase.json"),
+            "should scrub stale phase.json; stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(".git/index.lock"),
+            "should scrub stale index.lock; stdout={stdout}"
+        );
     }
 
     #[test]
@@ -610,8 +633,14 @@ exit 9
         let output = run(&untrusted_root, &bin_dir, &["workon", "demo"]);
         assert_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("not trusted"), "expected trust warning; stdout={stdout}");
-        assert!(stdout.contains("codex"), "warning names the engine; stdout={stdout}");
+        assert!(
+            stdout.contains("not trusted"),
+            "expected trust warning; stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("codex"),
+            "warning names the engine; stdout={stdout}"
+        );
 
         let trusted_root = temp_dir("engine-trusted");
         let bin_dir = seed_root(
@@ -621,7 +650,10 @@ exit 9
         let output = run(&trusted_root, &bin_dir, &["workon", "demo"]);
         assert_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(!stdout.contains("not trusted"), "trusted repo must not warn; stdout={stdout}");
+        assert!(
+            !stdout.contains("not trusted"),
+            "trusted repo must not warn; stdout={stdout}"
+        );
     }
 
     #[test]

@@ -37,13 +37,25 @@ struct InvokeOutput {
 
 impl InvokeOutput {
     fn passthrough() -> Self {
-        Self { ok: true, output: None, error: None }
+        Self {
+            ok: true,
+            output: None,
+            error: None,
+        }
     }
     fn replace(output: String) -> Self {
-        Self { ok: true, output: Some(output), error: None }
+        Self {
+            ok: true,
+            output: Some(output),
+            error: None,
+        }
     }
     fn block(error: String) -> Self {
-        Self { ok: false, output: None, error: Some(error) }
+        Self {
+            ok: false,
+            output: None,
+            error: Some(error),
+        }
     }
 }
 

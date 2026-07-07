@@ -188,8 +188,17 @@ fn team_t5_spawn_exec_delivers_prompt_to_worker_via_wake() {
     let log = root.join("spawn.jsonl");
     let output = run_fake_exec(
         &[
-            "team", "spawn", "alpha", "builder", "--engine", "codex", "--cwd",
-            "agents/builder", "--exec", "--prompt", "Issue #42: ship the widget",
+            "team",
+            "spawn",
+            "alpha",
+            "builder",
+            "--engine",
+            "codex",
+            "--cwd",
+            "agents/builder",
+            "--exec",
+            "--prompt",
+            "Issue #42: ship the widget",
         ],
         &root,
         &log,
