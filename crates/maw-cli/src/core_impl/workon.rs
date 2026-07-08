@@ -11,6 +11,7 @@ struct WorkonOptions {
     name: Option<String>,
     engine: Option<String>,
     layout: WorkonLayout,
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
     let mut fresh = false;
     let mut name = None;
     let mut engine = None;
+    let mut prompt = None;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
@@ -149,6 +151,14 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
                 engine = Some("claude".to_owned());
                 index += 1;
             }
+            "--prompt" => {
+                let tail: Vec<_> = argv[index + 1..].to_vec();
+                if tail.is_empty() { return Err("workon: --prompt requires text".to_owned()); }
+                let text = tail.join(" ");
+                if text.is_empty() || text.contains('\0') { return Err("workon: --prompt text is empty or contains NUL".to_owned()); }
+                prompt = Some(text);
+                break;
+            }
             value if value.starts_with('-') => return Err(workon_usage()),
             value => {
                 positional.push(value.to_owned());
@@ -166,7 +176,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
     if wt.is_none() && positional.len() == 1 && (fresh || name.is_some()) {
         return Err("workon: --fresh/--name requires --wt or a task".to_owned());
     }
-    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, engine, layout })
+    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, engine, layout, prompt })
 }
 
 fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
@@ -178,11 +188,11 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--layout nested|legacy]".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--layout nested|legacy] [--prompt <text>]".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
-    &["--layout", "--name", "-e", "--engine"]
+    &["--layout", "--name", "-e", "--engine", "--prompt"]
 }
 
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
@@ -277,6 +287,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 taskless_oracle,
                 force_new_window: options.fresh,
                 engine: options.engine.as_deref(),
+                prompt: options.prompt.as_deref(),
             },
             &mut stdout,
         )?;
@@ -292,7 +303,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 "new-session",
                 &["-d", "-s", &session, "-c", workon_path_str(&target_path)?, "-n", &window_name],
             )?;
-            workon_send_window_command(runner, &session, &window_name, &target_path, options.engine.as_deref())?;
+            workon_send_window_command(runner, &session, &window_name, &target_path, options.engine.as_deref(), options.prompt.as_deref())?;
             if taskless_oracle {
                 if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
                     let _ = writeln!(stdout, "\x1b[32m+\x1b[0m fleet registered {session}:{window_name}");
@@ -311,6 +322,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                     taskless_oracle,
                     force_new_window: options.fresh,
                     engine: options.engine.as_deref(),
+                    prompt: options.prompt.as_deref(),
                 },
                 &mut stdout,
             )?;
@@ -352,6 +364,7 @@ struct WorkonWindowLaunch<'a> {
     taskless_oracle: bool,
     force_new_window: bool,
     engine: Option<&'a str>,
+    prompt: Option<&'a str>,
 }
 
 fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
@@ -366,6 +379,7 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         taskless_oracle,
         force_new_window,
         engine,
+        prompt,
     } = launch;
 
     workon_validate_tmux_target(session)?;
@@ -379,7 +393,7 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     }
 
     let new_target = workon_new_window(runner, session, window_name, target_path)?;
-    workon_send_window_command_to_target(runner, &new_target, window_name, target_path, engine)?;
+    workon_send_window_command_to_target(runner, &new_target, window_name, target_path, engine, prompt)?;
 
     if taskless_oracle {
         if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(session, window_name, target_path)? {
@@ -397,9 +411,10 @@ fn workon_send_window_command<R: maw_tmux::TmuxRunner>(
     window_name: &str,
     target_path: &std::path::Path,
     engine: Option<&str>,
+    prompt: Option<&str>,
 ) -> Result<(), String> {
     let target = format!("{session}:{window_name}");
-    workon_send_window_command_to_target(runner, &target, window_name, target_path, engine)
+    workon_send_window_command_to_target(runner, &target, window_name, target_path, engine, prompt)
 }
 
 fn workon_send_window_command_to_target<R: maw_tmux::TmuxRunner>(
@@ -408,8 +423,13 @@ fn workon_send_window_command_to_target<R: maw_tmux::TmuxRunner>(
     window_name: &str,
     target_path: &std::path::Path,
     engine: Option<&str>,
+    prompt: Option<&str>,
 ) -> Result<(), String> {
-    let command = workon_build_command_in_dir(window_name, target_path, engine);
+    let mut command = workon_build_command_in_dir(window_name, target_path, engine);
+    if let Some(text) = prompt.filter(|p| !p.is_empty() && !p.starts_with('-')) {
+        use std::fmt::Write as _;
+        let _ = write!(command, " {}", workon_shell_quote(text));
+    }
     #[cfg(test)]
     let sleeper = |_| {};
     #[cfg(not(test))]
@@ -865,6 +885,11 @@ fn workon_validate_tmux_target(target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn workon_shell_quote(value: &str) -> String {
+    if value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '=')) { return value.to_owned(); }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn workon_path_str(path: &std::path::Path) -> Result<&str, String> {
     path.to_str().ok_or_else(|| format!("workon: path is not utf8: {}", path.display()))
 }
@@ -910,6 +935,7 @@ mod workon_tests {
             name: None,
             engine: None,
             layout: WorkonLayout::Nested,
+            prompt: None,
         }
     }
 

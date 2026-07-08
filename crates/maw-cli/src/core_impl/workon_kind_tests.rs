@@ -72,6 +72,7 @@ mod workon_kind_tests {
             name: None,
             engine: None,
             layout: WorkonLayout::Nested,
+            prompt: None,
         };
         let mut runner = WorkonKindMockTmux::default();
         let (stdout, _attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("oracle workon");
@@ -87,6 +88,7 @@ mod workon_kind_tests {
             name: None,
             engine: None,
             layout: WorkonLayout::Nested,
+            prompt: None,
         };
         let mut runner = WorkonKindMockTmux::default();
         let (stdout, _attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("project workon");
