@@ -287,7 +287,7 @@ fn fleet_parse_group_filter(raw: &str) -> Vec<String> {
 }
 
 fn fleet_usage() -> String {
-    "usage: maw fleet [add <session>|create <group>|show <group>|status <group>|ls|doctor|health|gc|init|consolidate|resume|sync|wake <group|--all>|sleep <group|--all>|token <group> [ls|status]] [--json] [--dry-run] [--fix] [--reboot] [--all] [--kill] [--resume] [--groups <group[,group]...>]".to_owned()
+    "usage: maw fleet [add <session>|create <group>|show <group>|status <group>|join <fleet> --code <code>|ls|doctor|health|gc|init|consolidate|resume|sync|wake <group|--all>|sleep <group|--all>|token <group> [ls|status]] [--json] [--dry-run] [--fix] [--reboot] [--all] [--kill] [--resume] [--groups <group[,group]...>]".to_owned()
 }
 
 fn fleet_load_state_with(runtime: &mut impl FleetRuntime) -> Result<FleetState, String> {
@@ -418,7 +418,7 @@ fn fleet_render_census(state: &FleetState, options: &FleetOptions) -> Result<Str
             if let Some(session) = &member.session {
                 let _ = writeln!(out, "      {} -> {}", member.handle, session);
             } else {
-                let _ = writeln!(out, "      {} -> {}", member.handle, "none");
+                let _ = writeln!(out, "      {} -> none", member.handle);
             }
         }
     }
@@ -461,7 +461,7 @@ fn fleet_census_groups(state: &FleetState, groups: &[String]) -> Vec<FleetGroupS
     let filtered = if groups.is_empty() {
         BTreeSet::<String>::new()
     } else {
-        groups.iter().map(|group| group.to_owned()).collect()
+        groups.iter().map(std::borrow::ToOwned::to_owned).collect()
     };
     let mut output = Vec::new();
     for entry in &state.fleet_entries {
@@ -472,7 +472,7 @@ fn fleet_census_groups(state: &FleetState, groups: &[String]) -> Vec<FleetGroupS
         let mut member_summaries = Vec::new();
         let mut sessions = Vec::new();
         for member in entry.session.members.clone().unwrap_or_default() {
-            let session = fleet_member_session(&member.handle, &candidates).map(|session| session.name.to_owned());
+            let session = fleet_member_session(&member.handle, &candidates).map(|session| session.name.clone());
             if let Some(name) = &session {
                 sessions.push(name.to_owned());
             }

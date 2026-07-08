@@ -109,8 +109,8 @@ fn fleet_roster_unnumbered_stem(entry: &NativeFleetEntry) -> &str {
         .map_or(stem, |(_, tail)| tail)
 }
 
-// Squadron-group view for completion + ls filtering (#307/#317): a roster is any fleet file
-// with group metadata (`groupName`) or explicit members[] (`members`).
+// Squadron-group view for completions + ls filtering (#307/#317): a roster is any fleet file
+// with group metadata (`groupName`) or explicit members[] (`members`); explicit groupName wins.
 fn fleet_roster_group_name(entry: &NativeFleetEntry) -> Option<String> {
     if !entry.session.group_name.is_empty() { return Some(entry.session.group_name.clone()); }
     entry.session.members.as_ref()?;
