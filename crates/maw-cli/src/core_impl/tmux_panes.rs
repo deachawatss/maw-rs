@@ -11,7 +11,7 @@ struct PanesOptions { target: Option<String>, pid: bool, all: bool }
 struct PanesRow { target: String, dims: String, command: String, title: String, pid: Option<String> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PanesFilter { Current, All, Target(String) }
+enum PanesFilter { All, Target(String) }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PanesResolve { Match(String), None { hints: Vec<String> }, Ambiguous(Vec<String>) }
@@ -65,7 +65,7 @@ fn panes_filter<R: maw_tmux::TmuxRunner>(options: &PanesOptions, runner: &mut R)
         let warning = options.target.as_ref().map_or_else(String::new, |_| "  \x1b[90m⚠ --all ignores target argument\x1b[0m\n".to_owned());
         return Ok((PanesFilter::All, warning));
     }
-    let Some(target) = &options.target else { return Ok((PanesFilter::Current, String::new())); };
+    let Some(target) = &options.target else { return Ok((PanesFilter::All, String::new())); };
     if let Some((session, rest)) = target.split_once(':') {
         let matched = panes_resolve_session(session, runner)?;
         panes_validate_target(rest)?;
@@ -136,7 +136,6 @@ fn panes_fetch_rows<R: maw_tmux::TmuxRunner>(filter: &PanesFilter, pid: bool, ru
 fn panes_list_args(filter: &PanesFilter, pid: bool) -> Result<Vec<String>, String> {
     let mut args = Vec::new();
     match filter {
-        PanesFilter::Current => {},
         PanesFilter::All => args.push("-a".to_owned()),
         PanesFilter::Target(target) => {
             panes_validate_target(target)?;
@@ -196,6 +195,48 @@ mod panes_tests {
         assert!(opts.pid);
         assert!(opts.all);
         assert!(panes_parse_args(&["-bad".to_owned()]).unwrap_err().contains("looks like a flag"));
+    }
+
+    #[derive(Debug, Default)]
+    struct PanesMockTmux {
+        calls: Vec<(String, Vec<String>)>,
+        list_panes_output: String,
+    }
+
+    impl maw_tmux::TmuxRunner for PanesMockTmux {
+        fn run(
+            &mut self,
+            subcommand: &str,
+            args: &[String],
+        ) -> Result<String, maw_tmux::TmuxError> {
+            self.calls.push((subcommand.to_owned(), args.to_vec()));
+            match subcommand {
+                "list-panes" => Ok(self.list_panes_output.clone()),
+                "list-sessions" => Ok(String::new()),
+                other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn panes_bare_invocation_lists_all_sessions_fleet_wide() {
+        let mut tmux = PanesMockTmux {
+            list_panes_output: "s1:0.0|||80x24|||zsh|||lead\ns2:1.0|||120x40|||vim|||work\n"
+                .to_owned(),
+            ..PanesMockTmux::default()
+        };
+
+        let output = panes_run_with_runner(&[], &mut tmux).expect("panes");
+
+        assert_eq!(tmux.calls.len(), 1);
+        let (cmd, args) = &tmux.calls[0];
+        assert_eq!(cmd, "list-panes");
+        assert!(
+            args.contains(&"-a".to_owned()),
+            "bare 'maw panes' must pass -a for fleet-wide listing, got: {args:?}"
+        );
+        assert!(output.contains("s1:0.0"));
+        assert!(output.contains("s2:1.0"));
     }
 
     #[test]

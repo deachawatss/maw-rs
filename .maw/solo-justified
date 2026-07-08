@@ -1,1 +1,1 @@
-omx unavailable on fresh Mac — codex worker stuck at welcome prompt, never accepted brief. Fallback per L1 brief directive.
+{"justification":"Two cohesive bug fixes in 2 tightly-coupled files (tmux_panes.rs, capture.rs) — unit test additions only, no cross-cutting logic"}

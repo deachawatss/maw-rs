@@ -261,6 +261,94 @@ mod capture_tests {
         assert_eq!(tmux.calls[1].1, capture_strings(&["-t", "03-neo:1", "-p", "-S", "-50"]));
     }
 
+    #[derive(Debug, Default)]
+    struct CaptureTargetAwareMock {
+        calls: Vec<(String, Vec<String>)>,
+        windows: String,
+        content: std::collections::BTreeMap<String, String>,
+    }
+
+    impl maw_tmux::TmuxRunner for CaptureTargetAwareMock {
+        fn run(
+            &mut self,
+            subcommand: &str,
+            args: &[String],
+        ) -> Result<String, maw_tmux::TmuxError> {
+            self.calls.push((subcommand.to_owned(), args.to_vec()));
+            match subcommand {
+                "list-windows" => Ok(self.windows.clone()),
+                "capture-pane" => {
+                    let target = args
+                        .windows(2)
+                        .find(|pair| pair[0] == "-t")
+                        .map_or("", |pair| pair[1].as_str());
+                    let base = target.split('.').next().unwrap_or(target);
+                    self.content
+                        .get(base)
+                        .cloned()
+                        .ok_or_else(|| maw_tmux::TmuxError::new(format!("no pane at {target}")))
+                }
+                other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_cross_window_returns_target_content_not_invoking_pane() {
+        let _lock = super::env_test_lock().lock().expect("lock");
+        let _env = CaptureEnvGuard::new();
+        let mut content = std::collections::BTreeMap::new();
+        content.insert("dev:0".to_owned(), "invoking pane output\n".to_owned());
+        content.insert("dev:1".to_owned(), "target window output\n".to_owned());
+        let mut tmux = CaptureTargetAwareMock {
+            windows: "dev|||0|||main|||1|||\ndev|||1|||worker|||0|||\n".to_owned(),
+            content,
+            ..CaptureTargetAwareMock::default()
+        };
+
+        let output =
+            capture_with_runner(&capture_strings(&["dev:worker"]), &mut tmux).expect("capture");
+
+        assert_eq!(output.stdout, "target window output\n");
+        let capture_call = &tmux.calls[1];
+        assert_eq!(capture_call.0, "capture-pane");
+        assert!(
+            capture_call.1.contains(&"-t".to_owned()),
+            "must pass -t flag"
+        );
+        assert!(
+            capture_call.1.contains(&"dev:1".to_owned()),
+            "must target dev:1 (the worker window), got: {:?}",
+            capture_call.1
+        );
+    }
+
+    #[test]
+    fn capture_cross_session_window_returns_target_content() {
+        let _lock = super::env_test_lock().lock().expect("lock");
+        let _env = CaptureEnvGuard::new();
+        let mut content = std::collections::BTreeMap::new();
+        content.insert("alpha:0".to_owned(), "alpha main content\n".to_owned());
+        content.insert("beta:2".to_owned(), "beta worker content\n".to_owned());
+        let mut tmux = CaptureTargetAwareMock {
+            windows: "alpha|||0|||main|||1|||\nbeta|||2|||worker|||0|||\n".to_owned(),
+            content,
+            ..CaptureTargetAwareMock::default()
+        };
+
+        let output =
+            capture_with_runner(&capture_strings(&["beta:worker"]), &mut tmux).expect("capture");
+
+        assert_eq!(output.stdout, "beta worker content\n");
+        let capture_call = &tmux.calls[1];
+        assert_eq!(capture_call.0, "capture-pane");
+        assert!(
+            capture_call.1.contains(&"beta:2".to_owned()),
+            "must resolve to beta:2, got: {:?}",
+            capture_call.1
+        );
+    }
+
     #[test]
     fn capture_validate_rejects_bad_resolved_tmux_target() {
         let error = capture_validate_tmux_target("neo:bad pane").expect_err("guard");
