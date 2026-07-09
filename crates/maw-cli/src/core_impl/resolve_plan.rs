@@ -429,8 +429,8 @@ fn command_category(command: &str) -> &'static str {
         | "auto-wake" => CATEGORY_ORDER[8],
 
         "health" | "doctor" | "check" | "costs" | "signals" | "activity" | "follow"
-        | "pulse" | "audit" | "dream" | "feed" | "triggers" | "trigger" | "on" | "token"
-        | "tokens" | "find" => CATEGORY_ORDER[9],
+        | "pulse" | "audit" | "dream" | "feed" | "triggers" | "trigger" | "on"
+        | "find" => CATEGORY_ORDER[9],
 
         "oracle" | "oracles" | "oracle-skills" | "oracle-workon" | "about" | "whoami"
         | "identity" | "tonk" | "awaken" | "awake" => CATEGORY_ORDER[10],
