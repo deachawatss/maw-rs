@@ -1,0 +1,541 @@
+{
+  "version": 1,
+  "frozen_at": "2026-07-09",
+  "frozen_by": "athena — denominator v3 (97 plugin-overlap + 11 js-core + 10 top-alias)",
+  "amendment_policy": "additions allowed via athena review; removals only via RELEASED-with-committed-fallthrough-test",
+  "gate_4and": {
+    "1_pass_threshold": "≥80% of surface PASS (≈95 verbs)",
+    "2_critical_set_100pct": [
+      "hey",
+      "send",
+      "run",
+      "kill",
+      "peek",
+      "ls",
+      "attach",
+      "wake",
+      "fleet",
+      "team",
+      "workon",
+      "inbox"
+    ],
+    "2_note": "critical verbs must be PASS or RELEASED — never FAIL, never un-scorecarded",
+    "3_invariant": "issue #345 merged (global fall-through-no-hang)",
+    "4_signoff": "Nat"
+  },
+  "allowlist": {
+    "normalize_before_diff": [
+      "startup banner",
+      "ANSI color",
+      "timing/duration",
+      "PID",
+      "ephemeral id/timestamp"
+    ],
+    "must_match": [
+      "stdout data",
+      "exit code",
+      "state/DB side-effects",
+      "idempotency",
+      "no-hang-on-bad-args (<1s)"
+    ]
+  },
+  "layers": {
+    "plugin_overlap": [
+      "about",
+      "absorb",
+      "activity",
+      "archive",
+      "artifact-manager",
+      "assign",
+      "attach",
+      "attach-ssh",
+      "avengers",
+      "awaken",
+      "bg",
+      "broadcast",
+      "bud",
+      "capture",
+      "check",
+      "cleanup",
+      "codex",
+      "completions",
+      "consent",
+      "contacts",
+      "costs",
+      "cross-team-queue",
+      "demo",
+      "discover",
+      "doctor",
+      "done",
+      "dream",
+      "federation",
+      "find",
+      "fleet",
+      "follow",
+      "health",
+      "inbox",
+      "incubate",
+      "init",
+      "kill",
+      "learn",
+      "locate",
+      "ls",
+      "mega",
+      "messages",
+      "on",
+      "oracle",
+      "oracle-skills",
+      "oracle-workon",
+      "overview",
+      "pair",
+      "pane",
+      "panes",
+      "park",
+      "peek",
+      "peers",
+      "ping",
+      "plugin",
+      "pr",
+      "profile",
+      "project",
+      "pulse",
+      "rename",
+      "restart",
+      "resume",
+      "reunion",
+      "run",
+      "scope",
+      "send",
+      "send-enter",
+      "send-text",
+      "session",
+      "setup",
+      "shellenv",
+      "signals",
+      "sleep",
+      "soul-sync",
+      "split",
+      "stop",
+      "stream",
+      "swarm",
+      "tab",
+      "tag",
+      "take",
+      "talk-to",
+      "team",
+      "tile",
+      "tmux",
+      "token",
+      "transport",
+      "triggers",
+      "trust",
+      "ui",
+      "view",
+      "wake",
+      "whoami",
+      "workon",
+      "workspace",
+      "zai",
+      "zenoh-scout",
+      "zoom"
+    ],
+    "core_collisions": [
+      "hey",
+      "plugins",
+      "artifacts",
+      "artifact",
+      "agents",
+      "agent",
+      "audit",
+      "serve",
+      "update",
+      "upgrade",
+      "version"
+    ],
+    "alias_collisions": [
+      "a",
+      "t",
+      "layout",
+      "bring",
+      "b",
+      "scaffold",
+      "awake",
+      "new",
+      "preflight",
+      "snapshots"
+    ]
+  },
+  "behavioral_rows": [
+    {
+      "id": "agent-shorthand",
+      "desc": "js: maw <agent> [msg] → send/peek default vs rs auto-bridge (#318)",
+      "counts_in_percent": false,
+      "verdict": "pending",
+      "note": "dispatch semantics — verdict required before flip"
+    }
+  ],
+  "released_prior": [
+    {
+      "verb": "atlas",
+      "resolution": "renamed native→discord-inv (#344/#346, athena signed)",
+      "fallthrough_test": "crates/maw-cli/tests/native_atlas_plugin.rs::atlas_namespace_is_owned_by_plugin_not_native_discord_inv",
+      "field_test": "13/13 (atlas-oracle, 2026-07-09)"
+    }
+  ],
+  "verdicts": {
+    "a": {
+      "status": "pending"
+    },
+    "about": {
+      "status": "pending"
+    },
+    "absorb": {
+      "status": "pending"
+    },
+    "activity": {
+      "status": "pending"
+    },
+    "agent": {
+      "status": "pending"
+    },
+    "agents": {
+      "status": "pending"
+    },
+    "archive": {
+      "status": "pending"
+    },
+    "artifact": {
+      "status": "pending"
+    },
+    "artifact-manager": {
+      "status": "pending"
+    },
+    "artifacts": {
+      "status": "pending"
+    },
+    "assign": {
+      "status": "pending"
+    },
+    "attach": {
+      "status": "pending"
+    },
+    "attach-ssh": {
+      "status": "pending"
+    },
+    "audit": {
+      "status": "pending"
+    },
+    "avengers": {
+      "status": "pending"
+    },
+    "awake": {
+      "status": "pending"
+    },
+    "awaken": {
+      "status": "pending"
+    },
+    "b": {
+      "status": "pending"
+    },
+    "bg": {
+      "status": "pending"
+    },
+    "bring": {
+      "status": "pending"
+    },
+    "broadcast": {
+      "status": "pending"
+    },
+    "bud": {
+      "status": "pending"
+    },
+    "capture": {
+      "status": "pending"
+    },
+    "check": {
+      "status": "pending"
+    },
+    "cleanup": {
+      "status": "pending"
+    },
+    "codex": {
+      "status": "pending"
+    },
+    "completions": {
+      "status": "pending"
+    },
+    "consent": {
+      "status": "pending"
+    },
+    "contacts": {
+      "status": "pending"
+    },
+    "costs": {
+      "status": "pending"
+    },
+    "cross-team-queue": {
+      "status": "pending"
+    },
+    "demo": {
+      "status": "pending"
+    },
+    "discover": {
+      "status": "pending"
+    },
+    "doctor": {
+      "status": "pending"
+    },
+    "done": {
+      "status": "pending"
+    },
+    "dream": {
+      "status": "pending"
+    },
+    "federation": {
+      "status": "pending"
+    },
+    "find": {
+      "status": "pending"
+    },
+    "fleet": {
+      "status": "pending"
+    },
+    "follow": {
+      "status": "pending"
+    },
+    "health": {
+      "status": "pending"
+    },
+    "hey": {
+      "status": "pending"
+    },
+    "inbox": {
+      "status": "pending"
+    },
+    "incubate": {
+      "status": "pending"
+    },
+    "init": {
+      "status": "pending"
+    },
+    "kill": {
+      "status": "pending"
+    },
+    "layout": {
+      "status": "pending"
+    },
+    "learn": {
+      "status": "pending"
+    },
+    "locate": {
+      "status": "pending"
+    },
+    "ls": {
+      "status": "pending"
+    },
+    "mega": {
+      "status": "pending"
+    },
+    "messages": {
+      "status": "pending"
+    },
+    "new": {
+      "status": "pending"
+    },
+    "on": {
+      "status": "pending"
+    },
+    "oracle": {
+      "status": "pending"
+    },
+    "oracle-skills": {
+      "status": "pending"
+    },
+    "oracle-workon": {
+      "status": "pending"
+    },
+    "overview": {
+      "status": "pending"
+    },
+    "pair": {
+      "status": "pending"
+    },
+    "pane": {
+      "status": "pending"
+    },
+    "panes": {
+      "status": "pending"
+    },
+    "park": {
+      "status": "pending"
+    },
+    "peek": {
+      "status": "pending"
+    },
+    "peers": {
+      "status": "pending"
+    },
+    "ping": {
+      "status": "pending"
+    },
+    "plugin": {
+      "status": "pending"
+    },
+    "plugins": {
+      "status": "pending"
+    },
+    "pr": {
+      "status": "pending"
+    },
+    "preflight": {
+      "status": "pending"
+    },
+    "profile": {
+      "status": "pending"
+    },
+    "project": {
+      "status": "pending"
+    },
+    "pulse": {
+      "status": "pending"
+    },
+    "rename": {
+      "status": "pending"
+    },
+    "restart": {
+      "status": "pending"
+    },
+    "resume": {
+      "status": "pending"
+    },
+    "reunion": {
+      "status": "pending"
+    },
+    "run": {
+      "status": "pending"
+    },
+    "scaffold": {
+      "status": "pending"
+    },
+    "scope": {
+      "status": "pending"
+    },
+    "send": {
+      "status": "pending"
+    },
+    "send-enter": {
+      "status": "pending"
+    },
+    "send-text": {
+      "status": "pending"
+    },
+    "serve": {
+      "status": "pending"
+    },
+    "session": {
+      "status": "pending"
+    },
+    "setup": {
+      "status": "pending"
+    },
+    "shellenv": {
+      "status": "pending"
+    },
+    "signals": {
+      "status": "pending"
+    },
+    "sleep": {
+      "status": "pending"
+    },
+    "snapshots": {
+      "status": "pending"
+    },
+    "soul-sync": {
+      "status": "pending"
+    },
+    "split": {
+      "status": "pending"
+    },
+    "stop": {
+      "status": "pending"
+    },
+    "stream": {
+      "status": "pending"
+    },
+    "swarm": {
+      "status": "pending"
+    },
+    "t": {
+      "status": "pending"
+    },
+    "tab": {
+      "status": "pending"
+    },
+    "tag": {
+      "status": "pending"
+    },
+    "take": {
+      "status": "pending"
+    },
+    "talk-to": {
+      "status": "pending"
+    },
+    "team": {
+      "status": "pending"
+    },
+    "tile": {
+      "status": "pending"
+    },
+    "tmux": {
+      "status": "pending"
+    },
+    "token": {
+      "status": "pending"
+    },
+    "transport": {
+      "status": "pending"
+    },
+    "triggers": {
+      "status": "pending"
+    },
+    "trust": {
+      "status": "pending"
+    },
+    "ui": {
+      "status": "pending"
+    },
+    "update": {
+      "status": "pending"
+    },
+    "upgrade": {
+      "status": "pending"
+    },
+    "version": {
+      "status": "pending"
+    },
+    "view": {
+      "status": "pending"
+    },
+    "wake": {
+      "status": "pending"
+    },
+    "whoami": {
+      "status": "pending"
+    },
+    "workon": {
+      "status": "pending"
+    },
+    "workspace": {
+      "status": "pending"
+    },
+    "zai": {
+      "status": "pending"
+    },
+    "zenoh-scout": {
+      "status": "pending"
+    },
+    "zoom": {
+      "status": "pending"
+    }
+  }
+}
