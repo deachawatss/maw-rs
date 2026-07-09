@@ -319,16 +319,15 @@
       "track2_converge_required": [
         "no-args: exit code rs=2 vs js=1 + format",
         "error-path: exit code rs=2 vs js=1 + verbosity",
-        "happy-path stdout: js='delivered → target: [sig] MSG' vs rs='delivered target' (Hyrum — scripts may grep 'delivered →')"
+        "happy-path stdout: js='delivered → target: [sig] MSG' vs rs='delivered target' (Hyrum — scripts may grep 'delivered →')",
+        "audit persistence (BLOCKING, athena ruling): rs must write audit.jsonl + maw-log.jsonl schema byte-compatible with js on EVERY send — covered by allowlist 'state/DB side-effects must match'; history tooling depends on maw-log (Nothing-is-Deleted). Currently rs writes zero (send_federation.rs)"
       ],
-      "escalated_to_athena": {
-        "id": "HEADER-RISK / audit-persistence-gap",
-        "finding": "rs hey/send writes ZERO message audit — touches neither ~/.maw comm-feed nor maw-log.jsonl; js writes on every send (confirmed 3x via find -newer + independently in send_federation.rs: no audit write)",
-        "classification": "NOT T1 (no crash), NOT T2 (not just text) = missing persistence infra",
-        "impact": "dashboard/history tooling would have holes for every message routed via rs — silent gap on the fleet backbone verb",
-        "status": "AWAITING athena track ruling"
-      },
-      "golden_fixtures": "/tmp/ft-hey/golden-js/ (4 cases .out/.err/.exit + README) — copy to repo fixtures for convergence"
+      "golden_fixtures": "/tmp/ft-hey/golden-js/ (4 cases .out/.err/.exit + README) — copy to repo fixtures for convergence",
+      "athena_ruling": "audit-gap = T2 converge-required + BLOCKING (not a new track). hey=FAIL until all 4 T2 sub-cases match. delivery core (exactly-once/ordered/signed) verified strong.",
+      "issues": [
+        "#348 audit/log writes (blocker)",
+        "#349 exit-codes/stdout/verbosity converge"
+      ]
     },
     "inbox": {
       "status": "pending"
