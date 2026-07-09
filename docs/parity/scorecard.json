@@ -370,7 +370,22 @@
       "status": "pending"
     },
     "peek": {
-      "status": "pending"
+      "status": "FAIL",
+      "date": "2026-07-09",
+      "attested_by": "atlas field-test (matrix v2, scratch session, read-only verified)",
+      "failures": [
+        "no-args listing: js literal last-3-lines vs rs last-non-blank (non-cosmetic)",
+        "happy path: js extra tip line; rs pads ~21 trailing blank lines; markers correct both",
+        "error message text differs entirely (exit codes match 1/1)",
+        "flag parsing: js has none (--help treated as target); rs supports --help/--lines/--history"
+      ],
+      "passes": [
+        "idempotency",
+        "no-hang <1s both",
+        "read-only (no session/tmux state mutated)"
+      ],
+      "js_bug_found": "uncaught HostExecError crash on window-index target (comm-peek.ts node-prefix branch silent no-op) — rs handles cleanly",
+      "note": "most divergences = rs more robust than js; needs athena policy ruling: byte-match-to-buggy-js vs canonical-behavior waiver"
     },
     "peers": {
       "status": "pending"
