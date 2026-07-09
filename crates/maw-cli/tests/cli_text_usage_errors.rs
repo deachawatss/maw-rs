@@ -31,10 +31,10 @@ fn assert_usage_error(args: &[&str], contains: &str) {
 
 #[test]
 fn top_level_help_and_unknown_command_branches_are_covered() {
-    assert_ok_text(&[], "usage: maw-rs");
-    assert_ok_text(&["help"], "usage: maw-rs");
-    assert_ok_text(&["--help"], "usage: maw-rs");
-    assert_ok_text(&["-h"], "usage: maw-rs");
+    assert_ok_text(&[], "usage: maw");
+    assert_ok_text(&["help"], "usage: maw");
+    assert_ok_text(&["--help"], "usage: maw");
+    assert_ok_text(&["-h"], "usage: maw");
     assert_eq!(
         dispatcher_status("definitely-not-a-command"),
         DispatchKind::NativeError

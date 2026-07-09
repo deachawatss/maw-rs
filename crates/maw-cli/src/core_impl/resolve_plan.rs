@@ -338,20 +338,107 @@ fn usage_ok() -> CliOutput {
 }
 
 fn usage_text() -> String {
-    concat!(
-        "usage: maw-rs <command> [args]\n",
-        "ported commands:\n",
-        "  a|attach <target> [--print] [--readonly|-r]   attach to a tmux session\n",
-        "  run <target> <cmd...>                         type text and press Enter\n",
-        "  send-enter <target> [--N <count>]             send Enter to a tmux target\n",
-        "  ls [--compact|-c] [--verbose|-v] [--json] [--watch[=secs]]  list live local sessions\n",
-        "  plugin ls [-v|--verbose]                      list installed plugins\n",
-        "  bring|b <oracle> [--to <session[:window]>]    plan a wake split target\n",
-        "  feed active|parse-line|describe                inspect local activity feed data\n",
-        "\n",
-        "portable parity commands are intentionally hidden from the default menu until their live UX ships.\n",
-    )
-    .to_owned()
+    let commands = completions_commands();
+    let mut groups: std::collections::BTreeMap<usize, Vec<&str>> =
+        std::collections::BTreeMap::new();
+
+    for cmd in &commands {
+        let cat = command_category(cmd);
+        let idx = CATEGORY_ORDER
+            .iter()
+            .position(|&c| c == cat)
+            .unwrap_or(CATEGORY_ORDER.len() - 1);
+        groups.entry(idx).or_default().push(cmd);
+    }
+
+    let mut out = format!(
+        "usage: maw <command> [args]\n\n{} commands available ({}):\n",
+        commands.len(),
+        MAW_RS_BUILD_VERSION,
+    );
+
+    for (idx, cmds) in &groups {
+        let category = CATEGORY_ORDER.get(*idx).unwrap_or(&"Other");
+        let _ = write!(out, "\n  {category}:\n");
+        for chunk in cmds.chunks(6) {
+            out.push_str("    ");
+            out.push_str(&chunk.join(", "));
+            out.push('\n');
+        }
+    }
+
+    out.push_str("\nRun 'maw <command> --help' for details on a specific command.\n");
+    out
+}
+
+const CATEGORY_ORDER: &[&str] = &[
+    "Session & Fleet",
+    "Communication",
+    "Teams",
+    "Tmux & Window",
+    "Worktree & Project",
+    "Federation & Peers",
+    "Auth & Consent",
+    "Plugin",
+    "Config & Setup",
+    "Diagnostics",
+    "Oracle & Identity",
+    "Build & Release",
+    "Other",
+];
+
+fn command_category(command: &str) -> &'static str {
+    match command {
+        "ls" | "panes" | "wake" | "sleep" | "kill" | "fleet" | "overview" | "locate"
+        | "discover" | "agents" | "agent" | "session" | "mega" | "avengers" | "swarm"
+        | "stop" | "rest" => CATEGORY_ORDER[0],
+
+        "hey" | "send" | "send-text" | "send-enter" | "reply" | "rp" | "broadcast"
+        | "notify" | "talk" | "talk-to" | "talkto" | "ping" | "messages" | "inbox"
+        | "forward-error" | "wave" | "contact" | "contacts" => CATEGORY_ORDER[1],
+
+        "team" | "t" | "assign" | "cross-team-queue" => CATEGORY_ORDER[2],
+
+        "tmux" | "attach" | "a" | "attach-ssh" | "view" | "split" | "stream" | "capture"
+        | "tab" | "tag" | "take" | "zoom" | "tile" | "pane" | "peek" | "handover" | "mv" => {
+            CATEGORY_ORDER[3]
+        }
+
+        "workon" | "worktree" | "workspace" | "ws" | "work" | "done" | "finish" | "bring"
+        | "b" | "park" | "resume" | "learn" | "project" | "incubate" | "bud" | "buddy"
+        | "scaffold" | "new" | "promote" | "preflight" | "snapshots" | "worktree-window"
+        | "archive" | "absorb" | "pr" | "cleanup" | "forget" | "rename" => CATEGORY_ORDER[4],
+
+        "federation" | "federation-sync" | "federation-identity" | "federation-health"
+        | "peers" | "peer" | "peer-probe" | "peer-sources" | "serve" | "serve-identity"
+        | "serve-peer-startup-warnings" | "transport" | "hub" | "bind-host" | "zenoh-scout"
+        | "scout" => CATEGORY_ORDER[5],
+
+        "auth" | "consent" | "consent-approval" | "consent-cleanup" | "consent-constants"
+        | "consent-expiry" | "consent-pending-read" | "consent-pending-status"
+        | "consent-pin" | "consent-request" | "consent-store" | "consent-trust-check"
+        | "consent-trust-revoke" | "trust" | "trusts" | "pair" | "pair-api"
+        | "pair-api-auto" | "pair-code" | "pair-code-store" | "auto-pair-proof"
+        | "recent-hello" | "scope" | "policy" | "split-policy" => CATEGORY_ORDER[6],
+
+        "plugin" | "plugins" | "plugin-manifest" | "plugin-artifact" | "plugin-scaffold"
+        | "plugin-policy" => CATEGORY_ORDER[7],
+
+        "config" | "init" | "setup" | "user-setup" | "shellenv" | "completions" | "xdg"
+        | "profile" | "soul-sync" | "soulsync" | "ss" | "update" | "upgrade"
+        | "auto-wake" => CATEGORY_ORDER[8],
+
+        "health" | "doctor" | "check" | "costs" | "signals" | "activity" | "follow"
+        | "pulse" | "audit" | "dream" | "feed" | "triggers" | "trigger" | "on" | "token"
+        | "tokens" | "find" => CATEGORY_ORDER[9],
+
+        "oracle" | "oracles" | "oracle-skills" | "oracle-workon" | "about" | "whoami"
+        | "identity" | "tonk" | "awaken" | "awake" => CATEGORY_ORDER[10],
+
+        "calver" | "restart" | "reboot" | "resolve" | "normalize" => CATEGORY_ORDER[11],
+
+        _ => CATEGORY_ORDER[12],
+    }
 }
 
 

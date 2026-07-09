@@ -46,11 +46,11 @@ fn attach_text_and_readonly_recovery_match_maw_js_surface() {
 fn attach_usage_and_default_menu_show_only_live_ported_commands() {
     let usage = run(&[]);
     assert_eq!(usage.code, 0);
-    assert!(usage.stdout.contains("ported commands:"));
-    assert!(usage.stdout.contains("a|attach <target>"));
-    assert!(usage.stdout.contains("ls [--compact|-c]"));
-    assert!(!usage.stdout.contains("pair-api"));
-    assert!(!usage.stdout.contains("plugin-manifest"));
+    assert!(usage.stdout.contains("commands available"));
+    assert!(usage.stdout.contains("attach"));
+    assert!(usage.stdout.contains("ls"));
+    assert!(usage.stdout.contains("pair-api"));
+    assert!(usage.stdout.contains("plugin-manifest"));
 
     let help = run(&["a", "--help"]);
     assert_eq!(help.code, 0);
