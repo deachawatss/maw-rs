@@ -307,7 +307,28 @@
       "status": "pending"
     },
     "hey": {
-      "status": "pending"
+      "status": "FAIL",
+      "date": "2026-07-09",
+      "attested_by": "atlas field-test (matrix v2 + T1/T2 tagging, extreme isolation, delivery verified from destination file)",
+      "passes": [
+        "delivery: exactly-once, in-order, auto-sign, correct newline, faster (0.08s vs js 0.51s error path)",
+        "--help special-case (matches W-002 pattern)",
+        "idempotency/ordering",
+        "no-hang"
+      ],
+      "track2_converge_required": [
+        "no-args: exit code rs=2 vs js=1 + format",
+        "error-path: exit code rs=2 vs js=1 + verbosity",
+        "happy-path stdout: js='delivered → target: [sig] MSG' vs rs='delivered target' (Hyrum — scripts may grep 'delivered →')"
+      ],
+      "escalated_to_athena": {
+        "id": "HEADER-RISK / audit-persistence-gap",
+        "finding": "rs hey/send writes ZERO message audit — touches neither ~/.maw comm-feed nor maw-log.jsonl; js writes on every send (confirmed 3x via find -newer + independently in send_federation.rs: no audit write)",
+        "classification": "NOT T1 (no crash), NOT T2 (not just text) = missing persistence infra",
+        "impact": "dashboard/history tooling would have holes for every message routed via rs — silent gap on the fleet backbone verb",
+        "status": "AWAITING athena track ruling"
+      },
+      "golden_fixtures": "/tmp/ft-hey/golden-js/ (4 cases .out/.err/.exit + README) — copy to repo fixtures for convergence"
     },
     "inbox": {
       "status": "pending"
