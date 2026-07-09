@@ -42,18 +42,15 @@ fn assert_ok_text(args: &[&str], expected: &str) {
 #[test]
 fn top_level_help_shows_only_live_ported_surfaces() {
     for args in [Vec::<&str>::new(), vec!["help"], vec!["--help"], vec!["-h"]] {
-        assert_ok_text(&args, "ported commands:");
-        assert_ok_text(&args, "a|attach <target>");
-        assert_ok_text(&args, "ls [--compact|-c]");
-        assert_ok_text(&args, "portable parity commands are intentionally hidden");
+        assert_ok_text(&args, "commands available");
+        assert_ok_text(&args, "attach");
+        assert_ok_text(&args, "ls");
     }
 
     let output = run(&[]);
-    assert!(!output.stdout.contains("auth verify-request"));
-    assert!(!output.stdout.contains("consent-request --from <from>"));
-    assert!(!output
-        .stdout
-        .contains("pair-api <generate|probe|accept|status>"));
+    assert!(output.stdout.contains("auth"));
+    assert!(output.stdout.contains("consent"));
+    assert!(output.stdout.contains("pair-api"));
 
     assert_eq!(
         dispatcher_status("not-a-real-command"),

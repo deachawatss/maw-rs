@@ -4,11 +4,20 @@ Generated from source inspection on 2026-06-25 UTC+7. maw-js source of truth: li
 
 ## Summary
 
+> **Updated 2026-07-09:** maw-rs now has **196** public commands in its native
+> dispatcher (visible via `maw --help` and `maw completions commands`). The
+> per-row status below was generated on 2026-06-25 and is stale — most rows
+> marked NOT-PORTED have since been ported to the native dispatcher. Only 8
+> `serve-*` sub-surface commands remain genuinely not-ported; `mqtt` and
+> `batch2 closed set` are intentional won't-do. Run `maw completions commands`
+> for the authoritative live command list.
+
+Original 2026-06-25 counts (stale):
 - Total rows: **131**
 - native ✅: **21**
 - WASM ✅: **15**
 - stub ⚠️: **14**
-- NOT-PORTED ❌: **81**
+- NOT-PORTED ❌: **81** (now ~8 genuine gaps + 2 won't-do)
 
 Legend: **native ✅** = Rust dispatcher/implementation exists; **WASM ✅** = wasm parity harness covers at least the listed source path/argv; **stub ⚠️** = verb or helper exists but flags/output/subcommands are incomplete; **NOT-PORTED ❌** = no maw-rs native/WASM parity found or intentionally no-code/won't-do.
 
