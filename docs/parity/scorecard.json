@@ -385,7 +385,33 @@
         "read-only (no session/tmux state mutated)"
       ],
       "js_bug_found": "uncaught HostExecError crash on window-index target (comm-peek.ts node-prefix branch silent no-op) — rs handles cleanly",
-      "note": "most divergences = rs more robust than js; needs athena policy ruling: byte-match-to-buggy-js vs canonical-behavior waiver"
+      "note": "most divergences = rs more robust than js; needs athena policy ruling: byte-match-to-buggy-js vs canonical-behavior waiver",
+      "track_split": {
+        "track2_converge_required": [
+          "no-args listing semantics (js literal last-3-lines)",
+          "happy-path: no trailing padding (rs pads ~21), tip-line parity",
+          "error message text byte-match js format"
+        ],
+        "track1_waivers": [
+          {
+            "id": "W-001",
+            "sub_case": "window-index target not found",
+            "spec": "target <session>:<idx> not found → exit 1 + stderr EXACTLY one line matching frozen rs format: no window '<idx>' in session '<name>' — windows: <list> · no stack trace · this format IS the golden (frozen, no drift)",
+            "status": "SIGNED-PENDING-ACTIVATION",
+            "signed_by": "athena",
+            "w4_js_bug": "maw-js#2865"
+          },
+          {
+            "id": "W-002",
+            "sub_case": "--help/-h handling",
+            "spec": "--help/-h → usage text on STDOUT, exit 0, never treated as target name · extra flags (--lines/--history) = allowed superset",
+            "status": "SIGNED-PENDING-ACTIVATION",
+            "signed_by": "athena",
+            "w4_js_bug": "maw-js#2866"
+          }
+        ],
+        "activation_rule": "waiver counts as waived-PASS only when w3 (rs committed test per spec) merges — tracked with #347"
+      }
     },
     "peers": {
       "status": "pending"
