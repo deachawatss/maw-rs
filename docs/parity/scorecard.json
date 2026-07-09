@@ -339,7 +339,7 @@
       "status": "pending"
     },
     "kill": {
-      "status": "FAIL",
+      "status": "HAZARD-FIXED",
       "date": "2026-07-09",
       "attested_by": "atlas field-test (19 kills, all ftkzz-* isolated, tmux-ls diff before/after every kill = fleet byte-identical)",
       "passes": [
@@ -357,7 +357,9 @@
         "kill --help: js prints generic tmux-plugin help (defect); rs correctly rejects flag + prints kill usage"
       ],
       "escalated_to_athena": "fuzzy-resolution KIND differs: js exact-match-only (ftkzz→not-found, kills nothing) vs rs prefix-match+ambiguity-refusal (finds 3, lists, refuses, kills nothing) — both SAFE, design question: should a destructive verb have fuzzy at all (per #318 typed resolver)",
-      "infra_finding": "audit.jsonl 24% corrupt from concurrent writes (filed urgent) — blocks trusting audit as evidence"
+      "infra_finding": "audit.jsonl 24% corrupt from concurrent writes (filed urgent) — blocks trusting audit as evidence",
+      "hazard_fixed": "#355 — session resolver exact-only, destructive substring-kill divergence closed live",
+      "remaining_t2": "error-text still differs from js (non-destructive) — parked for sweep-resume; do NOT mark full PASS"
     },
     "layout": {
       "status": "pending"
