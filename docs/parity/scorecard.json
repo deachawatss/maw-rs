@@ -339,7 +339,25 @@
       "status": "pending"
     },
     "kill": {
-      "status": "pending"
+      "status": "FAIL",
+      "date": "2026-07-09",
+      "attested_by": "atlas field-test (19 kills, all ftkzz-* isolated, tmux-ls diff before/after every kill = fleet byte-identical)",
+      "passes": [
+        "SAFETY GREEN: only scratch sessions killed, fleet intact",
+        "no-args",
+        "happy-path session",
+        "window-target (session survives)",
+        "error <1s",
+        "idempotency"
+      ],
+      "track2_blocking": [
+        "audit.jsonl schema differs: js={ts,cmd,args:[kill,target],user,pid} vs rs={args:[target],binary,cmd,ts,version} — rs missing user/pid (same class as #348); neither writes maw-log for kill"
+      ],
+      "track1_waiver_candidate": [
+        "kill --help: js prints generic tmux-plugin help (defect); rs correctly rejects flag + prints kill usage"
+      ],
+      "escalated_to_athena": "fuzzy-resolution KIND differs: js exact-match-only (ftkzz→not-found, kills nothing) vs rs prefix-match+ambiguity-refusal (finds 3, lists, refuses, kills nothing) — both SAFE, design question: should a destructive verb have fuzzy at all (per #318 typed resolver)",
+      "infra_finding": "audit.jsonl 24% corrupt from concurrent writes (filed urgent) — blocks trusting audit as evidence"
     },
     "layout": {
       "status": "pending"
