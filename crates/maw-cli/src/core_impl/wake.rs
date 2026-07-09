@@ -601,6 +601,13 @@ fn wake_session_matches(name: &str, oracle: &str) -> bool {
 fn wake_session_name(oracle: &str) -> String { format!("{:02}-{oracle}", wake_slot(oracle)) }
 
 fn wake_slot(oracle: &str) -> u32 {
+    if let Some(slot) = merged_config_value()
+        .get("slots")
+        .and_then(|slots| slots.get(oracle))
+        .and_then(serde_json::Value::as_u64)
+    {
+        return u32::try_from(slot).unwrap_or(u32::MAX);
+    }
     let mut hash = 0_u32;
     for byte in oracle.bytes() { hash = hash.wrapping_mul(33).wrapping_add(u32::from(byte)); }
     10 + (hash % 80)
@@ -900,6 +907,24 @@ mod wake_tests {
                 "bun codex-setup.ts 1 && CODEX_HOME=$PWD/.codex omx --direct --madmax"
             );
             assert_eq!(wake_resolve_engine_command("codex"), "codex");
+        });
+    }
+
+    #[test]
+    fn wake_slot_uses_config_then_falls_back_to_hash() {
+        wake_with_fixture(|_| {
+            let dir = active_config_dir();
+            std::fs::create_dir_all(&dir).expect("config dir");
+            std::fs::write(
+                dir.join("maw.config.50.json"),
+                r#"{"slots":{"gale":1,"leaf":2,"bamboo":3}}"#,
+            )
+            .expect("write config");
+            assert_eq!(wake_slot("gale"), 1);
+            assert_eq!(wake_slot("leaf"), 2);
+            assert_eq!(wake_slot("bamboo"), 3);
+            let unconfigured = wake_slot("unknown");
+            assert!((10..90).contains(&unconfigured), "hash fallback: {unconfigured}");
         });
     }
 

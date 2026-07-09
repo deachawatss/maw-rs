@@ -1,1 +1,1 @@
-{"justification":"Two cohesive bug fixes in 2 tightly-coupled files (tmux_panes.rs, capture.rs) — unit test additions only, no cross-cutting logic"}
+{"justification":"single-concern change: wake_slot() config lookup + hash fallback in 1 function, 1 file"}

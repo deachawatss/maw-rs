@@ -1,1 +1,7 @@
-{"route":"TEAM","justification":"4 separable fork-patch clusters (hey/done/team/workon) — explicit L1 worker split, binding mandate"}
+{
+  "engine": "claude",
+  "engineCommand": "claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions",
+  "engineWarned": false,
+  "justification": "single-concern change: wake_slot() config lookup + hash fallback in 1 function, 1 file",
+  "route": "SOLO"
+}
