@@ -81,6 +81,26 @@ fn swarm_tiled_positional_matches_committed_golden_without_ref_checkout() {
 }
 
 #[test]
+fn swarm_spawn_uses_safe_user_shell_instead_of_hardcoded_zsh() {
+    let root = swarm_temp_dir("shell");
+    let log = root.join("tmux.log");
+    let output = swarm_fake_command(&root.join("home"))
+        .env("MAW_RS_SWARM_FAKE_LOG", &log)
+        .env("SHELL", "/bin/fish")
+        .args(["swarm", "--count", "1"])
+        .output()
+        .expect("run swarm shell");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let log = fs::read_to_string(log).expect("tmux log");
+    assert!(log.contains("exec /bin/fish -li"), "{log}");
+    assert!(!log.contains("exec zsh"), "{log}");
+}
+
+#[test]
 fn swarm_help_matches_committed_golden_without_ref_checkout() {
     let output = Command::new(swarm_bin())
         .args(["swarm", "--help"])

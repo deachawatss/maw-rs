@@ -216,6 +216,8 @@ fn tile_split_pane<R: maw_tmux::TmuxRunner>(req: &TileSplitRequest<'_>, runner: 
 
 fn tile_shell_command(req: &TileSplitRequest<'_>) -> String {
     let command = req.opts.cmd.as_deref().unwrap_or_default();
+    let user_shell = tile_user_shell();
+    let user_shell_word = tile_shell_quote(&user_shell);
     let mut envs = vec![
         format!("MAW_TILE_PARENT={}", tile_shell_quote(req.parent)),
         format!("MAW_TILE_ROLE={}", tile_shell_quote(req.role)),
@@ -225,7 +227,12 @@ fn tile_shell_command(req: &TileSplitRequest<'_>) -> String {
     ];
     if let Some(parent_id) = &req.opts.parent_session_id { envs.push(format!("MAW_PARENT_SESSION_ID={}", tile_shell_quote(parent_id))); }
     if req.opts.count == 1 { if let Some(session_id) = &req.opts.session_id { envs.push(format!("MAW_SESSION_ID={}", tile_shell_quote(session_id))); } }
-    let body = if command.is_empty() { "exec zsh".to_owned() } else { format!("exec zsh -ic {}", tile_shell_quote(&format!("{command}; exec zsh"))) };
+    let body = if command.is_empty() {
+        format!("exec {user_shell_word}")
+    } else {
+        let command_then_shell = format!("{command}; exec {user_shell_word}");
+        format!("exec {user_shell_word} -ic {}", tile_shell_quote(&command_then_shell))
+    };
     let mut shell = format!("export {}; {body}", envs.join(" "));
     if !req.cwd.is_empty() { shell = format!("cd {} || exit $?; {shell}", tile_shell_quote(req.cwd)); }
     shell
@@ -400,6 +407,23 @@ fn tile_validate_tmux_args(args: &[&str]) -> Result<(), String> {
 }
 
 fn tile_shell_quote(value: &str) -> String { format!("'{}'", value.replace('\'', "'\\''")) }
+
+fn tile_user_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| tile_safe_shell_path(shell))
+        .unwrap_or_else(|| "/bin/bash".to_owned())
+}
+
+fn tile_safe_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.starts_with('/')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
+}
 
 fn tile_help_text() -> String {
     concat!(

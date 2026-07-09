@@ -22,9 +22,6 @@ fn maw_rs_binary_smoke_runs_main_and_prints_help() {
         .expect("run maw-rs binary");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
-    assert!(
-        stdout.contains("usage: maw <command> [args]"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("usage: maw <command> [args]"), "{stdout}");
     assert!(output.stderr.is_empty());
 }

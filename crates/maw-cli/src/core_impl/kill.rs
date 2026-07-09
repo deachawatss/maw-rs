@@ -741,6 +741,16 @@ fn kill_kill_resolved_windows(
             "window target required".to_owned()
         });
     }
+    if !options.force && kill_would_empty_session(session, indexes) {
+        return Err(format!(
+            "refusing to kill every window in session '{}' without --force.\n  \
+             this would destroy the session and any unsaved agent work in it.\n  \
+             → kill one pane:       maw kill {}:<window> --pane N\n  \
+             → graceful stop:       maw sleep {}\n  \
+             → really kill windows: maw kill {}:<window> --force",
+            session.name, session.name, session.name, session.name
+        ));
+    }
     let mut killed = Vec::new();
     for index in indexes {
         let target = format!("{}:{index}", session.name);
@@ -749,6 +759,22 @@ fn kill_kill_resolved_windows(
         killed.push(target);
     }
     Ok(kill_window_success(&killed))
+}
+
+fn kill_would_empty_session(session: &KillSession, indexes: &[u32]) -> bool {
+    if session.windows.is_empty() {
+        return false;
+    }
+    let requested = indexes
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let all = session
+        .windows
+        .iter()
+        .map(|window| window.index)
+        .collect::<std::collections::BTreeSet<_>>();
+    requested == all
 }
 
 fn kill_window_success(killed: &[String]) -> String {
@@ -1112,7 +1138,7 @@ mod kill_tests {
     #[test]
     fn kill_window_index_and_all_are_validated_against_listing() {
         let mut tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n07-demo|||2|||work|||0|||/tmp\n");
-        let output = kill_run_fake(&kill_strings(&["07-demo:work", "--all"]), &mut tmux);
+        let output = kill_run_fake(&kill_strings(&["07-demo:work", "--all", "--force"]), &mut tmux);
         assert_eq!(output.code, 0);
         assert!(output.stdout.contains("killed 2 windows"));
         assert_eq!(
@@ -1122,6 +1148,37 @@ mod kill_tests {
         assert_eq!(
             tmux.calls[2],
             ("kill-window".to_owned(), kill_strings(&["-t", "07-demo:2"]))
+        );
+    }
+
+    #[test]
+    fn kill_targeted_window_without_force_refuses_when_it_would_empty_session() {
+        let mut tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n");
+
+        let output = kill_run_fake(&kill_strings(&["07-demo:work"]), &mut tmux);
+
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("every window"), "{}", output.stderr);
+        assert!(output.stderr.contains("--force"), "{}", output.stderr);
+        assert!(
+            !tmux.calls.iter().any(|call| call.0 == "kill-window"),
+            "must not kill last window without --force: {:?}",
+            tmux.calls
+        );
+    }
+
+    #[test]
+    fn kill_all_matching_windows_without_force_refuses_when_it_would_empty_session() {
+        let mut tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n07-demo|||2|||work|||0|||/tmp\n");
+
+        let output = kill_run_fake(&kill_strings(&["07-demo:work", "--all"]), &mut tmux);
+
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("every window"), "{}", output.stderr);
+        assert!(
+            !tmux.calls.iter().any(|call| call.0 == "kill-window"),
+            "must not kill all windows without --force: {:?}",
+            tmux.calls
         );
     }
 

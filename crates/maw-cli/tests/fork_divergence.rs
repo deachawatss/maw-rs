@@ -140,6 +140,7 @@ esac
             .env("DONE_GIT_LOG", root.join("git.log"))
             .env("DONE_TMUX_LOG", root.join("tmux.log"))
             .env("DONE_CAPTURE_COUNT", root.join("capture-count"))
+            .env("MAW_TEST_MODE", "1")
             .env("MAW_DONE_RRR_WAIT_INTERVAL_MS", "0");
         command
     }
@@ -279,7 +280,6 @@ esac
     }
 
     #[test]
-    #[ignore = "fake-tmux display-message format mismatch with rrr send-keys gate — tracked in #1"]
     fn rrr_wait_polls_until_prompt_returns() {
         let (root, bin, main, worktree) = seed_done_fixture("rrr");
         let output = done_command(&root, &bin, &main, &worktree)
@@ -507,6 +507,10 @@ esac
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_GIT_LOG"
 if [ "$3" = "branch" ]; then exit 1; fi
+if [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
+  printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n' "$2"
+  exit 0
+fi
 if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   /bin/mkdir -p "$5/.maw" "$5/.git"
   /bin/printf '{}\n' > "$5/.maw/phase.json"

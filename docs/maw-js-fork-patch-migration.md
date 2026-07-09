@@ -74,12 +74,14 @@ So this migration intentionally patches existing implementations instead of addi
 
 These should be implemented as small hardening PRs on existing surfaces, not new plugin names:
 
-1. `team`: anchored spawn/kickoff and orphan pane sweep proofs.
-2. `workon`: fresh-worktree command sanitization proofs and engine-resolution policy tests.
-3. `overview`: roster reconciliation and pane-base-index proofs.
-4. `cleanup`: leaked internal session/team cleanup proofs.
-5. `pr`/fleet queue: dedupe and closed-PR reconciliation proofs.
-6. `spawn`: replace any remaining hardcoded shell use with the user's shell/default bash through shared tmux spawn helpers.
+1. `team`: anchored spawn/kickoff and orphan pane sweep proofs are covered by the native `team` owner plus `crates/maw-cli/src/wind/team.rs`.
+2. `workon`: fresh-worktree command sanitization, engine-resolution policy, shared `ψ/`, and Rust shared target-dir behavior are covered by the native `workon` owner plus `crates/maw-cli/src/wind/workon.rs`.
+3. `overview`: roster selection and non-zero pane/window index proofs are covered by `overview` tests and the live `TmuxSession` parser path.
+4. `cleanup`: leaked internal session/team cleanup stays on the native `cleanup` -> `view --zombie-agents` + `team prune` path, with bounded delete guards in `team_delete`.
+5. `pr`/fleet queue: `maw pr` targets the fork `origin` repo, writes `Closes #N` + `REQ: #N`, and rejects `Soul-Brews-Studio/*` origin URLs case-insensitively.
+6. `spawn`: `swarm` and `tile` no longer hardcode `zsh`; they use a safe absolute `$SHELL` value with `/bin/bash` fallback.
+
+Remaining genuine parity work is no longer fork-patch migration of the daily workflow. Treat further gaps as normal command parity issues with their own source rows/tests.
 
 ## Verification gates for this branch
 
@@ -93,6 +95,10 @@ cargo test -p maw-tmux busy_guard_blocks_send_during_active_output
 cargo test -p maw-tmux verify_submit_retries_with_engine_specific_intervals
 cargo test -p maw-tmux fork_divergence_hook_keeps_wind_delivery_at_submit_site
 cargo test -p maw-cli done_push_guard_blocks_main_head_and_closed_pr_states
+cargo test -p maw-cli --lib core_impl::pr_tests
+cargo test -p maw-cli --test native_workon_plugin
+cargo test -p maw-cli --test native_swarm_plugin
+cargo test -p maw-cli --test native_tile_plugin
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 target/debug/maw-rs --version

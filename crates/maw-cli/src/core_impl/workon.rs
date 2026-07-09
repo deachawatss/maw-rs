@@ -593,7 +593,109 @@ fn workon_create_worktree(
     } else {
         workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, "-b", branch])?;
     }
+    let main_path = workon_main_worktree_path(&repo.repo_path)?;
+    workon_link_shared_psi(&main_path, wt_path)?;
+    workon_write_cargo_target_config(&main_path, wt_path)?;
     Ok(())
+}
+
+fn workon_main_worktree_path(repo_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let raw = workon_git(repo_path, &["worktree", "list", "--porcelain"])?;
+    raw.lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "workon: could not resolve main worktree path".to_owned())
+}
+
+fn workon_link_shared_psi(
+    main_path: &std::path::Path,
+    wt_path: &std::path::Path,
+) -> Result<bool, String> {
+    let source = main_path.join("ψ");
+    if !source.is_dir() {
+        return Ok(false);
+    }
+    let target = wt_path.join("ψ");
+    if let Ok(existing) = std::fs::symlink_metadata(&target) {
+        if existing.file_type().is_symlink() && std::fs::read_link(&target).ok().as_deref() == Some(source.as_path()) {
+            return Ok(false);
+        }
+        workon_preserve_existing_psi(wt_path, &target)?;
+    }
+    workon_symlink_dir(&source, &target)?;
+    Ok(true)
+}
+
+fn workon_preserve_existing_psi(
+    wt_path: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
+    let backups = wt_path.join(".maw").join("psi-local-backups");
+    std::fs::create_dir_all(&backups)
+        .map_err(|error| format!("workon: create {}: {error}", backups.display()))?;
+    let mut index = 0_u32;
+    loop {
+        let name = if index == 0 {
+            "psi".to_owned()
+        } else {
+            format!("psi-{index}")
+        };
+        let backup = backups.join(name);
+        if backup.exists() || std::fs::symlink_metadata(&backup).is_ok() {
+            index = index.saturating_add(1);
+            continue;
+        }
+        std::fs::rename(target, &backup)
+            .map_err(|error| format!("workon: preserve {} to {}: {error}", target.display(), backup.display()))?;
+        return Ok(());
+    }
+}
+
+fn workon_write_cargo_target_config(
+    main_path: &std::path::Path,
+    wt_path: &std::path::Path,
+) -> Result<bool, String> {
+    if !main_path.join("Cargo.toml").is_file() {
+        return Ok(false);
+    }
+    let config = wt_path.join(".cargo").join("config.toml");
+    if config.exists() {
+        return Ok(false);
+    }
+    let Some(parent) = config.parent() else {
+        return Err(format!("workon: cargo config has no parent: {}", config.display()));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("workon: create {}: {error}", parent.display()))?;
+    let target_dir = workon_toml_basic_string(&main_path.join("target").to_string_lossy());
+    let body = format!("[build]\ntarget-dir = \"{target_dir}\"\n");
+    std::fs::write(&config, body)
+        .map_err(|error| format!("workon: write {}: {error}", config.display()))?;
+    Ok(true)
+}
+
+fn workon_toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(unix)]
+fn workon_symlink_dir(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("workon: create {}: {error}", parent.display()))?;
+    }
+    std::os::unix::fs::symlink(source, target)
+        .map_err(|error| format!("workon: link {} -> {}: {error}", target.display(), source.display()))
+}
+
+#[cfg(windows)]
+fn workon_symlink_dir(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("workon: create {}: {error}", parent.display()))?;
+    }
+    std::os::windows::fs::symlink_dir(source, target)
+        .map_err(|error| format!("workon: link {} -> {}: {error}", target.display(), source.display()))
 }
 
 fn workon_resolve_repo(repo: &str) -> Result<WorkonRepo, String> {
@@ -958,6 +1060,31 @@ mod workon_tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp root");
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_shared_psi_preserves_existing_worktree_psi() {
+        let root = workon_temp_root("shared-psi");
+        let main = root.join("main");
+        let wt = root.join("main/agents/feat");
+        std::fs::create_dir_all(main.join("ψ/memory")).expect("main psi");
+        std::fs::write(main.join("ψ/memory/main.md"), "main\n").expect("main memory");
+        std::fs::create_dir_all(wt.join("ψ/memory")).expect("worktree psi");
+        std::fs::write(wt.join("ψ/memory/local.md"), "local\n").expect("local memory");
+
+        assert!(workon_link_shared_psi(&main, &wt).expect("link"));
+
+        assert!(std::fs::symlink_metadata(wt.join("ψ"))
+            .expect("psi metadata")
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_link(wt.join("ψ")).expect("read link"), main.join("ψ"));
+        assert_eq!(
+            std::fs::read_to_string(wt.join(".maw/psi-local-backups/psi/memory/local.md"))
+                .expect("backup"),
+            "local\n"
+        );
     }
 
     #[test]

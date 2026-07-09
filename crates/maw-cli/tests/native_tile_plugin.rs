@@ -100,6 +100,7 @@ fn tile_native_spawn_cmd_uses_safe_tmux_argv_and_layouts() {
     let root = tile_temp("spawn");
     tile_install_fake_tmux(&root);
     let output = tile_command(&root)
+        .env("SHELL", "/bin/fish")
         .args([
             "tile",
             "1",
@@ -138,6 +139,9 @@ fn tile_native_spawn_cmd_uses_safe_tmux_argv_and_layouts() {
         log.contains("set-option -w -t @7 pane-border-status bottom"),
         "{log}"
     );
+    assert!(log.contains("exec '/bin/fish' -ic"), "{log}");
+    assert!(log.contains("exec '\\''/bin/fish'\\'''"), "{log}");
+    assert!(!log.contains("exec zsh"), "{log}");
     let _ = std::fs::remove_dir_all(root);
 }
 

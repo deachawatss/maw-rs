@@ -224,7 +224,18 @@ impl DoneRuntime for DoneLocal {
 
     fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
         done_validate_tmux_target(target)?;
-        TmuxClient::local().send_text_ungated(target, text).map(|_| ()).map_err(|error| error.message)
+        let mut client = TmuxClient::local();
+        if std::env::var("MAW_TEST_MODE").ok().as_deref() == Some("1") {
+            client
+                .send_text_ungated_with_sleeper(target, text, |_| {})
+                .map(|_| ())
+                .map_err(|error| error.message)
+        } else {
+            client
+                .send_text_ungated(target, text)
+                .map(|_| ())
+                .map_err(|error| error.message)
+        }
     }
 
     fn done_git(&mut self, args: &[String]) -> Result<String, String> { done_git(args) }

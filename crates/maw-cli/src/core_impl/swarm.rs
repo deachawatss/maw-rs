@@ -191,7 +191,7 @@ fn swarm_split_pane(
 ) -> Result<String, maw_tmux::TmuxError> {
     let mut args = Vec::new();
     if let Some(anchor) = anchor { args.extend(["-t".to_owned(), anchor.to_owned()]); }
-    args.extend(["-h".to_owned(), "-P".to_owned(), "-F".to_owned(), "#{pane_id}".to_owned(), "exec zsh -li".to_owned()]);
+    args.extend(["-h".to_owned(), "-P".to_owned(), "-F".to_owned(), "#{pane_id}".to_owned(), swarm_login_shell_command()]);
     Ok(runner.run("split-window", &args)?.trim().to_owned())
 }
 
@@ -221,7 +221,11 @@ fn swarm_start_agent(
     let label = format!("{} ({})", agent.name, agent.label);
     runner.run("select-pane", &["-t".to_owned(), pane.to_owned(), "-T".to_owned(), label])?;
     let command = swarm_command_with_env(agent, options);
-    let shell_line = format!("{}; printf '\\e[?1049l'; clear; exec zsh -li", swarm_shell_quote(&command));
+    let shell_line = format!(
+        "{}; printf '\\e[?1049l'; clear; {}",
+        swarm_shell_quote(&command),
+        swarm_login_shell_command()
+    );
     runner.run("send-keys", &["-t".to_owned(), pane.to_owned(), shell_line, "Enter".to_owned()])?;
     Ok(())
 }
@@ -240,6 +244,27 @@ fn swarm_shell_quote(value: &str) -> String {
         return value.to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn swarm_login_shell_command() -> String {
+    format!("exec {} -li", swarm_shell_quote(&swarm_user_shell()))
+}
+
+fn swarm_user_shell() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .filter(|shell| swarm_safe_shell_path(shell))
+        .unwrap_or_else(|| "/bin/bash".to_owned())
+}
+
+fn swarm_safe_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.starts_with('/')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.'))
 }
 
 fn swarm_member(agent: &SwarmAgent, pane: &str) -> SwarmTeamMember {

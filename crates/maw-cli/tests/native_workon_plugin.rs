@@ -53,6 +53,10 @@ esac
 printf '%s\n' "$*" >> "$MAW_FAKE_GIT_LOG"
 if [ "$3" = "branch" ]; then exit 1; fi
 if [ "$3" = "for-each-ref" ]; then exit 0; fi
+if [ "$3" = "worktree" ] && [ "$4" = "list" ]; then
+  printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n' "$2"
+  exit 0
+fi
 if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
   cd "$2" 2>/dev/null || exit 128
   pwd
@@ -61,6 +65,8 @@ fi
 if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   mkdir -p "$5"
   printf 'gitdir: fake\n' > "$5/.git"
+  mkdir -p "$5/ψ/memory"
+  printf 'local worktree memory\n' > "$5/ψ/memory/local.md"
   exit 0
 fi
 printf 'unexpected git args: %s\n' "$*" >&2
@@ -171,6 +177,44 @@ fn native_workon_create_nested_matches_committed_golden_without_ref_checkout() {
     );
     let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
     assert!(git_log.contains("worktree add"), "{git_log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_workon_create_links_psi_and_shares_cargo_target() {
+    let root = temp_dir("shared-state");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join("ψ/memory/learnings")).expect("main psi");
+    fs::write(repo.join("ψ/memory/learnings/main.md"), "main memory\n").expect("main learning");
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("cargo toml");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let wt = repo.join("agents/feat");
+    let psi = wt.join("ψ");
+    assert!(fs::symlink_metadata(&psi)
+        .expect("psi metadata")
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read_link(&psi).expect("psi link"), repo.join("ψ"));
+    assert_eq!(
+        fs::read_to_string(wt.join(".cargo/config.toml")).expect("cargo config"),
+        format!(
+            "[build]\ntarget-dir = \"{}\"\n",
+            repo.join("target").display()
+        )
+    );
 }
 
 #[test]

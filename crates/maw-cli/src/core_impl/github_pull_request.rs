@@ -15,6 +15,8 @@ struct PrOptions {
 struct PrPlan {
     cwd: std::path::PathBuf,
     branch: String,
+    base_repo: String,
+    base_branch: String,
     title: String,
     body: String,
 }
@@ -44,7 +46,8 @@ impl PrTmux for PrNativeTmux {
 
 trait PrProcess {
     fn pr_git_branch(&mut self, cwd: &std::path::Path) -> Result<String, String>;
-    fn pr_gh_create(&mut self, cwd: &std::path::Path, title: &str, body: &str) -> Result<String, String>;
+    fn pr_git_remote_url(&mut self, cwd: &std::path::Path, remote: &str) -> Result<String, String>;
+    fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String>;
     fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String>;
 }
 
@@ -66,11 +69,38 @@ impl PrProcess for PrNativeProcess {
         }
     }
 
-    fn pr_gh_create(&mut self, cwd: &std::path::Path, title: &str, body: &str) -> Result<String, String> {
+    fn pr_git_remote_url(&mut self, cwd: &std::path::Path, remote: &str) -> Result<String, String> {
         pr_validate_cwd(cwd)?;
+        pr_validate_remote_name(remote)?;
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["remote", "get-url", remote])
+            .output()
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        }
+        let code = output.status.code().unwrap_or(1);
+        Err(format!("git remote get-url {remote} failed (exit {code})"))
+    }
+
+    fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String> {
+        pr_validate_cwd(&plan.cwd)?;
         let output = std::process::Command::new("gh")
-            .current_dir(cwd)
-            .args(["pr", "create", "--title", title, "--body", body])
+            .current_dir(&plan.cwd)
+            .args([
+                "pr",
+                "create",
+                "--repo",
+                &plan.base_repo,
+                "--base",
+                &plan.base_branch,
+                "--title",
+                &plan.title,
+                "--body",
+                &plan.body,
+            ])
             .output()
             .map_err(|error| error.to_string())?;
         if output.status.success() {
@@ -109,9 +139,11 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
         return process.pr_gh_view_current(&cwd).map(|line| format!("{line}\n"));
     }
     let branch = process.pr_git_branch(&cwd)?;
-    let plan = pr_build_plan(cwd, branch, &options)?;
+    let origin_url = process.pr_git_remote_url(&cwd, "origin")?;
+    let base_repo = pr_github_repo_from_remote(&origin_url)?;
+    let plan = pr_build_plan(cwd, branch, base_repo, &options)?;
     let mut out = pr_render_start(&plan);
-    let url = process.pr_gh_create(&plan.cwd, &plan.title, &plan.body)?;
+    let url = process.pr_gh_create(&plan)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m {url}");
     Ok(out)
 }
@@ -163,18 +195,25 @@ fn pr_resolve_cwd<T: PrTmux>(window: Option<&str>, tmux: &mut T) -> Result<std::
     Ok(path)
 }
 
-fn pr_build_plan(cwd: std::path::PathBuf, branch: String, options: &PrOptions) -> Result<PrPlan, String> {
+fn pr_build_plan(
+    cwd: std::path::PathBuf,
+    branch: String,
+    base_repo: String,
+    options: &PrOptions,
+) -> Result<PrPlan, String> {
     pr_validate_branch(&branch)?;
+    pr_validate_base_repo(&base_repo)?;
     let title = options.title.clone().unwrap_or_else(|| pr_branch_to_title(&branch));
     pr_validate_text_arg(&title, "title")?;
     let body = options.body.clone().unwrap_or_else(|| pr_issue_body(&branch).unwrap_or_default());
     pr_validate_text_arg(&body, "body")?;
-    Ok(PrPlan { cwd, branch, title, body })
+    Ok(PrPlan { cwd, branch, base_repo, base_branch: "main".to_owned(), title, body })
 }
 
 fn pr_render_start(plan: &PrPlan) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "\x1b[36m⚡\x1b[0m creating PR: \"{}\" ({})", plan.title, plan.branch);
+    let _ = writeln!(out, "\x1b[36m⚡\x1b[0m target: {} ← {}", plan.base_repo, plan.base_branch);
     if let Some(issue) = pr_extract_issue_num(&plan.branch) {
         let _ = writeln!(out, "\x1b[36m⚡\x1b[0m linking to issue #{issue}");
     }
@@ -194,7 +233,7 @@ fn pr_branch_to_title(branch: &str) -> String {
 }
 
 fn pr_issue_body(branch: &str) -> Option<String> {
-    pr_extract_issue_num(branch).map(|issue| format!("Closes #{issue}"))
+    pr_extract_issue_num(branch).map(|issue| format!("Closes #{issue}\nREQ: #{issue}"))
 }
 
 fn pr_extract_issue_num(branch: &str) -> Option<u64> {
@@ -202,6 +241,23 @@ fn pr_extract_issue_num(branch: &str) -> Option<u64> {
     let tail = lower.split_once("issue-")?.1;
     let digits = tail.chars().take_while(char::is_ascii_digit).collect::<String>();
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn pr_github_repo_from_remote(url: &str) -> Result<String, String> {
+    let raw = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let slug = raw
+        .strip_prefix("https://github.com/")
+        .or_else(|| raw.strip_prefix("http://github.com/"))
+        .or_else(|| raw.strip_prefix("git@github.com:"))
+        .or_else(|| raw.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| raw.strip_prefix("github.com/"))
+        .ok_or_else(|| "pr: origin remote must be a GitHub URL".to_owned())?;
+    let (owner, repo) = slug.split_once('/').ok_or_else(|| "pr: origin remote must use owner/repo".to_owned())?;
+    pr_validate_github_segment(owner, "owner")?;
+    pr_validate_github_segment(repo, "repo")?;
+    let base_repo = format!("{owner}/{repo}");
+    pr_validate_base_repo(&base_repo)?;
+    Ok(base_repo)
 }
 
 fn pr_tmux_output(args: &[&str]) -> Result<String, String> {
@@ -251,6 +307,43 @@ fn pr_validate_branch(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn pr_validate_base_repo(value: &str) -> Result<(), String> {
+    let (owner, repo) = value.split_once('/').ok_or_else(|| "pr: base repo must use owner/repo".to_owned())?;
+    pr_validate_github_segment(owner, "owner")?;
+    pr_validate_github_segment(repo, "repo")?;
+    if owner.eq_ignore_ascii_case("Soul-Brews-Studio") {
+        return Err(format!(
+            "pr: refusing to create PR against read-only upstream {value}; set origin to a fork"
+        ));
+    }
+    Ok(())
+}
+
+fn pr_validate_github_segment(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.starts_with('-')
+        || value.contains("..")
+        || value.chars().any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+    {
+        return Err(format!("pr: GitHub {label} contains refused characters"));
+    }
+    Ok(())
+}
+
+fn pr_validate_remote_name(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.trim() != value
+        || value.starts_with('-')
+        || value.contains('/')
+        || value.contains("..")
+        || value.chars().any(char::is_control)
+    {
+        return Err("pr: remote name contains refused characters".to_owned());
+    }
+    Ok(())
+}
+
 fn pr_validate_text_arg(value: &str, name: &str) -> Result<(), String> {
     if value.starts_with('-') || value.chars().any(|ch| ch == '\0') {
         return Err(format!("pr: {name} contains refused characters"));
@@ -275,14 +368,23 @@ mod pr_tests {
     }
 
     #[derive(Default)]
-    struct PrMockProcess { branch: String, created: Vec<(String, String, String)>, viewed: Vec<String> }
+    struct PrMockProcess {
+        branch: String,
+        origin_url: String,
+        created: Vec<PrPlan>,
+        viewed: Vec<String>,
+    }
 
     impl PrProcess for PrMockProcess {
         fn pr_git_branch(&mut self, cwd: &std::path::Path) -> Result<String, String> {
             Ok(if self.branch.is_empty() { cwd.file_name().unwrap().to_string_lossy().into_owned() } else { self.branch.clone() })
         }
-        fn pr_gh_create(&mut self, cwd: &std::path::Path, title: &str, body: &str) -> Result<String, String> {
-            self.created.push((cwd.display().to_string(), title.to_owned(), body.to_owned()));
+        fn pr_git_remote_url(&mut self, _cwd: &std::path::Path, remote: &str) -> Result<String, String> {
+            assert_eq!(remote, "origin");
+            Ok(if self.origin_url.is_empty() { "https://github.com/acme/demo.git".to_owned() } else { self.origin_url.clone() })
+        }
+        fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String> {
+            self.created.push(plan.clone());
             Ok("https://github.com/acme/demo/pull/7".to_owned())
         }
         fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String> {
@@ -326,8 +428,10 @@ mod pr_tests {
         let output = pr_run(&[], &mut tmux, &mut process).expect("run");
 
         assert_eq!(output, include_str!("../../tests/fixtures/native-pr/create.stdout"));
-        assert_eq!(process.created[0].1, "Issue 140 Pr Native");
-        assert_eq!(process.created[0].2, "Closes #140");
+        assert_eq!(process.created[0].title, "Issue 140 Pr Native");
+        assert_eq!(process.created[0].body, "Closes #140\nREQ: #140");
+        assert_eq!(process.created[0].base_repo, "acme/demo");
+        assert_eq!(process.created[0].base_branch, "main");
     }
 
     #[test]
@@ -364,10 +468,48 @@ mod pr_tests {
     fn pr_overrides_title_body_and_rejects_detached_head() {
         let repo = pr_temp_dir("override");
         let options = PrOptions { window: None, title: Some("Custom".to_owned()), body: Some("Body".to_owned()), show_current: false };
-        let plan = pr_build_plan(repo, "feat/demo".to_owned(), &options).expect("plan");
+        let plan = pr_build_plan(repo, "feat/demo".to_owned(), "deachawatss/maw-rs".to_owned(), &options).expect("plan");
         assert_eq!(plan.title, "Custom");
         assert_eq!(plan.body, "Body");
-        let error = pr_build_plan(std::path::PathBuf::from("/tmp"), String::new(), &options).expect_err("detached");
+        let error = pr_build_plan(std::path::PathBuf::from("/tmp"), String::new(), "deachawatss/maw-rs".to_owned(), &options).expect_err("detached");
         assert!(error.contains("detached HEAD"));
+    }
+
+    #[test]
+    fn pr_targets_origin_fork_main_and_rejects_soul_brews_upstream() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("fork-target");
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/issue-17-help".to_owned(),
+            origin_url: "git@github.com:deachawatss/maw-rs.git".to_owned(),
+            ..PrMockProcess::default()
+        };
+
+        let output = pr_run(&[], &mut tmux, &mut process).expect("fork pr");
+
+        assert!(output.contains("target: deachawatss/maw-rs ← main"), "{output}");
+        assert_eq!(process.created[0].base_repo, "deachawatss/maw-rs");
+        assert_eq!(process.created[0].base_branch, "main");
+
+        let mut upstream_process = PrMockProcess {
+            branch: "agents/issue-17-help".to_owned(),
+            origin_url: "https://github.com/Soul-Brews-Studio/maw-rs.git".to_owned(),
+            ..PrMockProcess::default()
+        };
+        let err = pr_run(&[], &mut tmux, &mut upstream_process).expect_err("upstream refused");
+        assert!(err.contains("read-only upstream"), "{err}");
+        assert!(upstream_process.created.is_empty());
+
+        let mut mixed_case_upstream = PrMockProcess {
+            branch: "agents/issue-17-help".to_owned(),
+            origin_url: "git@github.com:soul-brews-studio/maw-rs.git".to_owned(),
+            ..PrMockProcess::default()
+        };
+        let err = pr_run(&[], &mut tmux, &mut mixed_case_upstream).expect_err("upstream case refused");
+        assert!(err.contains("read-only upstream"), "{err}");
+        assert!(mixed_case_upstream.created.is_empty());
     }
 }

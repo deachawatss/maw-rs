@@ -124,6 +124,20 @@ where
         wind_delivery::send_text_ungated_with_sleeper(self, target, text, config, std::thread::sleep)
     }
 
+    #[doc(hidden)]
+    pub fn send_text_ungated_with_sleeper<F>(
+        &mut self,
+        target: &str,
+        text: &str,
+        sleep: F,
+    ) -> Result<SendTextReport, TmuxError>
+    where
+        F: FnMut(std::time::Duration),
+    {
+        let config = wind_delivery::submit_config_for_target(self, target);
+        wind_delivery::send_text_ungated_with_sleeper(self, target, text, config, sleep)
+    }
+
     /// Smart text sending with explicit engine timing.
     ///
     /// # Errors
