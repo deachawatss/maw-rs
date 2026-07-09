@@ -67,6 +67,29 @@ git diff --name-only | grep '^ψ/' || true
 New logic belongs in the lowest layer that can hold it. Keep I/O out of leaf crates. Use
 `cargo tree` as the authoritative dependency graph.
 
+## No raw tmux
+
+Never use raw `tmux` commands (`send-keys`, `split-window`, `select-pane`, `join-pane`,
+`break-pane`, `select-layout`, `rename-window`, `kill-window`, etc.) when a `maw` verb
+exists. Use the maw verb instead:
+
+| instead of raw tmux | use maw verb |
+|---------------------|-------------|
+| `tmux send-keys` | `maw run` / `maw hey` / `maw send-text` / `maw send-enter` |
+| `tmux split-window` | `maw split` / `maw tile` / `maw new --split` |
+| `tmux kill-window` | `maw kill` / `maw done` |
+| `tmux new-window` | `maw new --window` |
+| `tmux select-layout` | `maw layout` (#264) |
+| `tmux join-pane` | `maw join` (#264) |
+| `tmux break-pane` | `maw break` (#264) |
+| `tmux swap-pane` | `maw swap` (#266) |
+| `tmux resize-pane` | `maw resize` (#267) |
+| `tmux select-pane` | `maw focus` (#267) |
+| `tmux select-pane -T` | `maw rename-pane` (#267) |
+
+If the maw verb doesn't exist yet (marked with issue #), file the gap — don't fall back
+to raw tmux. The safety hook blocks `tmux send-keys` for this reason.
+
 ## Style
 
 - Workspace Rust edition is 2021.
@@ -75,7 +98,12 @@ New logic belongs in the lowest layer that can hold it. Keep I/O out of leaf cra
 - New `crates/maw-cli/src/core_impl/*.rs` dispatcher files use per-file `DISPATCH_NN`
   consts. `build.rs` panics on duplicate dispatcher numbers, so renumber when parallel
   PRs collide.
-- For hand-written shell search, use `rg`, not recursive `grep -rn`.
+- For hand-written shell search, use `rg`, not recursive `grep -rn`. **Never sweep the
+  filesystem or ghq root** (no `grep -r`/`find`/`bfs` from `/`, `~`, or the code root
+  wholesale — 3 machine-freezing incidents, 2026-07-09). Find a repo:
+  `ghq list | rg <name>` or `ls -d "$(ghq root)"/github.com/*/<name>*` (ghq root varies
+  per machine — m5=/opt/Code, MBA=~/Code — always resolve via `$(ghq root)`). Find a
+  file: `git -C <repo> ls-files | rg <name>`. Content: `rg` in the narrowest dir.
 
 ## Fixtures
 
