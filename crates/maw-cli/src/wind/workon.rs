@@ -12,19 +12,29 @@ pub(crate) struct EngineResolution {
     pub(crate) warning: Option<String>,
 }
 
+pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
+    ".maw/strategy.json",
+    ".maw/solo-justified",
+    ".maw/spec-waived",
+    ".maw/aggregate-verified",
+    ".maw/done-pinged",
+    ".maw/auto-done-pinged",
+    ".maw/rrr-done",
+    ".maw/phase.json",
+    ".maw/lane",
+    ".maw/req-line",
+];
+
+const GITIGNORE_BLOCK_START: &str = "# >>> maw ephemeral markers (managed by maw-rs) >>>";
+const GITIGNORE_BLOCK_END: &str = "# <<< maw ephemeral markers <<<";
+
 pub(crate) fn sanitize_fresh_worktree(
     repo_path: &Path,
     wt_path: &Path,
 ) -> Result<Vec<String>, String> {
     run_git_clean(wt_path)?;
     let mut cleaned = Vec::new();
-    for relative in [
-        ".maw/phase.json",
-        ".maw/strategy.json",
-        ".maw/solo-justified",
-        ".maw/aggregate-verified",
-        ".maw/done-pinged",
-    ] {
+    for relative in EPHEMERAL_MARKERS {
         remove_stale_file(wt_path, relative, &mut cleaned)?;
     }
     for (label, path) in index_lock_candidates(wt_path) {
@@ -221,10 +231,170 @@ fn ghq_root() -> PathBuf {
     path
 }
 
+pub(crate) fn ensure_gitignore_ephemeral_block(root: &Path) -> Result<bool, String> {
+    let gitignore = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if existing.contains(GITIGNORE_BLOCK_START) {
+        return Ok(false);
+    }
+    let mut block = String::new();
+    block.push_str(GITIGNORE_BLOCK_START);
+    block.push('\n');
+    for marker in EPHEMERAL_MARKERS {
+        block.push_str(marker);
+        block.push('\n');
+    }
+    block.push_str(GITIGNORE_BLOCK_END);
+    block.push('\n');
+
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&block);
+    std::fs::write(&gitignore, content)
+        .map(|()| true)
+        .map_err(|error| format!("workon: write .gitignore: {error}"))
+}
+
 #[rustfmt::skip]
 fn current_xdg_env() -> maw_xdg::MawXdgEnv {
     const KEYS: &[&str] = &["MAW_HOME", "MAW_CONFIG_DIR", "MAW_XDG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "MAW_STATE_DIR", "XDG_DATA_HOME", "MAW_DATA_DIR", "XDG_CACHE_HOME", "MAW_CACHE_DIR", "MAW_TEST_MODE"];
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     let vars = KEYS.iter().filter_map(|key| std::env::var(key).ok().map(|value| ((*key).to_owned(), value)));
     maw_xdg::MawXdgEnv::with_vars(home, vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("maw-rs-workon-{label}-{stamp}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    #[test]
+    fn ephemeral_markers_list_is_complete() {
+        let expected = [
+            ".maw/strategy.json",
+            ".maw/solo-justified",
+            ".maw/spec-waived",
+            ".maw/aggregate-verified",
+            ".maw/done-pinged",
+            ".maw/auto-done-pinged",
+            ".maw/rrr-done",
+            ".maw/phase.json",
+            ".maw/lane",
+            ".maw/req-line",
+        ];
+        assert_eq!(EPHEMERAL_MARKERS, &expected);
+    }
+
+    #[test]
+    fn remove_stale_file_removes_present_markers_and_preserves_absent() {
+        let dir = temp_dir("stale-remove");
+        let maw = dir.join(".maw");
+        fs::create_dir_all(&maw).expect("maw dir");
+        fs::create_dir_all(maw.join("plugins")).expect("plugins dir");
+        fs::create_dir_all(maw.join("teams")).expect("teams dir");
+        fs::create_dir_all(maw.join("fleet")).expect("fleet dir");
+        fs::create_dir_all(maw.join("briefs")).expect("briefs dir");
+
+        for marker in EPHEMERAL_MARKERS {
+            fs::write(dir.join(marker), "stale").expect("write marker");
+        }
+        fs::write(maw.join("plugins/transcriber.json"), "{}").expect("plugin");
+        fs::write(maw.join("teams/team-a.json"), "{}").expect("team");
+        fs::write(maw.join("fleet/fleet.json"), "{}").expect("fleet");
+        fs::write(maw.join("briefs/brief.md"), "# brief").expect("brief");
+
+        let mut cleaned = Vec::new();
+        for marker in EPHEMERAL_MARKERS {
+            remove_stale_file(&dir, marker, &mut cleaned).unwrap();
+        }
+
+        for marker in EPHEMERAL_MARKERS {
+            assert!(
+                !dir.join(marker).exists(),
+                "ephemeral marker should be removed: {marker}"
+            );
+        }
+
+        assert!(maw.join("plugins/transcriber.json").exists(), "plugins preserved");
+        assert!(maw.join("teams/team-a.json").exists(), "teams preserved");
+        assert!(maw.join("fleet/fleet.json").exists(), "fleet preserved");
+        assert!(maw.join("briefs/brief.md").exists(), "briefs preserved");
+
+        assert_eq!(cleaned.len(), EPHEMERAL_MARKERS.len());
+        for marker in EPHEMERAL_MARKERS {
+            assert!(
+                cleaned.contains(&(*marker).to_owned()),
+                "cleaned list should contain {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_stale_file_tolerates_missing_markers() {
+        let dir = temp_dir("stale-missing");
+        fs::create_dir_all(dir.join(".maw")).expect("maw dir");
+
+        let mut cleaned = Vec::new();
+        for marker in EPHEMERAL_MARKERS {
+            remove_stale_file(&dir, marker, &mut cleaned).unwrap();
+        }
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn gitignore_block_written_on_first_call() {
+        let dir = temp_dir("gitignore-first");
+        fs::write(dir.join(".gitignore"), "target/\n").expect("seed");
+
+        let wrote = ensure_gitignore_ephemeral_block(&dir).unwrap();
+        assert!(wrote);
+
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(content.contains(GITIGNORE_BLOCK_START));
+        assert!(content.contains(GITIGNORE_BLOCK_END));
+        for marker in EPHEMERAL_MARKERS {
+            assert!(content.contains(marker), "gitignore should contain {marker}");
+        }
+        assert!(content.starts_with("target/\n"), "original content preserved");
+    }
+
+    #[test]
+    fn gitignore_block_is_idempotent() {
+        let dir = temp_dir("gitignore-idempotent");
+        fs::write(dir.join(".gitignore"), "target/\n").expect("seed");
+
+        ensure_gitignore_ephemeral_block(&dir).unwrap();
+        let first = fs::read_to_string(dir.join(".gitignore")).unwrap();
+
+        let wrote = ensure_gitignore_ephemeral_block(&dir).unwrap();
+        assert!(!wrote, "second call should be a no-op");
+
+        let second = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(first, second, "content should not be duplicated");
+    }
+
+    #[test]
+    fn gitignore_block_created_when_no_gitignore_exists() {
+        let dir = temp_dir("gitignore-new");
+
+        let wrote = ensure_gitignore_ephemeral_block(&dir).unwrap();
+        assert!(wrote);
+
+        let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(content.contains(GITIGNORE_BLOCK_START));
+        assert!(content.contains(".maw/strategy.json"));
+    }
 }

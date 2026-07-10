@@ -603,16 +603,13 @@ exit 9
 
     #[test]
     fn fresh_worktree_sanitizes_stale_state() {
-        // Wiring guard: --fresh must scrub the stale .maw session markers the fake
-        // `git worktree add` seeds, proving sanitize_fresh_worktree is wired (was
-        // dead code under #![allow(dead_code)]).
         let root = temp_dir("fresh-sanitize");
         let bin_dir = seed_root(&root, Some(r#"{"commands":{"default":"claude"}}"#));
-        let output = run(&root, &bin_dir, &["workon", "demo", "feat", "--fresh"]);
+        let output = run(&root, &bin_dir, &["workon", "demo", "feat"]);
         assert_success(&output);
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("sanitized fresh worktree"),
+            stdout.contains("sanitized worktree"),
             "expected sanitize line; stdout={stdout}"
         );
         assert!(
@@ -622,6 +619,10 @@ exit 9
         assert!(
             stdout.contains(".git/index.lock"),
             "should scrub stale index.lock; stdout={stdout}"
+        );
+        assert!(
+            stdout.contains(".gitignore: added maw ephemeral markers block"),
+            "should inject gitignore block; stdout={stdout}"
         );
     }
 

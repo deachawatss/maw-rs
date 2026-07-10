@@ -240,16 +240,20 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.layout)?;
                 let suffix = if branch_exists { ", reused branch" } else { "" };
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
-                // --fresh: scrub stale .maw session state + index.lock + git-clean
-                // untracked cruft so a reused branch doesn't inherit a prior
-                // session's phase/strategy/done markers, and seed CLAUDE.md.
-                if options.fresh {
-                    match crate::wind::workon::sanitize_fresh_worktree(&repo.repo_path, &wt_path) {
-                        Ok(cleaned) if !cleaned.is_empty() => {
-                            let _ = writeln!(stdout, "\x1b[32m+\x1b[0m sanitized fresh worktree ({})", cleaned.join(", "));
-                        }
-                        Ok(_) => {}
-                        Err(error) => return Err(error),
+                match crate::wind::workon::sanitize_fresh_worktree(&repo.repo_path, &wt_path) {
+                    Ok(cleaned) if !cleaned.is_empty() => {
+                        let _ = writeln!(stdout, "\x1b[32m+\x1b[0m sanitized worktree ({})", cleaned.join(", "));
+                    }
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+                match crate::wind::workon::ensure_gitignore_ephemeral_block(&repo.repo_path) {
+                    Ok(true) => {
+                        let _ = writeln!(stdout, "\x1b[32m+\x1b[0m .gitignore: added maw ephemeral markers block");
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {error}");
                     }
                 }
                 target_path = wt_path;

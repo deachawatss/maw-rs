@@ -12,3 +12,16 @@ examples/**/dist/
 
 # nova builder worktrees
 agents/
+
+# >>> maw ephemeral markers (managed by maw-rs) >>>
+.maw/strategy.json
+.maw/solo-justified
+.maw/spec-waived
+.maw/aggregate-verified
+.maw/done-pinged
+.maw/auto-done-pinged
+.maw/rrr-done
+.maw/phase.json
+.maw/lane
+.maw/req-line
+# <<< maw ephemeral markers <<<

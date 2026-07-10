@@ -69,6 +69,7 @@ if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   printf 'local worktree memory\n' > "$5/ψ/memory/local.md"
   exit 0
 fi
+if [ "$3" = "clean" ] && [ "$4" = "-fd" ]; then exit 0; fi
 printf 'unexpected git args: %s\n' "$*" >&2
 exit 9
 "#,
