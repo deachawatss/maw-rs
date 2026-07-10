@@ -1,7 +1,0 @@
-{
-  "engine": "claude",
-  "engineCommand": "claude --dangerously-skip-permissions --continue || claude --dangerously-skip-permissions",
-  "engineWarned": false,
-  "justification": "single-concern change: wake_slot() config lookup + hash fallback in 1 function, 1 file",
-  "route": "SOLO"
-}

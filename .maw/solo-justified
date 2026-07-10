@@ -1,1 +1,0 @@
-{"justification":"single-concern change: wake_slot() config lookup + hash fallback in 1 function, 1 file"}
