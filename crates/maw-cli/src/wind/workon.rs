@@ -13,16 +13,23 @@ pub(crate) struct EngineResolution {
 }
 
 pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
+    ".maw/delivery.json",
+    ".maw/l1-review-request.json",
+    ".maw/delivery-notified",
+    ".maw/l1-pane",
+    ".maw/auto-done-pinged",
+    ".maw/phase.json",
+    ".maw/lane",
+    ".maw/req-line",
+];
+
+const LEGACY_MARKERS: &[&str] = &[
     ".maw/strategy.json",
     ".maw/solo-justified",
     ".maw/spec-waived",
     ".maw/aggregate-verified",
     ".maw/done-pinged",
-    ".maw/auto-done-pinged",
     ".maw/rrr-done",
-    ".maw/phase.json",
-    ".maw/lane",
-    ".maw/req-line",
 ];
 
 const GITIGNORE_BLOCK_START: &str = "# >>> maw ephemeral markers (managed by maw-rs) >>>";
@@ -34,7 +41,7 @@ pub(crate) fn sanitize_fresh_worktree(
 ) -> Result<Vec<String>, String> {
     run_git_clean(wt_path)?;
     let mut cleaned = Vec::new();
-    for relative in EPHEMERAL_MARKERS {
+    for relative in EPHEMERAL_MARKERS.iter().chain(LEGACY_MARKERS) {
         remove_stale_file(wt_path, relative, &mut cleaned)?;
     }
     for (label, path) in index_lock_candidates(wt_path) {
@@ -48,9 +55,13 @@ pub(crate) fn sanitize_fresh_worktree(
     Ok(cleaned)
 }
 
-pub(crate) fn prepare_engine(window_name: &str, cwd: &Path) -> Result<EngineResolution, String> {
+pub(crate) fn prepare_engine(
+    window_name: &str,
+    cwd: &Path,
+    explicit_engine: Option<&str>,
+) -> Result<EngineResolution, String> {
     let config = load_config(cwd);
-    let command = resolve_command(&config, window_name);
+    let command = resolve_engine_command(&config, window_name, explicit_engine);
     let engine = detect_engine_name(&command);
     let warning = engine_warning(&config, &engine, repo_id_from_path(cwd).as_deref());
     let resolution = EngineResolution {
@@ -62,11 +73,50 @@ pub(crate) fn prepare_engine(window_name: &str, cwd: &Path) -> Result<EngineReso
     Ok(resolution)
 }
 
+pub(crate) fn record_l1_pane(cwd: &Path) -> Result<bool, String> {
+    let Ok(pane) = std::env::var("TMUX_PANE") else {
+        return Ok(false);
+    };
+    let pane = pane.trim();
+    if !valid_pane_id(pane) {
+        return Ok(false);
+    }
+    let dir = cwd.join(".maw");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("workon: create {}: {error}", dir.display()))?;
+    let path = dir.join("l1-pane");
+    let tmp = dir.join(format!(".l1-pane.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{pane}\n"))
+        .map_err(|error| format!("workon: write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| format!("workon: replace {}: {error}", path.display()))?;
+    Ok(true)
+}
+
+fn valid_pane_id(value: &str) -> bool {
+    value
+        .strip_prefix('%')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 fn load_config(cwd: &Path) -> serde_json::Value {
     maw_xdg::load_merged_config_in_dir(&current_xdg_env(), cwd).config
 }
 
-fn resolve_command(config: &serde_json::Value, window_name: &str) -> String {
+fn resolve_engine_command(
+    config: &serde_json::Value,
+    window_name: &str,
+    explicit_engine: Option<&str>,
+) -> String {
+    if let Some(engine) = explicit_engine.filter(|value| !value.trim().is_empty()) {
+        return config
+            .get("commands")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|commands| commands.get(engine))
+            .and_then(serde_json::Value::as_str)
+            .filter(|command| !command.trim().is_empty())
+            .map_or_else(|| engine.to_owned(), ToOwned::to_owned);
+    }
     let command = config
         .get("commands")
         .and_then(serde_json::Value::as_object)
@@ -194,18 +244,25 @@ fn trust_array_matches(value: Option<&serde_json::Value>, repo: &str) -> bool {
 
 #[rustfmt::skip]
 fn record_engine_choice(cwd: &Path, resolution: &EngineResolution) -> Result<bool, String> {
-    let path = cwd.join(".maw/strategy.json");
-    if !path.exists() { return Ok(false); }
-    let body = std::fs::read_to_string(&path).map_err(|error| format!("workon: read {}: {error}", path.display()))?;
-    let mut value = serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({}));
-    if !value.is_object() { value = serde_json::json!({}); }
-    let object = value.as_object_mut().ok_or_else(|| "workon: strategy json must be an object".to_owned())?;
+    let path = cwd.join(".maw/delivery.json");
+    if !path.exists() && !cwd.join(".git").is_file() { return Ok(false); }
+    let mut value: serde_json::Value = if path.exists() {
+        let body = std::fs::read_to_string(&path).map_err(|error| format!("workon: read {}: {error}", path.display()))?;
+        serde_json::from_str(&body).map_err(|error| format!("workon: invalid {}: {error}", path.display()))?
+    } else {
+        std::fs::create_dir_all(cwd.join(".maw"))
+            .map_err(|error| format!("workon: create .maw: {error}"))?;
+        serde_json::json!({ "version": 1 })
+    };
+    let object = value.as_object_mut().ok_or_else(|| "workon: delivery json must be an object".to_owned())?;
     object.insert("engine".to_owned(), resolution.engine.clone().into());
     object.insert("engineCommand".to_owned(), resolution.command.clone().into());
     object.insert("engineWarned".to_owned(), resolution.warning.is_some().into());
     if let Some(warning) = &resolution.warning { object.insert("engineWarning".to_owned(), warning.clone().into()); }
-    let rendered = serde_json::to_string_pretty(&value).map_err(|error| format!("workon: render strategy json: {error}"))?;
-    std::fs::write(&path, format!("{rendered}\n")).map_err(|error| format!("workon: write {}: {error}", path.display()))?;
+    let rendered = serde_json::to_string_pretty(&value).map_err(|error| format!("workon: render delivery json: {error}"))?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{rendered}\n")).map_err(|error| format!("workon: write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("workon: replace {}: {error}", path.display()))?;
     Ok(true)
 }
 
@@ -234,9 +291,6 @@ fn ghq_root() -> PathBuf {
 pub(crate) fn ensure_gitignore_ephemeral_block(root: &Path) -> Result<bool, String> {
     let gitignore = root.join(".gitignore");
     let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    if existing.contains(GITIGNORE_BLOCK_START) {
-        return Ok(false);
-    }
     let mut block = String::new();
     block.push_str(GITIGNORE_BLOCK_START);
     block.push('\n');
@@ -247,11 +301,27 @@ pub(crate) fn ensure_gitignore_ephemeral_block(root: &Path) -> Result<bool, Stri
     block.push_str(GITIGNORE_BLOCK_END);
     block.push('\n');
 
-    let mut content = existing;
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
+    let content = if let Some(start) = existing.find(GITIGNORE_BLOCK_START) {
+        let tail = &existing[start..];
+        let end_offset = tail.find(GITIGNORE_BLOCK_END).ok_or_else(|| {
+            "workon: malformed managed .gitignore block (missing end marker)".to_owned()
+        })?;
+        let end = start + end_offset + GITIGNORE_BLOCK_END.len();
+        let suffix = existing[end..]
+            .strip_prefix('\n')
+            .unwrap_or(&existing[end..]);
+        format!("{}{}{}", &existing[..start], block, suffix)
+    } else {
+        let mut appended = existing.clone();
+        if !appended.is_empty() && !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push_str(&block);
+        appended
+    };
+    if content == existing {
+        return Ok(false);
     }
-    content.push_str(&block);
     std::fs::write(&gitignore, content)
         .map(|()| true)
         .map_err(|error| format!("workon: write .gitignore: {error}"))
@@ -284,18 +354,77 @@ mod tests {
     #[test]
     fn ephemeral_markers_list_is_complete() {
         let expected = [
-            ".maw/strategy.json",
-            ".maw/solo-justified",
-            ".maw/spec-waived",
-            ".maw/aggregate-verified",
-            ".maw/done-pinged",
+            ".maw/delivery.json",
+            ".maw/l1-review-request.json",
+            ".maw/delivery-notified",
+            ".maw/l1-pane",
             ".maw/auto-done-pinged",
-            ".maw/rrr-done",
             ".maw/phase.json",
             ".maw/lane",
             ".maw/req-line",
         ];
         assert_eq!(EPHEMERAL_MARKERS, &expected);
+    }
+
+    #[test]
+    fn explicit_engine_selects_its_configured_command_instead_of_window_default() {
+        let config = serde_json::json!({
+            "commands": {
+                "default": "claude",
+                "demo-issue-42": "claude --model opus",
+                "omx": "omx --xhigh"
+            }
+        });
+
+        assert_eq!(
+            resolve_engine_command(&config, "demo-issue-42", Some("omx")),
+            "omx --xhigh"
+        );
+        assert_eq!(
+            detect_engine_name(&resolve_engine_command(
+                &config,
+                "demo-issue-42",
+                Some("omx")
+            )),
+            "omx"
+        );
+    }
+
+    #[test]
+    fn l1_pane_identifier_is_strictly_validated() {
+        assert!(valid_pane_id("%42"));
+        assert!(!valid_pane_id("42"));
+        assert!(!valid_pane_id("%-1"));
+        assert!(!valid_pane_id("%1;touch-pwned"));
+    }
+
+    #[test]
+    fn engine_choice_creates_delivery_skeleton_only_in_linked_worktree() {
+        let worktree = temp_dir("engine-delivery");
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: /tmp/common/worktrees/demo\n",
+        )
+        .expect("git file");
+        let resolution = EngineResolution {
+            engine: "omx".to_owned(),
+            command: "omx --xhigh".to_owned(),
+            warning: None,
+        };
+
+        assert!(record_engine_choice(&worktree, &resolution).expect("record"));
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(worktree.join(".maw/delivery.json")).expect("delivery"),
+        )
+        .expect("json");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["engine"], "omx");
+        assert_eq!(value["engineCommand"], "omx --xhigh");
+
+        let main = temp_dir("engine-main");
+        fs::create_dir_all(main.join(".git")).expect("git dir");
+        assert!(!record_engine_choice(&main, &resolution).expect("skip main"));
+        assert!(!main.join(".maw/delivery.json").exists());
     }
 
     #[test]
@@ -328,7 +457,10 @@ mod tests {
             );
         }
 
-        assert!(maw.join("plugins/transcriber.json").exists(), "plugins preserved");
+        assert!(
+            maw.join("plugins/transcriber.json").exists(),
+            "plugins preserved"
+        );
         assert!(maw.join("teams/team-a.json").exists(), "teams preserved");
         assert!(maw.join("fleet/fleet.json").exists(), "fleet preserved");
         assert!(maw.join("briefs/brief.md").exists(), "briefs preserved");
@@ -366,9 +498,15 @@ mod tests {
         assert!(content.contains(GITIGNORE_BLOCK_START));
         assert!(content.contains(GITIGNORE_BLOCK_END));
         for marker in EPHEMERAL_MARKERS {
-            assert!(content.contains(marker), "gitignore should contain {marker}");
+            assert!(
+                content.contains(marker),
+                "gitignore should contain {marker}"
+            );
         }
-        assert!(content.starts_with("target/\n"), "original content preserved");
+        assert!(
+            content.starts_with("target/\n"),
+            "original content preserved"
+        );
     }
 
     #[test]
@@ -387,6 +525,23 @@ mod tests {
     }
 
     #[test]
+    fn gitignore_block_migrates_legacy_markers() {
+        let dir = temp_dir("gitignore-migrate");
+        fs::write(
+            dir.join(".gitignore"),
+            format!("target/\n{GITIGNORE_BLOCK_START}\n.maw/strategy.json\n{GITIGNORE_BLOCK_END}\nnotes/\n"),
+        )
+        .expect("seed");
+
+        assert!(ensure_gitignore_ephemeral_block(&dir).expect("migrate"));
+        let content = fs::read_to_string(dir.join(".gitignore")).expect("read");
+        assert!(content.contains(".maw/delivery.json"));
+        assert!(!content.contains(".maw/strategy.json"));
+        assert!(content.ends_with("notes/\n"));
+        assert!(!ensure_gitignore_ephemeral_block(&dir).expect("idempotent"));
+    }
+
+    #[test]
     fn gitignore_block_created_when_no_gitignore_exists() {
         let dir = temp_dir("gitignore-new");
 
@@ -395,6 +550,6 @@ mod tests {
 
         let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
         assert!(content.contains(GITIGNORE_BLOCK_START));
-        assert!(content.contains(".maw/strategy.json"));
+        assert!(content.contains(".maw/delivery.json"));
     }
 }

@@ -218,6 +218,27 @@ fn workon_attach_interactive(session: &str) -> Result<(), String> {
     if status.success() { Ok(()) } else { Err(format!("workon: tmux attach exited with status {status}")) }
 }
 
+fn workon_prepare_delivery(stdout: &mut String, window_name: &str, target_path: &Path, engine: Option<&str>) {
+    // Preserve the permanent L1 caller pane so engine-neutral PR handoff can
+    // notify the reviewer without relying on Claude-only hooks.
+    if let Err(error) = crate::wind::workon::record_l1_pane(target_path) {
+        let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: L1 handoff target not recorded: {error}");
+    }
+
+    // Best-effort trust audit: launching work should not fail because delivery
+    // metadata could not be inspected or updated.
+    match crate::wind::workon::prepare_engine(window_name, target_path, engine) {
+        Ok(resolution) => {
+            if let Some(warning) = resolution.warning {
+                let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {warning}");
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: engine trust check skipped: {error}");
+        }
+    }
+}
+
 fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     options: &WorkonOptions,
     repo: &WorkonRepo,
@@ -264,20 +285,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         taskless_oracle = true;
     }
 
-    // Engine trust gate: resolve the engine that will actually run in this window
-    // and warn when a non-Claude engine is used on an untrusted repo (Claude hook
-    // gates may not apply), recording the choice into .maw/strategy.json when a
-    // strategy record exists. Best-effort — never block workon on it.
-    match crate::wind::workon::prepare_engine(&window_name, &target_path) {
-        Ok(resolution) => {
-            if let Some(warning) = resolution.warning {
-                let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {warning}");
-            }
-        }
-        Err(error) => {
-            let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: engine trust check skipped: {error}");
-        }
-    }
+    workon_prepare_delivery(&mut stdout, &window_name, &target_path, options.engine.as_deref());
 
     if std::env::var_os("TMUX").is_some() {
         let session = workon_tmux_run(runner, "display-message", &["-p", "#{session_name}"])?;

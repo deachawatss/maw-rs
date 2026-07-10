@@ -21,6 +21,50 @@ struct PrPlan {
     body: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryEvidence {
+    version: u64,
+    issue: u64,
+    mode: String,
+    #[serde(default)]
+    risk_tags: Vec<String>,
+    engine: String,
+    spec: Option<String>,
+    verification: DeliveryVerification,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryVerification {
+    commands: Vec<DeliveryCommand>,
+    live_evidence: String,
+    #[serde(default)]
+    artifacts: Vec<String>,
+    #[serde(default)]
+    open_risks: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+struct DeliveryCommand {
+    command: String,
+    result: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct PrReviewRequest {
+    version: u64,
+    pr_url: String,
+    pr_number: u64,
+    repo: String,
+    branch: String,
+    status: String,
+    notified: bool,
+    notified_at: Option<String>,
+    notifier: Option<String>,
+}
+
 trait PrTmux {
     fn pr_current_path(&mut self) -> Result<String, String>;
     fn pr_current_session(&mut self) -> Result<String, String>;
@@ -49,6 +93,8 @@ trait PrProcess {
     fn pr_git_remote_url(&mut self, cwd: &std::path::Path, remote: &str) -> Result<String, String>;
     fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String>;
     fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String>;
+    fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String>;
+    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<(), String>;
 }
 
 struct PrNativeProcess;
@@ -123,6 +169,35 @@ impl PrProcess for PrNativeProcess {
         let code = output.status.code().unwrap_or(1);
         Err(format!("gh pr view failed (exit {code})"))
     }
+
+    fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String> {
+        pr_enqueue_global_review(request)
+    }
+
+    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<(), String> {
+        let pane = std::env::var("MAW_L1_PANE")
+            .ok()
+            .or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-pane")).ok())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| pr_valid_pane_id(value))
+            .ok_or_else(|| "pr: L1 pane unavailable; queued for hook recovery".to_owned())?;
+        let literal = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, "-l", message])
+            .output()
+            .map_err(|error| format!("pr: notify L1: {error}"))?;
+        if !literal.status.success() {
+            return Err("pr: notify L1 literal send failed; queued for hook recovery".to_owned());
+        }
+        let enter = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, "Enter"])
+            .output()
+            .map_err(|error| format!("pr: notify L1 enter: {error}"))?;
+        if enter.status.success() {
+            Ok(())
+        } else {
+            Err("pr: notify L1 enter failed; queued for hook recovery".to_owned())
+        }
+    }
 }
 
 fn run_pr_command(argv: &[String]) -> CliOutput {
@@ -145,7 +220,136 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     let mut out = pr_render_start(&plan);
     let url = process.pr_gh_create(&plan)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m {url}");
+    let pr_number = pr_extract_pr_number(&url)
+        .ok_or_else(|| format!("pr: could not determine PR number from gh response: {url}"))?;
+    let mut request = PrReviewRequest {
+        version: 1,
+        pr_url: url.clone(),
+        pr_number,
+        repo: plan.base_repo.clone(),
+        branch: plan.branch.clone(),
+        status: "pending".to_owned(),
+        notified: false,
+        notified_at: None,
+        notifier: None,
+    };
+    pr_write_review_request(&plan.cwd, &request)?;
+    process.pr_enqueue_review(&request)?;
+    let issue = pr_extract_issue_num(&plan.branch).unwrap_or_default();
+    let message = format!("[codex] PR #{pr_number} ready for issue #{issue}. {url}");
+    match process.pr_notify_l1(&plan.cwd, &message) {
+        Ok(()) => {
+            request.notified = true;
+            "notified".clone_into(&mut request.status);
+            request.notified_at = Some(pr_now_epoch());
+            request.notifier = Some("maw-pr".to_owned());
+            pr_write_review_request(&plan.cwd, &request)?;
+            process.pr_enqueue_review(&request)?;
+            std::fs::write(plan.cwd.join(".maw/delivery-notified"), format!("{url}\n"))
+                .map_err(|error| format!("pr: write delivery-notified: {error}"))?;
+            let _ = writeln!(out, "\x1b[32m✅\x1b[0m L1 notified");
+        }
+        Err(error) => {
+            let _ = writeln!(out, "\x1b[33m⚠\x1b[0m {error}");
+        }
+    }
     Ok(out)
+}
+
+fn pr_write_review_request(cwd: &std::path::Path, request: &PrReviewRequest) -> Result<(), String> {
+    let dir = cwd.join(".maw");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("pr: create {}: {error}", dir.display()))?;
+    let path = dir.join("l1-review-request.json");
+    let tmp = dir.join(format!(".l1-review-request.{}.tmp", std::process::id()));
+    let body = serde_json::to_string_pretty(request)
+        .map_err(|error| format!("pr: render review request: {error}"))?
+        + "\n";
+    std::fs::write(&tmp, body).map_err(|error| format!("pr: write {}: {error}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("pr: replace {}: {error}", path.display()))
+}
+
+fn pr_enqueue_global_review(request: &PrReviewRequest) -> Result<(), String> {
+    let root = std::env::var_os("MAW_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".maw")))
+        .ok_or_else(|| "pr: HOME/MAW_STATE_DIR unavailable for review queue".to_owned())?;
+    std::fs::create_dir_all(&root).map_err(|error| format!("pr: create review queue dir: {error}"))?;
+    let _lock = PrQueueLock::acquire(&root)?;
+    let path = root.join("pr-queue.jsonl");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let row = serde_json::to_string(request).map_err(|error| format!("pr: render queue row: {error}"))?;
+    let mut replaced = false;
+    let mut lines = existing
+        .lines()
+        .map(|line| {
+            let matches = serde_json::from_str::<PrReviewRequest>(line).is_ok_and(|entry| {
+                entry.repo == request.repo && entry.pr_url == request.pr_url
+            });
+            if matches {
+                replaced = true;
+                row.clone()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !replaced {
+        lines.push(row);
+    }
+    let body = lines.join("\n") + "\n";
+    let tmp = root.join(format!(".pr-queue.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body).map_err(|error| format!("pr: write review queue: {error}"))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("pr: replace review queue: {error}"))
+}
+
+struct PrQueueLock {
+    path: std::path::PathBuf,
+}
+
+impl PrQueueLock {
+    fn acquire(root: &std::path::Path) -> Result<Self, String> {
+        let path = root.join(".pr-queue.lock");
+        for _ in 0..100 {
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_mins(1));
+                    if stale {
+                        let _ = std::fs::remove_dir(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                Err(error) => return Err(format!("pr: acquire review queue lock: {error}")),
+            }
+        }
+        Err("pr: review queue is busy; local handoff remains available for recovery".to_owned())
+    }
+}
+
+impl Drop for PrQueueLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn pr_valid_pane_id(value: &str) -> bool {
+    value.strip_prefix('%').is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn pr_now_epoch() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+        .to_string()
+}
+
+fn pr_extract_pr_number(url: &str) -> Option<u64> {
+    url.trim_end_matches('/').rsplit('/').next()?.parse().ok()
 }
 
 fn pr_parse_args(argv: &[String]) -> Result<PrOptions, String> {
@@ -203,11 +407,104 @@ fn pr_build_plan(
 ) -> Result<PrPlan, String> {
     pr_validate_branch(&branch)?;
     pr_validate_base_repo(&base_repo)?;
+    let branch_issue = pr_extract_issue_num(&branch)
+        .ok_or_else(|| "pr: branch must contain issue-<number> for one-issue/one-PR traceability".to_owned())?;
+    let delivery = pr_load_delivery(&cwd)?;
+    pr_validate_delivery(&delivery, branch_issue)?;
     let title = options.title.clone().unwrap_or_else(|| pr_branch_to_title(&branch));
     pr_validate_text_arg(&title, "title")?;
-    let body = options.body.clone().unwrap_or_else(|| pr_issue_body(&branch).unwrap_or_default());
+    let body = pr_render_delivery_body(options.body.as_deref(), &delivery);
     pr_validate_text_arg(&body, "body")?;
     Ok(PrPlan { cwd, branch, base_repo, base_branch: "main".to_owned(), title, body })
+}
+
+fn pr_load_delivery(cwd: &std::path::Path) -> Result<DeliveryEvidence, String> {
+    let path = cwd.join(".maw/delivery.json");
+    let body = std::fs::read_to_string(&path)
+        .map_err(|error| format!("pr: required {} is missing or unreadable: {error}", path.display()))?;
+    serde_json::from_str(&body)
+        .map_err(|error| format!("pr: invalid {}: {error}", path.display()))
+}
+
+fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: u64) -> Result<(), String> {
+    if delivery.version != 1 {
+        return Err(format!("pr: unsupported delivery version {} (expected 1)", delivery.version));
+    }
+    if delivery.issue != branch_issue {
+        return Err(format!(
+            "pr: delivery issue {} does not match branch issue {branch_issue}",
+            delivery.issue
+        ));
+    }
+    if !matches!(delivery.mode.as_str(), "fast" | "standard" | "swarm" | "discovery") {
+        return Err(format!("pr: invalid delivery mode {}", delivery.mode));
+    }
+    if !matches!(delivery.engine.as_str(), "omx" | "codex") {
+        return Err(format!("pr: invalid delivery engine {}", delivery.engine));
+    }
+    if delivery.verification.commands.is_empty() {
+        return Err("pr: delivery verification.commands must contain at least one command".to_owned());
+    }
+    for command in &delivery.verification.commands {
+        if command.command.trim().is_empty() {
+            return Err("pr: delivery verification command must be non-empty".to_owned());
+        }
+        let result = command.result.to_ascii_lowercase();
+        if !matches!(result.as_str(), "pass" | "fail" | "blocked") {
+            return Err(format!("pr: invalid verification result {}", command.result));
+        }
+        if result != "pass" {
+            return Err(format!(
+                "pr: verification command '{}' is {}; PR creation requires pass",
+                command.command, command.result
+            ));
+        }
+    }
+    if delivery.verification.live_evidence.trim().is_empty() {
+        return Err("pr: delivery verification.liveEvidence must be non-empty".to_owned());
+    }
+    Ok(())
+}
+
+fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence) -> String {
+    let mut sections = Vec::new();
+    if let Some(body) = user_body.filter(|body| !body.trim().is_empty()) {
+        sections.push(body.trim().to_owned());
+    }
+
+    let trace = format!("Closes #{}\nREQ: #{}", delivery.issue, delivery.issue);
+    if !sections.iter().any(|section| section.contains(&format!("Closes #{}", delivery.issue)))
+        || !sections.iter().any(|section| section.contains(&format!("REQ: #{}", delivery.issue)))
+    {
+        sections.push(trace);
+    }
+
+    let risk_tags = if delivery.risk_tags.is_empty() { "none".to_owned() } else { delivery.risk_tags.join(", ") };
+    let spec = delivery.spec.as_deref().unwrap_or("not required");
+    let artifacts = if delivery.verification.artifacts.is_empty() {
+        "none".to_owned()
+    } else {
+        delivery.verification.artifacts.join(", ")
+    };
+    let open_risks = if delivery.verification.open_risks.is_empty() {
+        "none".to_owned()
+    } else {
+        delivery.verification.open_risks.join("; ")
+    };
+    let commands = delivery
+        .verification
+        .commands
+        .iter()
+        .map(|command| format!("- `{}`: {}", command.command, command.result))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sections.push(format!(
+        "## Delivery\n\n- Mode: {}\n- Engine: {}\n- Risk tags: {risk_tags}\n- Spec: {spec}\n\n## Verification\n\n{commands}\n- Live evidence: {}\n- Artifacts: {artifacts}\n- Open risks: {open_risks}",
+        delivery.mode,
+        delivery.engine,
+        delivery.verification.live_evidence
+    ));
+    sections.join("\n\n")
 }
 
 fn pr_render_start(plan: &PrPlan) -> String {
@@ -230,10 +527,6 @@ fn pr_branch_to_title(branch: &str) -> String {
         else { out.push(ch); }
     }
     out
-}
-
-fn pr_issue_body(branch: &str) -> Option<String> {
-    pr_extract_issue_num(branch).map(|issue| format!("Closes #{issue}\nREQ: #{issue}"))
 }
 
 fn pr_extract_issue_num(branch: &str) -> Option<u64> {
@@ -373,6 +666,8 @@ mod pr_tests {
         origin_url: String,
         created: Vec<PrPlan>,
         viewed: Vec<String>,
+        enqueued: Vec<PrReviewRequest>,
+        notifications: Vec<String>,
     }
 
     impl PrProcess for PrMockProcess {
@@ -391,6 +686,18 @@ mod pr_tests {
             self.viewed.push(cwd.display().to_string());
             Ok("#7 Demo https://github.com/acme/demo/pull/7".to_owned())
         }
+        fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String> {
+            if let Some(existing) = self.enqueued.iter_mut().find(|entry| entry.pr_url == request.pr_url) {
+                *existing = request.clone();
+            } else {
+                self.enqueued.push(request.clone());
+            }
+            Ok(())
+        }
+        fn pr_notify_l1(&mut self, _cwd: &std::path::Path, message: &str) -> Result<(), String> {
+            self.notifications.push(message.to_owned());
+            Ok(())
+        }
     }
 
     fn pr_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
@@ -402,6 +709,26 @@ mod pr_tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp dir");
         path
+    }
+
+    fn pr_write_delivery(repo: &std::path::Path, issue: u64) {
+        std::fs::create_dir_all(repo.join(".maw")).expect("maw dir");
+        let delivery = serde_json::json!({
+                "version": 1,
+                "issue": issue,
+                "mode": "standard",
+                "riskTags": ["api"],
+                "engine": "omx",
+                "spec": format!("specs/{issue}-demo.md"),
+                "verification": {
+                    "commands": [{"command": "cargo test", "result": "pass"}],
+                    "liveEvidence": "VERIFIED-LIVE: focused CLI path",
+                    "artifacts": ["target/test.log"],
+                    "openRisks": []
+                }
+            });
+        let body = serde_json::to_string_pretty(&delivery).expect("render delivery") + "\n";
+        std::fs::write(repo.join(".maw/delivery.json"), body).expect("delivery");
     }
 
     #[test]
@@ -422,6 +749,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("create");
+        pr_write_delivery(&repo, 140);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess { branch: "agents/issue-140-pr-native".to_owned(), ..Default::default() };
 
@@ -429,9 +757,25 @@ mod pr_tests {
 
         assert_eq!(output, include_str!("../../tests/fixtures/native-pr/create.stdout"));
         assert_eq!(process.created[0].title, "Issue 140 Pr Native");
-        assert_eq!(process.created[0].body, "Closes #140\nREQ: #140");
+        assert!(process.created[0].body.contains("Closes #140\nREQ: #140"));
+        assert!(process.created[0].body.contains("## Delivery"));
+        assert!(process.created[0].body.contains("- Mode: standard"));
+        assert!(process.created[0].body.contains("- Engine: omx"));
+        assert!(process.created[0].body.contains("- `cargo test`: pass"));
+        assert!(process.created[0].body.contains("VERIFIED-LIVE: focused CLI path"));
         assert_eq!(process.created[0].base_repo, "acme/demo");
         assert_eq!(process.created[0].base_branch, "main");
+        assert_eq!(process.enqueued.len(), 1);
+        assert!(process.enqueued[0].notified);
+        assert_eq!(process.notifications, vec!["[codex] PR #7 ready for issue #140. https://github.com/acme/demo/pull/7"]);
+        let request = serde_json::from_str::<PrReviewRequest>(
+            &std::fs::read_to_string(repo.join(".maw/l1-review-request.json")).expect("request"),
+        )
+        .expect("request json");
+        assert!(request.notified);
+        assert_eq!(request.pr_number, 7);
+        assert_eq!(request.status, "notified");
+        assert_eq!(request.notifier.as_deref(), Some("maw-pr"));
     }
 
     #[test]
@@ -467,12 +811,83 @@ mod pr_tests {
     #[test]
     fn pr_overrides_title_body_and_rejects_detached_head() {
         let repo = pr_temp_dir("override");
+        pr_write_delivery(&repo, 42);
         let options = PrOptions { window: None, title: Some("Custom".to_owned()), body: Some("Body".to_owned()), show_current: false };
-        let plan = pr_build_plan(repo, "feat/demo".to_owned(), "deachawatss/maw-rs".to_owned(), &options).expect("plan");
+        let plan = pr_build_plan(repo, "agents/issue-42-demo".to_owned(), "deachawatss/maw-rs".to_owned(), &options).expect("plan");
         assert_eq!(plan.title, "Custom");
-        assert_eq!(plan.body, "Body");
+        assert!(plan.body.starts_with("Body\n\nCloses #42\nREQ: #42"));
         let error = pr_build_plan(std::path::PathBuf::from("/tmp"), String::new(), "deachawatss/maw-rs".to_owned(), &options).expect_err("detached");
         assert!(error.contains("detached HEAD"));
+    }
+
+    #[test]
+    fn pr_requires_valid_delivery_evidence_matching_branch_issue() {
+        let repo = pr_temp_dir("delivery-required");
+        let options = PrOptions { window: None, title: None, body: None, show_current: false };
+
+        let missing = pr_build_plan(
+            repo.clone(),
+            "agents/issue-42-demo".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+        )
+        .expect_err("missing delivery blocked");
+        assert!(missing.contains(".maw/delivery.json"), "{missing}");
+
+        pr_write_delivery(&repo, 41);
+        let mismatch = pr_build_plan(
+            repo.clone(),
+            "agents/issue-42-demo".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+        )
+        .expect_err("mismatched issue blocked");
+        assert!(mismatch.contains("delivery issue 41 does not match branch issue 42"), "{mismatch}");
+
+        pr_write_delivery(&repo, 42);
+        let path = repo.join(".maw/delivery.json");
+        let mut delivery: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
+        delivery["engine"] = "claude".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&delivery).expect("render delivery")).expect("delivery");
+        let invalid_engine = pr_build_plan(
+            repo,
+            "agents/issue-42-demo".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+        )
+        .expect_err("invalid engine blocked");
+        assert!(invalid_engine.contains("invalid delivery engine claude"), "{invalid_engine}");
+    }
+
+    #[test]
+    fn pr_global_review_queue_upserts_by_repo_and_url() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
+        let state = pr_temp_dir("review-queue");
+        std::env::set_var("MAW_STATE_DIR", &state);
+        let mut request = PrReviewRequest {
+            version: 1,
+            pr_url: "https://github.com/acme/demo/pull/7".to_owned(),
+            pr_number: 7,
+            repo: "acme/demo".to_owned(),
+            branch: "agents/issue-7-demo".to_owned(),
+            status: "pending".to_owned(),
+            notified: false,
+            notified_at: None,
+            notifier: None,
+        };
+
+        pr_enqueue_global_review(&request).expect("enqueue pending");
+        request.notified = true;
+        request.status = "notified".to_owned();
+        request.notified_at = Some("123".to_owned());
+        request.notifier = Some("maw-pr".to_owned());
+        pr_enqueue_global_review(&request).expect("upsert notified");
+
+        let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
+        assert_eq!(rows.lines().count(), 1);
+        assert_eq!(serde_json::from_str::<PrReviewRequest>(rows.trim()).expect("row"), request);
     }
 
     #[test]
@@ -481,6 +896,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("fork-target");
+        pr_write_delivery(&repo, 17);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess {
             branch: "agents/issue-17-help".to_owned(),

@@ -514,9 +514,9 @@ fi
 if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   /bin/mkdir -p "$5/.maw" "$5/.git"
   /bin/printf '{}\n' > "$5/.maw/phase.json"
-  /bin/printf '{}\n' > "$5/.maw/strategy.json"
-  /bin/printf '\n' > "$5/.maw/solo-justified"
-  /bin/printf '\n' > "$5/.maw/aggregate-verified"
+  /bin/printf '{}\n' > "$5/.maw/delivery.json"
+  /bin/printf '\n' > "$5/.maw/l1-review-request.json"
+  /bin/printf '\n' > "$5/.maw/delivery-notified"
   /bin/printf '\n' > "$5/.maw/done-pinged"
   /bin/printf '\n' > "$5/.git/index.lock"
   /bin/printf 'stale\n' > "$5/stale.tmp"
@@ -533,7 +533,7 @@ exit 9
         fs::create_dir_all(repo.join(".maw")).expect("repo dirs");
         fs::write(repo.join(".git"), "gitdir: main\n").expect("git marker");
         fs::write(repo.join("CLAUDE.md"), "main claude\n").expect("claude");
-        fs::write(repo.join(".maw/strategy.json"), "{}\n").expect("strategy");
+        fs::write(repo.join(".maw/delivery.json"), "{}\n").expect("delivery");
         if let Some(config) = config {
             let config_dir = root.join("xdg-config/maw");
             fs::create_dir_all(&config_dir).expect("config dir");
@@ -599,6 +599,29 @@ exit 9
 
         assert_success(&output);
         assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo -l codex exec"));
+    }
+
+    #[test]
+    fn explicit_omx_engine_drives_both_launch_and_trust_audit() {
+        let root = temp_dir("explicit-omx-engine");
+        let bin_dir = seed_root(
+            &root,
+            Some(
+                r#"{"commands":{"default":"claude","omx":"omx --xhigh"},"engineTrustedRepos":{"omx":["acme/demo"]}}"#,
+            ),
+        );
+
+        let output = run(
+            &root,
+            &bin_dir,
+            &["workon", "demo", "issue-42", "--engine", "omx"],
+        );
+
+        assert_success(&output);
+        assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo-issue-42 -l omx --xhigh"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("non-Claude engine 'claude'"), "{stdout}");
+        assert!(!stdout.contains("not trusted"), "{stdout}");
     }
 
     #[test]
