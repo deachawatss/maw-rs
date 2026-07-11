@@ -270,24 +270,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.layout)?;
                 let suffix = if branch_exists { ", reused branch" } else { "" };
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
-                match crate::wind::workon::sanitize_fresh_worktree(&repo.repo_path, &wt_path) {
-                    Ok(cleaned) if !cleaned.is_empty() => {
-                        let _ = writeln!(stdout, "\x1b[32m+\x1b[0m sanitized worktree ({})", cleaned.join(", "));
-                    }
-                    Ok(_) => {}
-                    Err(error) => return Err(error),
-                }
-                match crate::wind::workon::ensure_gitignore_ephemeral_block(&repo.repo_path) {
-                    Ok(true) => {
-                        let _ = writeln!(stdout, "\x1b[32m+\x1b[0m .gitignore: added maw ephemeral markers block");
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        return Err(format!(
-                            "{error}. Fix .gitignore manually or remove the malformed managed block, then retry"
-                        ));
-                    }
-                }
+                workon_finish_created_worktree(repo, &wt_path, &mut stdout)?;
                 target_path = wt_path;
             }
         }
@@ -629,8 +612,32 @@ fn workon_create_worktree(
     } else {
         workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, "-b", branch])?;
     }
-    workon_restore_shared_worktree_state(&repo.repo_path, wt_path)?;
     Ok(())
+}
+
+fn workon_finish_created_worktree(
+    repo: &WorkonRepo,
+    wt_path: &std::path::Path,
+    stdout: &mut String,
+) -> Result<(), String> {
+    match crate::wind::workon::sanitize_fresh_worktree(&repo.repo_path, wt_path) {
+        Ok(cleaned) if !cleaned.is_empty() => {
+            let _ = writeln!(stdout, "\x1b[32m+\x1b[0m sanitized worktree ({})", cleaned.join(", "));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(error),
+    }
+    workon_restore_shared_worktree_state(&repo.repo_path, wt_path)?;
+    match crate::wind::workon::ensure_gitignore_ephemeral_block(&repo.repo_path) {
+        Ok(true) => {
+            let _ = writeln!(stdout, "\x1b[32m+\x1b[0m .gitignore: added maw ephemeral markers block");
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(format!(
+            "{error}. Fix .gitignore manually or remove the malformed managed block, then retry"
+        )),
+    }
 }
 
 fn workon_restore_shared_worktree_state(
