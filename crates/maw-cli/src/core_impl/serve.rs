@@ -123,8 +123,8 @@ impl ServeDelivery for ServeSystemDelivery {
     }
 
     fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
-        let mut tmux = TmuxClient::local();
-        tmux.capture(target, Some(lines)).map_err(|error| error.to_string())
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        serve_capture_tail_with_runner(&mut runner, target, lines)
     }
 }
 
@@ -1644,6 +1644,15 @@ async fn api_mirror(
     }
 }
 
+fn serve_capture_tail_with_runner<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    target: &str,
+    lines: u32,
+) -> Result<String, String> {
+    let argv = vec![target.to_owned(), "--lines".to_owned(), lines.to_string()];
+    capture_with_runner(&argv, runner).map(|output| output.stdout)
+}
+
 fn serve_resolve_capture_target(
     target: &str,
     tmux: &mut TmuxClient<maw_tmux::CommandTmuxRunner>,
@@ -3051,6 +3060,65 @@ mod serve_tests {
         assert_eq!(missing_body["error"], "pane_not_found");
         assert_eq!(missing_body["target"], "missing:0");
         assert_eq!(missing_body["message"], "can't find pane: missing:0");
+    }
+
+    #[test]
+    fn serve_mirror_capture_uses_the_same_live_resolution_as_maw_capture() {
+        let mut runner = MirrorCaptureMockTmux {
+            windows: "01-gale|||1|||gale|||1|||\n".to_owned(),
+            capture: "live gale pane\n".to_owned(),
+            ..Default::default()
+        };
+
+        let content = serve_capture_tail_with_runner(&mut runner, "01-gale:gale", 15)
+            .expect("mirror capture resolves the live pane");
+
+        assert_eq!(content, "live gale pane\n");
+        assert_eq!(
+            runner.calls,
+            vec![
+                (
+                    "list-windows".to_owned(),
+                    vec![
+                        "-a".to_owned(),
+                        "-F".to_owned(),
+                        "#{session_name}|||#{window_index}|||#{window_name}|||#{window_active}|||#{pane_current_path}".to_owned(),
+                    ],
+                ),
+                (
+                    "capture-pane".to_owned(),
+                    vec![
+                        "-t".to_owned(),
+                        "01-gale:1".to_owned(),
+                        "-p".to_owned(),
+                        "-S".to_owned(),
+                        "-15".to_owned(),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct MirrorCaptureMockTmux {
+        calls: Vec<(String, Vec<String>)>,
+        windows: String,
+        capture: String,
+    }
+
+    impl maw_tmux::TmuxRunner for MirrorCaptureMockTmux {
+        fn run(
+            &mut self,
+            subcommand: &str,
+            args: &[String],
+        ) -> Result<String, maw_tmux::TmuxError> {
+            self.calls.push((subcommand.to_owned(), args.to_vec()));
+            match subcommand {
+                "list-windows" => Ok(self.windows.clone()),
+                "capture-pane" => Ok(self.capture.clone()),
+                other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
+            }
+        }
     }
 
     fn serve_test_app_with_o6_keys_delivery_and_inbox(
