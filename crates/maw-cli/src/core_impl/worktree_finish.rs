@@ -401,9 +401,10 @@ fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut impl
     match local.done_tmux("kill-window", &["-t".to_owned(), target.clone()]) { Ok(_) => { let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed window {target}"); }, Err(_) => stdout.push_str("  \x1b[33m⚠\x1b[0m could not kill window (may already be closed)\n") }
 }
 
-fn done_retrospective_command(command: &str) -> Option<&'static str> {
-    let lower = command.to_lowercase();
-    if lower.contains("omx") || lower.contains("oh-my-codex") { Some("$rrr") } else if lower.is_empty() || lower.contains("codex") || lower.contains("aider") || lower.contains("opencode") { None } else { Some("/rrr") }
+fn done_retrospective_command(_command: &str) -> Option<&'static str> {
+    // L2 agents run /rrr themselves after maw pr (doctrine: "Completion Boundary").
+    // maw done no longer sends a duplicate retro prompt.
+    None
 }
 
 fn done_select_worktree(target: &str, window_lower: &str, options: &DoneOptions, pane_info: Option<&DonePaneInfo>, local: &mut impl DoneRuntime, context: &DoneContext, stdout: &mut String) -> Result<Option<DoneWorktree>, String> {
