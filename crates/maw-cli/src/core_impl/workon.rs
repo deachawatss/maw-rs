@@ -274,7 +274,9 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                     }
                     Ok(false) => {}
                     Err(error) => {
-                        let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m {error}");
+                        return Err(format!(
+                            "{error}. Fix .gitignore manually or remove the malformed managed block, then retry"
+                        ));
                     }
                 }
                 target_path = wt_path;

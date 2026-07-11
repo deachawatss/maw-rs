@@ -180,6 +180,71 @@ fn native_workon_create_nested_matches_committed_golden_without_ref_checkout() {
     assert!(git_log.contains("worktree add"), "{git_log}");
 }
 
+#[test]
+fn native_workon_rejects_malformed_managed_gitignore_before_launching() {
+    let root = temp_dir("malformed-gitignore");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::write(
+        repo.join(".gitignore"),
+        "# >>> maw ephemeral markers (managed by maw-rs) >>>\n.maw/delivery.json\n",
+    )
+    .expect("malformed gitignore");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+    );
+
+    assert!(!output.status.success(), "workon should fail closed");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("malformed managed .gitignore block (missing end marker)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("Fix .gitignore manually or remove the malformed managed block, then retry"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("new-window")),
+        "L2 session must not launch"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn native_workon_rejects_read_only_gitignore_before_launching() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("readonly-gitignore");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let gitignore = root.join("ghq/github.com/acme/demo/.gitignore");
+    fs::write(&gitignore, "target/\n").expect("gitignore");
+    fs::set_permissions(&gitignore, fs::Permissions::from_mode(0o444)).expect("make read-only");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+    );
+
+    assert!(!output.status.success(), "workon should fail closed");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("workon: write .gitignore:"), "{stderr}");
+    assert!(
+        stderr
+            .contains("Fix .gitignore manually or remove the malformed managed block, then retry"),
+        "{stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("new-window")),
+        "L2 session must not launch"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn native_workon_create_links_psi_and_shares_cargo_target() {
