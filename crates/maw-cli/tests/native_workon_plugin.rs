@@ -69,7 +69,12 @@ if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   printf 'local worktree memory\n' > "$5/ψ/memory/local.md"
   exit 0
 fi
-if [ "$3" = "clean" ] && [ "$4" = "-fd" ]; then exit 0; fi
+if [ "$3" = "clean" ] && [ "$4" = "-fd" ]; then
+  if [ "${MAW_FAKE_GIT_CLEAN:-0}" = "1" ]; then
+    rm -rf "$2/.cargo" "$2/ψ"
+  fi
+  exit 0
+fi
 printf 'unexpected git args: %s\n' "$*" >&2
 exit 9
 "#,
@@ -111,6 +116,17 @@ fn run_from(
     args: &[&str],
     tmux_env: Option<&str>,
 ) -> std::process::Output {
+    run_from_with_git_clean(cwd, root, bin_dir, args, tmux_env, false)
+}
+
+fn run_from_with_git_clean(
+    cwd: &Path,
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+    tmux_env: Option<&str>,
+    git_clean_removes_untracked_state: bool,
+) -> std::process::Output {
     let mut command = Command::new(bin());
     command
         .args(args)
@@ -131,6 +147,9 @@ fn run_from(
             fs::read_to_string(root.join("windows.txt")).expect("windows"),
         )
         .env("MAW_FAKE_GIT_LOG", root.join("git.log"));
+    if git_clean_removes_untracked_state {
+        command.env("MAW_FAKE_GIT_CLEAN", "1");
+    }
     if let Some(value) = tmux_env {
         command.env("TMUX", value);
     }
@@ -247,18 +266,29 @@ fn native_workon_rejects_read_only_gitignore_before_launching() {
 
 #[cfg(unix)]
 #[test]
-fn native_workon_create_links_psi_and_shares_cargo_target() {
+fn native_workon_omx_create_restores_shared_state_after_git_clean() {
     let root = temp_dir("shared-state");
     let bin_dir = seed_hermetic_root(&root, "shell\n");
     let repo = root.join("ghq/github.com/acme/demo");
     fs::create_dir_all(repo.join("ψ/memory/learnings")).expect("main psi");
     fs::write(repo.join("ψ/memory/learnings/main.md"), "main memory\n").expect("main learning");
     fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("cargo toml");
+    fs::write(
+        root.join("xdg-config/maw/maw.config.json"),
+        serde_json::json!({"commands":{"default":"echo launch","omx":"omx-launch --direct"}})
+            .to_string(),
+    )
+    .expect("omx config");
 
-    let output = run(
+    let output = run_from_with_git_clean(
+        &root,
         &root,
         &bin_dir,
-        &["workon", "demo", "feat", "--layout", "nested"],
+        &[
+            "workon", "demo", "feat", "--layout", "nested", "--engine", "omx",
+        ],
+        Some("/tmp/tmux-1000/default,123,0"),
+        true,
     );
 
     assert!(
@@ -280,6 +310,11 @@ fn native_workon_create_links_psi_and_shares_cargo_target() {
             "[build]\ntarget-dir = \"{}\"\n",
             repo.join("target").display()
         )
+    );
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(
+        tmux_log.contains("send-keys -t 50-mawjs:demo-feat -l omx-launch --direct"),
+        "{tmux_log}"
     );
 }
 

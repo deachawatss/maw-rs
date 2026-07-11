@@ -568,7 +568,12 @@ fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &
     done_validate_exec_path(&worktree.main_path)?;
     done_validate_exec_path(&worktree.full_path)?;
     let branch = local.done_git(&["-C".to_owned(), worktree.full_path.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
-    local.done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "remove".to_owned(), "--".to_owned(), worktree.full_path.display().to_string()])?;
+    let mut remove_args = vec!["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "remove".to_owned()];
+    if options.force {
+        remove_args.push("--force".to_owned());
+    }
+    remove_args.extend(["--".to_owned(), worktree.full_path.display().to_string()]);
+    local.done_git(&remove_args)?;
     local.done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "prune".to_owned()])?;
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m removed worktree {}", worktree.label);
     done_cleanup_branch(&worktree.main_path, &branch, options, local, stdout);
@@ -755,12 +760,9 @@ mod done_tests {
             if args.ends_with(&["rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]) {
                 return Ok(format!("{}\n", self.branches.get(&cwd).map_or("agent/task", String::as_str)));
             }
-            if args.iter().any(|arg| arg == "--force") {
-                return Err("unexpected --force in git call".to_owned());
-            }
             if args.iter().any(|arg| arg == "remove") {
                 let worktree = Self::arg_after_separator(args).ok_or_else(|| "missing worktree path".to_owned())?;
-                if self.dirty_removals.contains(&worktree) {
+                if self.dirty_removals.contains(&worktree) && !args.iter().any(|arg| arg == "--force") {
                     return Err(format!("fatal: '{}' contains modified or untracked files", worktree.display()));
                 }
                 return Ok(String::new());
@@ -1060,5 +1062,36 @@ mod done_tests {
         let err = done_run_with_context(&done_args(&["worker"]), &mut runtime, &context).expect_err("dirty");
         assert!(err.contains("contains modified or untracked files"), "{err}");
         assert!(runtime.git_calls.iter().all(|args| !args.iter().any(|arg| arg == "--force")), "{:?}", runtime.git_calls);
+    }
+
+    #[test]
+    fn done_force_removes_dirty_worktree_with_git_force() {
+        let root = DoneTempRoot::new("dirty-force");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let dirty = main.join("agents/dirty-task");
+        done_write_fleet(&root, "worker", "acme/app/agents/dirty-task");
+
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.dirty_removals.insert(dirty.clone());
+
+        done_run_with_context(&done_args(&["worker", "--force"]), &mut runtime, &context)
+            .expect("forced removal of dirty worktree");
+
+        assert!(
+            runtime.git_calls.iter().any(|args| {
+                args == &vec![
+                    "-C".to_owned(),
+                    main.display().to_string(),
+                    "worktree".to_owned(),
+                    "remove".to_owned(),
+                    "--force".to_owned(),
+                    "--".to_owned(),
+                    dirty.display().to_string(),
+                ]
+            }),
+            "{:#?}",
+            runtime.git_calls
+        );
     }
 }
