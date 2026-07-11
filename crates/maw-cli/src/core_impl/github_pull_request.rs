@@ -65,6 +65,13 @@ struct PrReviewRequest {
     notifier: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PrL1Notification {
+    #[default]
+    Hey,
+    LegacyPaneFallback,
+}
+
 trait PrTmux {
     fn pr_current_path(&mut self) -> Result<String, String>;
     fn pr_current_session(&mut self) -> Result<String, String>;
@@ -94,7 +101,7 @@ trait PrProcess {
     fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String>;
     fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String>;
     fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String>;
-    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<(), String>;
+    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String>;
 }
 
 struct PrNativeProcess;
@@ -174,13 +181,13 @@ impl PrProcess for PrNativeProcess {
         pr_enqueue_global_review(request)
     }
 
-    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<(), String> {
-        let pane = std::env::var("MAW_L1_PANE")
-            .ok()
-            .or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-pane")).ok())
-            .map(|value| value.trim().to_owned())
-            .filter(|value| pr_valid_pane_id(value))
-            .ok_or_else(|| "pr: L1 pane unavailable; queued for hook recovery".to_owned())?;
+    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String> {
+        if let Some(oracle) = pr_l1_oracle(cwd) {
+            pr_notify_l1_with_hey(&oracle, message)?;
+            return Ok(PrL1Notification::Hey);
+        }
+        let pane = pr_l1_pane(cwd)
+            .ok_or_else(|| "pr: L1 oracle unavailable and legacy pane unavailable; queued for hook recovery".to_owned())?;
         let literal = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &pane, "-l", message])
             .output()
@@ -193,7 +200,7 @@ impl PrProcess for PrNativeProcess {
             .output()
             .map_err(|error| format!("pr: notify L1 enter: {error}"))?;
         if enter.status.success() {
-            Ok(())
+            Ok(PrL1Notification::LegacyPaneFallback)
         } else {
             Err("pr: notify L1 enter failed; queued for hook recovery".to_owned())
         }
@@ -238,7 +245,10 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     let issue = pr_extract_issue_num(&plan.branch).unwrap_or_default();
     let message = format!("[codex] PR #{pr_number} ready for issue #{issue}. {url}");
     match process.pr_notify_l1(&plan.cwd, &message) {
-        Ok(()) => {
+        Ok(notification) => {
+            if notification == PrL1Notification::LegacyPaneFallback {
+                let _ = writeln!(out, "\x1b[33m⚠\x1b[0m pr: L1 oracle metadata unavailable; used legacy .maw/l1-pane fallback");
+            }
             request.notified = true;
             "notified".clone_into(&mut request.status);
             request.notified_at = Some(pr_now_epoch());
@@ -254,6 +264,55 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
         }
     }
     Ok(out)
+}
+
+fn pr_l1_oracle(cwd: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(cwd.join(".maw/l1-oracle"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| pr_valid_oracle_name(value))
+}
+
+fn pr_l1_pane(cwd: &std::path::Path) -> Option<String> {
+    std::env::var("MAW_L1_PANE")
+        .ok()
+        .or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-pane")).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| pr_valid_pane_id(value))
+}
+
+fn pr_valid_oracle_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('-')
+        && value.chars().all(|ch| !ch.is_control() && !ch.is_whitespace())
+}
+
+fn pr_notify_l1_with_hey(oracle: &str, message: &str) -> Result<(), String> {
+    let oracle = oracle.to_owned();
+    let message = message.to_owned();
+    let worker = std::thread::Builder::new()
+        .name("maw-pr-l1-notify".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("pr: start L1 notify runtime: {error}"))?;
+            Ok::<CliOutput, String>(runtime.block_on(run_hey_in_process(&oracle, &message, false)))
+        })
+        .map_err(|error| format!("pr: start L1 notify worker: {error}"))?;
+    let output = worker
+        .join()
+        .map_err(|_| "pr: L1 notify worker panicked".to_owned())??;
+    if output.code == 0 {
+        return Ok(());
+    }
+    let detail = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    Err(format!("pr: notify L1 via maw hey failed: {detail}"))
 }
 
 fn pr_write_review_request(cwd: &std::path::Path, request: &PrReviewRequest) -> Result<(), String> {
@@ -668,6 +727,7 @@ mod pr_tests {
         viewed: Vec<String>,
         enqueued: Vec<PrReviewRequest>,
         notifications: Vec<String>,
+        notification: PrL1Notification,
     }
 
     impl PrProcess for PrMockProcess {
@@ -694,9 +754,9 @@ mod pr_tests {
             }
             Ok(())
         }
-        fn pr_notify_l1(&mut self, _cwd: &std::path::Path, message: &str) -> Result<(), String> {
+        fn pr_notify_l1(&mut self, _cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String> {
             self.notifications.push(message.to_owned());
-            Ok(())
+            Ok(self.notification)
         }
     }
 
@@ -776,6 +836,37 @@ mod pr_tests {
         assert_eq!(request.pr_number, 7);
         assert_eq!(request.status, "notified");
         assert_eq!(request.notifier.as_deref(), Some("maw-pr"));
+    }
+
+    #[test]
+    fn pr_reads_oracle_metadata_separately_from_legacy_pane() {
+        let repo = pr_temp_dir("l1-metadata");
+        let metadata = repo.join(".maw");
+        std::fs::create_dir_all(&metadata).expect("metadata dir");
+        std::fs::write(metadata.join("l1-oracle"), "50-mawjs\n").expect("oracle");
+        std::fs::write(metadata.join("l1-pane"), "%42\n").expect("pane");
+        assert_eq!(pr_l1_oracle(&repo).as_deref(), Some("50-mawjs"));
+        assert_eq!(pr_l1_pane(&repo).as_deref(), Some("%42"));
+    }
+
+    #[test]
+    fn pr_marks_legacy_pane_fallback() {
+        let repo = pr_temp_dir("l1-pane-fallback");
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        pr_write_delivery(&repo, 32);
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/issue-32-pr-hey-notification".to_owned(),
+            notification: PrL1Notification::LegacyPaneFallback,
+            ..PrMockProcess::default()
+        };
+
+        let output = pr_run(&[], &mut tmux, &mut process).expect("run");
+
+        assert!(output.contains("L1 oracle metadata unavailable; used legacy .maw/l1-pane fallback"), "{output}");
+        assert!(output.contains("\x1b[32m✅\x1b[0m L1 notified"), "{output}");
     }
 
     #[test]

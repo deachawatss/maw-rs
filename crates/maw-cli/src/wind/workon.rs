@@ -16,7 +16,7 @@ pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
     ".maw/delivery.json",
     ".maw/l1-review-request.json",
     ".maw/delivery-notified",
-    ".maw/l1-pane",
+    ".maw/l1-oracle",
     ".maw/auto-done-pinged",
     ".maw/phase.json",
     ".maw/lane",
@@ -24,6 +24,7 @@ pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
 ];
 
 const LEGACY_MARKERS: &[&str] = &[
+    ".maw/l1-pane",
     ".maw/strategy.json",
     ".maw/solo-justified",
     ".maw/spec-waived",
@@ -73,30 +74,30 @@ pub(crate) fn prepare_engine(
     Ok(resolution)
 }
 
-pub(crate) fn record_l1_pane(cwd: &Path) -> Result<bool, String> {
-    let Ok(pane) = std::env::var("TMUX_PANE") else {
-        return Ok(false);
-    };
-    let pane = pane.trim();
-    if !valid_pane_id(pane) {
+pub(crate) fn record_l1_oracle(cwd: &Path, oracle: &str) -> Result<bool, String> {
+    let oracle = oracle.trim();
+    if !valid_oracle_name(oracle) {
         return Ok(false);
     }
     let dir = cwd.join(".maw");
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("workon: create {}: {error}", dir.display()))?;
-    let path = dir.join("l1-pane");
-    let tmp = dir.join(format!(".l1-pane.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{pane}\n"))
+    let path = dir.join("l1-oracle");
+    let tmp = dir.join(format!(".l1-oracle.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{oracle}\n"))
         .map_err(|error| format!("workon: write {}: {error}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .map_err(|error| format!("workon: replace {}: {error}", path.display()))?;
     Ok(true)
 }
 
-fn valid_pane_id(value: &str) -> bool {
-    value
-        .strip_prefix('%')
-        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+fn valid_oracle_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.starts_with('-')
+        && value
+            .chars()
+            .all(|ch| !ch.is_control() && !ch.is_whitespace())
 }
 
 fn load_config(cwd: &Path) -> serde_json::Value {
@@ -357,7 +358,7 @@ mod tests {
             ".maw/delivery.json",
             ".maw/l1-review-request.json",
             ".maw/delivery-notified",
-            ".maw/l1-pane",
+            ".maw/l1-oracle",
             ".maw/auto-done-pinged",
             ".maw/phase.json",
             ".maw/lane",
@@ -391,11 +392,12 @@ mod tests {
     }
 
     #[test]
-    fn l1_pane_identifier_is_strictly_validated() {
-        assert!(valid_pane_id("%42"));
-        assert!(!valid_pane_id("42"));
-        assert!(!valid_pane_id("%-1"));
-        assert!(!valid_pane_id("%1;touch-pwned"));
+    fn l1_oracle_name_is_strictly_validated() {
+        assert!(valid_oracle_name("50-mawjs"));
+        assert!(!valid_oracle_name(""));
+        assert!(!valid_oracle_name(" 50-mawjs"));
+        assert!(!valid_oracle_name("-oracle"));
+        assert!(!valid_oracle_name("oracle\nnext"));
     }
 
     #[test]
