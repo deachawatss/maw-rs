@@ -50,9 +50,13 @@ impl PaneTreeRuntime for SystemPaneTreeRuntime {
                 .output()
                 .map_err(|error| format!("pane reaper: signal {pid} failed to start: {error}"))?;
             if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if pane_tree_signal_failure_is_benign(&stderr) {
+                    continue;
+                }
                 return Err(format!(
                     "pane reaper: signal {pid} failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    stderr.trim()
                 ));
             }
         }
@@ -63,6 +67,13 @@ impl PaneTreeRuntime for SystemPaneTreeRuntime {
         std::thread::sleep(PANE_TREE_REAP_GRACE);
         Ok(())
     }
+}
+
+fn pane_tree_signal_failure_is_benign(stderr: &str) -> bool {
+    let detail = stderr.to_ascii_lowercase();
+    detail.contains("no such process")
+        || detail.contains("operation not permitted")
+        || detail.contains("permission denied")
 }
 
 /// Reap the descendants of the supplied tmux pane roots without signalling the pane roots.
@@ -342,5 +353,20 @@ mod pane_tree_reaper_tests {
         reap_pane_descendants(&mut runtime, &[10]).expect("skip empty pane tree");
 
         assert!(runtime.signals.is_empty());
+    }
+
+    #[test]
+    fn accepts_a_survivor_that_exits_before_sigkill() {
+        assert!(pane_tree_signal_failure_is_benign(
+            "kill: 42: No such process"
+        ));
+        assert!(pane_tree_signal_failure_is_benign(
+            "kill: 42: Operation not permitted"
+        ));
+        assert!(!pane_tree_signal_failure_is_benign("kill: invalid signal"));
+
+        SystemPaneTreeRuntime
+            .pane_tree_signal(ProcessSignal::Kill, &[999_999_999])
+            .expect("an already-dead SIGKILL target is a successful reap");
     }
 }
