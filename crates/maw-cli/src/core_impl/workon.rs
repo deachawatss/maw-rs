@@ -218,11 +218,19 @@ fn workon_attach_interactive(session: &str) -> Result<(), String> {
     if status.success() { Ok(()) } else { Err(format!("workon: tmux attach exited with status {status}")) }
 }
 
-fn workon_prepare_delivery(stdout: &mut String, window_name: &str, target_path: &Path, engine: Option<&str>) {
-    // Preserve the permanent L1 caller pane so engine-neutral PR handoff can
-    // notify the reviewer without relying on Claude-only hooks.
-    if let Err(error) = crate::wind::workon::record_l1_pane(target_path) {
-        let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: L1 handoff target not recorded: {error}");
+fn workon_prepare_delivery(
+    stdout: &mut String,
+    window_name: &str,
+    target_path: &Path,
+    engine: Option<&str>,
+    parent_oracle: Option<&str>,
+) {
+    // Preserve the parent Oracle name so PR handoff can use the same
+    // federation-aware routing as `maw hey`.
+    if let Some(oracle) = parent_oracle {
+        if let Err(error) = crate::wind::workon::record_l1_oracle(target_path, oracle) {
+            let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: L1 handoff target not recorded: {error}");
+        }
     }
 
     // Best-effort trust audit: launching work should not fail because delivery
@@ -287,10 +295,16 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         taskless_oracle = true;
     }
 
-    workon_prepare_delivery(&mut stdout, &window_name, &target_path, options.engine.as_deref());
+    let parent_oracle = workon_parent_oracle(runner)?;
+    workon_prepare_delivery(
+        &mut stdout,
+        &window_name,
+        &target_path,
+        options.engine.as_deref(),
+        parent_oracle.as_deref(),
+    );
 
-    if std::env::var_os("TMUX").is_some() {
-        let session = workon_tmux_run(runner, "display-message", &["-p", "#{session_name}"])?;
+    if let Some(session) = parent_oracle {
         if session.is_empty() { return Err("could not detect current tmux session".to_owned()); }
         workon_ensure_window(
             runner,
@@ -379,6 +393,13 @@ struct WorkonWindowLaunch<'a> {
     force_new_window: bool,
     engine: Option<&'a str>,
     prompt: Option<&'a str>,
+}
+
+fn workon_parent_oracle<R: maw_tmux::TmuxRunner>(runner: &mut R) -> Result<Option<String>, String> {
+    if std::env::var_os("TMUX").is_none() {
+        return Ok(None);
+    }
+    workon_tmux_run(runner, "display-message", &["-p", "#{session_name}"]).map(Some)
 }
 
 fn workon_ensure_window<R: maw_tmux::TmuxRunner>(

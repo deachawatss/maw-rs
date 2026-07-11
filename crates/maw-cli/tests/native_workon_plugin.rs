@@ -308,6 +308,30 @@ fn native_workon_reuse_window_is_hermetic_and_does_not_spawn() {
 }
 
 #[test]
+fn native_workon_records_parent_oracle_for_l1_handoff() {
+    let root = temp_dir("l1-oracle");
+    let bin_dir = seed_hermetic_root(&root, "demo\n");
+
+    let output = run(&root, &bin_dir, &["workon", "demo"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata = root.join("ghq/github.com/acme/demo/.maw");
+    assert_eq!(
+        fs::read_to_string(metadata.join("l1-oracle")).expect("oracle metadata"),
+        "50-mawjs\n"
+    );
+    assert!(
+        !metadata.join("l1-pane").exists(),
+        "new workon runs must not persist the legacy pane target"
+    );
+}
+
+#[test]
 fn native_workon_outside_tmux_creates_session_and_prints_attach_plan() {
     let root = temp_dir("outside");
     let bin_dir = seed_hermetic_root(&root, "");
