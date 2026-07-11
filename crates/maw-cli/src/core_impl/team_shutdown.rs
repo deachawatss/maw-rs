@@ -127,6 +127,7 @@ fn team_shutdown_validate_pane_id(value: &str) -> Result<(), String> {
 fn team_shutdown_kill(pane_id: &str) -> Result<(), String> {
     if team_shutdown_fake_mode() { return team_shutdown_record_fake("kill", pane_id); }
     let mut runner = maw_tmux::CommandTmuxRunner::default();
+    reap_tmux_target(&mut runner, pane_id)?;
     maw_tmux::TmuxRunner::run(&mut runner, "kill-pane", &["-t".to_owned(), pane_id.to_owned()]).map(|_| ()).map_err(|error| error.message)
 }
 

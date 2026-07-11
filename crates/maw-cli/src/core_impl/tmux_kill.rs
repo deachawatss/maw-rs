@@ -92,6 +92,7 @@ fn tmux_kill_session<R: maw_tmux::TmuxRunner>(
     let session = tmux_kill_resolve_session(&args.target, &sessions)?;
     tmux_kill_validate_resolved_target(&session, "resolved session")?;
     tmux_kill_refuse_protected_session(&session, args.force)?;
+    reap_tmux_target(runner, &session)?;
     runner
         .run("kill-session", &tmux_kill_strings(&["-t", &session]))
         .map_err(|error| format!("tmux kill-session failed: {}", error.message))?;
@@ -113,6 +114,7 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
     tmux_kill_validate_resolved_target(&pane.id, "resolved pane id")?;
     tmux_kill_validate_resolved_target(&pane.session, "resolved pane session")?;
     tmux_kill_refuse_protected_session(&pane.session, args.force)?;
+    reap_tmux_target(runner, &pane.id)?;
     runner
         .run("kill-pane", &tmux_kill_strings(&["-t", &pane.id]))
         .map_err(|error| format!("tmux kill-pane failed: {}", error.message))?;
@@ -357,10 +359,12 @@ mod tmux_kill_tests {
         let mut runner = fake_runner();
         let output = tmux_kill_run_with(&fake_args(&["%42"]), &mut runner).expect("kill pane");
         assert_eq!(output, "  \x1b[32m✓\x1b[0m killed pane %42\n");
-        assert_eq!(runner.calls.len(), 2);
+        assert_eq!(runner.calls.len(), 3);
         assert_eq!(runner.calls[0].subcommand, "list-panes");
-        assert_eq!(runner.calls[1].subcommand, "kill-pane");
-        assert_eq!(runner.calls[1].args, fake_args(&["-t", "%42"]));
+        assert_eq!(runner.calls[1].subcommand, "list-panes");
+        assert_eq!(runner.calls[1].args, fake_args(&["-t", "%42", "-F", "#{pane_pid}"]));
+        assert_eq!(runner.calls[2].subcommand, "kill-pane");
+        assert_eq!(runner.calls[2].args, fake_args(&["-t", "%42"]));
     }
 
     #[test]
@@ -369,10 +373,12 @@ mod tmux_kill_tests {
         let output = tmux_kill_run_with(&fake_args(&["scratch", "--session"]), &mut runner)
             .expect("kill session");
         assert_eq!(output, "  \x1b[32m✓\x1b[0m killed session scratch\n");
-        assert_eq!(runner.calls.len(), 2);
+        assert_eq!(runner.calls.len(), 3);
         assert_eq!(runner.calls[0].subcommand, "list-sessions");
-        assert_eq!(runner.calls[1].subcommand, "kill-session");
-        assert_eq!(runner.calls[1].args, fake_args(&["-t", "scratch"]));
+        assert_eq!(runner.calls[1].subcommand, "list-panes");
+        assert_eq!(runner.calls[1].args, fake_args(&["-t", "scratch", "-F", "#{pane_pid}"]));
+        assert_eq!(runner.calls[2].subcommand, "kill-session");
+        assert_eq!(runner.calls[2].args, fake_args(&["-t", "scratch"]));
     }
 
     #[test]
@@ -400,7 +406,7 @@ mod tmux_kill_tests {
         let output = tmux_kill_run_with(&fake_args(&["demo", "--session", "--force"]), &mut runner)
             .expect("forced kill session");
         assert!(output.contains("killed session 07-demo"));
-        assert_eq!(runner.calls[1].subcommand, "kill-session");
+        assert_eq!(runner.calls[2].subcommand, "kill-session");
     }
 
     #[test]
