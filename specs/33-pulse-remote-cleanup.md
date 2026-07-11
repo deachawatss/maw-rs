@@ -1,7 +1,7 @@
 # SPEC-33: Pulse remote cleanup
 
-Issue: #33  
-Date: 2026-07-11  
+Issue: #33
+Date: 2026-07-11
 Mode: standard
 
 ## Objective
