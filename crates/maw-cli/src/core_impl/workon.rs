@@ -262,6 +262,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         let branches = workon_agent_branches(&repo.repo_path)?;
         match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
             WorkonWorktreePlan::Reuse { path } => {
+                workon_restore_shared_worktree_state(&repo.repo_path, &path)?;
                 let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing worktree: {}", path.display());
                 target_path = path;
             }
@@ -628,18 +629,17 @@ fn workon_create_worktree(
     } else {
         workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, "-b", branch])?;
     }
-    let main_path = workon_main_worktree_path(&repo.repo_path)?;
-    workon_link_shared_psi(&main_path, wt_path)?;
-    workon_write_cargo_target_config(&main_path, wt_path)?;
+    workon_restore_shared_worktree_state(&repo.repo_path, wt_path)?;
     Ok(())
 }
 
-fn workon_main_worktree_path(repo_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
-    let raw = workon_git(repo_path, &["worktree", "list", "--porcelain"])?;
-    raw.lines()
-        .find_map(|line| line.strip_prefix("worktree "))
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| "workon: could not resolve main worktree path".to_owned())
+fn workon_restore_shared_worktree_state(
+    repo_path: &std::path::Path,
+    worktree_path: &std::path::Path,
+) -> Result<(), String> {
+    workon_link_shared_psi(repo_path, worktree_path)?;
+    workon_write_cargo_target_config(repo_path, worktree_path)?;
+    Ok(())
 }
 
 fn workon_link_shared_psi(

@@ -284,6 +284,33 @@ fn native_workon_create_links_psi_and_shares_cargo_target() {
 }
 
 #[test]
+fn native_workon_reuse_repairs_missing_shared_cargo_target_config() {
+    let root = temp_dir("reuse-shared-target");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    let worktree = repo.join("agents/reused");
+    fs::create_dir_all(&worktree).expect("worktree");
+    fs::write(worktree.join(".git"), "gitdir: fake\n").expect("worktree git marker");
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").expect("cargo toml");
+
+    let output = run(&root, &bin_dir, &["workon", "demo", "reused"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join(".cargo/config.toml")).expect("cargo config"),
+        format!(
+            "[build]\ntarget-dir = \"{}\"\n",
+            repo.join("target").display()
+        )
+    );
+}
+
+#[test]
 fn native_workon_reuse_window_is_hermetic_and_does_not_spawn() {
     let root = temp_dir("reuse");
     let bin_dir = seed_hermetic_root(&root, "demo\n");
