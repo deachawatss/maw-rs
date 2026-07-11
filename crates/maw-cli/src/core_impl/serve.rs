@@ -22,6 +22,7 @@ const DEFAULT_SERVE_BIND: &str = "0.0.0.0";
 const SERVE_FEED_MAX: usize = 200;
 const SERVE_LOG_TEXT_MAX: usize = 2_000;
 const SERVE_LOG_ERROR_MAX: usize = 1_000;
+const DEFAULT_MIRROR_LINES: u32 = 50;
 const DELIVERY_IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;
 #[cfg(test)]
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
@@ -373,6 +374,7 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/feed", get(api_feed_get).post(api_feed_post))
         .route("/api/sessions", get(api_sessions))
         .route("/api/capture", get(api_capture))
+        .route("/api/mirror", get(api_mirror))
         .route("/api/probe", post(api_probe))
         .route("/api/wake", post(api_wake))
         .route("/api/pane-keys", post(api_pane_keys))
@@ -1622,6 +1624,26 @@ async fn api_capture(Query(query): Query<CaptureQuery>) -> impl IntoResponse {
     }
 }
 
+async fn api_mirror(
+    State(state): State<Arc<ServeState>>,
+    Query(query): Query<MirrorQuery>,
+) -> axum::response::Response {
+    let target = query.target.unwrap_or_default();
+    let lines = query.lines.unwrap_or(DEFAULT_MIRROR_LINES);
+    match state.delivery.capture_tail(&target, lines) {
+        Ok(content) => content.into_response(),
+        Err(message) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "pane_not_found",
+                "target": target,
+                "message": message,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 fn serve_resolve_capture_target(
     target: &str,
     tmux: &mut TmuxClient<maw_tmux::CommandTmuxRunner>,
@@ -2718,6 +2740,12 @@ struct CaptureQuery {
     target: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MirrorQuery {
+    target: Option<String>,
+    lines: Option<u32>,
+}
+
 #[cfg(test)]
 #[allow(clippy::redundant_closure_for_method_calls)]
 mod serve_tests {
@@ -2737,6 +2765,8 @@ mod serve_tests {
         sessions: Mutex<Vec<Vec<RouteSession>>>,
         sends: Mutex<Vec<(String, String)>>,
         captures: Mutex<HashMap<String, String>>,
+        capture_requests: Mutex<Vec<(String, u32)>>,
+        capture_error: Mutex<Option<String>>,
         send_error: Mutex<Option<String>>,
         list_error: Mutex<Option<String>>,
     }
@@ -2767,6 +2797,14 @@ mod serve_tests {
         fn sends(&self) -> Vec<(String, String)> {
             self.sends.lock().expect("sends").clone()
         }
+
+        fn capture_requests(&self) -> Vec<(String, u32)> {
+            self.capture_requests.lock().expect("capture requests").clone()
+        }
+
+        fn set_capture_error(&self, error: Option<&str>) {
+            *self.capture_error.lock().expect("capture error") = error.map(ToOwned::to_owned);
+        }
     }
 
     impl ServeDelivery for FakeServeDelivery {
@@ -2792,7 +2830,14 @@ mod serve_tests {
             Ok(())
         }
 
-        fn capture_tail(&self, target: &str, _lines: u32) -> Result<String, String> {
+        fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
+            if let Some(error) = self.capture_error.lock().expect("capture error").clone() {
+                return Err(error);
+            }
+            self.capture_requests
+                .lock()
+                .expect("capture requests")
+                .push((target.to_owned(), lines));
             Ok(self
                 .captures
                 .lock()
@@ -2941,6 +2986,71 @@ mod serve_tests {
             delivery,
             serve_test_receiver_inbox(),
         )
+    }
+
+    #[tokio::test]
+    async fn serve_api_mirror_returns_text_uses_requested_lines_and_reports_missing_panes() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_capture("oracle:0", "oracle terminal output\n");
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            Vec::new(),
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let default_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/mirror?target=oracle%3A0")
+                    .body(Body::empty())
+                    .expect("default mirror request"),
+        )
+        .await
+        .expect("default mirror response");
+        assert_eq!(default_response.status(), StatusCode::OK);
+        assert_eq!(
+            default_response.headers()[reqwest::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+        let default_body = axum::body::to_bytes(default_response.into_body(), 64 * 1024)
+            .await
+            .expect("default mirror body");
+        assert_eq!(default_body.as_ref(), b"oracle terminal output\n");
+        assert_eq!(delivery.capture_requests(), vec![("oracle:0".to_owned(), 50)]);
+
+        let requested_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/mirror?target=oracle%3A0&lines=12")
+                    .body(Body::empty())
+                    .expect("requested mirror request"),
+            )
+            .await
+            .expect("requested mirror response");
+        assert_eq!(requested_response.status(), StatusCode::OK);
+        assert_eq!(
+            delivery.capture_requests(),
+            vec![("oracle:0".to_owned(), 50), ("oracle:0".to_owned(), 12)]
+        );
+
+        delivery.set_capture_error(Some("can't find pane: missing:0"));
+        let missing_response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/mirror?target=missing%3A0")
+                    .body(Body::empty())
+                    .expect("missing mirror request"),
+            )
+            .await
+            .expect("missing mirror response");
+        assert_eq!(missing_response.status(), StatusCode::NOT_FOUND);
+        let missing_body = response_json(missing_response).await;
+        assert_eq!(missing_body["error"], "pane_not_found");
+        assert_eq!(missing_body["target"], "missing:0");
+        assert_eq!(missing_body["message"], "can't find pane: missing:0");
     }
 
     fn serve_test_app_with_o6_keys_delivery_and_inbox(
