@@ -46,6 +46,34 @@ exit 42
     chmod_exec(&gh);
 }
 
+fn write_fake_cleanup_gh(bin_dir: &Path) {
+    let gh = bin_dir.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MAW_PULSE_GH_LOG"
+case "$*" in
+  *'pr view agents/1-old --repo acme/widgets --json state')
+    printf '%s\n' '{"state":"MERGED"}'
+    exit 0
+    ;;
+  *'pr view agents/merged --repo acme/widgets --json state')
+    printf '%s\n' '{"state":"MERGED"}'
+    exit 0
+    ;;
+  *'pr view agents/open --repo acme/widgets --json state')
+    printf '%s\n' '{"state":"OPEN"}'
+    exit 0
+    ;;
+esac
+printf 'unexpected gh: %s\n' "$*" >&2
+exit 42
+"#,
+    )
+    .expect("write fake cleanup gh");
+    chmod_exec(&gh);
+}
+
 fn write_fake_git(bin_dir: &Path) {
     let git = bin_dir.join("git");
     fs::write(
@@ -61,6 +89,24 @@ exit 42
 "#,
     )
     .expect("write fake git");
+    chmod_exec(&git);
+}
+
+fn write_fake_cleanup_git(bin_dir: &Path) {
+    let git = bin_dir.join("git");
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MAW_PULSE_GIT_LOG"
+case "$*" in
+  *'/agents/merged rev-parse --abbrev-ref HEAD') printf 'agents/merged\n'; exit 0 ;;
+  *'/agents/open rev-parse --abbrev-ref HEAD') printf 'agents/open\n'; exit 0 ;;
+  *'worktree list --porcelain') exit 0 ;;
+esac
+exit 0
+"#,
+    )
+    .expect("write fake cleanup git");
     chmod_exec(&git);
 }
 
@@ -151,6 +197,7 @@ fn native_pulse_cleanup_dry_run_is_hermetic_and_matches_golden() {
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
     write_fake_git(&bin_dir);
+    write_fake_cleanup_gh(&bin_dir);
     write_fake_tmux(&bin_dir);
     let worktree = root.join("ghq/github.com/acme/widgets/agents/1-old");
     fs::create_dir_all(&worktree).expect("worktree");
@@ -183,6 +230,57 @@ fn native_pulse_cleanup_dry_run_is_hermetic_and_matches_golden() {
     assert!(fs::read_to_string(root.join("git.log"))
         .expect("git log")
         .contains("rev-parse --abbrev-ref HEAD"));
+    assert_eq!(
+        fs::read_to_string(root.join("gh.log")).expect("gh log"),
+        "pr view agents/1-old --repo acme/widgets --json state\n"
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert!(!git_log.contains("fetch --prune origin"));
+    assert!(!git_log.contains("push origin --delete agents/1-old"));
+}
+
+#[test]
+fn native_pulse_cleanup_prunes_once_and_deletes_only_merged_remote_branches() {
+    let root = temp_dir("cleanup-live");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_fake_cleanup_git(&bin_dir);
+    write_fake_cleanup_gh(&bin_dir);
+    write_fake_tmux(&bin_dir);
+    for name in ["merged", "open"] {
+        let worktree = root.join(format!("ghq/github.com/acme/widgets/agents/{name}"));
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../../.git/worktrees/test\n",
+        )
+        .expect("git marker");
+    }
+
+    let output = run(&root, &["pulse", "cleanup"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("deleted remote branch agents/merged"));
+    assert!(!stdout.contains("deleted remote branch agents/open"));
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert_eq!(git_log.matches("fetch --prune origin").count(), 1);
+    assert!(git_log.contains("push origin --delete agents/merged"));
+    assert!(!git_log.contains("push origin --delete agents/open"));
+    assert!(git_log.contains("branch -d agents/merged"));
+    assert!(git_log.contains("branch -d agents/open"));
+    assert_eq!(
+        fs::read_to_string(root.join("gh.log")).expect("gh log"),
+        concat!(
+            "pr view agents/merged --repo acme/widgets --json state\n",
+            "pr view agents/open --repo acme/widgets --json state\n"
+        )
+    );
 }
 
 #[test]

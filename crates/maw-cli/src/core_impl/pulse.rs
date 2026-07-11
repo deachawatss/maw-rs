@@ -28,6 +28,11 @@ struct PulseGhIssueWithUrl {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+struct PulseGhPullRequest {
+    state: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
 struct PulseComment {
     id: serde_json::Value,
     #[serde(default)]
@@ -267,12 +272,37 @@ fn pulse_cleanup(dry_run: bool) -> Result<String, String> {
     let stale_count = worktrees.iter().filter(|worktree| worktree.status == PulseWorktreeStatus::Stale).count();
     let orphan_count = worktrees.iter().filter(|worktree| worktree.status == PulseWorktreeStatus::Orphan).count();
     let _ = writeln!(stdout, "  \x1b[32m{active_count} active\x1b[0m | \x1b[33m{stale_count} stale\x1b[0m | \x1b[31m{orphan_count} orphan\x1b[0m\n");
+    if !dry_run {
+        let repos = stale.iter().map(|worktree| worktree.main_path.clone()).collect::<BTreeSet<_>>();
+        for repo in repos {
+            pulse_cleanup_fetch_origin(&repo)?;
+        }
+    }
     for worktree in stale {
         let color = if worktree.status == PulseWorktreeStatus::Orphan { "\x1b[31m" } else { "\x1b[33m" };
         let _ = writeln!(stdout, "{color}{}\x1b[0m  {} ({}) [{}]", pulse_status_name(worktree.status), worktree.name, worktree.main_repo, worktree.branch);
-        if !dry_run {
+        if dry_run {
+            match pulse_remote_branch_is_merged(&worktree) {
+                Ok(true) => {
+                    let _ = writeln!(stdout, "  \x1b[90mwould delete remote branch {}\x1b[0m", worktree.branch);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let _ = writeln!(stdout, "  \x1b[33mwarn:\x1b[0m remote branch left intact: {error}");
+                }
+            }
+        } else {
             for line in pulse_cleanup_worktree(&worktree)? {
                 let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {line}");
+            }
+            match pulse_cleanup_remote_branch(&worktree) {
+                Ok(Some(line)) => {
+                    let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {line}");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = writeln!(stdout, "  \x1b[33mwarn:\x1b[0m remote branch left intact: {error}");
+                }
             }
         }
     }
@@ -598,6 +628,66 @@ fn pulse_cleanup_worktree(worktree: &PulseWorktree) -> Result<Vec<String>, Strin
     }
     let _ = &worktree.repo;
     Ok(log)
+}
+
+fn pulse_cleanup_fetch_origin(main_path: &std::path::Path) -> Result<(), String> {
+    let main = main_path.to_str().ok_or_else(|| "pulse: non-utf8 main repo path".to_owned())?;
+    pulse_validate_path_arg(main, "main repo path")?;
+    pulse_command_stdout(
+        "git",
+        &[
+            "-C".to_owned(),
+            main.to_owned(),
+            "fetch".to_owned(),
+            "--prune".to_owned(),
+            "origin".to_owned(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn pulse_cleanup_remote_branch(worktree: &PulseWorktree) -> Result<Option<String>, String> {
+    if !pulse_remote_branch_is_merged(worktree)? {
+        return Ok(None);
+    }
+    let main = worktree.main_path.to_str().ok_or_else(|| "pulse: non-utf8 main repo path".to_owned())?;
+    pulse_validate_path_arg(main, "main repo path")?;
+    pulse_validate_target_arg(&worktree.branch, "branch")?;
+    pulse_command_stdout(
+        "git",
+        &[
+            "-C".to_owned(),
+            main.to_owned(),
+            "push".to_owned(),
+            "origin".to_owned(),
+            "--delete".to_owned(),
+            worktree.branch.clone(),
+        ],
+    )?;
+    Ok(Some(format!("deleted remote branch {}", worktree.branch)))
+}
+
+fn pulse_remote_branch_is_merged(worktree: &PulseWorktree) -> Result<bool, String> {
+    if !worktree.branch.starts_with("agents/") {
+        return Ok(false);
+    }
+    pulse_validate_target_arg(&worktree.branch, "branch")?;
+    pulse_validate_target_arg(&worktree.main_repo, "main repo")?;
+    let raw = pulse_command_stdout(
+        "gh",
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            worktree.branch.clone(),
+            "--repo".to_owned(),
+            worktree.main_repo.clone(),
+            "--json".to_owned(),
+            "state".to_owned(),
+        ],
+    )?;
+    let pull_request: PulseGhPullRequest = serde_json::from_str(raw.trim())
+        .map_err(|error| format!("pulse: parse gh pr view json: {error}"))?;
+    Ok(pull_request.state == "MERGED")
 }
 
 fn pulse_tmux_window_names() -> BTreeSet<String> {
