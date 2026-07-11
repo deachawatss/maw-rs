@@ -461,22 +461,48 @@ fn done_resolve_registered_worktree(local: &mut impl DoneRuntime, path: &std::pa
         Ok(output) => std::path::PathBuf::from(output.trim()),
         Err(_) => return Ok(None),
     };
-    let Some(worktree) = done_parse_live_worktree_path(&top_level, context) else { return Ok(None); };
-    if done_is_registered_worktree(local, &worktree)? { Ok(Some(worktree)) } else { Ok(None) }
-}
-
-fn done_parse_live_worktree_path(full_path: &std::path::Path, context: &DoneContext) -> Option<DoneWorktree> {
-    done_parse_worktree_path(full_path, &context.repos_root).or_else(|| {
-        done_repos_root_from_cwd(full_path).and_then(|repos_root| done_parse_worktree_path(full_path, &repos_root))
-    })
-}
-
-fn done_is_registered_worktree(local: &mut impl DoneRuntime, worktree: &DoneWorktree) -> Result<bool, String> {
-    done_validate_exec_path(&worktree.main_path)?;
-    let Ok(raw) = local.done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "list".to_owned(), "--porcelain".to_owned()]) else {
-        return Ok(false);
+    if top_level.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    done_validate_exec_path(&top_level)?;
+    let Ok(raw) = local.done_git(&[
+        "-C".to_owned(),
+        top_level.display().to_string(),
+        "worktree".to_owned(),
+        "list".to_owned(),
+        "--porcelain".to_owned(),
+    ]) else {
+        return Ok(None);
     };
-    Ok(raw.lines().filter_map(|line| line.strip_prefix("worktree ")).any(|path| done_same_path(std::path::Path::new(path), &worktree.full_path)))
+    Ok(done_worktree_from_git_list(&raw, &top_level, context))
+}
+
+fn done_worktree_from_git_list(raw: &str, full_path: &std::path::Path, context: &DoneContext) -> Option<DoneWorktree> {
+    let paths = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(std::path::PathBuf::from)
+        .collect::<Vec<_>>();
+    if !paths.iter().any(|path| done_same_path(path, full_path)) {
+        return None;
+    }
+    let parsed = done_parse_worktree_path(full_path, &context.repos_root).or_else(|| {
+        done_repos_root_from_cwd(full_path)
+            .and_then(|repos_root| done_parse_worktree_path(full_path, &repos_root))
+    });
+    let listed_main = paths.first()?;
+    let main_path = if done_same_path(listed_main, full_path) {
+        parsed.as_ref()?.main_path.clone()
+    } else {
+        listed_main.clone()
+    };
+    done_validate_exec_path(&main_path).ok()?;
+    let label = parsed.map_or_else(|| full_path.display().to_string(), |worktree| worktree.label);
+    Some(DoneWorktree {
+        main_path,
+        full_path: full_path.to_path_buf(),
+        label,
+    })
 }
 
 fn done_same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -710,12 +736,20 @@ mod done_tests {
                     .ok_or_else(|| "not a git repository".to_owned());
             }
             if args.ends_with(&["worktree".to_owned(), "list".to_owned(), "--porcelain".to_owned()]) {
-                let mut out = format!("worktree {}\n\n", cwd.display());
-                if let Some(worktrees) = self.registered.get(&cwd) {
+                let registered = self.registered.iter().find(|(main, worktrees)| {
+                    *main == &cwd || worktrees.iter().any(|worktree| worktree == &cwd)
+                });
+                let out = if let Some((main, worktrees)) = registered {
+                    let mut out = format!("worktree {}\n\n", main.display());
                     for worktree in worktrees {
-                        let _ = write!(out, "worktree {}\n\n", worktree.display());
+                        if worktree != main {
+                            let _ = write!(out, "worktree {}\n\n", worktree.display());
+                        }
                     }
-                }
+                    out
+                } else {
+                    format!("worktree {}\n\n", cwd.display())
+                };
                 return Ok(out);
             }
             if args.ends_with(&["rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]) {
@@ -881,6 +915,84 @@ mod done_tests {
         assert!(done_same_path(&resolved.main_path, &main), "{} != {}", resolved.main_path.display(), main.display());
         assert!(done_same_path(&resolved.full_path, &live), "{} != {}", resolved.full_path.display(), live.display());
         assert_eq!(resolved.label, "acme/app/agents/live-task");
+    }
+
+    #[test]
+    fn done_live_cwd_outside_known_layout_uses_git_worktree_list() {
+        let root = DoneTempRoot::new("live-git-list");
+        let context = root.context();
+        let main = root.path.join("arbitrary/main-checkout");
+        let live = root.path.join("arbitrary/worker-checkout");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![done_test_window("lead"), done_test_window("worker")],
+            ..DoneFakeRuntime::default()
+        };
+        runtime
+            .pane_info
+            .insert("s:worker".to_owned(), ("codex".to_owned(), live.display().to_string()));
+        runtime.register_worktree(&main, &live);
+
+        let out = done_run_with_context(
+            &done_args(&["worker", "--dry-run"]),
+            &mut runtime,
+            &context,
+        )
+        .expect("done");
+
+        assert!(
+            out.contains(&format!("would remove worktree {}", live.display())),
+            "{out}"
+        );
+        assert!(
+            runtime.git_calls.iter().any(|args| {
+                args == &vec![
+                    "-C".to_owned(),
+                    live.display().to_string(),
+                    "worktree".to_owned(),
+                    "list".to_owned(),
+                    "--porcelain".to_owned(),
+                ]
+            }),
+            "{:#?}",
+            runtime.git_calls
+        );
+    }
+
+    #[test]
+    fn done_removes_worktree_before_cleaning_its_local_branch() {
+        let root = DoneTempRoot::new("branch-cleanup-order");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let live = main.join("agents/merged-task");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![done_test_window("lead"), done_test_window("worker")],
+            ..DoneFakeRuntime::default()
+        };
+        runtime
+            .pane_info
+            .insert("s:worker".to_owned(), ("codex".to_owned(), live.display().to_string()));
+        runtime.register_worktree(&main, &live);
+
+        done_run_with_context(
+            &done_args(&["worker", "--force", "--clean-branch"]),
+            &mut runtime,
+            &context,
+        )
+        .expect("done");
+
+        let remove = runtime
+            .git_calls
+            .iter()
+            .position(|args| args.get(2).is_some_and(|arg| arg == "worktree") && args.get(3).is_some_and(|arg| arg == "remove"))
+            .expect("worktree remove");
+        let branch_delete = runtime
+            .git_calls
+            .iter()
+            .position(|args| args.get(2).is_some_and(|arg| arg == "branch") && args.get(3).is_some_and(|arg| arg == "-D"))
+            .expect("branch delete");
+        assert!(remove < branch_delete, "{:#?}", runtime.git_calls);
+        assert_eq!(runtime.git_calls[remove][1], main.display().to_string());
+        assert_eq!(runtime.git_calls[branch_delete][1], main.display().to_string());
     }
 
     #[test]
