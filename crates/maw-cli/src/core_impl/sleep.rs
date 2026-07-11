@@ -62,6 +62,7 @@ trait SleepTmux {
     fn sleep_capture_pane(&mut self, pane_id: &str) -> Result<String, String>;
     fn sleep_send_exit(&mut self, target: &str) -> Result<(), String>;
     fn sleep_wait_grace(&mut self) -> Result<(), String>;
+    fn sleep_reap_target(&mut self, target: &str) -> Result<(), String>;
     fn sleep_kill_window(&mut self, target: &str) -> Result<(), String>;
     fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String>;
     fn sleep_save_tab_order(&mut self, session: &str, windows: &[SleepWindow]) -> Result<(), String>;
@@ -121,13 +122,20 @@ impl SleepTmux for SleepSystemTmux {
         Ok(())
     }
 
+    fn sleep_reap_target(&mut self, target: &str) -> Result<(), String> {
+        sleep_validate_tmux_target(target)?;
+        reap_tmux_target(&mut self.runner, target)
+    }
+
     fn sleep_kill_window(&mut self, target: &str) -> Result<(), String> {
         sleep_validate_tmux_target(target)?;
+        self.sleep_reap_target(target)?;
         sleep_tmux_run(&mut self.runner, "kill-window", &["-t", target]).map(|_| ())
     }
 
     fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String> {
         sleep_validate_pane_id(pane_id)?;
+        self.sleep_reap_target(pane_id)?;
         sleep_tmux_run(&mut self.runner, "kill-pane", &["-t", pane_id]).map(|_| ())
     }
 
@@ -576,6 +584,7 @@ mod sleep_tests {
         }
         fn sleep_send_exit(&mut self, target: &str) -> Result<(), String> { self.calls.push(format!("send-exit {target}")); Ok(()) }
         fn sleep_wait_grace(&mut self) -> Result<(), String> { self.calls.push("wait3s".to_owned()); Ok(()) }
+        fn sleep_reap_target(&mut self, _target: &str) -> Result<(), String> { Ok(()) }
         fn sleep_kill_window(&mut self, target: &str) -> Result<(), String> { self.calls.push(format!("kill-window {target}")); for s in &mut self.sessions { s.windows.retain(|w| format!("{}:{}", s.name, w.name) != target); } Ok(()) }
         fn sleep_kill_pane(&mut self, pane_id: &str) -> Result<(), String> { self.calls.push(format!("kill-pane {pane_id}")); self.panes.retain(|pane| pane.pane_id != pane_id); Ok(()) }
         fn sleep_save_tab_order(&mut self, session: &str, _windows: &[SleepWindow]) -> Result<(), String> { self.calls.push(format!("save-tab-order {session}")); Ok(()) }

@@ -61,6 +61,7 @@ trait KillTmux {
     fn kill_list_sessions(&mut self) -> Result<Vec<KillSession>, String>;
     fn kill_list_panes_all(&mut self) -> Result<String, String>;
     fn kill_list_pane_indexes(&mut self, target: &str) -> Result<Vec<u32>, String>;
+    fn kill_reap_target(&mut self, target: &str) -> Result<(), String>;
     fn kill_kill_session(&mut self, session: &str) -> Result<(), String>;
     fn kill_kill_window(&mut self, target: &str) -> Result<(), String>;
     fn kill_kill_pane(&mut self, target: &str) -> Result<(), String>;
@@ -131,18 +132,26 @@ impl KillTmux for KillSystemTmux {
         .map(|raw| kill_parse_numbers(&raw))
     }
 
+    fn kill_reap_target(&mut self, target: &str) -> Result<(), String> {
+        kill_validate_tmux_target(target)?;
+        reap_tmux_target(&mut self.runner, target)
+    }
+
     fn kill_kill_session(&mut self, session: &str) -> Result<(), String> {
         kill_validate_tmux_target(session)?;
+        self.kill_reap_target(session)?;
         kill_tmux_run(&mut self.runner, "kill-session", &["-t", session]).map(|_| ())
     }
 
     fn kill_kill_window(&mut self, target: &str) -> Result<(), String> {
         kill_validate_tmux_target(target)?;
+        self.kill_reap_target(target)?;
         kill_tmux_run(&mut self.runner, "kill-window", &["-t", target]).map(|_| ())
     }
 
     fn kill_kill_pane(&mut self, target: &str) -> Result<(), String> {
         kill_validate_tmux_target(target)?;
+        self.kill_reap_target(target)?;
         kill_tmux_run(&mut self.runner, "kill-pane", &["-t", target]).map(|_| ())
     }
 }
@@ -974,6 +983,10 @@ mod kill_tests {
                 kill_strings(&["-t", target, "-F", "#{pane_index}"]),
             ));
             Ok(kill_parse_numbers(&self.pane_indexes_raw))
+        }
+
+        fn kill_reap_target(&mut self, target: &str) -> Result<(), String> {
+            kill_validate_tmux_target(target)
         }
 
         fn kill_kill_session(&mut self, session: &str) -> Result<(), String> {

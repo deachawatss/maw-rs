@@ -51,6 +51,7 @@ trait DoneRuntime {
     fn done_list_windows(&mut self) -> Vec<DoneWindow>;
     fn done_current_identity(&mut self) -> Option<(String, i32)>;
     fn done_pane_info(&mut self, target: &str) -> Option<(String, String)>;
+    fn done_reap_target(&mut self, target: &str) -> Result<(), String>;
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String>;
     fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String>;
     fn done_git(&mut self, args: &[String]) -> Result<String, String>;
@@ -216,6 +217,11 @@ impl DoneRuntime for DoneLocal {
         let raw = maw_tmux::TmuxRunner::run(&mut self.runner, "display-message", &args).ok()?;
         let (command, cwd) = raw.trim_end().split_once('\t').unwrap_or((raw.trim(), ""));
         Some((command.trim().to_owned(), cwd.trim().to_owned()))
+    }
+
+    fn done_reap_target(&mut self, target: &str) -> Result<(), String> {
+        done_validate_tmux_target(target)?;
+        reap_tmux_target(&mut self.runner, target)
     }
 
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
@@ -398,7 +404,7 @@ fn done_pr_state_is_closed_or_merged(state: &str) -> bool {
 fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) {
     let target = done_tmux_target(window);
     if options.dry_run { let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would kill window {target}"); return; }
-    match local.done_tmux("kill-window", &["-t".to_owned(), target.clone()]) { Ok(_) => { let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed window {target}"); }, Err(_) => stdout.push_str("  \x1b[33m⚠\x1b[0m could not kill window (may already be closed)\n") }
+    match local.done_reap_target(&target).and_then(|_| local.done_tmux("kill-window", &["-t".to_owned(), target.clone()])) { Ok(_) => { let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed window {target}"); }, Err(_) => stdout.push_str("  \x1b[33m⚠\x1b[0m could not kill window (may already be closed)\n") }
 }
 
 fn done_retrospective_command(_command: &str) -> Option<&'static str> {
@@ -720,6 +726,8 @@ mod done_tests {
 
         fn done_pane_info(&mut self, target: &str) -> Option<(String, String)> { self.pane_info.get(target).cloned() }
 
+        fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Ok(()) }
+
         fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
             self.tmux_calls.push((command.to_owned(), args.to_vec()));
             Ok(String::new())
@@ -783,6 +791,8 @@ mod done_tests {
         fn done_current_identity(&mut self) -> Option<(String, i32)> { None }
 
         fn done_pane_info(&mut self, _target: &str) -> Option<(String, String)> { None }
+
+        fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
 
         fn done_tmux(&mut self, _command: &str, _args: &[String]) -> Result<String, String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
 
