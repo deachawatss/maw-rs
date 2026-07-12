@@ -52,7 +52,21 @@ esac
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_GIT_LOG"
 if [ "$3" = "branch" ]; then exit 1; fi
-if [ "$3" = "for-each-ref" ]; then exit 0; fi
+if [ "$3" = "for-each-ref" ]; then
+  if [ -f "$2/.maw-test-existing-agent-branch" ]; then printf 'agents/feat\n'; fi
+  exit 0
+fi
+if [ "$3" = "fetch" ] && [ "$4" = "origin" ]; then
+  if [ "${MAW_FAKE_GIT_FETCH_FAIL:-0}" = "1" ]; then
+    printf 'fatal: Authentication failed for origin\n' >&2
+    exit 128
+  fi
+  exit 0
+fi
+if [ "$3" = "symbolic-ref" ] && [ "$6" = "refs/remotes/origin/HEAD" ]; then
+  printf 'origin/main\n'
+  exit 0
+fi
 if [ "$3" = "worktree" ] && [ "$4" = "list" ]; then
   printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n' "$2"
   exit 0
@@ -158,6 +172,250 @@ fn run_from_with_git_clean(
 
 fn normalize_root(text: &str, root: &Path) -> String {
     text.replace(&root.display().to_string(), "<ROOT>")
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed:\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("git utf8")
+}
+
+fn run_with_system_git(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("XDG_DATA_HOME", root.join("xdg-data"))
+        .env("XDG_CACHE_HOME", root.join("xdg-cache"))
+        .env("MAW_TEST_MODE", "1")
+        .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("MAW_FAKE_TMUX_LOG", root.join("tmux.log"))
+        .env(
+            "MAW_FAKE_TMUX_WINDOWS",
+            fs::read_to_string(root.join("windows.txt")).expect("windows"),
+        )
+        .env("TMUX", "/tmp/tmux-1000/default,123,0")
+        .output()
+        .expect("run maw-rs")
+}
+
+fn run_with_fetch_failure(root: &Path, bin_dir: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(bin());
+    command
+        .args(args)
+        .current_dir(root)
+        .env_clear()
+        .env("PATH", bin_dir)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("xdg-config"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("XDG_DATA_HOME", root.join("xdg-data"))
+        .env("XDG_CACHE_HOME", root.join("xdg-cache"))
+        .env("MAW_TEST_MODE", "1")
+        .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("GHQ_ROOT", root.join("ghq"))
+        .env("MAW_FAKE_TMUX_LOG", root.join("tmux.log"))
+        .env(
+            "MAW_FAKE_TMUX_WINDOWS",
+            fs::read_to_string(root.join("windows.txt")).expect("windows"),
+        )
+        .env("MAW_FAKE_GIT_LOG", root.join("git.log"))
+        .env("MAW_FAKE_GIT_FETCH_FAIL", "1")
+        .env("TMUX", "/tmp/tmux-1000/default,123,0");
+    command.output().expect("run maw-rs")
+}
+
+#[test]
+fn native_workon_fresh_branch_uses_fetched_origin_tip_not_stale_local_main() {
+    let root = temp_dir("origin-tip");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    fs::remove_file(bin_dir.join("git")).expect("remove fake git");
+
+    let remote = root.join("remote.git");
+    run_git(
+        &root,
+        &["init", "--bare", remote.to_str().expect("remote path")],
+    );
+    let seed = root.join("seed");
+    fs::create_dir_all(&seed).expect("seed dir");
+    run_git(&seed, &["init"]);
+    run_git(&seed, &["config", "user.email", "test@example.com"]);
+    run_git(&seed, &["config", "user.name", "Test User"]);
+    fs::write(seed.join("README.md"), "initial\n").expect("initial file");
+    run_git(&seed, &["add", "README.md"]);
+    run_git(&seed, &["commit", "-m", "initial"]);
+    run_git(&seed, &["branch", "-M", "main"]);
+    run_git(
+        &seed,
+        &[
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path"),
+        ],
+    );
+    run_git(&seed, &["push", "-u", "origin", "main"]);
+    run_git(
+        &root,
+        &[
+            "--git-dir",
+            remote.to_str().expect("remote path"),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ],
+    );
+
+    let local = root.join("local");
+    run_git(
+        &root,
+        &[
+            "clone",
+            remote.to_str().expect("remote path"),
+            local.to_str().expect("local path"),
+        ],
+    );
+    let upstream = root.join("upstream");
+    run_git(
+        &root,
+        &[
+            "clone",
+            remote.to_str().expect("remote path"),
+            upstream.to_str().expect("upstream path"),
+        ],
+    );
+    run_git(&upstream, &["config", "user.email", "test@example.com"]);
+    run_git(&upstream, &["config", "user.name", "Test User"]);
+    fs::write(upstream.join("README.md"), "origin tip\n").expect("origin tip file");
+    run_git(&upstream, &["add", "README.md"]);
+    run_git(&upstream, &["commit", "-m", "origin tip"]);
+    run_git(&upstream, &["push"]);
+
+    let local_main_before_fetch = run_git(&local, &["rev-parse", "main"]);
+    let output = run_with_system_git(
+        &root,
+        &bin_dir,
+        &["workon", local.to_str().expect("local path"), "fresh"],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let branch_tip = run_git(&local, &["rev-parse", "agents/fresh"]);
+    let origin_tip = run_git(&local, &["rev-parse", "origin/main"]);
+    assert_eq!(branch_tip.trim(), origin_tip.trim());
+    assert_ne!(branch_tip.trim(), local_main_before_fetch.trim());
+}
+
+#[test]
+fn native_workon_base_overrides_the_default_origin_start_point() {
+    let root = temp_dir("base");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &[
+            "workon",
+            "demo",
+            "feat",
+            "--base",
+            "origin/release",
+            "--layout",
+            "nested",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert!(git_log.contains("fetch origin"), "{git_log}");
+    assert!(
+        git_log.contains("worktree add") && git_log.contains("origin/release"),
+        "{git_log}"
+    );
+}
+
+#[test]
+fn native_workon_fetch_failure_is_actionable_and_does_not_create_a_worktree() {
+    let root = temp_dir("fetch-failure");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+
+    let output = run_with_fetch_failure(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "workon should stop when fetch fails"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("failed to fetch origin"), "{stderr}");
+    assert!(
+        stderr.contains("network and origin authentication"),
+        "{stderr}"
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert!(git_log.contains("fetch origin"), "{git_log}");
+    assert!(!git_log.contains("worktree add"), "{git_log}");
+}
+
+#[test]
+fn native_workon_existing_branch_fetches_before_reusing_that_branch() {
+    let root = temp_dir("existing-branch");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::write(
+        repo.join(".maw-test-existing-agent-branch"),
+        "agents/feat\n",
+    )
+    .expect("branch marker");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &[
+            "workon", "demo", "--wt", "feat", "--name", "feat", "--layout", "nested",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    let fetch = git_log.find("fetch origin").expect("fetch origin");
+    let add = git_log.find("worktree add").expect("worktree add");
+    assert!(fetch < add, "{git_log}");
+    assert!(
+        git_log.contains("worktree add") && git_log.contains("agents/feat"),
+        "{git_log}"
+    );
 }
 
 #[test]
