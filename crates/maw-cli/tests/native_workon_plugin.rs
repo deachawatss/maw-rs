@@ -433,6 +433,54 @@ fn native_workon_outside_tmux_creates_session_and_prints_attach_plan() {
 }
 
 #[test]
+fn native_workon_headless_oracle_flag_uses_the_requested_existing_session() {
+    let root = temp_dir("headless-oracle");
+    let bin_dir = seed_hermetic_root(&root, "");
+    write_exe(
+        &bin_dir.join("tmux"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
+case "$1" in
+  has-session) [ "$2" = "-t" ] && [ "$3" = "=01-gale" ] ;;
+  list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
+  display-message) printf '0\n' ;;
+  new-window|send-keys|select-window|capture-pane) exit 0 ;;
+  *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
+esac
+"#,
+    );
+
+    let output = run_with_tmux_env(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--oracle", "01-gale"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("workon 'demo-feat' in 01-gale"), "{stdout}");
+    assert!(!stdout.contains("run: tmux attach"), "{stdout}");
+
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(tmux_log.contains("has-session -t =01-gale"), "{tmux_log}");
+    assert!(
+        tmux_log.contains("list-windows -t 01-gale -F #{window_name}"),
+        "{tmux_log}"
+    );
+    assert!(
+        tmux_log.contains("new-window -P -F #{window_id} -t 01-gale: -n demo-feat -c"),
+        "{tmux_log}"
+    );
+    assert!(!tmux_log.contains("new-session"), "{tmux_log}");
+}
+
+#[test]
 fn native_workon_dot_resolves_current_repo() {
     let root = temp_dir("dot");
     let bin_dir = seed_hermetic_root(&root, "shell\n");

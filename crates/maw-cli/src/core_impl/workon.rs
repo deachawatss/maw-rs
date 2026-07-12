@@ -12,6 +12,7 @@ struct WorkonOptions {
     engine: Option<String>,
     layout: WorkonLayout,
     prompt: Option<String>,
+    oracle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,8 +87,14 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
     let mut name = None;
     let mut engine = None;
     let mut prompt = None;
+    let mut oracle = None;
     let mut index = 0;
     while index < argv.len() {
+        if let Some((target, next_index)) = workon_parse_target_session(argv, index)? {
+            oracle = Some(target);
+            index = next_index;
+            continue;
+        }
         match argv[index].as_str() {
             "--help" | "-h" => return Err(workon_usage()),
             "--layout" => {
@@ -166,17 +173,43 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
             }
         }
     }
+    let repo = workon_parse_repo(&positional, wt.as_ref(), fresh, name.as_ref())?;
+    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, engine, layout, prompt, oracle })
+}
+
+fn workon_parse_target_session(argv: &[String], index: usize) -> Result<Option<(String, usize)>, String> {
+    let flag = &argv[index];
+    let (session, next_index) = match flag.as_str() {
+        "--oracle" | "--session" => {
+            let Some(value) = argv.get(index + 1) else { return Err(format!("workon: {flag} requires a value")); };
+            (value.clone(), index + 2)
+        }
+        value => {
+            let Some(session) = value.strip_prefix("--oracle=").or_else(|| value.strip_prefix("--session=")) else {
+                return Ok(None);
+            };
+            (session.to_owned(), index + 1)
+        }
+    };
+    workon_validate_tmux_target(&session)?;
+    Ok(Some((session, next_index)))
+}
+
+fn workon_parse_repo(
+    positional: &[String],
+    wt: Option<&WorkonWorktreeRequest>,
+    fresh: bool,
+    name: Option<&String>,
+) -> Result<String, String> {
     let Some(repo) = positional.first().cloned() else { return Err(workon_usage()); };
     if positional.len() > 2 { return Err(workon_usage()); }
     workon_validate_query(&repo, "repo")?;
     if let Some(task) = positional.get(1) { workon_validate_slug_input(task, "task")?; }
-    if wt.is_some() && positional.len() > 1 {
-        return Err("workon: use either positional task or --wt, not both".to_owned());
-    }
+    if wt.is_some() && positional.len() > 1 { return Err("workon: use either positional task or --wt, not both".to_owned()); }
     if wt.is_none() && positional.len() == 1 && (fresh || name.is_some()) {
         return Err("workon: --fresh/--name requires --wt or a task".to_owned());
     }
-    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, engine, layout, prompt })
+    Ok(repo)
 }
 
 fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
@@ -188,11 +221,11 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--layout nested|legacy] [--prompt <text>]".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
-    &["--layout", "--name", "-e", "--engine", "--prompt"]
+    &["--layout", "--name", "-e", "--engine", "--oracle", "--session", "--prompt"]
 }
 
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
@@ -256,6 +289,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut target_path = repo.repo_path.clone();
     let mut window_name = repo.repo_name.clone();
     let mut taskless_oracle = false;
+    let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
 
     if let Some(request) = workon_resolve_worktree_name(options)? {
         let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
@@ -279,7 +313,6 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         taskless_oracle = true;
     }
 
-    let parent_oracle = workon_parent_oracle(runner)?;
     workon_prepare_delivery(
         &mut stdout,
         &window_name,
@@ -379,7 +412,16 @@ struct WorkonWindowLaunch<'a> {
     prompt: Option<&'a str>,
 }
 
-fn workon_parent_oracle<R: maw_tmux::TmuxRunner>(runner: &mut R) -> Result<Option<String>, String> {
+fn workon_parent_oracle<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    explicit_oracle: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(session) = explicit_oracle {
+        workon_validate_tmux_target(session)?;
+        workon_tmux_run(runner, "has-session", &["-t", &format!("={session}")])
+            .map_err(|_| format!("workon: target tmux session '{session}' does not exist"))?;
+        return Ok(Some(session.to_owned()));
+    }
     if std::env::var_os("TMUX").is_none() {
         return Ok(None);
     }
@@ -1080,6 +1122,7 @@ mod workon_tests {
             engine: None,
             layout: WorkonLayout::Nested,
             prompt: None,
+            oracle: None,
         }
     }
 
@@ -1139,6 +1182,50 @@ mod workon_tests {
         assert!(parsed.fresh);
         assert_eq!(parsed.engine.as_deref(), Some("codex"));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "--wt", "other"])).is_err());
+    }
+
+    #[test]
+    fn workon_oracle_and_session_flags_target_an_existing_session() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::remove_var("TMUX");
+
+        let temp = std::env::temp_dir().join("maw-rs-workon-unit");
+        let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
+        let options = workon_parse_args(&workon_strings(&["demo", "--oracle", "01-gale"])).expect("oracle target parses");
+        let alias = workon_parse_args(&workon_strings(&["demo", "--session=01-gale"])).expect("session alias parses");
+        let mut runner = WorkonMockTmux { has_session: true, ..Default::default() };
+
+        let (stdout, attach) = workon_cmd_with_runner(&options, &repo, &mut runner).expect("targeted workon");
+
+        assert!(attach.is_none());
+        assert!(stdout.contains("workon 'demo' in 01-gale"), "{stdout}");
+        assert_eq!(runner.calls[0], ("has-session".to_owned(), workon_strings(&["-t", "=01-gale"])));
+        assert_eq!(runner.calls[1], ("list-windows".to_owned(), workon_strings(&["-t", "01-gale", "-F", "#{window_name}"])));
+        assert!(runner.calls.iter().any(|(command, args)| {
+            command == "new-window"
+                && args.iter().position(|arg| arg == "-t").and_then(|index| args.get(index + 1)) == Some(&"01-gale:".to_owned())
+        }));
+        assert!(!runner.calls.iter().any(|(command, _)| command == "new-session"));
+        assert_eq!(workon_parse_args(&workon_strings(&["demo", "--session", "01-gale"])).expect("session target parses"), alias);
+    }
+
+    #[test]
+    fn workon_oracle_flag_rejects_missing_session_before_creating_an_orphan() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::remove_var("TMUX");
+
+        let temp = std::env::temp_dir().join("maw-rs-workon-unit");
+        let repo = WorkonRepo { repo_path: temp.join("acme/demo"), repo_name: "demo".to_owned(), parent_dir: temp.join("acme") };
+        let options = workon_parse_args(&workon_strings(&["demo", "--oracle", "01-gale"])).expect("oracle target parses");
+        let mut runner = WorkonMockTmux::default();
+
+        let error = workon_cmd_with_runner(&options, &repo, &mut runner).expect_err("missing target session");
+
+        assert!(error.contains("01-gale"), "{error}");
+        assert_eq!(runner.calls, vec![("has-session".to_owned(), workon_strings(&["-t", "=01-gale"]))]);
+        assert!(!runner.calls.iter().any(|(command, _)| command == "new-session"));
     }
 
     #[test]
