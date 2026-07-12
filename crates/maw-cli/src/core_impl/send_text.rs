@@ -3,6 +3,16 @@ const DISPATCH_84: &[DispatcherEntry] = &[DispatcherEntry {
     handler: Handler::Sync(sendtext_run_command),
 }];
 
+const SENDTEXT_CONFIRM_CAPTURE_LINES: u32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendtextPendingState {
+    Cleared,
+    MatchesSent,
+    DifferentInput,
+    Unconfirmed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SendtextOptions {
     target: String,
@@ -52,11 +62,26 @@ fn sendtext_send_text<R, F>(
     runner: &mut R,
     target: &str,
     text: &str,
-    mut sleep: F,
+    sleep: F,
 ) -> Result<maw_tmux::SendTextReport, maw_tmux::TmuxError>
 where
     R: maw_tmux::TmuxRunner,
     F: FnMut(std::time::Duration),
+{
+    sendtext_send_text_with_execution_confirm(runner, target, text, sleep, |_, _| Ok(false))
+}
+
+fn sendtext_send_text_with_execution_confirm<R, F, C>(
+    runner: &mut R,
+    target: &str,
+    text: &str,
+    mut sleep: F,
+    mut execution_confirmed: C,
+) -> Result<maw_tmux::SendTextReport, maw_tmux::TmuxError>
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+    C: FnMut(&mut R, &str) -> Result<bool, maw_tmux::TmuxError>,
 {
     sendtext_exit_mode_if_needed(runner, target)?;
     let used_buffer = text.contains('\n') || text.len() > 500;
@@ -68,7 +93,7 @@ where
     }
     sleep(std::time::Duration::from_millis(maw_tmux::SEND_SETTLE_MS));
     let (enter_attempts, warned_pending) =
-        sendtext_submit_with_confirm(runner, target, text, &mut sleep)?;
+        sendtext_submit_with_confirm(runner, target, text, &mut sleep, &mut execution_confirmed)?;
     Ok(maw_tmux::SendTextReport {
         used_buffer,
         enter_attempts,
@@ -108,24 +133,38 @@ fn sendtext_exit_mode_if_needed<R: maw_tmux::TmuxRunner>(
     }
 }
 
-fn sendtext_submit_with_confirm<R, F>(
+fn sendtext_submit_with_confirm<R, F, C>(
     runner: &mut R,
     target: &str,
     text: &str,
     sleep: &mut F,
+    execution_confirmed: &mut C,
 ) -> Result<(u32, bool), maw_tmux::TmuxError>
 where
     R: maw_tmux::TmuxRunner,
     F: FnMut(std::time::Duration),
+    C: FnMut(&mut R, &str) -> Result<bool, maw_tmux::TmuxError>,
 {
+    let mut last_state = SendtextPendingState::Unconfirmed;
     for attempt in 1..=maw_tmux::MAX_SUBMIT_ATTEMPTS {
         runner.run("send-keys", &maw_tmux::tmux_send_enter_args(target))?;
         sleep(std::time::Duration::from_millis(maw_tmux::SUBMIT_CONFIRM_MS));
         match sendtext_pending_state_after_grace(runner, target, text, sleep) {
-            maw_tmux::PendingInputState::Cleared => return Ok((attempt, false)),
-            maw_tmux::PendingInputState::DifferentInput => return Ok((attempt, true)),
-            maw_tmux::PendingInputState::MatchesSent => {}
+            SendtextPendingState::Cleared => return Ok((attempt, false)),
+            SendtextPendingState::DifferentInput => return Ok((attempt, true)),
+            SendtextPendingState::Unconfirmed if execution_confirmed(runner, target)? => {
+                return Ok((attempt, false));
+            }
+            state @ (SendtextPendingState::MatchesSent | SendtextPendingState::Unconfirmed) => {
+                last_state = state;
+            }
         }
+    }
+    if last_state == SendtextPendingState::Unconfirmed {
+        return Err(maw_tmux::TmuxError::new(format!(
+            "⚠ submission could not be confirmed after {} Enter attempts: no shell prompt detected",
+            maw_tmux::MAX_SUBMIT_ATTEMPTS
+        )));
     }
     Ok((maw_tmux::MAX_SUBMIT_ATTEMPTS, true))
 }
@@ -135,7 +174,7 @@ fn sendtext_pending_state_after_grace<R, F>(
     target: &str,
     text: &str,
     sleep: &mut F,
-) -> maw_tmux::PendingInputState
+) -> SendtextPendingState
 where
     R: maw_tmux::TmuxRunner,
     F: FnMut(std::time::Duration),
@@ -149,32 +188,31 @@ fn sendtext_pending_input_state<R: maw_tmux::TmuxRunner>(
     runner: &mut R,
     target: &str,
     text: &str,
-) -> maw_tmux::PendingInputState {
-    let Some(pending) = sendtext_pending_input(runner, target) else {
-        return maw_tmux::PendingInputState::Cleared;
+) -> SendtextPendingState {
+    let Ok(content) = runner.run(
+        "capture-pane",
+        &[
+            "-t".to_owned(),
+            target.to_owned(),
+            "-e".to_owned(),
+            "-p".to_owned(),
+            "-S".to_owned(),
+            format!("-{SENDTEXT_CONFIRM_CAPTURE_LINES}"),
+        ],
+    ) else {
+        return SendtextPendingState::Unconfirmed;
+    };
+    if maw_tmux::pane_has_empty_prompt_from_capture(&content) {
+        return SendtextPendingState::Cleared;
+    }
+    let Some(pending) = maw_tmux::pane_pending_input_from_capture(&content) else {
+        return SendtextPendingState::Unconfirmed;
     };
     if maw_tmux::pending_input_matches_sent(&pending, text) {
-        maw_tmux::PendingInputState::MatchesSent
+        SendtextPendingState::MatchesSent
     } else {
-        maw_tmux::PendingInputState::DifferentInput
+        SendtextPendingState::DifferentInput
     }
-}
-
-fn sendtext_pending_input<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Option<String> {
-    runner
-        .run(
-            "capture-pane",
-            &[
-                "-t".to_owned(),
-                target.to_owned(),
-                "-e".to_owned(),
-                "-p".to_owned(),
-                "-S".to_owned(),
-                "-5".to_owned(),
-            ],
-        )
-        .ok()
-        .and_then(|content| maw_tmux::pane_pending_input_from_capture(&content))
 }
 
 fn sendtext_parse_args(argv: &[String]) -> Result<SendtextOptions, String> {
@@ -271,7 +309,7 @@ mod sendtext_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             self.responses
                 .pop_front()
-                .unwrap_or_else(|| Ok(String::new()))
+                .unwrap_or_else(|| Ok("$ \r".to_owned()))
         }
 
         fn run_with_stdin(
@@ -287,7 +325,7 @@ mod sendtext_tests {
             ));
             self.responses
                 .pop_front()
-                .unwrap_or_else(|| Ok(String::new()))
+                .unwrap_or_else(|| Ok("$ \r".to_owned()))
         }
     }
 
@@ -335,6 +373,47 @@ mod sendtext_tests {
         runner: &mut impl maw_tmux::TmuxRunner,
     ) -> Result<CliOutput, String> {
         sendtext_with_runner_and_sleeper(argv, runner, |_| {})
+    }
+
+    #[test]
+    fn sendtext_fails_closed_when_no_prompt_can_confirm_submission() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut responses = vec![Ok("0"), Ok("")];
+        for _ in 0..maw_tmux::MAX_SUBMIT_ATTEMPTS {
+            responses.extend([Ok(""), Ok("shell is still starting"), Ok("shell is still starting")]);
+        }
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(responses);
+
+        let error = sendtext_with_no_sleep(&sendtext_strings(&["%9", "deploy"]), &mut tmux)
+            .expect_err("unconfirmed submission must fail");
+
+        assert!(error.contains("could not be confirmed"), "{error}");
+        assert_eq!(
+            tmux.calls
+                .iter()
+                .filter(|(command, args)| command == "send-keys" && args.last().is_some_and(|arg| arg == "Enter"))
+                .count(),
+            maw_tmux::MAX_SUBMIT_ATTEMPTS as usize
+        );
+    }
+
+    #[test]
+    fn sendtext_confirmation_captures_ten_lines() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = SendtextEnvGuard::sendtext_new();
+        let mut tmux =
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
+
+        sendtext_with_no_sleep(&sendtext_strings(&["%9", "deploy"]), &mut tmux).expect("send");
+
+        let captures = tmux
+            .calls
+            .iter()
+            .filter(|(command, _)| command == "capture-pane")
+            .collect::<Vec<_>>();
+        assert_eq!(captures.len(), 2);
+        assert!(captures.iter().all(|(_, args)| args.ends_with(&sendtext_strings(&["-S", "-10"]))));
     }
 
     #[test]

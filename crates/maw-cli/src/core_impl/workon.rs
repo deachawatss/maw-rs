@@ -483,7 +483,9 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     }
 
     let new_target = workon_new_window(runner, session, window_name, target_path)?;
+    workon_wait_for_shell_prompt(runner, &new_target)?;
     workon_send_window_command_to_target(runner, &new_target, window_name, target_path, engine, prompt)?;
+    workon_wait_for_launch(runner, &new_target)?;
 
     if taskless_oracle {
         if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(session, window_name, target_path)? {
@@ -493,6 +495,109 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
 
     let _ = writeln!(stdout, "\x1b[32m✅\x1b[0m workon '{window_name}' in {session} → {}", target_path.display());
     Ok(())
+}
+
+const WORKON_PROMPT_READY_POLL_MS: u64 = 250;
+const WORKON_PROMPT_READY_ATTEMPTS: u32 = 60;
+const WORKON_LAUNCH_POLL_MS: u64 = 250;
+const WORKON_LAUNCH_ATTEMPTS: u32 = 40;
+
+fn workon_wait_for_shell_prompt<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    target: &str,
+) -> Result<(), String> {
+    #[cfg(test)]
+    let sleeper = |_| {};
+    #[cfg(not(test))]
+    let sleeper = std::thread::sleep;
+    workon_wait_for_shell_prompt_with_sleeper(runner, target, sleeper)
+}
+
+fn workon_wait_for_shell_prompt_with_sleeper<R, F>(
+    runner: &mut R,
+    target: &str,
+    mut sleep: F,
+) -> Result<(), String>
+where
+    R: maw_tmux::TmuxRunner,
+    F: FnMut(std::time::Duration),
+{
+    for attempt in 0..WORKON_PROMPT_READY_ATTEMPTS {
+        let capture = runner
+            .run(
+                "capture-pane",
+                &[
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "-e".to_owned(),
+                    "-p".to_owned(),
+                    "-S".to_owned(),
+                    "-10".to_owned(),
+                ],
+            )
+            .map_err(|error| format!("workon: could not inspect new pane {target}: {}", error.message))?;
+        if maw_tmux::pane_has_empty_prompt_from_capture(&capture) {
+            return Ok(());
+        }
+        if attempt + 1 < WORKON_PROMPT_READY_ATTEMPTS {
+            sleep(std::time::Duration::from_millis(WORKON_PROMPT_READY_POLL_MS));
+        }
+    }
+    Err(format!(
+        "workon: timed out waiting for a shell prompt in {target}; launch command was not sent"
+    ))
+}
+
+fn workon_wait_for_launch<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Result<(), String> {
+    #[cfg(test)]
+    let sleeper = |_| {};
+    #[cfg(not(test))]
+    let sleeper = std::thread::sleep;
+    for attempt in 0..WORKON_LAUNCH_ATTEMPTS {
+        let command = runner
+            .run(
+                "display-message",
+                &[
+                    "-t".to_owned(),
+                    target.to_owned(),
+                    "-p".to_owned(),
+                    "#{pane_current_command}".to_owned(),
+                ],
+            )
+            .map_err(|error| format!("workon: could not verify launch in {target}: {}", error.message))?;
+        if workon_launch_started_command(command.trim()) {
+            return Ok(());
+        }
+        if attempt + 1 < WORKON_LAUNCH_ATTEMPTS {
+            sleeper(std::time::Duration::from_millis(WORKON_LAUNCH_POLL_MS));
+        }
+    }
+    Err(format!(
+        "workon: launch command did not start in {target}; pane is still running a shell"
+    ))
+}
+
+fn workon_launch_started<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Result<bool, maw_tmux::TmuxError> {
+    runner
+        .run(
+            "display-message",
+            &[
+                "-t".to_owned(),
+                target.to_owned(),
+                "-p".to_owned(),
+                "#{pane_current_command}".to_owned(),
+            ],
+        )
+        .map(|command| workon_launch_started_command(command.trim()))
+}
+
+fn workon_launch_started_command(command: &str) -> bool {
+    !command.is_empty() && !workon_is_shell_command(command)
+}
+
+fn workon_is_shell_command(command: &str) -> bool {
+    let command = command.rsplit('/').next().unwrap_or(command).to_ascii_lowercase();
+    matches!(command.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh" | "tcsh" | "csh")
 }
 
 fn workon_send_window_command<R: maw_tmux::TmuxRunner>(
@@ -524,9 +629,14 @@ fn workon_send_window_command_to_target<R: maw_tmux::TmuxRunner>(
     let sleeper = |_| {};
     #[cfg(not(test))]
     let sleeper = std::thread::sleep;
-    sendtext_send_text(runner, target, &command, sleeper)
-        .map(|_| ())
-        .map_err(|error| error.message)
+    let report = sendtext_send_text_with_execution_confirm(runner, target, &command, sleeper, workon_launch_started)
+        .map_err(|error| error.message)?;
+    if report.warned_pending && !workon_launch_started(runner, target).map_err(|error| error.message)? {
+        return Err(format!(
+            "workon: launch submission could not be confirmed in {target}; pane has no shell prompt or running engine"
+        ));
+    }
+    Ok(())
 }
 
 fn workon_new_window<R: maw_tmux::TmuxRunner>(
@@ -1165,19 +1275,25 @@ mod workon_tests {
         sessions: String,
         windows: String,
         has_session: bool,
+        pane_command: String,
+        capture_responses: std::collections::VecDeque<String>,
     }
 
     impl maw_tmux::TmuxRunner for WorkonMockTmux {
         fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             match subcommand {
+                "display-message" if args.iter().any(|arg| arg == "#{pane_current_command}") => {
+                    Ok(if self.pane_command.is_empty() { "node\n".to_owned() } else { self.pane_command.clone() })
+                }
                 "display-message" => Ok(self.session.clone()),
                 "list-sessions" => Ok(self.sessions.clone()),
                 "list-windows" => Ok(self.windows.clone()),
                 "has-session" => {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
-                "new-window" | "new-session" | "send-keys" | "select-window" | "capture-pane" => Ok(String::new()),
+                "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$ \r".to_owned())),
+                "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
         }
@@ -1206,6 +1322,31 @@ mod workon_tests {
             repo_name: "demo".to_owned(),
             parent_dir: root.join("acme"),
         }
+    }
+
+    #[test]
+    fn workon_waits_for_an_empty_shell_prompt_before_launching() {
+        let mut runner = WorkonMockTmux {
+            capture_responses: std::collections::VecDeque::from([
+                "initializing shell".to_owned(),
+                "$ \r".to_owned(),
+            ]),
+            ..Default::default()
+        };
+        let mut sleeps = Vec::new();
+
+        workon_wait_for_shell_prompt_with_sleeper(&mut runner, "%42", |duration| sleeps.push(duration))
+            .expect("prompt eventually becomes ready");
+
+        assert_eq!(
+            runner
+                .calls
+                .iter()
+                .filter(|(command, _)| command == "capture-pane")
+                .count(),
+            2
+        );
+        assert_eq!(sleeps, vec![std::time::Duration::from_millis(250)]);
     }
 
     fn workon_branch_set(values: &[&str]) -> std::collections::BTreeSet<String> {

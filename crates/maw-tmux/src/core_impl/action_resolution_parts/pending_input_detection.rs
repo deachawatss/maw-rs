@@ -79,6 +79,27 @@ pub fn pane_pending_input_from_capture(content: &str) -> Option<String> {
     None
 }
 
+/// Return true when captured pane output ends at an empty shell prompt.
+///
+/// This deliberately differs from [`pane_pending_input_from_capture`]: an empty
+/// prompt is a positive readiness signal, while a capture without any recognized
+/// prompt is unknown and must not be treated as a successful submission.
+#[must_use]
+pub fn pane_has_empty_prompt_from_capture(content: &str) -> bool {
+    let lines = content
+        .lines()
+        .map(normalize_capture_line)
+        .collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate().rev() {
+        match prompt_line(line) {
+            PromptLine::Empty if trailing_after_prompt_is_chrome(&lines, index) => return true,
+            PromptLine::Pending(_) if trailing_after_prompt_is_chrome(&lines, index) => return false,
+            PromptLine::Pending(_) | PromptLine::Empty | PromptLine::None => {}
+        }
+    }
+    false
+}
+
 /// Classification of pane pending input against the exact text maw just sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingInputState {

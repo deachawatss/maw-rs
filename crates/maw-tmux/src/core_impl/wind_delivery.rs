@@ -269,3 +269,57 @@ fn last_clean_non_empty_capture_line(content: &str) -> Option<String> {
         .rfind(|line| !line.trim().is_empty())
         .map(|line| strip_tmux_ansi(line).replace('\r', ""))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct UngatedRunner {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl TmuxRunner for UngatedRunner {
+        fn run(&mut self, subcommand: &str, _args: &[String]) -> Result<String, TmuxError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(subcommand.to_owned());
+            if subcommand == "capture-pane" {
+                Ok("$ \r".to_owned())
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    #[test]
+    fn hey_delivery_is_ungated_before_text_is_sent() {
+        let runner = UngatedRunner::default();
+        let calls = std::sync::Arc::clone(&runner.calls);
+        let mut client = TmuxClient::new(runner);
+
+        send_text_ungated_with_sleeper(
+            &mut client,
+            "%7",
+            "[gale] hello",
+            SubmitConfig::claude(),
+            |_| {},
+        )
+        .expect("ungated delivery");
+
+        let calls = calls.lock().expect("calls lock");
+        let literal_send = calls
+            .iter()
+            .position(|call| call == "send-keys")
+            .expect("literal text send");
+        let confirmation_capture = calls
+            .iter()
+            .position(|call| call == "capture-pane")
+            .expect("post-submit confirmation capture");
+        assert!(
+            literal_send < confirmation_capture,
+            "ungated delivery must not readiness-poll before sending: {calls:?}"
+        );
+    }
+}
