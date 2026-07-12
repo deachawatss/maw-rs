@@ -388,7 +388,7 @@ mod tab_tests {
                 ),
                 "list-windows" => Ok(self.windows.clone()),
                 "list-panes" => Ok(self.pane_command.clone()),
-                "capture-pane" => Ok(self.capture.clone()),
+                "capture-pane" => Ok(if self.capture.is_empty() { "$".to_owned() } else { self.capture.clone() }),
                 "new-window" => self.new_window_error.as_ref().map_or_else(
                     || Ok(String::new()),
                     |message| Err(maw_tmux::TmuxError::new(message.clone())),

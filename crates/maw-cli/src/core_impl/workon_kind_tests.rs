@@ -17,7 +17,9 @@ mod workon_kind_tests {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
                 "list-windows" => Ok(self.windows.clone()),
-                "display-message" | "new-session" | "new-window" | "send-keys" | "select-window" | "capture-pane" => Ok(String::new()),
+                "display-message" if args.iter().any(|arg| arg == "#{pane_current_command}") => Ok("node\n".to_owned()),
+                "capture-pane" => Ok("$".to_owned()),
+                "display-message" | "new-session" | "new-window" | "send-keys" | "select-window" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
         }
