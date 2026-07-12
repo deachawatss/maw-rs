@@ -39,9 +39,15 @@ fn seed_hermetic_root(root: &Path, existing_windows: &str) -> PathBuf {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
-  display-message) printf '50-mawjs\n' ;;
+  display-message)
+    case "$*" in
+      *pane_current_command*) printf 'node\n' ;;
+      *) printf '50-mawjs\n' ;;
+    esac
+    ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
   has-session) exit 1 ;;
+  capture-pane) printf '$ \r\n' ;;
   new-session|new-window|send-keys|select-window) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
@@ -685,7 +691,7 @@ fn native_workon_outside_tmux_creates_session_and_prints_attach_plan() {
         "{tmux_log}"
     );
     assert!(
-        tmux_log.contains("capture-pane -t demo:demo -e -p -S -5"),
+        tmux_log.contains("capture-pane -t demo:demo -e -p -S -10"),
         "{tmux_log}"
     );
 }
@@ -701,8 +707,14 @@ printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
   has-session) [ "$2" = "-t" ] && [ "$3" = "=01-gale" ] ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
-  display-message) printf '0\n' ;;
-  new-window|send-keys|select-window|capture-pane) exit 0 ;;
+  display-message)
+    case "$*" in
+      *pane_current_command*) printf 'node\n' ;;
+      *) printf '0\n' ;;
+    esac
+    ;;
+  capture-pane) printf '$ \r\n' ;;
+  new-window|send-keys|select-window) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
