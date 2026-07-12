@@ -1292,7 +1292,7 @@ mod workon_tests {
                 "has-session" => {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
-                "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$ \r".to_owned())),
+                "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$".to_owned())),
                 "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
@@ -1329,7 +1329,7 @@ mod workon_tests {
         let mut runner = WorkonMockTmux {
             capture_responses: std::collections::VecDeque::from([
                 "initializing shell".to_owned(),
-                "$ \r".to_owned(),
+                "$".to_owned(),
             ]),
             ..Default::default()
         };

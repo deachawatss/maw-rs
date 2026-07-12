@@ -286,7 +286,7 @@ mod tests {
                 .expect("calls lock")
                 .push(subcommand.to_owned());
             if subcommand == "capture-pane" {
-                Ok("$ \r".to_owned())
+                Ok("$".to_owned())
             } else {
                 Ok(String::new())
             }

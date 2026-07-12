@@ -118,6 +118,14 @@
     }
 
     #[test]
+    fn bare_prompt_markers_are_empty_prompts_but_marker_text_is_not() {
+        for marker in ["$", "%", "#", "❯"] {
+            assert!(pane_has_empty_prompt_from_capture(marker), "{marker}");
+        }
+        assert!(!pane_has_empty_prompt_from_capture("$HOME"));
+    }
+
+    #[test]
     fn pending_input_matching_is_duplicate_safe() {
         assert!(pending_input_matches_sent("deploy now", "deploy now"));
         assert!(pending_input_matches_sent(

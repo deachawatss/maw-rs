@@ -47,7 +47,7 @@ case "$1" in
     ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
   has-session) exit 1 ;;
-  capture-pane) printf '$ \r\n' ;;
+  capture-pane) printf '$\n' ;;
   new-session|new-window|send-keys|select-window) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
@@ -713,7 +713,7 @@ case "$1" in
       *) printf '0\n' ;;
     esac
     ;;
-  capture-pane) printf '$ \r\n' ;;
+  capture-pane) printf '$\n' ;;
   new-window|send-keys|select-window) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac

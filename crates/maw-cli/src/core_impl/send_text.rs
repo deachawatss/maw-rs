@@ -309,7 +309,7 @@ mod sendtext_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             self.responses
                 .pop_front()
-                .unwrap_or_else(|| Ok("$ \r".to_owned()))
+                .unwrap_or_else(|| Ok("$".to_owned()))
         }
 
         fn run_with_stdin(
@@ -325,7 +325,7 @@ mod sendtext_tests {
             ));
             self.responses
                 .pop_front()
-                .unwrap_or_else(|| Ok("$ \r".to_owned()))
+                .unwrap_or_else(|| Ok("$".to_owned()))
         }
     }
 
@@ -403,7 +403,7 @@ mod sendtext_tests {
         let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = SendtextEnvGuard::sendtext_new();
         let mut tmux =
-            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$"), Ok("$")]);
 
         sendtext_with_no_sleep(&sendtext_strings(&["%9", "deploy"]), &mut tmux).expect("send");
 
@@ -427,7 +427,7 @@ mod sendtext_tests {
         let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = SendtextEnvGuard::sendtext_new();
         let mut tmux =
-            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$"), Ok("$")]);
 
         let output = sendtext_with_no_sleep(&sendtext_strings(&["%9", "hello", "world"]), &mut tmux)
             .expect("send");
@@ -445,7 +445,7 @@ mod sendtext_tests {
         let _env = SendtextEnvGuard::sendtext_new();
         let long_text = "x".repeat(501);
         let mut tmux =
-            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$ \r"), Ok("$ \r")]);
+            SendtextMockTmux::sendtext_with_responses(vec![Ok("0"), Ok(""), Ok(""), Ok("$"), Ok("$")]);
 
         let output = sendtext_with_no_sleep(&[String::from("%9"), long_text.clone()], &mut tmux)
             .expect("send");
@@ -606,8 +606,8 @@ mod sendtext_tests {
             Ok("0"),
             Ok(""),
             Ok(""),
-            Ok("$ \r"),
-            Ok("$ \r"),
+            Ok("$"),
+            Ok("$"),
         ]);
 
         let output = sendtext_with_no_sleep(

@@ -155,6 +155,9 @@ fn prompt_line(line: &str) -> PromptLine {
         return PromptLine::None;
     }
     let rest = chars.as_str();
+    if rest.is_empty() {
+        return PromptLine::Empty;
+    }
     let input = rest.trim_start();
     if input.len() == rest.len() {
         return PromptLine::None;
