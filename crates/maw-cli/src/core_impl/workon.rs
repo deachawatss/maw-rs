@@ -9,6 +9,7 @@ struct WorkonOptions {
     wt: Option<WorkonWorktreeRequest>,
     fresh: bool,
     name: Option<String>,
+    base: Option<String>,
     engine: Option<String>,
     layout: WorkonLayout,
     prompt: Option<String>,
@@ -85,6 +86,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
     let mut wt = None;
     let mut fresh = false;
     let mut name = None;
+    let mut base = None;
     let mut engine = None;
     let mut prompt = None;
     let mut oracle = None;
@@ -95,6 +97,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
             index = next_index;
             continue;
         }
+        if workon_parse_base_flag(argv, &mut base, &mut index)? { continue; }
         match argv[index].as_str() {
             "--help" | "-h" => return Err(workon_usage()),
             "--layout" => {
@@ -174,7 +177,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
         }
     }
     let repo = workon_parse_repo(&positional, wt.as_ref(), fresh, name.as_ref())?;
-    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, engine, layout, prompt, oracle })
+    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, base, engine, layout, prompt, oracle })
 }
 
 fn workon_parse_target_session(argv: &[String], index: usize) -> Result<Option<(String, usize)>, String> {
@@ -193,6 +196,32 @@ fn workon_parse_target_session(argv: &[String], index: usize) -> Result<Option<(
     };
     workon_validate_tmux_target(&session)?;
     Ok(Some((session, next_index)))
+}
+
+fn workon_parse_base_flag(
+    argv: &[String],
+    base: &mut Option<String>,
+    index: &mut usize,
+) -> Result<bool, String> {
+    let flag = &argv[*index];
+    let (value, next_index) = match flag.as_str() {
+        "--base" => {
+            let Some(value) = argv.get(*index + 1) else {
+                return Err("workon: --base requires a value".to_owned());
+            };
+            (value.clone(), *index + 2)
+        }
+        value => {
+            let Some(value) = value.strip_prefix("--base=") else {
+                return Ok(false);
+            };
+            (value.to_owned(), *index + 1)
+        }
+    };
+    workon_validate_base_ref(&value)?;
+    *base = Some(value);
+    *index = next_index;
+    Ok(true)
 }
 
 fn workon_parse_repo(
@@ -221,11 +250,11 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>|--codex|--claude] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
-    &["--layout", "--name", "-e", "--engine", "--oracle", "--session", "--prompt"]
+    &["--layout", "--name", "--base", "-e", "--engine", "--oracle", "--session", "--prompt"]
 }
 
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
@@ -301,7 +330,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 target_path = path;
             }
             WorkonWorktreePlan::Create { wt_path, branch, branch_exists, .. } => {
-                workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.layout)?;
+                workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.base.as_deref(), options.layout)?;
                 let suffix = if branch_exists { ", reused branch" } else { "" };
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
                 workon_finish_created_worktree(repo, &wt_path, &mut stdout)?;
@@ -643,16 +672,19 @@ fn workon_create_worktree(
     wt_path: &std::path::Path,
     branch: &str,
     branch_exists: bool,
+    base: Option<&str>,
     layout: WorkonLayout,
 ) -> Result<(), String> {
     if matches!(layout, WorkonLayout::Nested) {
         std::fs::create_dir_all(repo.repo_path.join("agents"))
             .map_err(|error| format!("workon: create agents dir: {error}"))?;
     }
+    workon_fetch_origin(&repo.repo_path)?;
     if branch_exists {
         workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, branch])?;
     } else {
-        workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, "-b", branch])?;
+        let start_point = workon_start_point(&repo.repo_path, base)?;
+        workon_git(&repo.repo_path, &["worktree", "add", workon_path_str(wt_path)?, "-b", branch, &start_point])?;
     }
     Ok(())
 }
@@ -906,6 +938,36 @@ fn workon_agent_branches(repo_path: &std::path::Path) -> Result<std::collections
     Ok(raw.lines().map(str::trim).filter(|line| !line.is_empty()).map(ToOwned::to_owned).collect())
 }
 
+fn workon_fetch_origin(repo_path: &std::path::Path) -> Result<(), String> {
+    workon_git(repo_path, &["fetch", "origin"]).map(|_| ()).map_err(|error| {
+        format!(
+            "workon: failed to fetch origin; check your network and origin authentication, then retry: {error}"
+        )
+    })
+}
+
+fn workon_start_point(repo_path: &std::path::Path, base: Option<&str>) -> Result<String, String> {
+    if let Some(base) = base {
+        return Ok(base.to_owned());
+    }
+    let remote_head = workon_git(
+        repo_path,
+        &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .map_err(|error| {
+        format!(
+            "workon: could not determine origin's default branch after fetch; set origin/HEAD or use --base <ref>: {error}"
+        )
+    })?;
+    let remote_head = remote_head.trim();
+    if remote_head.strip_prefix("origin/").is_some_and(|branch| !branch.is_empty()) {
+        return Ok(remote_head.to_owned());
+    }
+    Err(format!(
+        "workon: origin default branch must resolve to origin/<branch>, got {remote_head:?}; use --base <ref>"
+    ))
+}
+
 fn workon_sanitize_task_slug(task: &str) -> String {
     let mut out = String::new();
     let mut previous_space = false;
@@ -1064,6 +1126,17 @@ fn workon_validate_slug_input(value: &str, name: &str) -> Result<(), String> {
     } else { Ok(()) }
 }
 
+fn workon_validate_base_ref(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err("workon: --base must be a non-option git ref without whitespace".to_owned());
+    }
+    Ok(())
+}
+
 fn workon_validate_tmux_target(target: &str) -> Result<(), String> {
     if target.is_empty() || target.trim() != target || target.starts_with('-') {
         return Err("tmux target/session must be non-empty, unpadded, and not start with '-'".to_owned());
@@ -1119,6 +1192,7 @@ mod workon_tests {
             wt: None,
             fresh: false,
             name: None,
+            base: None,
             engine: None,
             layout: WorkonLayout::Nested,
             prompt: None,
@@ -1182,6 +1256,11 @@ mod workon_tests {
         assert!(parsed.fresh);
         assert_eq!(parsed.engine.as_deref(), Some("codex"));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "--wt", "other"])).is_err());
+        let base = workon_parse_args(&workon_strings(&["repo", "task", "--base=origin/release"])).expect("base");
+        assert_eq!(base.base.as_deref(), Some("origin/release"));
+        assert!(workon_parse_args(&workon_strings(&["repo", "task", "--base", "bad ref"])).is_err());
+        assert!(workon_usage().contains("fetch origin"));
+        assert!(workon_usage().contains("--base <ref>"));
     }
 
     #[test]
