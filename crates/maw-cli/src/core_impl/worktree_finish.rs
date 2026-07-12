@@ -205,10 +205,7 @@ impl DoneRuntime for DoneLocal {
     }
 
     fn done_current_identity(&mut self) -> Option<(String, i32)> {
-        let args = ["-p".to_owned(), "#{session_name}\t#{window_index}".to_owned()];
-        let raw = maw_tmux::TmuxRunner::run(&mut self.runner, "display-message", &args).ok()?;
-        let (session, index) = raw.trim().split_once('\t')?;
-        Some((session.to_owned(), index.parse::<i32>().ok()?))
+        done_invoking_pane_identity(&mut self.runner)
     }
 
     fn done_pane_info(&mut self, target: &str) -> Option<(String, String)> {
@@ -245,6 +242,23 @@ impl DoneRuntime for DoneLocal {
     }
 
     fn done_git(&mut self, args: &[String]) -> Result<String, String> { done_git(args) }
+}
+
+/// Resolve the session and window of the pane that invoked `maw done`.
+///
+/// Tmux otherwise resolves `display-message` against client focus, which may
+/// be a different window after a focus-switching command such as `maw workon`.
+fn done_invoking_pane_identity(runner: &mut impl maw_tmux::TmuxRunner) -> Option<(String, i32)> {
+    let pane = crate::wind::team::caller_pane()?;
+    let args = [
+        "-t".to_owned(),
+        pane,
+        "-p".to_owned(),
+        "#{session_name}\t#{window_index}".to_owned(),
+    ];
+    let raw = runner.run("display-message", &args).ok()?;
+    let (session, index) = raw.trim().split_once('\t')?;
+    Some((session.to_owned(), index.parse::<i32>().ok()?))
 }
 
 fn done_parse_window_line(line: &str) -> Option<DoneWindow> {

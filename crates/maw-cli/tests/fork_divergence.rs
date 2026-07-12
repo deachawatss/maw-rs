@@ -84,10 +84,12 @@ case "$1" in
 ' "$DONE_MAIN" "$DONE_WORKTREE" ;;
   display-message)
     case "$*" in
+      *"-t $TMUX_PANE -p "*) printf '13-nova\t%s
+' "${DONE_INVOKING_INDEX:-0}" ;;
       *pane_current_command*) printf '%s	%s
 ' "${DONE_PANE_COMMAND:-codex}" "$DONE_WORKTREE" ;;
       *) printf '13-nova	%s
-' "${DONE_CURRENT_INDEX:-0}" ;;
+' "${DONE_FOCUSED_INDEX:-0}" ;;
     esac ;;
   capture-pane)
     count=0
@@ -310,7 +312,8 @@ esac
     fn self_invocation_guard_blocks_own_window() {
         let (root, bin, main, worktree) = seed_done_fixture("self");
         let output = done_command(&root, &bin, &main, &worktree)
-            .env("DONE_CURRENT_INDEX", "1")
+            .env("TMUX_PANE", "%1")
+            .env("DONE_INVOKING_INDEX", "1")
             .args(["done", "task-done", "--dry-run"])
             .output()
             .expect("run done");
@@ -320,6 +323,48 @@ esac
             stderr.contains("refusing to done current window 'task-done' in session '13-nova'"),
             "{stderr}"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn done_uses_invoking_pane_not_client_focused_window_for_self_guard() {
+        let (root, bin, main, worktree) = seed_done_fixture("invoking-pane-identity");
+        let output = done_command(&root, &bin, &main, &worktree)
+            .env("TMUX_PANE", "%0")
+            .env("DONE_INVOKING_INDEX", "0")
+            .env("DONE_FOCUSED_INDEX", "1")
+            .args(["done", "task-done", "--dry-run"])
+            .output()
+            .expect("run done");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+        assert!(
+            log.contains("display-message -t %0 -p #{session_name}\t#{window_index}"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn done_headless_skips_self_guard_and_reaps_target_window() {
+        let (root, bin, main, worktree) = seed_done_fixture("headless-identity");
+        let output = done_command(&root, &bin, &main, &worktree)
+            .env_remove("TMUX_PANE")
+            .env("DONE_FOCUSED_INDEX", "1")
+            .args(["done", "task-done"])
+            .output()
+            .expect("run done");
+        assert!(
+            output.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+        assert!(log.contains("kill-window -t 13-nova:task-done"), "{log}");
         let _ = std::fs::remove_dir_all(root);
     }
 }
