@@ -51,6 +51,19 @@ struct DeliveryCommand {
     result: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryCommandResult {
+    Pass,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrDeliveryCommandOutcome {
+    Passed,
+    Exited(Option<i32>),
+    TimedOut { timeout_ms: u64 },
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct PrReviewRequest {
@@ -98,6 +111,11 @@ impl PrTmux for PrNativeTmux {
 trait PrProcess {
     fn pr_git_branch(&mut self, cwd: &std::path::Path) -> Result<String, String>;
     fn pr_git_remote_url(&mut self, cwd: &std::path::Path, remote: &str) -> Result<String, String>;
+    fn pr_rerun_delivery_command(
+        &mut self,
+        cwd: &std::path::Path,
+        command: &str,
+    ) -> Result<PrDeliveryCommandOutcome, String>;
     fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String>;
     fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String>;
     fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String>;
@@ -136,6 +154,14 @@ impl PrProcess for PrNativeProcess {
         }
         let code = output.status.code().unwrap_or(1);
         Err(format!("git remote get-url {remote} failed (exit {code})"))
+    }
+
+    fn pr_rerun_delivery_command(
+        &mut self,
+        cwd: &std::path::Path,
+        command: &str,
+    ) -> Result<PrDeliveryCommandOutcome, String> {
+        pr_rerun_local_delivery_command(cwd, command)
     }
 
     fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String> {
@@ -223,7 +249,7 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     let branch = process.pr_git_branch(&cwd)?;
     let origin_url = process.pr_git_remote_url(&cwd, "origin")?;
     let base_repo = pr_github_repo_from_remote(&origin_url)?;
-    let plan = pr_build_plan(cwd, branch, base_repo, &options)?;
+    let plan = pr_build_plan(cwd, branch, base_repo, &options, process)?;
     let mut out = pr_render_start(&plan);
     let url = process.pr_gh_create(&plan)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m {url}");
@@ -463,6 +489,7 @@ fn pr_build_plan(
     branch: String,
     base_repo: String,
     options: &PrOptions,
+    process: &mut impl PrProcess,
 ) -> Result<PrPlan, String> {
     pr_validate_branch(&branch)?;
     pr_validate_base_repo(&base_repo)?;
@@ -470,6 +497,7 @@ fn pr_build_plan(
         .ok_or_else(|| "pr: branch must contain issue-<number> for one-issue/one-PR traceability".to_owned())?;
     let delivery = pr_load_delivery(&cwd)?;
     pr_validate_delivery(&delivery, branch_issue)?;
+    pr_rerun_delivery_commands(&delivery, &cwd, process)?;
     let title = options.title.clone().unwrap_or_else(|| pr_branch_to_title(&branch));
     pr_validate_text_arg(&title, "title")?;
     let body = pr_render_delivery_body(options.body.as_deref(), &delivery);
@@ -486,6 +514,9 @@ fn pr_load_delivery(cwd: &std::path::Path) -> Result<DeliveryEvidence, String> {
 }
 
 fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: u64) -> Result<(), String> {
+    // The WF pre-guard.sh hook remains the engine-neutral shape-only fallback for
+    // direct `gh pr create` and older binaries. Native `maw pr` owns re-running
+    // successful local verification commands after this validation succeeds.
     if delivery.version != 1 {
         return Err(format!("pr: unsupported delivery version {} (expected 1)", delivery.version));
     }
@@ -508,21 +539,113 @@ fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: u64) -> Resul
         if command.command.trim().is_empty() {
             return Err("pr: delivery verification command must be non-empty".to_owned());
         }
-        let result = command.result.to_ascii_lowercase();
-        if !matches!(result.as_str(), "pass" | "fail" | "blocked") {
-            return Err(format!("pr: invalid verification result {}", command.result));
-        }
-        if result != "pass" {
-            return Err(format!(
-                "pr: verification command '{}' is {}; PR creation requires pass",
-                command.command, command.result
-            ));
-        }
+        let _ = pr_delivery_command_result(&command.result)?;
     }
     if delivery.verification.live_evidence.trim().is_empty() {
         return Err("pr: delivery verification.liveEvidence must be non-empty".to_owned());
     }
     Ok(())
+}
+
+fn pr_delivery_command_result(result: &str) -> Result<DeliveryCommandResult, String> {
+    let result = result.trim();
+    let normalized = result.to_ascii_lowercase();
+    if normalized == "pass" || normalized.starts_with("pass:") {
+        return Ok(DeliveryCommandResult::Pass);
+    }
+    if normalized == "skip" || normalized.starts_with("skip:") {
+        return Ok(DeliveryCommandResult::Skip);
+    }
+    if matches!(normalized.as_str(), "fail" | "blocked") {
+        return Err(format!("pr: verification result {result} blocks PR creation"));
+    }
+    Err(format!("pr: invalid verification result {result}"))
+}
+
+fn pr_rerun_delivery_commands(
+    delivery: &DeliveryEvidence,
+    cwd: &std::path::Path,
+    process: &mut impl PrProcess,
+) -> Result<(), String> {
+    for delivery_command in &delivery.verification.commands {
+        if pr_delivery_command_result(&delivery_command.result)? == DeliveryCommandResult::Skip {
+            continue;
+        }
+        match process.pr_rerun_delivery_command(cwd, &delivery_command.command) {
+            Ok(PrDeliveryCommandOutcome::Passed) => {}
+            Ok(PrDeliveryCommandOutcome::Exited(Some(exit_code))) => {
+                return Err(format!(
+                    "pr: verification command '{}' failed on re-run (observed exit code {exit_code})",
+                    delivery_command.command
+                ));
+            }
+            Ok(PrDeliveryCommandOutcome::Exited(None)) => {
+                return Err(format!(
+                    "pr: verification command '{}' terminated on re-run without an exit code",
+                    delivery_command.command
+                ));
+            }
+            Ok(PrDeliveryCommandOutcome::TimedOut { timeout_ms }) => {
+                return Err(format!(
+                    "pr: verification command '{}' timed out after {timeout_ms}ms; re-run verification blocks PR",
+                    delivery_command.command
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "pr: verification command '{}' could not be re-run: {error}; use skip: <reason> or defer it to openRisks",
+                    delivery_command.command
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+const PR_DELIVERY_COMMAND_TIMEOUT_DEFAULT_MS: u64 = 300_000;
+const PR_DELIVERY_COMMAND_TIMEOUT_ENV: &str = "MAW_PR_VERIFICATION_TIMEOUT_MS";
+
+fn pr_delivery_command_timeout_ms() -> u64 {
+    std::env::var(PR_DELIVERY_COMMAND_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| (100..=900_000).contains(millis))
+        .unwrap_or(PR_DELIVERY_COMMAND_TIMEOUT_DEFAULT_MS)
+}
+
+fn pr_rerun_local_delivery_command(
+    cwd: &std::path::Path,
+    command: &str,
+) -> Result<PrDeliveryCommandOutcome, String> {
+    pr_validate_cwd(cwd)?;
+    let timeout_ms = pr_delivery_command_timeout_ms();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", command])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| format!("spawn failed: {error}"))?;
+    let started_at = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(PrDeliveryCommandOutcome::Passed),
+            Ok(Some(status)) => return Ok(PrDeliveryCommandOutcome::Exited(status.code())),
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(PrDeliveryCommandOutcome::TimedOut { timeout_ms });
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait failed: {error}"));
+            }
+        }
+    }
 }
 
 fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence) -> String {
@@ -554,7 +677,13 @@ fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence)
         .verification
         .commands
         .iter()
-        .map(|command| format!("- `{}`: {}", command.command, command.result))
+        .map(|command| {
+            let suffix = match pr_delivery_command_result(&command.result) {
+                Ok(DeliveryCommandResult::Skip) => " (not re-run)",
+                Ok(DeliveryCommandResult::Pass) | Err(_) => "",
+            };
+            format!("- `{}`: {}{suffix}", command.command, command.result)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     sections.push(format!(
@@ -723,6 +852,8 @@ mod pr_tests {
     struct PrMockProcess {
         branch: String,
         origin_url: String,
+        rerun_commands: Vec<String>,
+        rerun_outcomes: std::collections::VecDeque<PrDeliveryCommandOutcome>,
         created: Vec<PrPlan>,
         viewed: Vec<String>,
         enqueued: Vec<PrReviewRequest>,
@@ -737,6 +868,14 @@ mod pr_tests {
         fn pr_git_remote_url(&mut self, _cwd: &std::path::Path, remote: &str) -> Result<String, String> {
             assert_eq!(remote, "origin");
             Ok(if self.origin_url.is_empty() { "https://github.com/acme/demo.git".to_owned() } else { self.origin_url.clone() })
+        }
+        fn pr_rerun_delivery_command(
+            &mut self,
+            _cwd: &std::path::Path,
+            command: &str,
+        ) -> Result<PrDeliveryCommandOutcome, String> {
+            self.rerun_commands.push(command.to_owned());
+            Ok(self.rerun_outcomes.pop_front().unwrap_or(PrDeliveryCommandOutcome::Passed))
         }
         fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String> {
             self.created.push(plan.clone());
@@ -825,6 +964,7 @@ mod pr_tests {
         assert!(process.created[0].body.contains("VERIFIED-LIVE: focused CLI path"));
         assert_eq!(process.created[0].base_repo, "acme/demo");
         assert_eq!(process.created[0].base_branch, "main");
+        assert_eq!(process.rerun_commands, vec!["cargo test".to_owned()]);
         assert_eq!(process.enqueued.len(), 1);
         assert!(process.enqueued[0].notified);
         assert_eq!(process.notifications, vec!["[codex] PR #7 ready for issue #140. https://github.com/acme/demo/pull/7"]);
@@ -904,10 +1044,11 @@ mod pr_tests {
         let repo = pr_temp_dir("override");
         pr_write_delivery(&repo, 42);
         let options = PrOptions { window: None, title: Some("Custom".to_owned()), body: Some("Body".to_owned()), show_current: false };
-        let plan = pr_build_plan(repo, "agents/issue-42-demo".to_owned(), "deachawatss/maw-rs".to_owned(), &options).expect("plan");
+        let mut process = PrMockProcess::default();
+        let plan = pr_build_plan(repo, "agents/issue-42-demo".to_owned(), "deachawatss/maw-rs".to_owned(), &options, &mut process).expect("plan");
         assert_eq!(plan.title, "Custom");
         assert!(plan.body.starts_with("Body\n\nCloses #42\nREQ: #42"));
-        let error = pr_build_plan(std::path::PathBuf::from("/tmp"), String::new(), "deachawatss/maw-rs".to_owned(), &options).expect_err("detached");
+        let error = pr_build_plan(std::path::PathBuf::from("/tmp"), String::new(), "deachawatss/maw-rs".to_owned(), &options, &mut process).expect_err("detached");
         assert!(error.contains("detached HEAD"));
     }
 
@@ -915,12 +1056,14 @@ mod pr_tests {
     fn pr_requires_valid_delivery_evidence_matching_branch_issue() {
         let repo = pr_temp_dir("delivery-required");
         let options = PrOptions { window: None, title: None, body: None, show_current: false };
+        let mut process = PrMockProcess::default();
 
         let missing = pr_build_plan(
             repo.clone(),
             "agents/issue-42-demo".to_owned(),
             "deachawatss/maw-rs".to_owned(),
             &options,
+            &mut process,
         )
         .expect_err("missing delivery blocked");
         assert!(missing.contains(".maw/delivery.json"), "{missing}");
@@ -931,6 +1074,7 @@ mod pr_tests {
             "agents/issue-42-demo".to_owned(),
             "deachawatss/maw-rs".to_owned(),
             &options,
+            &mut process,
         )
         .expect_err("mismatched issue blocked");
         assert!(mismatch.contains("delivery issue 41 does not match branch issue 42"), "{mismatch}");
@@ -946,9 +1090,101 @@ mod pr_tests {
             "agents/issue-42-demo".to_owned(),
             "deachawatss/maw-rs".to_owned(),
             &options,
+            &mut process,
         )
         .expect_err("invalid engine blocked");
         assert!(invalid_engine.contains("invalid delivery engine claude"), "{invalid_engine}");
+    }
+
+    #[test]
+    fn pr_blocks_delivery_command_claimed_pass_when_rerun_fails() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("delivery-rerun-failure");
+        pr_write_delivery(&repo, 53);
+        let path = repo.join(".maw/delivery.json");
+        let mut delivery: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
+        delivery["verification"]["commands"][0]["command"] = "exit 7".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&delivery).expect("render delivery")).expect("delivery");
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/issue-53-delivery-rerun".to_owned(),
+            rerun_outcomes: [PrDeliveryCommandOutcome::Exited(Some(7))].into(),
+            ..Default::default()
+        };
+
+        let error = pr_run(&[], &mut tmux, &mut process).expect_err("failed rerun blocks PR");
+
+        assert!(error.contains("exit 7"), "{error}");
+        assert!(error.contains("exit code 7"), "{error}");
+        assert_eq!(process.rerun_commands, ["exit 7"]);
+        assert!(process.created.is_empty());
+    }
+
+    #[test]
+    fn pr_reruns_detailed_pass_and_surfaces_unrun_skip_in_handoff() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("delivery-skip");
+        pr_write_delivery(&repo, 53);
+        let path = repo.join(".maw/delivery.json");
+        let mut delivery: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
+        delivery["verification"]["commands"] = serde_json::json!([
+            {"command": "cargo test -p maw-cli", "result": "pass: focused CLI suite"},
+            {"command": "gh pr view", "result": "skip: deferred to PR review"}
+        ]);
+        std::fs::write(&path, serde_json::to_string_pretty(&delivery).expect("render delivery")).expect("delivery");
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess { branch: "agents/issue-53-delivery-skip".to_owned(), ..Default::default() };
+
+        pr_run(&[], &mut tmux, &mut process).expect("green verification creates PR");
+
+        assert_eq!(process.rerun_commands, vec!["cargo test -p maw-cli".to_owned()]);
+        assert!(process.created[0].body.contains("skip: deferred to PR review (not re-run)"));
+    }
+
+    #[test]
+    fn pr_blocks_delivery_command_when_rerun_times_out() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("delivery-timeout");
+        pr_write_delivery(&repo, 53);
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/issue-53-delivery-timeout".to_owned(),
+            rerun_outcomes: [PrDeliveryCommandOutcome::TimedOut { timeout_ms: 100 }].into(),
+            ..Default::default()
+        };
+
+        let error = pr_run(&[], &mut tmux, &mut process).expect_err("timed out rerun blocks PR");
+
+        assert!(error.contains("cargo test"), "{error}");
+        assert!(error.contains("timed out after 100ms"), "{error}");
+        assert!(process.created.is_empty());
+    }
+
+    #[test]
+    fn pr_native_delivery_rerun_reports_exit_code_and_timeout() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture(PR_DELIVERY_COMMAND_TIMEOUT_ENV);
+        let repo = pr_temp_dir("delivery-native-rerun");
+        let mut process = PrNativeProcess;
+
+        assert_eq!(
+            process.pr_rerun_delivery_command(&repo, "exit 7").expect("run exit"),
+            PrDeliveryCommandOutcome::Exited(Some(7))
+        );
+
+        std::env::set_var(PR_DELIVERY_COMMAND_TIMEOUT_ENV, "100");
+        assert_eq!(
+            process.pr_rerun_delivery_command(&repo, "sleep 1").expect("run timeout"),
+            PrDeliveryCommandOutcome::TimedOut { timeout_ms: 100 }
+        );
     }
 
     #[test]
