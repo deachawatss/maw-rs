@@ -750,7 +750,7 @@ fn fleet_parse_entry(path: &std::path::Path, strict: bool, label: &str) -> Resul
 }
 
 fn load_native_fleet() -> Vec<NativeFleetSession> {
-    fleet_load_entries().into_iter().map(|entry| entry.session).collect()
+    fleet_load_entries().into_iter().filter(fleet_entry_is_session).map(|entry| entry.session).collect()
 }
 
 fn native_fleet_apply_role_markers(session: &mut NativeFleetSession) {
@@ -790,7 +790,7 @@ fn native_fleet_repo_path(repo: &str) -> Option<std::path::PathBuf> {
 
 fn native_repo_kind_for_path(path: &std::path::Path) -> Option<NativeRepoKind> {
     let slugs = native_repo_slugs_for_path(path);
-    for entry in fleet_load_entries() {
+    for entry in fleet_load_entries().into_iter().filter(fleet_entry_is_session) {
         for window in &entry.session.windows {
             if window.kind.is_some() && native_fleet_window_matches_slugs(window, &slugs) {
                 return window.kind;
@@ -966,6 +966,93 @@ mod native_fleet_loader_tests {
             assert_eq!(entries[0].session.name, "01-alpha");
             assert_eq!(entries[1].session.name, "01-alpha");
         });
+    }
+
+    #[test]
+    fn native_fleet_session_loader_excludes_squad_rosters() {
+        let root = fleet_loader_temp_root("session-boundary");
+        fleet_loader_write(
+            &root.join("state/fleet/01-session.json"),
+            r#"{"name":"01-session","windows":[]}"#,
+        );
+        fleet_loader_write(
+            &root.join("state/fleet/squads/02-squad/squad.json"),
+            r#"{"name":"02-squad","windows":[{"name":"stale","repo":"acme/stale"}],"members":[]}"#,
+        );
+
+        fleet_loader_env(&root, || {
+            let sessions = load_native_fleet();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].name, "01-session");
+        });
+    }
+
+    #[test]
+    fn native_fleet_loader_migrates_all_roster_layouts_idempotently() {
+        let root = fleet_loader_temp_root("squad-migration");
+        let fleet = root.join("fleet");
+        fleet_loader_write(
+            &fleet.join("01-flat.json"),
+            r#"{"name":"01-flat","groupName":"flat","unknown":"keep","windows":[],"members":[{"handle":"one","memberUnknown":true}]}"#,
+        );
+        fleet_loader_write(
+            &fleet.join("groups/02-groups/group.json"),
+            r#"{"name":"02-groups","groupName":"groups","windows":[],"members":[]}"#,
+        );
+        fleet_loader_write(
+            &fleet.join("squads/03-squads/group.json"),
+            r#"{"name":"03-squads","groupName":"squads","windows":[],"members":[]}"#,
+        );
+        fleet_loader_write(
+            &fleet.join("99-session.json"),
+            r#"{"name":"99-session","windows":[]}"#,
+        );
+
+        let first = fleet_load_entries_impl(vec![fleet.clone()], true, "fleet test").expect("first load");
+        assert_eq!(first.len(), 4);
+        let flat = fleet.join("squads/01-flat/squad.json");
+        let first_body = std::fs::read_to_string(&flat).expect("migrated flat roster");
+        let value: serde_json::Value = serde_json::from_str(&first_body).expect("migrated json");
+        assert_eq!(value["squadName"], "flat");
+        assert_eq!(value["unknown"], "keep");
+        assert_eq!(value["members"][0]["memberUnknown"], true);
+        assert!(value.get("groupName").is_none());
+        assert!(fleet.join("squads/02-groups/squad.json").exists());
+        assert!(fleet.join("squads/03-squads/squad.json").exists());
+        assert!(fleet.join("99-session.json").exists(), "session snapshot stays flat");
+
+        let second = fleet_load_entries_impl(vec![fleet], true, "fleet test").expect("second load");
+        assert_eq!(second.len(), first.len());
+        assert_eq!(std::fs::read_to_string(flat).expect("stable roster"), first_body);
+    }
+
+    #[test]
+    fn native_fleet_loader_canonical_roster_wins_all_legacy_collisions() {
+        let root = fleet_loader_temp_root("squad-collision");
+        let fleet = root.join("fleet");
+        let canonical = fleet.join("squads/04-keep/squad.json");
+        fleet_loader_write(
+            &canonical,
+            r#"{"name":"04-keep","squadName":"keep","winner":true,"windows":[],"members":[]}"#,
+        );
+        for path in [
+            fleet.join("04-keep.json"),
+            fleet.join("groups/04-keep/group.json"),
+            fleet.join("squads/04-keep/group.json"),
+        ] {
+            fleet_loader_write(
+                &path,
+                r#"{"name":"04-keep","groupName":"legacy","winner":false,"windows":[],"members":[]}"#,
+            );
+        }
+
+        let entries = fleet_load_entries_impl(vec![fleet.clone()], true, "fleet test").expect("load");
+        assert_eq!(entries.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(canonical).expect("canonical")).expect("json");
+        assert_eq!(value["winner"], true);
+        assert!(!fleet.join("04-keep.json").exists());
+        assert!(!fleet.join("groups/04-keep/group.json").exists());
+        assert!(!fleet.join("squads/04-keep/group.json").exists());
     }
 
     #[test]
