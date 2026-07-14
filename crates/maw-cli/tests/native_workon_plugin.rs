@@ -20,6 +20,19 @@ fn temp_dir(name: &str) -> PathBuf {
     path
 }
 
+fn isolated_cargo_target_dir(worktree: &Path) -> PathBuf {
+    let slug = worktree
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("worktree directory name");
+    let root = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    root.join(format!("maw-rs-target-{slug}"))
+}
+
 fn write_exe(path: &Path, body: &str) {
     fs::write(path, body).expect("write exe");
     #[cfg(unix)]
@@ -530,8 +543,8 @@ fn native_workon_rejects_read_only_gitignore_before_launching() {
 
 #[cfg(unix)]
 #[test]
-fn native_workon_omx_create_restores_shared_state_after_git_clean() {
-    let root = temp_dir("shared-state");
+fn native_workon_omx_create_restores_worktree_state_after_git_clean() {
+    let root = temp_dir("worktree-state");
     let bin_dir = seed_hermetic_root(&root, "shell\n");
     let repo = root.join("ghq/github.com/acme/demo");
     fs::create_dir_all(repo.join("ψ/memory/learnings")).expect("main psi");
@@ -568,12 +581,10 @@ fn native_workon_omx_create_restores_shared_state_after_git_clean() {
         .file_type()
         .is_symlink());
     assert_eq!(fs::read_link(&psi).expect("psi link"), repo.join("ψ"));
+    let expected_target = isolated_cargo_target_dir(&wt);
     assert_eq!(
         fs::read_to_string(wt.join(".cargo/config.toml")).expect("cargo config"),
-        format!(
-            "[build]\ntarget-dir = \"{}\"\n",
-            repo.join("target").display()
-        )
+        format!("[build]\ntarget-dir = \"{}\"\n", expected_target.display())
     );
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(
@@ -583,8 +594,8 @@ fn native_workon_omx_create_restores_shared_state_after_git_clean() {
 }
 
 #[test]
-fn native_workon_reuse_repairs_missing_shared_cargo_target_config() {
-    let root = temp_dir("reuse-shared-target");
+fn native_workon_reuse_repairs_missing_isolated_cargo_target_config() {
+    let root = temp_dir("reuse-isolated-target");
     let bin_dir = seed_hermetic_root(&root, "shell\n");
     let repo = root.join("ghq/github.com/acme/demo");
     let worktree = repo.join("agents/reused");
@@ -600,12 +611,10 @@ fn native_workon_reuse_repairs_missing_shared_cargo_target_config() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let expected_target = isolated_cargo_target_dir(&worktree);
     assert_eq!(
         fs::read_to_string(worktree.join(".cargo/config.toml")).expect("cargo config"),
-        format!(
-            "[build]\ntarget-dir = \"{}\"\n",
-            repo.join("target").display()
-        )
+        format!("[build]\ntarget-dir = \"{}\"\n", expected_target.display())
     );
 }
 
