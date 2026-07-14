@@ -35,7 +35,7 @@ maw-tmux = { path = "../maw-tmux" }
 maw-transport = { path = "../maw-transport" }
 maw-worktree = { path = "../maw-worktree" }
 maw-xdg = { path = "../maw-xdg" }
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "multipart", "tokio", "query", "ws"] }
 futures-util = "0.3"
 rand = "0.8"
 portable-pty = "0.9"

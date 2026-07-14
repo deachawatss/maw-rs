@@ -358,7 +358,8 @@ fn config_is_secret_key(key: &str) -> bool {
     ) {
         return false;
     }
-    if lower == "federationtoken"
+    if lower == "pin"
+        || lower == "federationtoken"
         || lower == "pubkey"
         || lower == "peerpubkey"
         || lower == "peerkey"
