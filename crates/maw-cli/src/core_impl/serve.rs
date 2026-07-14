@@ -2091,15 +2091,35 @@ fn serve_replace_box_runs(input: &str, replacement: &str) -> String {
 
 async fn api_action(
     State(state): State<Arc<ServeState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let action = serde_json::from_slice::<ActionBody>(&body).unwrap_or_default();
     match action.kind.as_deref() {
-        Some("send") => {
-            let payload = json!({"target": action.target, "text": action.text});
-            serve_deliver_send(&state, &headers, &Bytes::from(payload.to_string()))
-        }
+        Some("send") => match verify_protected_request_outcome(&state, peer, &method, &uri, &headers, &body) {
+            ProtectedRequestOutcome::Accept => {
+                let payload = json!({"target": action.target, "text": action.text});
+                serve_deliver_send(&state, &headers, &Bytes::from(payload.to_string()))
+            }
+            ProtectedRequestOutcome::Reject { decision, response } => {
+                serve_log_lifecycle(
+                    &state,
+                    json!({
+                        "kind": "message",
+                        "direction": "inbound",
+                        "state": "failed",
+                        "event": "auth-reject",
+                        "decision": serve_truncate(&decision, SERVE_LOG_ERROR_MAX),
+                        "route": "action",
+                        "source": "serve",
+                    }),
+                );
+                response
+            }
+        },
         Some("workspace-create") => {
             let Some(name) = action.name.filter(|name| !name.trim().is_empty()) else {
                 return serve_ui_error(StatusCode::BAD_REQUEST, "name required");
@@ -2228,14 +2248,11 @@ async fn api_config_file(Query(query): Query<ConfigFileQuery>) -> Response {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return serve_ui_error(StatusCode::NOT_FOUND, "not found"),
         Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("read config: {error}")),
     };
-    if name == "maw.config.json" {
-        let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
-            return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid config JSON");
-        };
-        config_redact_value(&mut value);
-        return Json(json!({"content": serde_json::to_string_pretty(&value).unwrap_or_default()})).into_response();
-    }
-    Json(json!({"content": raw})).into_response()
+    let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+        return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid config JSON");
+    };
+    config_redact_value(&mut value);
+    Json(json!({"content": serde_json::to_string_pretty(&value).unwrap_or_default()})).into_response()
 }
 
 async fn api_config_file_save(
@@ -2249,10 +2266,41 @@ async fn api_config_file_save(
         Ok(path) => path,
         Err(error) => return serve_ui_error(StatusCode::FORBIDDEN, &error),
     };
-    if serde_json::from_str::<Value>(&body.content).is_err() {
+    let Ok(mut value) = serde_json::from_str::<Value>(&body.content) else {
         return serve_ui_error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    let mut content = format!("{}\n", body.content.trim_end());
+    if name == "maw.config.json" {
+        let existing_pin = serve_configured_pin();
+        let original = match config_read_target() {
+            Ok(config) => config,
+            Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+        if let Some(existing_pin) = existing_pin {
+            let redacted_pin = config_mask_secret(&Value::String(existing_pin.clone()));
+            let submitted_pin = value.get("pin").and_then(Value::as_str);
+            let target_pin = original.get("pin").and_then(Value::as_str);
+            let preserves_redacted_pin = value.get("pin") == Some(&redacted_pin);
+            let leaves_lower_layer_pin_alone = submitted_pin.is_none() && target_pin.is_none();
+            if body.current_pin.as_deref() != Some(existing_pin.as_str())
+                && submitted_pin != Some(existing_pin.as_str())
+                && !leaves_lower_layer_pin_alone
+            {
+                if preserves_redacted_pin {
+                    let Some(map) = value.as_object_mut() else {
+                        return serve_ui_error(StatusCode::BAD_REQUEST, "config root must be an object");
+                    };
+                    map.insert("pin".to_owned(), Value::String(existing_pin));
+                    content = match serde_json::to_string_pretty(&value) {
+                        Ok(content) => format!("{content}\n"),
+                        Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("render config: {error}")),
+                    };
+                } else {
+                    return serve_ui_error(StatusCode::UNAUTHORIZED, "current pin required");
+                }
+            }
+        }
     }
-    let content = format!("{}\n", body.content.trim_end());
     let result = if name == "maw.config.json" {
         config_atomic_write(&path, &content)
     } else {
@@ -2379,7 +2427,10 @@ async fn api_fleet_config() -> Response {
     paths.sort();
     for path in paths {
         match std::fs::read_to_string(&path).ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
-            Some(config) => configs.push(config),
+            Some(mut config) => {
+                config_redact_value(&mut config);
+                configs.push(config);
+            }
             None => return Json(json!({"configs": configs, "error": format!("invalid fleet config: {}", path.display())})).into_response(),
         }
     }
@@ -2413,11 +2464,15 @@ async fn serve_oracle_get(endpoint: &str, parameters: Vec<(&str, String)>) -> Re
             .unwrap_or_else(|| "http://localhost:47778".to_owned())
     });
     base = base.trim_end_matches('/').to_owned();
-    let Ok(mut url) = reqwest::Url::parse(&format!("{base}/api/{endpoint}")) else {
-        return serve_ui_error(StatusCode::BAD_GATEWAY, "invalid Oracle URL");
+    let Ok(mut url) = serve_oracle_url(&base, endpoint) else {
+        return serve_ui_error(StatusCode::BAD_GATEWAY, "Oracle URL is not allowed");
     };
     url.query_pairs_mut().extend_pairs(parameters.iter().map(|(key, value)| (*key, value.as_str())));
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
         Ok(client) => client,
         Err(error) => return serve_ui_error(StatusCode::BAD_GATEWAY, &format!("Oracle client: {error}")),
     };
@@ -2436,7 +2491,36 @@ async fn serve_oracle_get(endpoint: &str, parameters: Vec<(&str, String)>) -> Re
     }
 }
 
+fn serve_oracle_url(base: &str, endpoint: &str) -> Result<reqwest::Url, ()> {
+    let url = reqwest::Url::parse(&format!("{base}/api/{endpoint}")).map_err(|_| ())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(());
+    }
+    let Some(host) = url.host_str() else {
+        return Err(());
+    };
+    if !serve_oracle_host_allowed(host) {
+        return Err(());
+    }
+    Ok(url)
+}
+
+fn serve_oracle_host_allowed(host: &str) -> bool {
+    let ip_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost") || ip_host.parse::<IpAddr>().is_ok_and(|address| address.is_loopback())
+}
+
 async fn api_pin_set(Json(body): Json<PinBody>) -> Response {
+    let existing_pin = serve_configured_pin();
+    if existing_pin
+        .as_deref()
+        .is_some_and(|pin| body.current_pin.as_deref() != Some(pin))
+    {
+        return serve_ui_error(StatusCode::UNAUTHORIZED, "current pin required");
+    }
     let pin = body.pin.unwrap_or_default().chars().filter(char::is_ascii_digit).collect::<String>();
     let mut config = match config_read_target() {
         Ok(config) if config.is_object() => config,
@@ -2452,6 +2536,13 @@ async fn api_pin_set(Json(body): Json<PinBody>) -> Response {
         Ok(()) => Json(json!({"ok": true, "length": pin.len(), "enabled": !pin.is_empty()})).into_response(),
         Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
+}
+
+fn serve_configured_pin() -> Option<String> {
+    config_load_layers()
+        .ok()
+        .and_then(|loaded| loaded.config.get("pin").and_then(Value::as_str).map(ToOwned::to_owned))
+        .filter(|pin| !pin.is_empty())
 }
 
 async fn api_pin_verify(Json(body): Json<PinBody>) -> Response {
@@ -3669,8 +3760,10 @@ struct ConfigFileQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ConfigFileSaveBody {
     content: String,
+    current_pin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3693,8 +3786,10 @@ struct OracleTracesQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PinBody {
     pin: Option<String>,
+    current_pin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4746,6 +4841,69 @@ mod serve_tests {
         repo
     }
 
+    struct ServeConfigEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+        config: std::path::PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ServeConfigEnv {
+        fn new(label: &str) -> Self {
+            let guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+            let keys = [
+                "MAW_HOME",
+                "MAW_CONFIG_DIR",
+                "MAW_XDG",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect::<Vec<_>>();
+            let root = std::env::temp_dir().join(format!(
+                "maw-rs-serve-config-{label}-{}-{}",
+                std::process::id(),
+                random_hex(4)
+            ));
+            let config = root.join("config");
+            std::fs::create_dir_all(config.join("fleet")).expect("config fleet dir");
+            for key in ["MAW_HOME", "MAW_XDG", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+                std::env::remove_var(key);
+            }
+            std::env::set_var("MAW_CONFIG_DIR", &config);
+            Self {
+                _guard: guard,
+                root,
+                config,
+                saved,
+            }
+        }
+
+        fn write_config(&self, body: &str) {
+            std::fs::write(self.config.join("maw.config.json"), body).expect("root config");
+        }
+
+        fn write_fleet(&self, name: &str, body: &str) {
+            std::fs::write(self.config.join("fleet").join(name), body).expect("fleet config");
+        }
+    }
+
+    impl Drop for ServeConfigEnv {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
     struct ServeInboxManifestEnv {
         _guard: std::sync::MutexGuard<'static, ()>,
         root: std::path::PathBuf,
@@ -5253,6 +5411,217 @@ mod serve_tests {
         assert_eq!(payload["events"][0]["state"], "failed");
         assert_eq!(payload["events"][0]["decision"], "refuse-missing-peer-key");
         assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_action_send_rejects_unsigned_non_loopback_delivery() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            Vec::new(),
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(unsigned_json_request(
+                "POST",
+                "/api/action",
+                r#"{"type":"send","target":"capture-agent","text":"unsigned"}"#,
+            ))
+            .await
+            .expect("action response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(delivery.sends().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_action_send_accepts_signed_non_loopback_delivery() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let body = r#"{"type":"send","target":"capture-agent","text":"signed"}"#;
+
+        let response = app
+            .oneshot(signed_json_request(
+                "POST",
+                "/api/action",
+                body,
+                KEY,
+                FROM,
+                1_782_553_858,
+            ))
+            .await
+            .expect("action response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            delivery.sends(),
+            vec![(
+                "capture-agent:0".to_owned(),
+                "[sender-oracle:sender-node] signed".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_api_pin_set_requires_current_pin_before_overwrite() {
+        let config = ServeConfigEnv::new("pin-overwrite");
+        config.write_config(r#"{"pin":"2468"}"#);
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_553_858, Some(NON_LOOPBACK_TEST_PEER));
+
+        let rejected = app
+            .clone()
+            .oneshot(unsigned_json_request("POST", "/api/pin-set", r#"{"pin":"9999"}"#))
+            .await
+            .expect("pin response");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert!(std::fs::read_to_string(config.config.join("maw.config.json"))
+            .expect("stored pin")
+            .contains("2468"));
+
+        let accepted = app
+            .oneshot(unsigned_json_request(
+                "POST",
+                "/api/pin-set",
+                r#"{"currentPin":"2468","pin":"9999"}"#,
+            ))
+            .await
+            .expect("pin response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(std::fs::read_to_string(config.config.join("maw.config.json"))
+            .expect("stored pin")
+            .contains("9999"));
+    }
+
+    #[tokio::test]
+    async fn serve_config_file_save_requires_current_pin_to_change_pin() {
+        let config = ServeConfigEnv::new("config-save-pin-overwrite");
+        config.write_config(r#"{"pin":"2468","node":"local"}"#);
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_553_858, Some(NON_LOOPBACK_TEST_PEER));
+
+        let rejected = app
+            .clone()
+            .oneshot(unsigned_json_request(
+                "POST",
+                "/api/config-file?path=maw.config.json",
+                r#"{"content":"{\"pin\":\"9999\",\"node\":\"local\"}"}"#,
+            ))
+            .await
+            .expect("config save response");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert!(std::fs::read_to_string(config.config.join("maw.config.json"))
+            .expect("stored pin")
+            .contains("2468"));
+
+        let accepted = app
+            .oneshot(unsigned_json_request(
+                "POST",
+                "/api/config-file?path=maw.config.json",
+                r#"{"currentPin":"2468","content":"{\"pin\":\"9999\",\"node\":\"local\"}"}"#,
+            ))
+            .await
+            .expect("config save response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(std::fs::read_to_string(config.config.join("maw.config.json"))
+            .expect("stored pin")
+            .contains("9999"));
+    }
+
+    #[tokio::test]
+    async fn serve_config_file_save_preserves_redacted_pin_without_current_pin() {
+        let config = ServeConfigEnv::new("config-save-redacted-pin");
+        config.write_config(r#"{"pin":"2468","node":"old"}"#);
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_553_858, Some(NON_LOOPBACK_TEST_PEER));
+
+        let response = app
+            .oneshot(unsigned_json_request(
+                "POST",
+                "/api/config-file?path=maw.config.json",
+                r#"{"content":"{\"pin\":\"****\",\"node\":\"updated\"}"}"#,
+            ))
+            .await
+            .expect("config save response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored = std::fs::read_to_string(config.config.join("maw.config.json")).expect("stored config");
+        assert!(stored.contains("2468"));
+        assert!(stored.contains("updated"));
+    }
+
+    #[tokio::test]
+    async fn serve_config_reads_redact_root_and_fleet_secrets() {
+        let config = ServeConfigEnv::new("redact-config-reads");
+        config.write_config(r#"{"pin":"2468","federationToken":"root-token-1234"}"#);
+        config.write_fleet(
+            "secret.json",
+            r#"{"pin":"1357","serve":{"token":"fleet-token-5678"},"federationToken":"fleet-federation-4321"}"#,
+        );
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_553_858, Some(NON_LOOPBACK_TEST_PEER));
+
+        let root = response_json(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/config-file?path=maw.config.json")
+                        .body(Body::empty())
+                        .expect("root config request"),
+                )
+                .await
+                .expect("root config response"),
+        )
+        .await;
+        let root_content = root["content"].as_str().expect("root content");
+        assert!(!root_content.contains("2468"));
+        assert!(!root_content.contains("root-token-1234"));
+
+        let fleet_file = response_json(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/config-file?path=fleet%2Fsecret.json")
+                        .body(Body::empty())
+                        .expect("fleet file request"),
+                )
+                .await
+                .expect("fleet file response"),
+        )
+        .await;
+        let fleet_content = fleet_file["content"].as_str().expect("fleet content");
+        assert!(!fleet_content.contains("1357"));
+        assert!(!fleet_content.contains("fleet-token-5678"));
+        assert!(!fleet_content.contains("fleet-federation-4321"));
+
+        let fleet = response_json(
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/fleet-config")
+                    .body(Body::empty())
+                    .expect("fleet config request"),
+            )
+            .await
+            .expect("fleet config response"),
+        )
+        .await;
+        let fleet_body = fleet.to_string();
+        assert!(!fleet_body.contains("1357"));
+        assert!(!fleet_body.contains("fleet-token-5678"));
+        assert!(!fleet_body.contains("fleet-federation-4321"));
+    }
+
+    #[test]
+    fn serve_oracle_url_allows_only_loopback_http_targets() {
+        let local = serve_oracle_url("http://localhost:47779", "search").expect("localhost Oracle URL");
+        assert_eq!(local.as_str(), "http://localhost:47779/api/search");
+        assert!(serve_oracle_url("https://127.0.0.1:47779", "traces").is_ok());
+        assert!(serve_oracle_url("https://[::1]:47779", "traces").is_ok());
+        assert!(serve_oracle_url("http://169.254.169.254/latest", "search").is_err());
+        assert!(serve_oracle_url("https://oracle.example", "search").is_err());
+        assert!(serve_oracle_url("file:///tmp/oracle", "search").is_err());
     }
 
     #[tokio::test]
