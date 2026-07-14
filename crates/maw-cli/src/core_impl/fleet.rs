@@ -177,6 +177,9 @@ fn run_fleet_command(argv: &[String]) -> CliOutput {
 }
 
 fn fleet_run(argv: &[String]) -> Result<(i32, String), String> {
+    if let Some(result) = wind_fleet_pr_queue(argv) {
+        return result;
+    }
     if let Some(result) = fleet_roster_intercept(argv) {
         return result;
     }
