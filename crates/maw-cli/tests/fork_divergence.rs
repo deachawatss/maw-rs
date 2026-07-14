@@ -91,13 +91,6 @@ case "$1" in
       *) printf '13-nova	%s
 ' "${DONE_FOCUSED_INDEX:-0}" ;;
     esac ;;
-  capture-pane)
-    count=0
-    if [ -f "$DONE_CAPTURE_COUNT" ]; then IFS= read -r count < "$DONE_CAPTURE_COUNT"; fi
-    count=$((count + 1)); printf '%s' "$count" > "$DONE_CAPTURE_COUNT"
-    if [ "$count" -lt 4 ]; then printf 'retrospective still running
-'; else printf 'ctx%% 
-'; fi ;;
   send-keys|kill-window) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -141,9 +134,7 @@ esac
             .env("DONE_WORKTREE", worktree)
             .env("DONE_GIT_LOG", root.join("git.log"))
             .env("DONE_TMUX_LOG", root.join("tmux.log"))
-            .env("DONE_CAPTURE_COUNT", root.join("capture-count"))
-            .env("MAW_TEST_MODE", "1")
-            .env("MAW_DONE_RRR_WAIT_INTERVAL_MS", "0");
+            .env("MAW_TEST_MODE", "1");
         command
     }
 
@@ -282,7 +273,7 @@ esac
     }
 
     #[test]
-    fn rrr_wait_polls_until_prompt_returns() {
+    fn done_does_not_send_duplicate_retrospective() {
         let (root, bin, main, worktree) = seed_done_fixture("rrr");
         let output = done_command(&root, &bin, &main, &worktree)
             .env("DONE_PANE_COMMAND", "claude")
@@ -294,16 +285,18 @@ esac
             "stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let count: u32 = std::fs::read_to_string(root.join("capture-count"))
-            .expect("capture count")
-            .trim()
-            .parse()
-            .expect("count is numeric");
-        assert!(count >= 4, "expected ≥4 capture-pane polls, got {count}");
         let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
         assert!(
-            log.contains("send-keys -t 13-nova:task-done -l /rrr"),
-            "{log}"
+            log.contains("display-message -t 13-nova:task-done -p #{pane_current_command}\t#{pane_current_path}"),
+            "maw done must inspect the Claude pane before applying the no-retrospective contract: {log}"
+        );
+        assert!(
+            !log.contains("send-keys -t 13-nova:task-done -l /rrr"),
+            "maw done must not send a duplicate retrospective command: {log}"
+        );
+        assert!(
+            !log.contains("capture-pane -t 13-nova:task-done -p -S -40"),
+            "maw done must not wait for a retrospective prompt: {log}"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -552,6 +545,11 @@ esac
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_GIT_LOG"
 if [ "$3" = "branch" ]; then exit 1; fi
+if [ "$3" = "fetch" ] && [ "$4" = "origin" ]; then exit 0; fi
+if [ "$3" = "symbolic-ref" ] && [ "$6" = "refs/remotes/origin/HEAD" ]; then
+  printf 'origin/main\n'
+  exit 0
+fi
 if [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
   printf 'worktree %s\nHEAD 0000000000000000000000000000000000000000\nbranch refs/heads/main\n\n' "$2"
   exit 0
