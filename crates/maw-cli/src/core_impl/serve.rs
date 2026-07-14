@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    extract::{ws::WebSocketUpgrade, ConnectInfo, Path as AxumPath, Query, State},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,7 +26,7 @@ const DEFAULT_SERVE_BIND: &str = "0.0.0.0";
 const SERVE_FEED_MAX: usize = 200;
 const SERVE_LOG_TEXT_MAX: usize = 2_000;
 const SERVE_LOG_ERROR_MAX: usize = 1_000;
-const DEFAULT_MIRROR_LINES: u32 = 50;
+const DEFAULT_MIRROR_LINES: u32 = 40;
 const DELIVERY_IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;
 #[cfg(test)]
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
@@ -431,6 +431,21 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/sessions", get(api_sessions))
         .route("/api/capture", get(api_capture))
         .route("/api/mirror", get(api_mirror))
+        .route("/api/action", post(api_action))
+        .route("/api/attach", post(api_attach).layer(DefaultBodyLimit::max(10 * 1024 * 1024)))
+        .route("/api/config", get(api_config))
+        .route("/api/config-files", get(api_config_files))
+        .route(
+            "/api/config-file",
+            get(api_config_file).post(api_config_file_save).put(api_config_file_create).delete(api_config_file_delete),
+        )
+        .route("/api/config-file/toggle", post(api_config_file_toggle))
+        .route("/api/fleet-config", get(api_fleet_config))
+        .route("/api/oracle/search", get(api_oracle_search))
+        .route("/api/oracle/traces", get(api_oracle_traces))
+        .route("/api/pin-set", post(api_pin_set))
+        .route("/api/pin-verify", post(api_pin_verify))
+        .route("/api/sleep", post(api_sleep))
         .route("/api/probe", post(api_probe))
         .route("/api/wake", post(api_wake))
         .route("/api/pane-keys", post(api_pane_keys))
@@ -1986,7 +2001,7 @@ async fn api_mirror(
     let target = query.target.unwrap_or_default();
     let lines = query.lines.unwrap_or(DEFAULT_MIRROR_LINES);
     match state.delivery.capture_tail(&target, lines) {
-        Ok(content) => content.into_response(),
+        Ok(content) => serve_process_mirror(&content, lines).into_response(),
         Err(message) => (
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1997,6 +2012,474 @@ async fn api_mirror(
         )
             .into_response(),
     }
+}
+
+fn serve_process_mirror(raw: &str, lines: u32) -> String {
+    const BOX_SEPARATOR: &str = "────────────────────────────────────────────────────────────";
+    let without_osc = serve_strip_osc_sequences(raw);
+    let normalized = serve_replace_box_runs(&without_osc, BOX_SEPARATOR);
+    let mut visible = normalized
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let lines = usize::try_from(lines).unwrap_or(usize::MAX);
+    if lines != 0 && visible.len() > lines {
+        visible = visible.split_off(visible.len() - lines);
+    }
+    format!("{}{}", "\n".repeat(lines.saturating_sub(visible.len())), visible.join("\n"))
+}
+
+fn serve_strip_osc_sequences(raw: &str) -> String {
+    let mut stripped = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    while let Some(offset) = raw[cursor..].find("\x1b]") {
+        let start = cursor + offset;
+        stripped.push_str(&raw[cursor..start]);
+        let bytes = raw.as_bytes();
+        let mut index = start + 2;
+        let mut terminator = None;
+        while index < bytes.len() {
+            if bytes[index] == b'\x07' {
+                terminator = Some(index + 1);
+                break;
+            }
+            if bytes[index] == b'\x1b' {
+                if bytes.get(index + 1) == Some(&b'\\') {
+                    terminator = Some(index + 2);
+                }
+                break;
+            }
+            index += 1;
+        }
+        if let Some(end) = terminator {
+            cursor = end;
+        } else {
+            stripped.push_str("\x1b]");
+            cursor = start + 2;
+        }
+    }
+    stripped.push_str(&raw[cursor..]);
+    stripped
+}
+
+fn serve_replace_box_runs(input: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut run = String::new();
+    let mut count = 0;
+    for character in input.chars() {
+        if matches!(character, '─' | '━') {
+            run.push(character);
+            count += 1;
+            continue;
+        }
+        if count >= 6 {
+            output.push_str(replacement);
+        } else {
+            output.push_str(&run);
+        }
+        run.clear();
+        count = 0;
+        output.push(character);
+    }
+    if count >= 6 {
+        output.push_str(replacement);
+    } else {
+        output.push_str(&run);
+    }
+    output
+}
+
+async fn api_action(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let action = serde_json::from_slice::<ActionBody>(&body).unwrap_or_default();
+    match action.kind.as_deref() {
+        Some("send") => {
+            let payload = json!({"target": action.target, "text": action.text});
+            serve_deliver_send(&state, &headers, &Bytes::from(payload.to_string()))
+        }
+        Some("workspace-create") => {
+            let Some(name) = action.name.filter(|name| !name.trim().is_empty()) else {
+                return serve_ui_error(StatusCode::BAD_REQUEST, "name required");
+            };
+            let node_id = load_hey_config().node.unwrap_or_else(|| "local".to_owned());
+            api_workspace_create(State(state), Json(WorkspaceCreateBody { name, node_id }))
+                .await
+                .into_response()
+        }
+        _ => serve_ui_error(StatusCode::BAD_REQUEST, "unsupported action"),
+    }
+}
+
+async fn api_attach(mut multipart: Multipart) -> Response {
+    const MAX_BYTES: usize = 10 * 1024 * 1024;
+    const ALLOWED_MIME: &[(&str, &str)] = &[
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/webp", "webp"),
+        ("image/heic", "heic"),
+        ("image/heif", "heif"),
+    ];
+    let field = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("file") => field,
+        Ok(_) => return serve_ui_error(StatusCode::BAD_REQUEST, "missing file field"),
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &format!("invalid upload: {error}")),
+    };
+    let name = serve_safe_attachment_name(field.file_name().unwrap_or("upload"));
+    let mime_type = field
+        .content_type()
+        .map_or_else(String::new, ToOwned::to_owned);
+    let Some((_, extension)) = ALLOWED_MIME.iter().find(|(mime, _)| *mime == mime_type) else {
+        return serve_ui_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported mime type");
+    };
+    let bytes = match field.bytes().await {
+        Ok(bytes) if bytes.len() <= MAX_BYTES => bytes,
+        Ok(_) => return serve_ui_error(StatusCode::PAYLOAD_TOO_LARGE, "file too large"),
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &format!("invalid upload: {error}")),
+    };
+    let id = serve_attachment_id();
+    let filename = format!("{id}.{extension}");
+    let inbox = maw_xdg::maw_data_path(&current_xdg_env(), &["inbox"]);
+    if let Err(error) = std::fs::create_dir_all(&inbox) {
+        return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("create inbox: {error}"));
+    }
+    let path = inbox.join(&filename);
+    if let Err(error) = std::fs::write(&path, &bytes) {
+        return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("write upload: {error}"));
+    }
+    Json(json!({
+        "ok": true,
+        "id": id,
+        "url": format!("/files/{filename}"),
+        "localUrl": path.display().to_string(),
+        "name": name,
+        "size": bytes.len(),
+        "mimeType": mime_type,
+    }))
+    .into_response()
+}
+
+fn serve_safe_attachment_name(name: &str) -> String {
+    let safe = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() { "upload".to_owned() } else { safe }
+}
+
+fn serve_attachment_id() -> String {
+    let mut bytes = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut id = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut id, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    id
+}
+
+async fn api_config() -> Response {
+    match config_load_layers() {
+        Ok(mut loaded) => {
+            config_redact_value(&mut loaded.config);
+            Json(loaded.config).into_response()
+        }
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    }
+}
+
+async fn api_config_files() -> Response {
+    let mut files = vec![json!({"name": "maw.config.json", "path": "maw.config.json", "enabled": true})];
+    let fleet_dir = maw_xdg::maw_core_paths(&current_xdg_env()).fleet_dir;
+    let mut names = std::fs::read_dir(fleet_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| serve_fleet_config_file_name(name))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    names.sort();
+    files.extend(names.into_iter().map(|name| {
+        json!({"name": name, "path": format!("fleet/{name}"), "enabled": !name.ends_with(".disabled")})
+    }));
+    Json(json!({"files": files})).into_response()
+}
+
+async fn api_config_file(Query(query): Query<ConfigFileQuery>) -> Response {
+    let Some(name) = query.path.as_deref() else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "path required");
+    };
+    let path = match serve_config_file_path(name) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return serve_ui_error(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("read config: {error}")),
+    };
+    if name == "maw.config.json" {
+        let Ok(mut value) = serde_json::from_str::<Value>(&raw) else {
+            return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, "invalid config JSON");
+        };
+        config_redact_value(&mut value);
+        return Json(json!({"content": serde_json::to_string_pretty(&value).unwrap_or_default()})).into_response();
+    }
+    Json(json!({"content": raw})).into_response()
+}
+
+async fn api_config_file_save(
+    Query(query): Query<ConfigFileQuery>,
+    Json(body): Json<ConfigFileSaveBody>,
+) -> Response {
+    let Some(name) = query.path.as_deref() else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "path required");
+    };
+    let path = match serve_config_file_path(name) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::FORBIDDEN, &error),
+    };
+    if serde_json::from_str::<Value>(&body.content).is_err() {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "invalid JSON");
+    }
+    let content = format!("{}\n", body.content.trim_end());
+    let result = if name == "maw.config.json" {
+        config_atomic_write(&path, &content)
+    } else {
+        path.parent()
+            .ok_or_else(|| "fleet path has no parent".to_owned())
+            .and_then(|parent| std::fs::create_dir_all(parent).map_err(|error| error.to_string()))
+            .and_then(|()| std::fs::write(&path, content).map_err(|error| error.to_string()))
+    };
+    match result {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    }
+}
+
+async fn api_config_file_toggle(Query(query): Query<ConfigFileQuery>) -> Response {
+    let Some(name) = query.path.as_deref().filter(|name| name.starts_with("fleet/")) else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "invalid path");
+    };
+    let path = match serve_config_file_path(name) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let new_name = if let Some(enabled) = name.strip_suffix(".disabled") {
+        enabled.to_owned()
+    } else {
+        format!("{name}.disabled")
+    };
+    let new_path = match serve_config_file_path(&new_name) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &error),
+    };
+    match std::fs::rename(path, new_path) {
+        Ok(()) => Json(json!({"ok": true, "newPath": new_name})).into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serve_ui_error(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("toggle config: {error}")),
+    }
+}
+
+async fn api_config_file_delete(Query(query): Query<ConfigFileQuery>) -> Response {
+    let Some(name) = query.path.as_deref().filter(|name| name.starts_with("fleet/")) else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "cannot delete");
+    };
+    let path = match serve_config_file_path(name) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &error),
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serve_ui_error(StatusCode::NOT_FOUND, "not found"),
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("delete config: {error}")),
+    }
+}
+
+async fn api_config_file_create(Json(body): Json<ConfigFileCreateBody>) -> Response {
+    if !serve_json_file_name(&body.name) || !serve_plain_file_name(&body.name) {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "name must end with .json");
+    }
+    if serde_json::from_str::<Value>(&body.content).is_err() {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "invalid JSON");
+    }
+    let path = match serve_config_file_path(&format!("fleet/{}", body.name)) {
+        Ok(path) => path,
+        Err(error) => return serve_ui_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let Some(parent) = path.parent() else {
+        return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, "fleet path has no parent");
+    };
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("create fleet directory: {error}"));
+    }
+    let result = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, format!("{}\n", body.content.trim_end()).as_bytes())
+    });
+    match result {
+        Ok(()) => Json(json!({"ok": true, "path": format!("fleet/{}", body.name)})).into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => serve_ui_error(StatusCode::CONFLICT, "file already exists"),
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("create config: {error}")),
+    }
+}
+
+fn serve_config_file_path(name: &str) -> Result<PathBuf, String> {
+    if name == "maw.config.json" {
+        return Ok(config_target_path());
+    }
+    let Some(file_name) = name.strip_prefix("fleet/") else {
+        return Err("invalid path".to_owned());
+    };
+    if !serve_plain_file_name(file_name) || !serve_fleet_config_file_name(file_name) {
+        return Err("invalid path".to_owned());
+    }
+    Ok(maw_xdg::maw_core_paths(&current_xdg_env()).fleet_dir.join(file_name))
+}
+
+fn serve_plain_file_name(name: &str) -> bool {
+    !name.is_empty() && std::path::Path::new(name).file_name().is_some_and(|file_name| file_name == name)
+}
+
+fn serve_json_file_name(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+fn serve_fleet_config_file_name(name: &str) -> bool {
+    serve_json_file_name(name)
+        || name
+            .strip_suffix(".disabled")
+            .is_some_and(serve_json_file_name)
+}
+
+async fn api_fleet_config() -> Response {
+    let fleet_dir = maw_xdg::maw_core_paths(&current_xdg_env()).fleet_dir;
+    let mut configs = Vec::new();
+    let entries = match std::fs::read_dir(fleet_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Json(json!({"configs": configs})).into_response(),
+        Err(error) => return Json(json!({"configs": configs, "error": error.to_string()})).into_response(),
+    };
+    let mut paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        match std::fs::read_to_string(&path).ok().and_then(|raw| serde_json::from_str::<Value>(&raw).ok()) {
+            Some(config) => configs.push(config),
+            None => return Json(json!({"configs": configs, "error": format!("invalid fleet config: {}", path.display())})).into_response(),
+        }
+    }
+    Json(json!({"configs": configs})).into_response()
+}
+
+async fn api_oracle_search(Query(query): Query<OracleSearchQuery>) -> Response {
+    let Some(q) = query.q.filter(|q| !q.trim().is_empty()) else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "q required");
+    };
+    let mut parameters = vec![("q", q), ("mode", query.mode.unwrap_or_else(|| "hybrid".to_owned())), ("limit", query.limit.unwrap_or_else(|| "10".to_owned()))];
+    if let Some(model) = query.model {
+        parameters.push(("model", model));
+    }
+    serve_oracle_get("search", parameters).await
+}
+
+async fn api_oracle_traces(Query(query): Query<OracleTracesQuery>) -> Response {
+    let limit = match query.limit.as_deref().unwrap_or("10").parse::<u8>() {
+        Ok(limit @ 1..=100) => limit.to_string(),
+        _ => return serve_ui_error(StatusCode::BAD_REQUEST, "limit must be between 1 and 100"),
+    };
+    serve_oracle_get("traces", vec![("limit", limit)]).await
+}
+
+async fn serve_oracle_get(endpoint: &str, parameters: Vec<(&str, String)>) -> Response {
+    let mut base = std::env::var("ORACLE_URL").unwrap_or_else(|_| {
+        config_load_layers()
+            .ok()
+            .and_then(|loaded| loaded.config.get("oracleUrl").and_then(Value::as_str).map(ToOwned::to_owned))
+            .unwrap_or_else(|| "http://localhost:47778".to_owned())
+    });
+    base = base.trim_end_matches('/').to_owned();
+    let Ok(mut url) = reqwest::Url::parse(&format!("{base}/api/{endpoint}")) else {
+        return serve_ui_error(StatusCode::BAD_GATEWAY, "invalid Oracle URL");
+    };
+    url.query_pairs_mut().extend_pairs(parameters.iter().map(|(key, value)| (*key, value.as_str())));
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() {
+        Ok(client) => client,
+        Err(error) => return serve_ui_error(StatusCode::BAD_GATEWAY, &format!("Oracle client: {error}")),
+    };
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(error) => return serve_ui_error(StatusCode::BAD_GATEWAY, &format!("Oracle unreachable: {error}")),
+    };
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(error) => return serve_ui_error(StatusCode::BAD_GATEWAY, &format!("read Oracle response: {error}")),
+    };
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(body) => (status, Json(body)).into_response(),
+        Err(error) => serve_ui_error(StatusCode::BAD_GATEWAY, &format!("invalid Oracle response: {error}")),
+    }
+}
+
+async fn api_pin_set(Json(body): Json<PinBody>) -> Response {
+    let pin = body.pin.unwrap_or_default().chars().filter(char::is_ascii_digit).collect::<String>();
+    let mut config = match config_read_target() {
+        Ok(config) if config.is_object() => config,
+        Ok(_) => json!({}),
+        Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
+    config["pin"] = Value::String(pin.clone());
+    let content = match serde_json::to_string_pretty(&config) {
+        Ok(content) => format!("{content}\n"),
+        Err(error) => return serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("render config: {error}")),
+    };
+    match config_atomic_write(&config_target_path(), &content) {
+        Ok(()) => Json(json!({"ok": true, "length": pin.len(), "enabled": !pin.is_empty()})).into_response(),
+        Err(error) => serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    }
+}
+
+async fn api_pin_verify(Json(body): Json<PinBody>) -> Response {
+    let configured = config_load_layers()
+        .ok()
+        .and_then(|loaded| loaded.config.get("pin").and_then(Value::as_str).map(ToOwned::to_owned))
+        .unwrap_or_default();
+    Json(json!({"ok": configured.is_empty() || body.pin.as_deref() == Some(configured.as_str())})).into_response()
+}
+
+async fn api_sleep(body: Bytes) -> Response {
+    let target = serde_json::from_slice::<SleepApiBody>(&body)
+        .ok()
+        .and_then(|body| body.target)
+        .filter(|target| !target.trim().is_empty());
+    let Some(target) = target else {
+        return serve_ui_error(StatusCode::BAD_REQUEST, "target required");
+    };
+    let output = sleep_run_command(std::slice::from_ref(&target));
+    if output.code == 0 {
+        Json(json!({"ok": true, "target": target})).into_response()
+    } else {
+        serve_ui_error(StatusCode::INTERNAL_SERVER_ERROR, output.stderr.trim())
+    }
+}
+
+fn serve_ui_error(status: StatusCode, error: &str) -> Response {
+    (status, Json(json!({"ok": false, "error": error}))).into_response()
 }
 
 fn serve_capture_tail_with_runner<R: maw_tmux::TmuxRunner>(
@@ -3171,6 +3654,54 @@ struct MirrorQuery {
     lines: Option<u32>,
 }
 
+#[derive(Default, Deserialize)]
+struct ActionBody {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    target: Option<String>,
+    text: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfigFileQuery {
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ConfigFileSaveBody {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigFileCreateBody {
+    name: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct OracleSearchQuery {
+    q: Option<String>,
+    mode: Option<String>,
+    limit: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OracleTracesQuery {
+    limit: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PinBody {
+    pin: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SleepApiBody {
+    target: Option<String>,
+}
+
 #[cfg(test)]
 #[allow(clippy::redundant_closure_for_method_calls)]
 mod serve_tests {
@@ -3481,7 +4012,10 @@ mod serve_tests {
     #[tokio::test]
     async fn serve_api_mirror_returns_text_uses_requested_lines_and_reports_missing_panes() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
-        delivery.set_capture("oracle:0", "oracle terminal output\n");
+        delivery.set_capture(
+            "oracle:0",
+            "\x1b]8;;https://example.test\x1b\\linked\x1b]8;;\x07\n────────\n\nsecond\n",
+        );
         let app = serve_test_app_with_o6_keys_and_delivery(
             Vec::new(),
             1_782_277_200,
@@ -3507,23 +4041,37 @@ mod serve_tests {
         let default_body = axum::body::to_bytes(default_response.into_body(), 64 * 1024)
             .await
             .expect("default mirror body");
-        assert_eq!(default_body.as_ref(), b"oracle terminal output\n");
-        assert_eq!(delivery.capture_requests(), vec![("oracle:0".to_owned(), 50)]);
+        assert_eq!(
+            default_body.as_ref(),
+            format!(
+                "{}linked\n────────────────────────────────────────────────────────────\nsecond",
+                "\n".repeat(37)
+            )
+            .as_bytes()
+        );
+        assert_eq!(delivery.capture_requests(), vec![("oracle:0".to_owned(), 40)]);
 
         let requested_response = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/api/mirror?target=oracle%3A0&lines=12")
+                    .uri("/api/mirror?target=oracle%3A0&lines=3")
                     .body(Body::empty())
                     .expect("requested mirror request"),
-            )
-            .await
-            .expect("requested mirror response");
+        )
+        .await
+        .expect("requested mirror response");
         assert_eq!(requested_response.status(), StatusCode::OK);
+        let requested_body = axum::body::to_bytes(requested_response.into_body(), 64 * 1024)
+            .await
+            .expect("requested mirror body");
+        assert_eq!(
+            requested_body.as_ref(),
+            "linked\n────────────────────────────────────────────────────────────\nsecond".as_bytes()
+        );
         assert_eq!(
             delivery.capture_requests(),
-            vec![("oracle:0".to_owned(), 50), ("oracle:0".to_owned(), 12)]
+            vec![("oracle:0".to_owned(), 40), ("oracle:0".to_owned(), 3)]
         );
 
         delivery.set_capture_error(Some("can't find pane: missing:0"));
@@ -3541,6 +4089,40 @@ mod serve_tests {
         assert_eq!(missing_body["error"], "pane_not_found");
         assert_eq!(missing_body["target"], "missing:0");
         assert_eq!(missing_body["message"], "can't find pane: missing:0");
+    }
+
+    #[tokio::test]
+    async fn serve_ui_compat_routes_are_mounted() {
+        let app = serve_test_app_with_o6_keys(Vec::new(), 1_782_277_200, Some(NON_LOOPBACK_TEST_PEER));
+        let requests = [
+            (Method::GET, "/api/config", ""),
+            (Method::GET, "/api/config-files", ""),
+            (Method::GET, "/api/fleet-config", ""),
+            (Method::GET, "/api/oracle/search", ""),
+            (Method::GET, "/api/oracle/traces?limit=invalid", ""),
+            (Method::POST, "/api/action", r#"{"type":"unsupported"}"#),
+            (Method::POST, "/api/attach", ""),
+            (Method::POST, "/api/pin-set", r#"{"pin":0}"#),
+            (Method::POST, "/api/pin-verify", r#"{"pin":0}"#),
+            (Method::POST, "/api/sleep", "{}"),
+            (Method::GET, "/ws/pty", ""),
+        ];
+
+        for (method, uri, body) in requests {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("ui compatibility request"),
+                )
+                .await
+                .expect("ui compatibility response");
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[test]
