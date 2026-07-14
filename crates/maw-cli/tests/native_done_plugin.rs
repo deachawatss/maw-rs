@@ -74,7 +74,7 @@ if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; th
   if [ "$2" = "{worktree}" ]; then printf '{worktree}\n'; exit 0; fi
   exit 128
 fi
-if [ "$1" = "-C" ] && [ "$2" = "{main}" ] && [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
+if [ "$1" = "-C" ] && [ "$2" = "{worktree}" ] && [ "$3" = "worktree" ] && [ "$4" = "list" ] && [ "$5" = "--porcelain" ]; then
   printf 'worktree {main}\n\nworktree {worktree}\n\n'
   exit 0
 fi

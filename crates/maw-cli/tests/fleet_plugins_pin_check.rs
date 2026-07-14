@@ -20,10 +20,15 @@
 //! reproduces its committed pin.
 
 use maw_cli::run_cli;
-use maw_plugin_manifest::hash_file;
+use maw_plugin_manifest::{
+    hash_file, invoke_plugin, load_manifest_from_dir, ExtismWasmInvokeRuntime, InvokeContext,
+    InvokeSource, LoadedPlugin, MawWasmHost,
+};
 use serde_json::Value;
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, create_dir_all, read_to_string};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Manifest filenames a fleet plugin may use to declare its ship artifact. `plugin.json`
@@ -49,13 +54,15 @@ fn args(values: &[&str]) -> Vec<String> {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
     let dir = std::env::temp_dir().join(format!(
-        "maw-rs-fleet-pin-{label}-{}-{nonce}",
-        std::process::id()
+        "maw-rs-fleet-pin-{label}-{}-{nonce}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     create_dir_all(&dir).expect("temp dir");
     dir
@@ -73,6 +80,107 @@ fn copy_tree(src: &Path, dst: &Path) {
             fs::copy(&from, &to).expect("copy file");
         }
     }
+}
+
+fn seed_ctq_vault(root: &Path) {
+    let atlas = root.join("vault/atlas/inbox");
+    let neo = root.join("vault/neo/inbox");
+    create_dir_all(&atlas).expect("atlas inbox");
+    create_dir_all(&neo).expect("neo inbox");
+    fs::write(atlas.join("001-handoff.md"), "---\nfrom: zai\nto: nat\nteam: atlas\ntype: handoff\nsubject: Review vault scanner\n---\nPlease review the vault scanner.\n").expect("atlas msg");
+    fs::write(neo.join("002-question.md"), "---\nfrom: morpheus\nto: zai\nteam: neo\ntype: question\nsubject: Need queue answer\n---\nCan you confirm the queue filter?\n").expect("neo msg");
+}
+
+fn hermes_fake_body(path: &str) -> &'static str {
+    match path {
+        "/users/@me" => r#"{"username":"hermes-bot","id":"bot-42","bot":true}"#,
+        "/users/@me/guilds" => r#"[{"name":"Nous","id":"guild1"}]"#,
+        "/channels/ch1" => r#"{"id":"ch1","guild_id":"guild1"}"#,
+        "/channels/ch1/messages" => {
+            r#"[{"id":"m2","author":{"username":"trinity","bot":true},"content":"ack"},{"id":"m1","author":{"username":"neo","bot":false},"content":"hello"}]"#
+        }
+        "/guilds/guild1/threads/active" => {
+            r#"{"threads":[{"id":"th1","name":"Alpha","parent_id":"ch1","message_count":2,"last_message_id":"9"}]}"#
+        }
+        "/channels/ch1/threads/archived/public" => {
+            r#"{"threads":[{"id":"th2","name":"Old","parent_id":"ch1","message_count":1,"last_message_id":"7"}]}"#
+        }
+        "/channels/th1/messages" => {
+            r#"[{"id":"tm1","author":{"username":"morpheus","bot":false},"content":"thread hi"}]"#
+        }
+        "/channels/th2/messages" => {
+            r#"[{"id":"tm0","author":{"username":"archive-bot","bot":true},"content":"old note"}]"#
+        }
+        _ => r#"{"error":"unexpected fake path"}"#,
+    }
+}
+
+fn hermes_host(plugin: &LoadedPlugin) -> MawWasmHost {
+    let mut host = MawWasmHost::new(plugin);
+    for (path, query) in [
+        ("/users/@me", None),
+        ("/users/@me/guilds", None),
+        (
+            "/channels/ch1/messages",
+            Some(serde_json::json!({"limit": "2"})),
+        ),
+        ("/channels/ch1", None),
+        ("/guilds/guild1/threads/active", None),
+        (
+            "/channels/ch1/threads/archived/public",
+            Some(serde_json::json!({"limit": "50"})),
+        ),
+        (
+            "/channels/th1/messages",
+            Some(serde_json::json!({"limit": "50"})),
+        ),
+        (
+            "/channels/th2/messages",
+            Some(serde_json::json!({"limit": "50"})),
+        ),
+    ] {
+        let mut request = serde_json::json!({
+            "endpoint": "discord-rest",
+            "method": "GET",
+            "path": path,
+        });
+        if let Some(query) = query {
+            request["query"] = query;
+        }
+        let response = serde_json::json!({
+            "ok": true,
+            "value": {"status": 200, "body": hermes_fake_body(path)},
+        });
+        host = host.with_fake_response("maw.net.fetch", request.to_string(), response.to_string());
+    }
+    host
+}
+
+#[rustfmt::skip]
+fn atlas_host(plugin: &LoadedPlugin) -> MawWasmHost {
+    let responses = [
+        ("/users/@me", None, r#"{"username":"atlas-bot","id":"bot-72","bot":true}"#),
+        ("/users/@me/guilds", None, r#"[{"name":"Fleet Lab","id":"guild1"}]"#),
+        ("/guilds/guild1/channels", None, r#"[{"id":"ch1","name":"ops","type":0},{"id":"vc1","name":"Lounge","type":2}]"#),
+        ("/channels/ch1/messages", Some(serde_json::json!({"limit": "2"})), r#"[{"id":"m2","author":{"username":"atlas-bot","bot":true},"content":"ack","timestamp":"2026-07-13T10:02:00Z"},{"id":"m1","author":{"username":"nat","bot":false},"content":"hello","timestamp":"2026-07-13T10:01:00Z"}]"#),
+        ("/guilds/guild1/threads/active", None, r#"{"threads":[{"id":"th1","name":"ops-thread","parent_id":"ch1"}]}"#),
+    ];
+    responses.into_iter().fold(MawWasmHost::new(plugin), |host, (path, query, body)| {
+        let mut request = serde_json::json!({"endpoint":"discord-rest","method":"GET","path":path});
+        if let Some(query) = query { request["query"] = query; }
+        let response = serde_json::json!({"ok":true,"value":{"status":200,"body":body}});
+        host.with_fake_response("maw.net.fetch", request.to_string(), response.to_string())
+    })
+}
+
+fn normalize_root(root: &Path, output: &str) -> String {
+    let raw = root.display().to_string();
+    let mut normalized = output.replace(&format!("/private{raw}"), "$ROOT");
+    normalized = normalized.replace(&raw, "$ROOT");
+    if let Ok(canonical) = root.canonicalize() {
+        normalized = normalized.replace(&canonical.display().to_string(), "$ROOT");
+    }
+    normalized
 }
 
 /// An `artifact` pin declared by one manifest: the relative artifact path + its sha256.
@@ -243,13 +351,14 @@ fn fleet_plugins_artifacts_match_manifest_sha256() {
 }
 
 #[test]
-fn cross_team_queue_fleet_artifact_installs_and_invokes_scaffold() {
+fn cross_team_queue_fleet_artifact_installs_and_scans_vault() {
     let source = fleet_plugins_dir().join("cross-team-queue");
     assert!(
         source.join("plugin.json").is_file(),
         "missing cross-team-queue fleet plugin"
     );
     let root = temp_dir("ctq-invoke");
+    seed_ctq_vault(&root);
     let install_root = root.join("plugins");
     let install = run_cli(&args(&[
         "plugin",
@@ -264,32 +373,195 @@ fn cross_team_queue_fleet_artifact_installs_and_invokes_scaffold() {
         install.stderr, install.stdout
     );
 
-    let invoke = run_cli(&args(&[
-        "plugin-manifest",
-        "invoke",
-        "--scan-dir",
+    let plugin = load_manifest_from_dir(&install_root.join("cross-team-queue"))
+        .expect("load installed cross-team-queue")
+        .expect("installed cross-team-queue manifest");
+    let invoke_ctq = |argv: &[&str]| {
+        let context = InvokeContext::new(
+            InvokeSource::Cli,
+            argv.iter().map(|value| (*value).to_owned()).collect(),
+        );
+        let host = MawWasmHost::new(&plugin)
+            .with_vault_config_roots(Some(root.join("vault")), None)
+            .with_manifest_fs_roots_from(&root);
+        let mut runtime = ExtismWasmInvokeRuntime::default().with_host("cross-team-queue", host);
+        invoke_plugin(&plugin, &context, &mut runtime)
+    };
+    let invoke = invoke_ctq(&["--json"]);
+    let filtered = invoke_ctq(&["--json", "--recipient", "nat"]);
+
+    assert!(invoke.ok, "plugin invoke failed: {:?}", invoke.error);
+    let stdout = invoke.output.unwrap_or_default();
+    assert_eq!(
+        normalize_root(&root, &format!("{stdout}\n")),
+        include_str!("fixtures/zerobun/cross-team-queue-scan.stdout")
+    );
+    assert!(filtered.ok, "filtered invoke failed: {:?}", filtered.error);
+    let filtered = normalize_root(&root, &filtered.output.unwrap_or_default());
+    assert!(
+        filtered.contains("\"totalItems\":1")
+            && filtered.contains("\"recipient\":\"nat\"")
+            && !filtered.contains("\"recipient\":\"zai\""),
+        "{filtered}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn team_fleet_artifact_locks_contract_and_lists_read_only_stores() {
+    let source = fleet_plugins_dir().join("team");
+    let manifest: Value =
+        serde_json::from_str(&read_to_string(source.join("plugin.json")).expect("team manifest"))
+            .expect("manifest json");
+    let contract: Value =
+        serde_json::from_str(&read_to_string(source.join("contract.json")).expect("team contract"))
+            .expect("contract json");
+    assert_eq!(manifest["cli"]["command"], contract["command"]);
+    assert_eq!(manifest["cli"]["aliases"], contract["aliases"]);
+    assert_eq!(manifest["cli"]["help"], contract["usage"]);
+    assert_eq!(
+        manifest["capabilities"],
+        serde_json::json!(["fs:read:teams", "fs:read:vault", "tmux:read"])
+    );
+
+    let root = temp_dir("team-list");
+    for (path, body) in [
+        (
+            ".claude/teams/alpha/config.json",
+            r#"{"name":"alpha","members":[{"name":"lead","agentType":"team-lead","tmuxPaneId":"%0"},{"name":"scout","tmuxPaneId":"%1"},{"name":"reviewer","tmuxPaneId":"%dead"}]}"#,
+        ),
+        (
+            ".claude/teams/quiet/config.json",
+            r#"{"name":"quiet","members":[{"name":"builder","tmuxPaneId":""}]}"#,
+        ),
+        (
+            "vault/memory/mailbox/teams/vault-only/manifest.json",
+            r#"{"members":["archivist",{"name":"scribe"}]}"#,
+        ),
+        (
+            "vault/memory/mailbox/teams/alpha/manifest.json",
+            r#"{"members":["duplicate"]}"#,
+        ),
+    ] {
+        let path = root.join(path);
+        create_dir_all(path.parent().expect("fixture parent")).expect("fixture dir");
+        fs::write(path, body).expect("fixture file");
+    }
+    let plugin = load_manifest_from_dir(&source)
+        .expect("load team")
+        .expect("team manifest");
+    for args in [vec![], vec!["list".to_owned()], vec!["ls".to_owned()]] {
+        let host = MawWasmHost::new(&plugin)
+            .with_vault_config_roots(Some(root.join("vault")), None)
+            .with_manifest_fs_roots_from(&root)
+            .with_fake_response(
+                "maw.tmux.command",
+                r##"{"command":"list-panes","args":["-a","-F","#{pane_id}"]}"##,
+                r#"{"ok":true,"value":{"command":"list-panes","args":[],"stdout":"%0\n%1\n"}}"#,
+            );
+        let mut runtime = ExtismWasmInvokeRuntime::default().with_host("team", host);
+        let invoke = invoke_plugin(
+            &plugin,
+            &InvokeContext::new(InvokeSource::Cli, args.clone()),
+            &mut runtime,
+        );
+        assert!(invoke.ok, "team {args:?} failed: {:?}", invoke.error);
+        assert_eq!(
+            normalize_root(&root, &invoke.output.unwrap_or_default()),
+            include_str!("fixtures/zerobun/team-wasm-list.stdout")
+        );
+    }
+    fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn hermes_fleet_artifact_invokes_discord_read_only_verbs() {
+    let source = fleet_plugins_dir().join("hermes");
+    let manifest: Value =
+        serde_json::from_str(&read_to_string(source.join("plugin.json")).expect("hermes manifest"))
+            .expect("json");
+    assert_eq!(
+        manifest["capabilities"],
+        serde_json::json!(["net:fetch:discord-rest", "secret:use:discord-bot-token"])
+    );
+    assert_eq!(
+        manifest["secrets"]["discord-bot-token"]["env"],
+        "DISCORD_BOT_TOKEN"
+    );
+    let root = temp_dir("hermes-invoke");
+    let staged = root.join("hermes");
+    copy_tree(&source, &staged);
+    let install_root = root.join("plugins");
+    let install = run_cli(&args(&[
+        "plugin",
+        "install",
+        &staged.display().to_string(),
+        "--root",
         &install_root.display().to_string(),
-        "--plugin",
-        "cross-team-queue",
-        "--arg",
-        "--json",
-        "--arg",
-        "--recipient",
-        "--arg",
-        "nat",
     ]));
+    assert_eq!(
+        install.code, 0,
+        "plugin install failed: {}\n{}",
+        install.stderr, install.stdout
+    );
+
+    let plugin = load_manifest_from_dir(&install_root.join("hermes"))
+        .expect("load installed hermes")
+        .expect("installed hermes manifest");
+    let mut observed = String::new();
+    for (label, argv) in [
+        ("whoami", vec!["whoami"]),
+        ("channels", vec!["channels"]),
+        ("read", vec!["read", "ch1", "2"]),
+        ("threads-list", vec!["threads", "list", "ch1", "--all"]),
+        ("threads-read", vec!["threads", "read", "ch1", "--all"]),
+    ] {
+        let context = InvokeContext::new(
+            InvokeSource::Cli,
+            argv.into_iter().map(str::to_owned).collect(),
+        );
+        let mut runtime =
+            ExtismWasmInvokeRuntime::default().with_host("hermes", hermes_host(&plugin));
+        let invoke = invoke_plugin(&plugin, &context, &mut runtime);
+        assert!(invoke.ok, "hermes {label} failed: {:?}", invoke.error);
+        writeln!(
+            &mut observed,
+            "## {label}\n{}",
+            invoke.output.unwrap_or_default()
+        )
+        .expect("append observed");
+    }
     fs::remove_dir_all(&root).ok();
 
     assert_eq!(
-        invoke.code, 0,
-        "plugin invoke failed: {}\n{}",
-        invoke.stderr, invoke.stdout
+        observed,
+        include_str!("fixtures/zerobun/hermes-wasm-read-only.stdout")
     );
-    assert_eq!(
-        invoke.stdout,
-        include_str!("fixtures/zerobun/cross-team-queue-empty.stdout")
-    );
-    assert!(invoke.stderr.is_empty(), "{}", invoke.stderr);
+}
+
+#[test]
+#[rustfmt::skip]
+fn atlas_fleet_artifact_invokes_read_only_state_verbs() {
+    let source = fleet_plugins_dir().join("atlas");
+    let manifest: Value = serde_json::from_str(&read_to_string(source.join("plugin.json")).expect("atlas manifest")).expect("json");
+    assert_eq!(manifest["capabilities"], serde_json::json!(["net:fetch:discord-rest", "secret:use:atlas-bot-token"]));
+    assert_eq!(manifest["secrets"]["atlas-bot-token"]["pass"], "discord/atlas-oracle-token");
+    assert_eq!(manifest["cli"]["aliases"], serde_json::json!(["at"]));
+    let root = temp_dir("atlas-invoke");
+    let install_root = root.join("plugins");
+    let install = run_cli(&args(&["plugin", "install", &source.display().to_string(), "--root", &install_root.display().to_string()]));
+    assert_eq!(install.code, 0, "plugin install failed: {}\n{}", install.stderr, install.stdout);
+    let plugin = load_manifest_from_dir(&install_root.join("atlas")).expect("load installed atlas").expect("installed atlas manifest");
+    let mut observed = String::new();
+    for (label, argv) in [("whoami", vec!["whoami"]), ("ls", vec!["ls"]), ("read", vec!["read", "ops", "--limit=2"]), ("threads", vec!["threads", "--json"])] {
+        let context = InvokeContext::new(InvokeSource::Cli, argv.into_iter().map(str::to_owned).collect());
+        let mut runtime = ExtismWasmInvokeRuntime::default().with_host("atlas", atlas_host(&plugin));
+        let invoke = invoke_plugin(&plugin, &context, &mut runtime);
+        assert!(invoke.ok, "atlas {label} failed: {:?}", invoke.error);
+        writeln!(&mut observed, "## {label}\n{}", invoke.output.unwrap_or_default()).expect("append observed");
+    }
+    fs::remove_dir_all(&root).ok();
+    assert_eq!(observed, include_str!("fixtures/zerobun/atlas-wasm-read-only.stdout"));
 }
 
 #[test]

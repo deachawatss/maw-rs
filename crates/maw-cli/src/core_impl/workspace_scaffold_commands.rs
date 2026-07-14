@@ -1135,7 +1135,7 @@ fn new_ensure_fleet_session_entry(session: &str, window: &str, cwd: &std::path::
         return Ok(NewFleetStatusNative::Skipped);
     };
     let env = current_xdg_env();
-    if fleet_load_entries_for_env(&env).iter().any(|entry| entry.session.name == session) {
+    if fleet_load_entries_for_env(&env).iter().any(|entry| fleet_entry_is_session(entry) && entry.session.name == session) {
         return Ok(NewFleetStatusNative::Exists);
     }
     let fleet_dir = maw_state_path(&env, &["fleet"]);
@@ -1363,7 +1363,11 @@ fn promote_resolution_error_message(target: &str, resolved: PromoteResolveResult
 }
 
 fn promote_destination_session(options: &PromoteOptionsNative, src_window: &str) -> Result<String, String> {
-    let destination = if let Some(value) = &options.as_session { promote_validate_session_name(value, "--as")? } else { wake_session_name(src_window) };
+    let destination = if let Some(value) = &options.as_session {
+        promote_validate_session_name(value, "--as")?
+    } else {
+        wake_session_name(src_window, &[])
+    };
     promote_validate_session_name(&destination, "destination session")
 }
 

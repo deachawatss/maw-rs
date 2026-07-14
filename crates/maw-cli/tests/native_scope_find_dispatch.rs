@@ -23,6 +23,7 @@ fn epic55_run(args: &[&str], cwd: &Path, maw_home: &Path, ghq_root: &Path) -> st
     Command::new(epic55_bin())
         .args(args)
         .current_dir(cwd)
+        .env("HOME", maw_home)
         .env("MAW_HOME", maw_home)
         .env("GHQ_ROOT", ghq_root)
         .env("MAW_JS_REF_DIR", "/nonexistent")
@@ -114,10 +115,6 @@ fn epic55_dispatch_registers_scope_find_without_token_slice() {
     );
     assert_eq!(
         maw_cli::dispatcher_status("find"),
-        maw_cli::DispatchKind::Native
-    );
-    assert_eq!(
-        maw_cli::dispatcher_status("token"),
         maw_cli::DispatchKind::Native
     );
 }

@@ -1,17 +1,21 @@
 use axum::{
-    body::Bytes,
-    extract::{ConnectInfo, Path as AxumPath, Query, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
-    response::IntoResponse,
-    routing::{get, post},
+    body::{Body, Bytes},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{any, get, post},
     Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashSet,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
 };
 #[cfg(test)]
@@ -45,6 +49,52 @@ struct ServeState {
     #[cfg(test)]
     serve_core_state_override: Option<crate::serve_core::ServecoreSharedState>,
     trust_store_path: std::path::PathBuf,
+    plugin_serve_routes: Vec<ServePluginRoute>,
+    api_token_auth: ServeApiTokenAuth,
+}
+
+#[derive(Debug, Clone)]
+struct ServePluginRoute {
+    name: String,
+    command: Option<String>,
+    prefix: String,
+    health_path: String,
+    events: Vec<String>,
+    event_path: Option<String>,
+    dir: PathBuf,
+    process: Arc<Mutex<Option<ServePluginProcess>>>,
+}
+
+#[derive(Debug)]
+struct ServePluginProcess { port: u16, child: Child }
+
+impl Drop for ServePluginProcess {
+    fn drop(&mut self) { let _ = self.child.kill(); }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ServeApiTokenAuth {
+    token: Option<String>,
+    loopback_exempt: bool,
+    forced_open: bool,
+}
+
+impl ServeApiTokenAuth {
+    #[cfg(test)]
+    fn open() -> Self { Self { token: None, loopback_exempt: true, forced_open: true } }
+
+    fn mode_label(&self) -> &'static str {
+        if self.forced_open { "open (configured)" } else if self.token.is_some() { "token" } else { "open" }
+    }
+
+    fn token_matches(&self, headers: &HeaderMap) -> bool {
+        let Some(token) = self.token.as_deref() else { return true; };
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        bearer == Some(token) || header_to_string(headers, "x-maw-token") == token
+    }
 }
 
 trait ServeDelivery: Send + Sync {
@@ -189,6 +239,7 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
             }
         }
     };
+    let api_token_auth = load_serve_api_token_auth();
     let app = serve_router(ServeState {
         cached_pubkey: args.cached_pubkey,
         peer_pubkeys: load_inbound_peer_pubkeys(),
@@ -206,8 +257,11 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         #[cfg(test)]
         serve_core_state_override: None,
         trust_store_path: trust_store_path(),
+        plugin_serve_routes: serve_discover_plugin_routes(),
+        api_token_auth: api_token_auth.clone(),
     });
     println!("maw-rs serve listening http://{local_addr}");
+    println!("maw-rs serve auth: {}", api_token_auth.mode_label());
     match axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -365,10 +419,12 @@ fn serve_core_state(state: &ServeState) -> crate::serve_core::ServecoreSharedSta
 
 fn serve_router(state: ServeState) -> Router {
     let serve_core_state = serve_core_state(&state);
+    let plugin_serve_routes = state.plugin_serve_routes.clone();
     let state = Arc::new(state);
     let router = Router::new();
     let router = crate::serve_core::servecore_mount_core_routes(router);
     let router = crate::serve_core::modules::servecore_mount_modules(router, &[]);
+    let router = serve_mount_plugin_routes(router, &plugin_serve_routes);
     let router = router
         .route("/api/send", post(api_send))
         .route("/api/feed", get(api_feed_get).post(api_feed_post))
@@ -398,8 +454,302 @@ fn serve_router(state: ServeState) -> Router {
         .route("/api/workspace/:id/message", post(api_workspace_message));
     let router = router.fallback(api_not_found);
     let router = crate::serve_core::servecore_apply_pipeline(router);
+    let router = router.layer(middleware::from_fn_with_state(
+        state.api_token_auth.clone(),
+        serve_api_token_gate,
+    ));
     let router = crate::serve_core::servecore_with_shared_state(router, serve_core_state);
     router.with_state(state)
+}
+
+async fn serve_api_token_gate(
+    State(auth): State<ServeApiTokenAuth>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    if !path.starts_with("/api/") || path == "/api/health" || auth.forced_open || auth.token.is_none() {
+        return next.run(req).await;
+    }
+    if auth.loopback_exempt {
+        if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+            if maw_auth::is_loopback(Some(&peer.ip().to_string())) {
+                return next.run(req).await;
+            }
+        }
+    }
+    if auth.token_matches(req.headers()) {
+        return next.run(req).await;
+    }
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized", "auth": "maw-serve-token"}))).into_response()
+}
+
+fn serve_discover_plugin_routes() -> Vec<ServePluginRoute> {
+    maw_plugin_manifest::discover_packages(&maw_plugin_manifest::DiscoverPackagesOptions::default())
+        .plugins
+        .into_iter()
+        .filter_map(|plugin| {
+            let serve = plugin.manifest.engine?.serve?;
+            let name = plugin.manifest.name;
+            let Some(prefix) = serve.prefix else {
+                eprintln!("maw serve: skipping plugin {name}: engine.serve.prefix missing");
+                return None;
+            };
+            let Some(health_path) =
+                serve_join_plugin_path(&prefix, serve.health.as_deref().unwrap_or("/health"))
+            else {
+                eprintln!("maw serve: skipping plugin {name}: invalid engine.serve health path");
+                return None;
+            };
+            let event_path = match serve.event_path.as_deref() {
+                Some(path) => {
+                    let Some(joined) = serve_join_plugin_path(&prefix, path) else {
+                        eprintln!("maw serve: skipping plugin {name}: invalid engine.serve eventPath");
+                        return None;
+                    };
+                    Some(joined)
+                },
+                None => None,
+            };
+            Some(ServePluginRoute {
+                name,
+                command: serve.command,
+                prefix,
+                health_path,
+                events: serve.events.unwrap_or_default(),
+                event_path,
+                dir: plugin.dir,
+                process: Arc::new(Mutex::new(None)),
+            })
+        })
+        .filter(|route| {
+            let collides = serve_plugin_route_collides(route);
+            if collides {
+                eprintln!(
+                    "maw serve: skipping plugin {}: engine.serve prefix {} collides with core route",
+                    route.name, route.prefix
+                );
+            }
+            !collides
+        })
+        .collect()
+}
+
+fn serve_join_plugin_path(prefix: &str, path: &str) -> Option<String> {
+    if !prefix.starts_with("/api/") || !path.starts_with('/') {
+        return None;
+    }
+    Some(format!("{}{}", prefix.trim_end_matches('/'), path))
+}
+
+fn serve_plugin_route_collides(route: &ServePluginRoute) -> bool {
+    const CORE_PREFIXES: &[&str] = &[
+        "/api/agents", "/api/capture", "/api/feed", "/api/health", "/api/message-ledger",
+        "/api/orchestration", "/api/plugins", "/api/probe", "/api/requests", "/api/reply",
+        "/api/request", "/api/send", "/api/serve-core", "/api/sessions", "/api/transport",
+        "/api/triggers", "/api/trust", "/api/wake", "/api/workspace", "/api/worktrees",
+    ];
+    CORE_PREFIXES
+        .iter()
+        .any(|core| route.prefix == *core || route.prefix.starts_with(&format!("{core}/")))
+}
+
+fn serve_mount_plugin_routes(
+    mut router: Router<Arc<ServeState>>,
+    plugin_routes: &[ServePluginRoute],
+) -> Router<Arc<ServeState>> {
+    for route in plugin_routes {
+        if route.command.is_some() {
+            router = router
+                .route(&route.prefix, any(api_plugin_serve_proxy))
+                .route(&format!("{}/*path", route.prefix), any(api_plugin_serve_proxy));
+        }
+        router = router.route(&route.health_path, get(api_plugin_serve_health));
+        if let Some(event_path) = &route.event_path {
+            router = router.route(event_path, get(api_plugin_serve_events));
+        }
+    }
+    router
+}
+
+async fn api_plugin_serve_health(
+    State(state): State<Arc<ServeState>>,
+    uri: Uri,
+) -> Response {
+    let Some(route) = serve_plugin_route_for_path(&state, uri.path()) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "plugin route not found"}))).into_response();
+    };
+    if route.command.is_some() && serve_plugin_process_running(route) {
+        return serve_proxy_to_plugin(route, Method::GET, &uri, HeaderMap::new(), Bytes::new()).await;
+    }
+    (StatusCode::OK, Json(json!({"ok": true, "plugin": route.name, "prefix": route.prefix, "command": route.command, "health": route.health_path}))).into_response()
+}
+
+async fn api_plugin_serve_proxy(
+    State(state): State<Arc<ServeState>>,
+    ws: Option<WebSocketUpgrade>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(route) = serve_plugin_route_for_prefix(&state, uri.path()) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "plugin route not found"}))).into_response();
+    };
+    if let Some(ws) = ws {
+        let route = route.clone();
+        return ws.on_upgrade(move |socket| serve_proxy_websocket(route, uri, headers, socket)).into_response();
+    }
+    serve_proxy_to_plugin(route, method, &uri, headers, body).await
+}
+
+async fn api_plugin_serve_events(
+    State(state): State<Arc<ServeState>>,
+    uri: Uri,
+) -> impl IntoResponse {
+    serve_plugin_route_for_path(&state, uri.path()).map_or_else(
+        || (StatusCode::NOT_FOUND, Json(json!({"ok": false, "error": "plugin route not found"}))),
+        |route| (StatusCode::OK, Json(json!({"ok": true, "plugin": route.name, "events": route.events}))),
+    )
+}
+
+fn serve_plugin_route_for_path<'a>(state: &'a ServeState, path: &str) -> Option<&'a ServePluginRoute> {
+    state
+        .plugin_serve_routes
+        .iter()
+        .find(|route| route.health_path == path || route.event_path.as_deref() == Some(path))
+}
+
+fn serve_plugin_route_for_prefix<'a>(state: &'a ServeState, path: &str) -> Option<&'a ServePluginRoute> {
+    state.plugin_serve_routes.iter().filter(|route| route.command.is_some()).find(|route| path == route.prefix || path.starts_with(&format!("{}/", route.prefix)))
+}
+
+fn serve_plugin_process_running(route: &ServePluginRoute) -> bool {
+    let mut guard = route.process.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(process) = guard.as_mut() else { return false; };
+    if let Ok(None) = process.child.try_wait() { return true; }
+    *guard = None;
+    false
+}
+
+fn serve_plugin_process_port(route: &ServePluginRoute) -> Result<u16, String> {
+    {
+        let mut guard = route.process.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(process) = guard.as_mut() {
+            if process.child.try_wait().map_err(|error| error.to_string())?.is_none() { return Ok(process.port); }
+            *guard = None;
+        }
+    }
+    let port = serve_allocate_loopback_port()?;
+    let command = route.command.as_deref().ok_or_else(|| "missing engine.serve.command".to_owned())?;
+    let argv = command.split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+    let (program, command_args) = argv.split_first().ok_or_else(|| "empty engine.serve.command".to_owned())?;
+    let child = Command::new(program).args(command_args).current_dir(&route.dir)
+        .env("PORT", port.to_string()).env("MAW_ENGINE_SERVE_PORT", port.to_string()).env("MAW_ENGINE_SERVE_PREFIX", &route.prefix)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        .map_err(|error| format!("spawn {}: {error}", route.name))?;
+    let mut guard = route.process.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(ServePluginProcess { port, child });
+    serve_wait_loopback_port(port);
+    Ok(port)
+}
+
+fn serve_allocate_loopback_port() -> Result<u16, String> {
+    TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).and_then(|listener| listener.local_addr()).map(|addr| addr.port()).map_err(|error| format!("allocate plugin port: {error}"))
+}
+
+fn serve_wait_loopback_port(port: u16) {
+    for _ in 0..20 {
+        if TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() { return; }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+async fn serve_proxy_to_plugin(route: &ServePluginRoute, method: Method, uri: &Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let port = match serve_plugin_process_port(route) {
+        Ok(port) => port,
+        Err(error) => return (StatusCode::BAD_GATEWAY, Json(json!({"ok": false, "error": error, "plugin": route.name}))).into_response(),
+    };
+    let target = format!("http://127.0.0.1:{port}{}", uri.path_and_query().map_or_else(|| uri.path().to_owned(), ToString::to_string));
+    let req_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({"ok": false, "error": format!("bad method: {error}")}))).into_response(),
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.request(req_method, &target).body(body.to_vec());
+    if let Some(content_type) = headers.get(axum::http::header::CONTENT_TYPE) {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type.as_bytes());
+    }
+    match request.send().await {
+        Ok(response) => {
+            if response.status() == reqwest::StatusCode::NOT_FOUND && uri.path() != route.health_path && serve_spa_fallback_path(&method, uri).is_some() {
+                if let Ok(fallback) = client.get(format!("http://127.0.0.1:{port}{}/index.html", route.prefix)).send().await {
+                    return serve_proxy_response(fallback).await;
+                }
+            }
+            serve_proxy_response(response).await
+        },
+        Err(error) => (StatusCode::BAD_GATEWAY, Json(json!({"ok": false, "error": format!("proxy failed: {error}"), "plugin": route.name}))).into_response(),
+    }
+}
+
+fn serve_spa_fallback_path(method: &Method, uri: &Uri) -> Option<()> {
+    (method == Method::GET && !uri.path().rsplit('/').next().is_some_and(|segment| segment.contains('.'))).then_some(())
+}
+
+async fn serve_proxy_response(response: reqwest::Response) -> Response {
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = response.headers().get(reqwest::header::CONTENT_TYPE).cloned();
+    let bytes = response.bytes().await.unwrap_or_default();
+    let mut out = (status, Body::from(bytes)).into_response();
+    if let Some(value) = content_type.and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok()) {
+        out.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    out
+}
+
+async fn serve_proxy_websocket(route: ServePluginRoute, uri: Uri, headers: HeaderMap, socket: axum::extract::ws::WebSocket) {
+    let Ok(port) = serve_plugin_process_port(&route) else { return; };
+    let target = format!("ws://127.0.0.1:{port}{}", uri.path_and_query().map_or_else(|| uri.path().to_owned(), ToString::to_string));
+    let Ok(mut request) = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(target) else { return; };
+    if let Some(protocol) = headers.get(axum::http::header::SEC_WEBSOCKET_PROTOCOL).and_then(|value| value.to_str().ok()) {
+        if let Ok(value) = protocol.parse() { request.headers_mut().insert("sec-websocket-protocol", value); }
+    }
+    let Ok((upstream, _)) = tokio_tungstenite::connect_async(request).await else { return; };
+    let (mut client_tx, mut client_rx) = socket.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    loop {
+        tokio::select! {
+            from_client = client_rx.next() => match from_client {
+                Some(Ok(message)) => if let Some(message) = serve_ws_to_upstream(message) { if upstream_tx.send(message).await.is_err() { break; } },
+                _ => break,
+            },
+            from_upstream = upstream_rx.next() => match from_upstream {
+                Some(Ok(message)) => if let Some(message) = serve_ws_to_client(message) { if client_tx.send(message).await.is_err() { break; } },
+                _ => break,
+            },
+        }
+    }
+}
+
+fn serve_ws_to_upstream(message: axum::extract::ws::Message) -> Option<tokio_tungstenite::tungstenite::Message> {
+    match message {
+        axum::extract::ws::Message::Text(text) => Some(tokio_tungstenite::tungstenite::Message::Text(text)),
+        axum::extract::ws::Message::Binary(bytes) => Some(tokio_tungstenite::tungstenite::Message::Binary(bytes)),
+        axum::extract::ws::Message::Ping(bytes) => Some(tokio_tungstenite::tungstenite::Message::Ping(bytes)),
+        axum::extract::ws::Message::Pong(bytes) => Some(tokio_tungstenite::tungstenite::Message::Pong(bytes)),
+        axum::extract::ws::Message::Close(_) => None,
+    }
+}
+
+fn serve_ws_to_client(message: tokio_tungstenite::tungstenite::Message) -> Option<axum::extract::ws::Message> {
+    match message {
+        tokio_tungstenite::tungstenite::Message::Text(text) => Some(axum::extract::ws::Message::Text(text)),
+        tokio_tungstenite::tungstenite::Message::Binary(bytes) => Some(axum::extract::ws::Message::Binary(bytes)),
+        tokio_tungstenite::tungstenite::Message::Ping(bytes) => Some(axum::extract::ws::Message::Ping(bytes)),
+        tokio_tungstenite::tungstenite::Message::Pong(bytes) => Some(axum::extract::ws::Message::Pong(bytes)),
+        tokio_tungstenite::tungstenite::Message::Close(_) | tokio_tungstenite::tungstenite::Message::Frame(_) => None,
+    }
 }
 
 async fn api_send(
@@ -1202,7 +1552,12 @@ fn receiver_inbox_now_millis() -> u128 {
 fn receiver_inbox_iso_from_millis(millis: u128) -> String {
     let seconds = i64::try_from(millis / 1_000).unwrap_or(i64::MAX);
     let ms = u32::try_from(millis % 1_000).unwrap_or(999);
-    let (year, month, day, hour, minute, second) = unix_seconds_to_utc(seconds);
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = cli_dispatch_civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{ms:03}Z")
 }
 
@@ -2151,10 +2506,16 @@ fn verify_protected_request_outcome(
         cached_pubkey,
         now,
     });
-    if maw_auth::is_refuse_decision(&decision) {
-        let kind = decision.kind().to_owned();
+    let refusal = if matches!(&decision, FromVerifyDecision::AcceptLegacy { .. }) {
+        Some("refuse-unsigned")
+    } else if maw_auth::is_refuse_decision(&decision) {
+        Some(decision.kind())
+    } else {
+        None
+    };
+    if let Some(kind) = refusal {
         return ProtectedRequestOutcome::Reject {
-            decision: kind.clone(),
+            decision: kind.to_owned(),
             response: (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "unauthorized", "decision": kind})),
@@ -2209,6 +2570,30 @@ fn extract_auth_headers(headers: &HeaderMap) -> Headers {
         (
             "x-maw-auth-version",
             header_to_string(headers, "x-maw-auth-version"),
+        ),
+        (
+            "x-maw-ed25519-signature",
+            header_to_string(headers, "x-maw-ed25519-signature"),
+        ),
+        (
+            "x-maw-signature-ed25519",
+            header_to_string(headers, "x-maw-signature-ed25519"),
+        ),
+        (
+            "x-maw-from-signature-ed25519",
+            header_to_string(headers, "x-maw-from-signature-ed25519"),
+        ),
+        (
+            "x-maw-ed25519-pubkey",
+            header_to_string(headers, "x-maw-ed25519-pubkey"),
+        ),
+        (
+            "x-maw-pubkey",
+            header_to_string(headers, "x-maw-pubkey"),
+        ),
+        (
+            "x-maw-peer-pubkey",
+            header_to_string(headers, "x-maw-peer-pubkey"),
         ),
     ])
 }
@@ -2308,6 +2693,37 @@ fn unix_millis() -> u64 {
 
 fn agent_key(node_id: &str, name: &str) -> String {
     format!("{node_id}:{name}")
+}
+
+fn load_serve_api_token_auth() -> ServeApiTokenAuth {
+    let config = merged_config_value_for_env(&real_xdg_env());
+    let serve = config.get("serve");
+    let forced_open = serve
+        .and_then(|v| v.get("authMode").or_else(|| v.get("auth")))
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("open"))
+        || serve.and_then(|v| v.get("open")).and_then(Value::as_bool) == Some(true);
+    let loopback_exempt = serve
+        .and_then(|v| v.get("loopbackExempt").or_else(|| v.get("authLoopbackExempt")))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let config_token = serve
+        .and_then(|v| v.get("token").or_else(|| v.get("apiToken")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let env_token = std::env::var("MAW_SERVE_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let env_overrides = env_token.is_some();
+    let token = env_token.or(config_token);
+    ServeApiTokenAuth {
+        token: if forced_open && !env_overrides { None } else { token },
+        loopback_exempt,
+        forced_open: forced_open && !env_overrides,
+    }
 }
 
 fn load_serve_workspace_key() -> Option<String> {
@@ -2929,11 +3345,76 @@ mod serve_tests {
             now_override: Some(1_782_277_200),
             serve_core_state_override: None,
             trust_store_path,
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
         })
+    }
+
+    fn serve_test_app_with_plugin_routes(plugin_serve_routes: Vec<ServePluginRoute>) -> Router {
+        serve_router(ServeState {
+            cached_pubkey: Some(KEY.to_owned()),
+            peer_pubkeys: Vec::new(),
+            workspace_key: Some(KEY.to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            delivery: serve_test_delivery(),
+            receiver_inbox: serve_test_receiver_inbox(),
+            delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            feed: Mutex::new(Vec::new()),
+            peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
+            now_override: Some(1_782_277_200),
+            serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("plugins"),
+            plugin_serve_routes,
+            api_token_auth: ServeApiTokenAuth::open(),
+        })
+    }
+
+    fn serve_test_app_with_api_auth(api_token_auth: ServeApiTokenAuth) -> Router {
+        serve_router(ServeState {
+            cached_pubkey: Some(KEY.to_owned()),
+            peer_pubkeys: Vec::new(),
+            workspace_key: Some(KEY.to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            delivery: serve_test_delivery(),
+            receiver_inbox: serve_test_receiver_inbox(),
+            delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            feed: Mutex::new(Vec::new()),
+            peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
+            now_override: Some(1_782_277_200),
+            serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("api-token"),
+            plugin_serve_routes: vec![ServePluginRoute {
+                name: "testext".to_owned(),
+                command: None,
+                prefix: "/api/testext".to_owned(),
+                health_path: "/api/testext/health".to_owned(),
+                events: Vec::new(),
+                event_path: None,
+                dir: std::env::temp_dir(),
+                process: Arc::new(Mutex::new(None)),
+            }],
+            api_token_auth,
+        })
+    }
+
+    fn serve_test_proxy_route(port: u16, child: Child) -> ServePluginRoute {
+        ServePluginRoute {
+            name: "testext".to_owned(),
+            command: Some("sleep 60".to_owned()),
+            prefix: "/api/testext".to_owned(),
+            health_path: "/api/testext/health".to_owned(),
+            events: Vec::new(),
+            event_path: None,
+            dir: std::env::temp_dir(),
+            process: Arc::new(Mutex::new(Some(ServePluginProcess { port, child }))),
+        }
     }
 
     fn signed_trust_request(method: &str, uri: &str, auth_path: &str, body: &'static str) -> axum::http::Request<Body> {
         let headers = sign_headers_v3_at(
+            KEY,
             KEY,
             FROM,
             method,
@@ -3142,6 +3623,8 @@ mod serve_tests {
             now_override: Some(now),
             serve_core_state_override: None,
             trust_store_path: serve_test_trust_store_path("o6"),
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
         })
     }
 
@@ -3174,6 +3657,28 @@ mod serve_tests {
         request
     }
 
+
+
+    fn unsigned_json_request(method: &str, uri: &str, body: &'static str) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
+        request
+    }
+
+    fn signed_api_send_json_request(
+        body: &'static str,
+        key: &str,
+        from: &str,
+        now: i64,
+    ) -> axum::http::Request<Body> {
+        signed_json_request("POST", "/api/send", body, key, from, now)
+    }
+
     fn signed_json_request(
         method: &str,
         path: &str,
@@ -3182,7 +3687,7 @@ mod serve_tests {
         from: &str,
         now: i64,
     ) -> axum::http::Request<Body> {
-        let headers = sign_headers_v3_at(key, from, method, path, Some(body.as_bytes()), now)
+        let headers = sign_headers_v3_at(key, key, from, method, path, Some(body.as_bytes()), now)
             .expect("sign v3");
         let mut builder = axum::http::Request::builder()
             .method(method)
@@ -3194,6 +3699,36 @@ mod serve_tests {
         let mut request = builder.body(Body::from(body)).expect("request");
         request.extensions_mut().insert(ConnectInfo(NON_LOOPBACK_TEST_PEER));
         request
+    }
+
+
+    #[tokio::test]
+    async fn serve_send_accepts_signed_and_prefixes_bracket_text() {
+        let body = r#"{"target":"capture-agent","text":"[fake:node] signed"}"#;
+        let app = serve_test_app(serve_test_trust_store_path("signed-send"));
+        let response = app.oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200)).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn serve_send_flags_not_rejects_unsigned_legacy_loopback() {
+        let app = serve_test_app_with_o6_keys(vec![], 1_782_277_200, Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 49_152)));
+        let mut unsigned_from = unsigned_json_request("POST", "/api/send", r#"{"target":"capture-agent","text":"[fake] hello"}"#);
+        unsigned_from.headers_mut().insert("x-maw-from", axum::http::HeaderValue::from_static(FROM));
+        let response = app.oneshot(unsigned_from).await.expect("unsigned legacy");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serve_send_rejects_mismatched_signature() {
+        let signed_body = r#"{"target":"capture-agent","text":"hello"}"#;
+        let mut request = signed_api_send_json_request(signed_body, KEY, FROM, 1_782_277_200);
+        *request.body_mut() = Body::from(r#"{"target":"capture-agent","text":"tampered"}"#);
+        let app = serve_test_app(serve_test_trust_store_path("v3-mismatch"));
+        let response = app.oneshot(request).await.expect("mismatch");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -3518,6 +4053,38 @@ mod serve_tests {
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["state"], "delivered");
         assert_eq!(payload["target"], "capture-agent:0");
+    }
+
+    #[tokio::test]
+    async fn serve_o6_send_rejects_unsigned_but_accepts_registered_maw_js_peer() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![captured_send_key()],
+            1_782_553_858,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+        let unsigned = unsigned_json_request(
+            "POST",
+            "/api/send",
+            r#"{"target":"capture-agent","text":"unsigned"}"#,
+        );
+
+        let response = app.clone().oneshot(unsigned).await.expect("unsigned send");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+        assert_eq!(payload["decision"], "refuse-unsigned");
+        assert!(delivery.sends().is_empty());
+
+        let response = app
+            .oneshot(captured_send_request())
+            .await
+            .expect("registered peer send");
+        let status = response.status();
+        let payload = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(delivery.sends().len(), 1);
     }
 
     #[tokio::test]
@@ -4149,6 +4716,8 @@ mod serve_tests {
             now_override: Some(1_782_277_200),
             serve_core_state_override: None,
             trust_store_path: serve_test_trust_store_path("server"),
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
         });
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -4165,6 +4734,16 @@ mod serve_tests {
         addr
     }
 
+    async fn spawn_plugin_proxy_server(route: ServePluginRoute) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy addr");
+        let app = serve_test_app_with_plugin_routes(vec![route]);
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.expect("proxy server");
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn serve_real_wire_accepts_v3_rejects_unsigned_and_accepts_legacy() {
         let addr = spawn_test_server().await;
@@ -4173,6 +4752,7 @@ mod serve_tests {
         let body = r#"{"target":"remote-oracle","text":"hello"}"#;
         let timestamp = 1_782_277_200_i64;
         let headers = sign_headers_v3_at(
+            KEY,
             KEY,
             FROM,
             "POST",
@@ -4224,6 +4804,201 @@ mod serve_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn serve_plugin_proxy_websocket_passthrough() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind ws upstream");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept ws upstream");
+            let mut ws = tokio_tungstenite::accept_async(stream).await.expect("accept websocket");
+            assert_eq!(ws.next().await.expect("frame").expect("ok").into_text().expect("text"), "ping");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text("pong".to_owned())).await.expect("send pong");
+        });
+        let child = Command::new("/bin/sleep").arg("5").spawn().expect("sleep child");
+        let addr = spawn_plugin_proxy_server(serve_test_proxy_route(port, child)).await;
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/testext/ws?room=1")).await.expect("connect proxy ws");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text("ping".to_owned())).await.expect("send ping");
+        let reply = ws.next().await.expect("reply").expect("reply ok").into_text().expect("text");
+        assert_eq!(reply, "pong");
+    }
+
+    #[tokio::test]
+    async fn serve_plugin_proxy_spa_index_fallback_on_extensionless_404() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind upstream");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            for response in [b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".as_slice(), b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 13\r\n\r\n<main></main>".as_slice()] {
+                let (mut stream, _) = listener.accept().await.expect("accept upstream");
+                let mut buf = [0_u8; 1024];
+                let n = stream.read(&mut buf).await.expect("read request");
+                let request = String::from_utf8_lossy(&buf[..n]);
+                assert!(request.starts_with(if response[9] == b'4' { "GET /api/testext/board/42 " } else { "GET /api/testext/index.html " }));
+                stream.write_all(response).await.expect("write response");
+            }
+        });
+        let child = Command::new("/bin/sleep").arg("5").spawn().expect("sleep child");
+        let app = serve_test_app_with_plugin_routes(vec![serve_test_proxy_route(port, child)]);
+        let response = app.oneshot(axum::http::Request::get("/api/testext/board/42").body(Body::empty()).unwrap()).await.expect("proxy response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("body");
+        assert_eq!(&body[..], b"<main></main>");
+    }
+
+    #[tokio::test]
+    async fn serve_plugin_engine_command_prefix_http_proxies_when_process_is_up() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind upstream");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept upstream");
+            let mut buf = [0_u8; 1024];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /api/testext/assets/app.js?x=1 "));
+            stream.write_all(b"HTTP/1.1 202 Accepted\r\ncontent-type: text/plain\r\ncontent-length: 7\r\n\r\nproxied").await.expect("write response");
+        });
+        let child = Command::new("/bin/sleep").arg("60").spawn().expect("sleep child");
+        let app = serve_test_app_with_plugin_routes(vec![serve_test_proxy_route(port, child)]);
+        let response = app.oneshot(axum::http::Request::get("/api/testext/assets/app.js?x=1").body(Body::empty()).unwrap()).await.expect("proxy response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.expect("body");
+        assert_eq!(&body[..], b"proxied");
+    }
+
+    #[tokio::test]
+    async fn serve_plugin_health_falls_back_when_command_process_is_down() {
+        let route = ServePluginRoute {
+            name: "testext".to_owned(),
+            command: Some("sleep 60".to_owned()),
+            prefix: "/api/testext".to_owned(),
+            health_path: "/api/testext/health".to_owned(),
+            events: Vec::new(),
+            event_path: None,
+            dir: std::env::temp_dir(),
+            process: Arc::new(Mutex::new(None)),
+        };
+        let app = serve_test_app_with_plugin_routes(vec![route]);
+        let response = app.oneshot(axum::http::Request::get("/api/testext/health").body(Body::empty()).unwrap()).await.expect("health");
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["plugin"], "testext");
+        assert_eq!(payload["command"], "sleep 60");
+    }
+
+    #[tokio::test]
+    async fn serve_api_token_auth_gates_api_but_leaves_health_open() {
+        let app = serve_test_app_with_api_auth(ServeApiTokenAuth {
+            token: Some("secret-token".to_owned()),
+            loopback_exempt: false,
+            forced_open: false,
+        });
+        let denied = app.clone().oneshot(axum::http::Request::get("/api/feed").body(Body::empty()).unwrap()).await.expect("denied");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let health = app.clone().oneshot(axum::http::Request::get("/api/health").body(Body::empty()).unwrap()).await.expect("health");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let bearer = app.clone().oneshot(
+            axum::http::Request::get("/api/feed")
+                .header("authorization", "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        ).await.expect("bearer");
+        assert_eq!(bearer.status(), StatusCode::OK);
+
+        let plugin = app.oneshot(
+            axum::http::Request::get("/api/testext/health")
+                .header("x-maw-token", "secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        ).await.expect("plugin x token");
+        assert_eq!(plugin.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn serve_api_token_auth_open_mode_is_backward_compatible() {
+        let app = serve_test_app_with_api_auth(ServeApiTokenAuth::open());
+        let response = app.oneshot(axum::http::Request::get("/api/feed").body(Body::empty()).unwrap()).await.expect("open mode");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+
+    #[tokio::test]
+    async fn serve_mounts_discovered_plugin_engine_serve_health_and_skips_bad_manifest() {
+        let (root, plugin_routes) = {
+            let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+            let _plugins_restore = EnvVarRestore::capture("MAW_PLUGINS_DIR");
+            let root = std::env::temp_dir().join(format!(
+                "maw-serve-plugin-{}-{}",
+                std::process::id(),
+                random_hex(4)
+            ));
+            let plugins = root.join("plugins");
+            serve_write_plugin(
+                &plugins,
+                "testext",
+                &json!({"prefix": "/api/testext", "health": "/health", "events": ["ready"], "eventPath": "/events"}),
+            );
+            serve_write_plugin(&plugins, "badext", &json!({"prefix": "/not-api/bad"}));
+            std::env::set_var("MAW_PLUGINS_DIR", &plugins);
+            (root, serve_discover_plugin_routes())
+        };
+
+        let app = serve_test_app_with_plugin_routes(plugin_routes);
+        let health = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/api/testext/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("plugin health");
+        assert_eq!(health.status(), StatusCode::OK);
+        let payload = response_json(health).await;
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["plugin"], "testext");
+        assert_eq!(payload["prefix"], "/api/testext");
+
+        let missing = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/not-api/bad/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("bad plugin skipped");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let core = app
+            .oneshot(axum::http::Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .expect("core health");
+        assert_eq!(core.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn serve_write_plugin(root: &std::path::Path, name: &str, serve: &Value) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("plugin dir");
+        std::fs::write(dir.join("index.ts"), "export default async function run() {}\n").expect("entry");
+        std::fs::write(
+            dir.join("plugin.json"),
+            serde_json::to_vec_pretty(&json!({
+                "name": name,
+                "version": "1.0.0",
+                "sdk": "*",
+                "target": "js",
+                "entry": "index.ts",
+                "engine": {"serve": serve}
+            }))
+            .expect("manifest json"),
+        )
+        .expect("manifest");
+    }
 
     #[tokio::test]
     async fn serve_trust_live_is_auth_gated_atomic_redacted_and_tofu_safe() {
@@ -4452,6 +5227,8 @@ mod serve_tests {
             now_override: Some(1_782_277_200),
             serve_core_state_override: Some(fake_core),
             trust_store_path: serve_test_trust_store_path("agents"),
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
         });
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {

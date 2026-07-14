@@ -37,20 +37,28 @@ fn attach_text_and_readonly_recovery_match_maw_js_surface() {
         .stdout
         .contains("\"tmuxArgs\":[\"attach\",\"-r\",\"-t\",\"50-mawjs\"]"));
 
-    let missing = run(&["a", "ghost", "--alive", "50-mawjs", "--plan-json"]);
+    let missing = run(&[
+        "a",
+        "unlikely-attach-missing-363",
+        "--alive",
+        "50-mawjs",
+        "--plan-json",
+    ]);
     assert_eq!(missing.code, 1);
-    assert!(missing.stdout.contains("\"action\":\"recover\""));
+    assert!(!missing
+        .stdout
+        .contains("maw wake unlikely-attach-missing-363 --attach"));
 }
 
 #[test]
 fn attach_usage_and_default_menu_show_only_live_ported_commands() {
     let usage = run(&[]);
     assert_eq!(usage.code, 0);
-    assert!(usage.stdout.contains("commands available"));
-    assert!(usage.stdout.contains("attach"));
-    assert!(usage.stdout.contains("ls"));
-    assert!(usage.stdout.contains("pair-api"));
-    assert!(usage.stdout.contains("plugin-manifest"));
+    assert!(usage.stdout.contains("ported commands:"));
+    assert!(usage.stdout.contains("a|attach <target>"));
+    assert!(usage.stdout.contains("ls [--compact|-c]"));
+    assert!(!usage.stdout.contains("pair-api"));
+    assert!(!usage.stdout.contains("plugin-manifest"));
 
     let help = run(&["a", "--help"]);
     assert_eq!(help.code, 0);
@@ -80,12 +88,14 @@ fn attach_alive_equals_and_text_recover_paths_are_covered() {
     assert_eq!(alive_equals.code, 0, "{}", alive_equals.stderr);
     assert!(alive_equals.stdout.contains("\"action\":\"print\""));
 
-    let recover_text = run(&["a", "ghost", "--alive=50-mawjs"]);
+    let recover_text = run(&["a", "unlikely-attach-text-missing-363", "--alive=50-mawjs"]);
     assert_eq!(recover_text.code, 1);
     assert!(recover_text
         .stdout
-        .contains("attach: 'ghost' resolved to missing session ghost"));
-    assert!(recover_text.stdout.contains("maw wake ghost --attach"));
+        .contains("attach: 'unlikely-attach-text-missing-363' not found"));
+    assert!(!recover_text
+        .stdout
+        .contains("maw wake unlikely-attach-text-missing-363 --attach"));
 }
 
 #[test]
@@ -118,11 +128,14 @@ fn attach_refuses_ambiguous_fuzzy_session_matches() {
         "--alive=06-caller",
         "--plan-json",
     ]);
-    assert_eq!(ambiguous.code, 2);
+    assert_eq!(ambiguous.code, 1);
     assert!(ambiguous
-        .stderr
-        .contains("attach: 'call' matches multiple sessions"));
-    assert!(ambiguous.stderr.contains("05-calliope, 06-caller"));
+        .stdout
+        .contains("\"context\":\"matches multiple sessions\""));
+    assert!(ambiguous
+        .stdout
+        .contains("\"action\":\"maw attach 05-calliope\""));
+    assert!(ambiguous.stderr.is_empty());
 }
 
 #[test]
@@ -158,5 +171,7 @@ fn attach_without_fake_alive_uses_live_probe_recover_path() {
         "--plan-json",
     ]);
     assert_eq!(missing.code, 1, "{}{}", missing.stdout, missing.stderr);
-    assert!(missing.stdout.contains("\"action\":\"recover\""));
+    assert!(missing
+        .stdout
+        .contains("attach: 'unlikely-goal-coverage-session-zz-1850' not found"));
 }

@@ -626,7 +626,17 @@ fn plugin_emit_wasm_dist(dir: &std::path::Path, wasm_path: &std::path::Path) -> 
 }
 
 fn plugin_cargo_build_args() -> Vec<String> {
-    ["build", "--release", "--target", "wasm32-unknown-unknown"].iter().map(|value| (*value).to_owned()).collect()
+    [
+        "build",
+        "--release",
+        "--target",
+        "wasm32-unknown-unknown",
+        "--target-dir",
+        "target",
+    ]
+    .iter()
+    .map(|value| (*value).to_owned())
+    .collect()
 }
 
 fn plugin_assemblyscript_args(
@@ -1041,6 +1051,25 @@ mod plugin_native_tests {
             "{manifest}"
         );
         assert!(!manifest.contains("DELEGATED-MAW"));
+    }
+
+    #[test]
+    fn plugin_create_ts_scaffold_self_invokes_when_run_by_bun() {
+        let root = plugin_temp_root("create-ts");
+        let dir = root.join("route-probe");
+        let out = plugin_run_command(&plugin_args(&[
+            "create",
+            "route-probe",
+            "--dir",
+            &dir.display().to_string(),
+        ]));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let entry = std::fs::read_to_string(dir.join("src").join("index.ts")).expect("entry");
+        assert!(entry.contains("export async function handler"), "{entry}");
+        assert!(entry.contains("export default handler"), "{entry}");
+        assert!(entry.contains("if (import.meta.main)"), "{entry}");
+        assert!(entry.contains("process.argv.slice(2)"), "{entry}");
+        assert!(entry.contains("process.exit(result.ok ? 0 : 1)"), "{entry}");
     }
 
     #[test]

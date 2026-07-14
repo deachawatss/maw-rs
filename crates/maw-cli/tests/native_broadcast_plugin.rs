@@ -36,7 +36,7 @@ fn broadcast_seed(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     broadcast_write(&root.join("CLAUDE.md"), "test repo\n");
     broadcast_write(
         &config.join("fleet/01-alpha.json"),
-        r#"{"name":"01-alpha","groupName":"alpha","windows":[{"name":"neo-oracle"}]}"#,
+        r#"{"name":"01-alpha","squadName":"alpha","windows":[{"name":"neo-oracle"}]}"#,
     );
     broadcast_write(
         &home.join(".claude/teams/tk/config.json"),
@@ -60,6 +60,9 @@ case "$1" in
       *) printf 'unknown\n' ;;
     esac
     ;;
+  list-sessions)
+    printf '01-alpha\n02-beta\n99-overview\n'
+    ;;
   list-windows)
     printf '01-alpha|||0|||neo-oracle|||1|||/tmp\n01-alpha|||1|||shell|||0|||/tmp\n02-beta|||0|||beta-oracle|||0|||/tmp\n99-overview|||0|||watch|||0|||/tmp\n'
     ;;
@@ -81,6 +84,13 @@ esac
 }
 
 fn broadcast_command(root: &Path, home: &Path, config: &Path) -> Command {
+    let plugins = root.join("plugins");
+    let plugin = plugins.join("broadcast");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/native-broadcast/broadcast-plugin");
+    std::fs::create_dir_all(&plugin).expect("plugin dir");
+    std::fs::copy(fixture.join("plugin.json"), plugin.join("plugin.json")).expect("manifest");
+    std::fs::copy(fixture.join("plugin.wasm"), plugin.join("plugin.wasm")).expect("wasm");
     let mut command = Command::new(broadcast_bin());
     command
         .current_dir(root)
@@ -92,13 +102,14 @@ fn broadcast_command(root: &Path, home: &Path, config: &Path) -> Command {
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("MAW_PLUGINS_DIR", plugins)
         .env("BROADCAST_TMUX_LOG", root.join("tmux.log"))
         .env("PATH", root.join("bin"));
     command
 }
 
 #[test]
-fn broadcast_native_session_golden_is_hermetic_without_js_ref() {
+fn broadcast_plugin_session_golden_is_hermetic_without_js_ref() {
     let (root, home, config) = broadcast_seed("session");
     let output = broadcast_command(&root, &home, &config)
         .args(["broadcast", "hello", "fleet", "--session", "01-alpha"])
@@ -119,14 +130,18 @@ fn broadcast_native_session_golden_is_hermetic_without_js_ref() {
         log.contains("send-keys -t 01-alpha:0 -l [broadcast from sender-window] hello fleet"),
         "{log}"
     );
+    assert!(
+        !log.contains("capture-pane"),
+        "broadcast must not wait for a pane readiness gate: {log}"
+    );
     assert!(!log.contains("send-keys -t 01-alpha:1"), "{log}");
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn broadcast_native_registers_team_fleet_and_blocks_option_injection() {
+fn broadcast_plugin_registers_team_fleet_and_blocks_option_injection() {
     let (root, home, config) = broadcast_seed("scope");
-    assert_eq!(dispatcher_status("broadcast"), DispatchKind::Native);
+    assert_eq!(dispatcher_status("broadcast"), DispatchKind::NativeError);
     let output = broadcast_command(&root, &home, &config)
         .args(["broadcast", "hi", "--team", "tk", "--fleet", "alpha"])
         .output()

@@ -95,22 +95,59 @@ fn write_built_js_plugin(dir: &Path, name: &str) {
     .expect("dist entry");
 }
 
+fn write_serve_only_plugin(dir: &Path, name: &str) {
+    fs::create_dir_all(dir).expect("plugin dir");
+    fs::write(
+        dir.join("plugin.json"),
+        format!(
+            r#"{{
+  "name": "{name}",
+  "version": "0.1.0",
+  "sdk": "*",
+  "cli": {{ "command": "{name}" }},
+  "engine": {{
+    "serve": {{
+      "command": "bun run server-demo.ts",
+      "prefix": "/api/{name}"
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .expect("manifest");
+}
+
 fn fixture_repo(root: &Path, name: &str) -> PathBuf {
     let repo = root.join("repo");
     fs::create_dir_all(&repo).expect("repo dir");
     write_js_plugin(&repo, name);
 
+    commit_fixture_repo(&repo);
+    repo
+}
+
+fn monorepo_fixture(root: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let repo = root.join("repo");
+    let package = repo.join("packages").join(name);
+    write_js_plugin(&package, name);
+    fs::write(repo.join("README.md"), "# fixture monorepo\n").expect("readme");
+    commit_fixture_repo(&repo);
+    (repo, package)
+}
+
+fn commit_fixture_repo(repo: &Path) {
     let init = Command::new("git")
         .arg("init")
         .arg("-q")
-        .arg(&repo)
+        .arg(repo)
         .output()
         .expect("git init");
     assert_success(&init, "git init");
-    git(&repo, &["add", "."]);
+    git(repo, &["add", "."]);
     let commit = Command::new("git")
         .arg("-C")
-        .arg(&repo)
+        .arg(repo)
         .args([
             "-c",
             "user.name=maw-rs test",
@@ -124,8 +161,6 @@ fn fixture_repo(root: &Path, name: &str) -> PathBuf {
         .output()
         .expect("git commit");
     assert_success(&commit, "git commit");
-
-    repo
 }
 
 fn with_host_plugin_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Command {
@@ -140,7 +175,7 @@ fn with_host_plugin_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Co
 }
 
 #[test]
-fn plugin_install_git_file_url_clones_builds_and_installs_to_default_root() {
+fn plugin_install_git_root_manifest_repo_regression() {
     let root = temp_dir("git-file");
     let repo = fixture_repo(&root, "git-fixture");
     let maw_home = root.join("maw-home");
@@ -194,6 +229,144 @@ fn plugin_install_git_file_url_clones_builds_and_installs_to_default_root() {
 }
 
 #[test]
+fn plugin_install_git_existing_plugin_requires_force_to_reinstall() {
+    let root = temp_dir("git-reinstall");
+    let repo = fixture_repo(&root, "reinstall-fixture");
+    let install_root = root.join("plugins");
+    let file_url = format!(
+        "file://{}",
+        repo.canonicalize().expect("repo path").display()
+    );
+    let run = |force: bool| {
+        let mut command = Command::new(maw_bin());
+        command.args([
+            "plugin",
+            "install",
+            &file_url,
+            "--root",
+            install_root.to_str().expect("install root utf8"),
+        ]);
+        if force {
+            command.arg("--force");
+        }
+        with_host_plugin_env(&mut command, &root)
+            .output()
+            .expect("maw plugin reinstall")
+    };
+
+    assert_success(&run(false), "initial install");
+    let install_dir = install_root.join("reinstall-fixture");
+    fs::write(install_dir.join("stale.txt"), "stale\n").expect("stale file");
+
+    let refused = run(false);
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&refused.stdout).is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        "plugin 'reinstall-fixture' is already installed; use --force to reinstall\n"
+    );
+
+    let forced = run(true);
+    assert_success(&forced, "forced reinstall");
+    assert!(String::from_utf8_lossy(&forced.stderr).is_empty());
+    assert!(install_dir.join("plugin.json").is_file());
+    assert!(!install_dir.join("stale.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plugin_install_git_subpath_builds_selected_package() {
+    let root = temp_dir("git-subpath");
+    let (repo, _) = monorepo_fixture(&root, "subpath-fixture");
+    let install_root = root.join("plugins");
+    let file_url = format!(
+        "file://{}",
+        repo.canonicalize().expect("repo path").display()
+    );
+
+    let output = with_host_plugin_env(
+        Command::new(maw_bin()).args([
+            "plugin",
+            "install",
+            &file_url,
+            "--path",
+            "packages/subpath-fixture",
+            "--root",
+            install_root.to_str().expect("install root utf8"),
+        ]),
+        &root,
+    )
+    .output()
+    .expect("maw plugin install subpath");
+
+    assert_success(&output, "plugin install subpath");
+    assert!(String::from_utf8_lossy(&output.stderr).is_empty());
+    assert!(install_root.join("subpath-fixture/plugin.json").is_file());
+    assert!(install_root.join("subpath-fixture/index.js").is_file());
+    assert!(!install_root.join("README.md").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plugin_install_git_sha256_pin_combines_with_subpath() {
+    let root = temp_dir("git-subpath-sha");
+    let (repo, _) = monorepo_fixture(&root, "pinned-subpath");
+    let file_url = format!(
+        "file://{}",
+        repo.canonicalize().expect("repo path").display()
+    );
+    let probe_root = root.join("probe-plugins");
+    let probe = with_host_plugin_env(
+        Command::new(maw_bin()).args([
+            "plugin",
+            "install",
+            &file_url,
+            "--path",
+            "packages/pinned-subpath",
+            "--root",
+            probe_root.to_str().expect("probe root utf8"),
+        ]),
+        &root,
+    )
+    .output()
+    .expect("probe install");
+    assert_success(&probe, "probe install");
+    let installed_manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(probe_root.join("pinned-subpath/plugin.json")).expect("installed manifest"),
+    )
+    .expect("manifest json");
+    let sha256 = installed_manifest["artifact"]["sha256"]
+        .as_str()
+        .expect("artifact sha256");
+
+    let install_root = root.join("plugins");
+    let pinned = with_host_plugin_env(
+        Command::new(maw_bin()).args([
+            "plugin",
+            "install",
+            &file_url,
+            "--path",
+            "packages/pinned-subpath",
+            "--sha256",
+            sha256,
+            "--root",
+            install_root.to_str().expect("install root utf8"),
+        ]),
+        &root,
+    )
+    .output()
+    .expect("pinned subpath install");
+
+    assert_success(&pinned, "pinned subpath install");
+    assert!(String::from_utf8_lossy(&pinned.stderr).is_empty());
+    assert!(install_root.join("pinned-subpath/plugin.json").is_file());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn plugin_install_local_dir_with_explicit_root_still_works() {
     let root = temp_dir("local-root");
     let source = root.join("source");
@@ -226,6 +399,35 @@ fn plugin_install_local_dir_with_explicit_root_still_works() {
     );
     assert!(install_dir.join("plugin.json").is_file());
     assert!(install_dir.join("index.js").is_file());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plugin_install_then_bare_invoke_serve_only_prints_mounted_url() {
+    let root = temp_dir("serve-only");
+    let source = root.join("source");
+    write_serve_only_plugin(&source, "agora-fixture");
+
+    let install = with_host_plugin_env(
+        Command::new(maw_bin()).args(["plugin", "install", source.to_str().expect("source utf8")]),
+        &root,
+    )
+    .output()
+    .expect("maw plugin install");
+    assert_success(&install, "install serve-only plugin");
+
+    let invoke = with_host_plugin_env(Command::new(maw_bin()).arg("agora-fixture"), &root)
+        .env("MAW_PORT", "4567")
+        .output()
+        .expect("maw agora-fixture");
+
+    assert_success(&invoke, "invoke serve-only plugin");
+    assert_eq!(
+        String::from_utf8_lossy(&invoke.stdout),
+        "http://localhost:4567/api/agora-fixture/\n"
+    );
+    assert!(String::from_utf8_lossy(&invoke.stderr).is_empty());
 
     let _ = fs::remove_dir_all(root);
 }
