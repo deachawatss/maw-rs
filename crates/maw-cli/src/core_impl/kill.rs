@@ -756,14 +756,11 @@ fn kill_kill_resolved_windows(
             "window target required".to_owned()
         });
     }
-    if !options.force && kill_would_empty_session(session, indexes) {
+    let closes_last_window = kill_would_empty_session(session, indexes);
+    if closes_last_window && !options.force {
         return Err(format!(
-            "refusing to kill every window in session '{}' without --force.\n  \
-             this would destroy the session and any unsaved agent work in it.\n  \
-             → kill one pane:       maw kill {}:<window> --pane N\n  \
-             → graceful stop:       maw sleep {}\n  \
-             → really kill windows: maw kill {}:<window> --force",
-            session.name, session.name, session.name, session.name
+            "refusing to close the last window of session '{}' (would destroy it) — pass --force",
+            session.name
         ));
     }
     let mut killed = Vec::new();
@@ -773,7 +770,15 @@ fn kill_kill_resolved_windows(
         tmux.kill_kill_window(&target)?;
         killed.push(target);
     }
-    Ok(kill_window_success(&killed))
+    let mut output = kill_window_success(&killed);
+    if closes_last_window {
+        let _ = writeln!(
+            output,
+            "⚡ closed the last window; session '{}' is gone",
+            session.name
+        );
+    }
+    Ok(output)
 }
 
 fn kill_would_empty_session(session: &KillSession, indexes: &[u32]) -> bool {
@@ -1171,14 +1176,59 @@ mod kill_tests {
     }
 
     #[test]
+    fn kill_last_window_index_requires_force_and_reports_session_gone() {
+        let mut refused_tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n");
+        let refused = kill_run_fake(&kill_strings(&["07-demo", "--index", "0"]), &mut refused_tmux);
+
+        assert_eq!(refused.code, 1);
+        assert!(
+            refused.stderr.contains(
+                "refusing to close the last window of session '07-demo' (would destroy it) — pass --force"
+            ),
+            "{}",
+            refused.stderr
+        );
+        assert!(
+            !refused_tmux.calls.iter().any(|call| call.0 == "kill-window"),
+            "must not kill the last window without --force: {:?}",
+            refused_tmux.calls
+        );
+
+        let mut forced_tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n");
+        let forced = kill_run_fake(
+            &kill_strings(&["07-demo", "--index", "0", "--force"]),
+            &mut forced_tmux,
+        );
+
+        assert_eq!(forced.code, 0);
+        assert!(
+            forced
+                .stdout
+                .contains("⚡ closed the last window; session '07-demo' is gone"),
+            "{}",
+            forced.stdout
+        );
+        assert!(
+            forced_tmux.calls.iter().any(|call| call.0 == "kill-window"),
+            "--force must kill the last window: {:?}",
+            forced_tmux.calls
+        );
+    }
+
+    #[test]
     fn kill_targeted_window_without_force_refuses_when_it_would_empty_session() {
         let mut tmux = kill_fake("07-demo|||0|||work|||1|||/tmp\n");
 
         let output = kill_run_fake(&kill_strings(&["07-demo:work"]), &mut tmux);
 
         assert_eq!(output.code, 1);
-        assert!(output.stderr.contains("every window"), "{}", output.stderr);
-        assert!(output.stderr.contains("--force"), "{}", output.stderr);
+        assert!(
+            output.stderr.contains(
+                "refusing to close the last window of session '07-demo' (would destroy it) — pass --force"
+            ),
+            "{}",
+            output.stderr
+        );
         assert!(
             !tmux.calls.iter().any(|call| call.0 == "kill-window"),
             "must not kill last window without --force: {:?}",
@@ -1193,7 +1243,13 @@ mod kill_tests {
         let output = kill_run_fake(&kill_strings(&["07-demo:work", "--all"]), &mut tmux);
 
         assert_eq!(output.code, 1);
-        assert!(output.stderr.contains("every window"), "{}", output.stderr);
+        assert!(
+            output.stderr.contains(
+                "refusing to close the last window of session '07-demo' (would destroy it) — pass --force"
+            ),
+            "{}",
+            output.stderr
+        );
         assert!(
             !tmux.calls.iter().any(|call| call.0 == "kill-window"),
             "must not kill all windows without --force: {:?}",
