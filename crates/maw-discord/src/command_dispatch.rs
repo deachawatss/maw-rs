@@ -6,6 +6,13 @@ use super::*;
 ///
 /// Returns an error output if the reqwest client cannot be constructed.
 pub async fn run_discord_command(args: Vec<String>) -> DiscordOutput {
+    run_discord_command_with_pane_relay(args, &UnavailablePaneRelay).await
+}
+
+pub async fn run_discord_command_with_pane_relay(
+    args: Vec<String>,
+    relay: &dyn DiscordPaneRelay,
+) -> DiscordOutput {
     let Ok(rest) = ReqwestDiscordRest::new() else {
         return DiscordOutput {
             code: 1,
@@ -13,13 +20,22 @@ pub async fn run_discord_command(args: Vec<String>) -> DiscordOutput {
             stderr: "failed to initialize Discord REST client\n".to_owned(),
         };
     };
-    run_discord_command_with(&args, &DiscordEnv::from_process(), &rest).await
+    run_discord_command_with_relay(&args, &DiscordEnv::from_process(), &rest, relay).await
 }
 
 pub async fn run_discord_command_with(
     args: &[String],
     env: &DiscordEnv,
     rest: &dyn DiscordRest,
+) -> DiscordOutput {
+    run_discord_command_with_relay(args, env, rest, &UnavailablePaneRelay).await
+}
+
+async fn run_discord_command_with_relay(
+    args: &[String],
+    env: &DiscordEnv,
+    rest: &dyn DiscordRest,
+    relay: &dyn DiscordPaneRelay,
 ) -> DiscordOutput {
     let mut logs = Vec::new();
     let ok = match args.first().map(|s| s.to_lowercase()) {
@@ -46,7 +62,7 @@ pub async fn run_discord_command_with(
         Some(sub) if sub == "pair" => pair(env, &args[1..], &mut logs),
         Some(sub) if sub == "route" => route(env, &args[1..], &mut logs),
         Some(sub) if sub == "serve" => {
-            wind_discord_serve::serve(env, rest, &args[1..], &mut logs).await
+            wind_discord_serve::serve(env, rest, &args[1..], relay, &mut logs).await
         }
         Some(sub) => {
             logs.push(format!("unknown subcommand: {sub}"));
@@ -59,6 +75,18 @@ pub async fn run_discord_command_with(
         code: if ok { 0 } else { 1 },
         stdout: with_final_newline(&logs.join("\n")),
         stderr: String::new(),
+    }
+}
+
+struct UnavailablePaneRelay;
+
+impl DiscordPaneRelay for UnavailablePaneRelay {
+    fn relay<'a>(
+        &'a self,
+        _target: &'a str,
+        _body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("in-process Discord pane relay unavailable".to_owned()) })
     }
 }
 

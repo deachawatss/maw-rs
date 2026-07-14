@@ -82,6 +82,19 @@ fn env(root: &std::path::Path) -> DiscordEnv {
     }
 }
 
+fn seed_native_serve_map(root: &Path, bot: &str) {
+    let map_path = root
+        .join("ghq/github.com/deachawatss")
+        .join(bot)
+        .join("ψ/memory/discord-channel-map.json");
+    fs::create_dir_all(map_path.parent().expect("map parent")).expect("native map dir");
+    fs::write(
+        map_path,
+        "{\n  \"bot_id\": \"7\",\n  \"wind_user_id\": \"42\",\n  \"general\": \"111\",\n  \"ops\": \"222\"\n}\n",
+    )
+    .expect("native channel map");
+}
+
 fn seed_bot(root: &std::path::Path, bot: &str) -> DiscordEnv {
     let env = env(root);
     fs::create_dir_all(env.home.join(".password-store/discord")).expect("pass dir");
@@ -115,6 +128,7 @@ fn seed_bot(root: &std::path::Path, bot: &str) -> DiscordEnv {
         ),
     )
     .expect("state dirs");
+    seed_native_serve_map(root, bot);
     env
 }
 
@@ -324,6 +338,8 @@ async fn discord_pair_route_and_serve_are_native_and_hermetic() {
     assert_eq!(route.code, 0, "{}", route.stdout);
     assert!(route.stdout.contains("✓ route ops → 222"));
 
+    // Native serve uses the oracle-owned map introduced by #69, rather than the
+    // legacy bot-repository map that pair and route maintain.
     let posted = run_discord_command_with(
         &[
             "serve".to_owned(),
@@ -338,7 +354,7 @@ async fn discord_pair_route_and_serve_are_native_and_hermetic() {
     )
     .await;
     assert_eq!(posted.code, 0, "{}", posted.stdout);
-    assert!(posted.stdout.contains("✓ posted Discord message to 222"));
+    assert!(posted.stdout.contains("✓ posted Discord message to ops"));
     let posts = rest.posts.lock().expect("posts");
     assert_eq!(posts.len(), 1);
     assert_eq!(posts[0].0, "/channels/222/messages");
@@ -374,15 +390,26 @@ async fn discord_security_guards_reject_bad_inputs_and_non_loopback() {
     )
     .await;
     assert_ne!(bad_serve.code, 0);
-    assert!(bad_serve.stdout.contains("refuses non-loopback"));
+    assert!(bad_serve.stdout.contains("usage: maw discord serve"));
+    assert!(!bad_serve.stdout.contains("native gateway"));
+    assert!(rest.posts.lock().expect("posts").is_empty());
 
-    let dry =
-        run_discord_command_with(&["serve".to_owned(), "--dry-run".to_owned()], &env, &rest).await;
+    let dry = run_discord_command_with(
+        &[
+            "serve".to_owned(),
+            "--dry-run".to_owned(),
+            "nova-oracle".to_owned(),
+        ],
+        &env,
+        &rest,
+    )
+    .await;
     assert_eq!(dry.code, 0);
-    assert_eq!(
-        dry.stdout,
-        include_str!("fixtures/native-discord/serve-dry-run.stdout")
-    );
+    assert!(dry
+        .stdout
+        .starts_with(include_str!("fixtures/native-discord/serve-dry-run.stdout")));
+    assert!(dry.stdout.contains("discord-channel-map.json"));
+    assert!(dry.stdout.contains("mapped channels: 2"));
     assert!(!dry.stdout.contains("0.0.0.0"));
 }
 
@@ -416,7 +443,7 @@ async fn discord_serve_rest_errors_are_redacted() {
         "{}",
         out.stdout
     );
-    assert!(out.stdout.contains("[REDACTED]"), "{}", out.stdout);
+    assert_eq!(out.stdout, "✗ Discord post failed\n");
     std::env::remove_var("DISCORD_BOT_TOKEN");
 }
 
@@ -434,10 +461,12 @@ fn discord_runtime_fake_maw_no_delegate_proof() {
     fs::create_dir_all(&bin).expect("bin");
     discord_write_fake_marker(&bin, "maw", "DELEGATED-MAW");
     discord_write_fake_marker(&bin, "bun", "DELEGATED-BUN");
+    seed_native_serve_map(&root, "nova-oracle");
     let output = Command::new(env!("CARGO_BIN_EXE_maw-rs"))
         .arg("discord")
         .arg("serve")
         .arg("--dry-run")
+        .arg("nova-oracle")
         .env("PATH", &bin)
         .env("HOME", root.join("home"))
         .env("GHQ_ROOT", root.join("ghq"))
@@ -447,7 +476,7 @@ fn discord_runtime_fake_maw_no_delegate_proof() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
-    assert!(stdout.contains("127.0.0.1"), "stdout={stdout}");
+    assert!(stdout.contains("native gateway dry-run"), "stdout={stdout}");
     assert!(!stdout.contains("DELEGATED-MAW"), "stdout={stdout}");
     assert!(!stderr.contains("DELEGATED-MAW"), "stderr={stderr}");
     assert!(!stdout.contains("DELEGATED-BUN"), "stdout={stdout}");
