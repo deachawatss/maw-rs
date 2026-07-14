@@ -325,11 +325,13 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         let branches = workon_agent_branches(&repo.repo_path)?;
         match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
             WorkonWorktreePlan::Reuse { path } => {
+                workon_cargo_disk_preflight(&repo.repo_path, &path, &mut stdout)?;
                 workon_restore_shared_worktree_state(&repo.repo_path, &path)?;
                 let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing worktree: {}", path.display());
                 target_path = path;
             }
             WorkonWorktreePlan::Create { wt_path, branch, branch_exists, .. } => {
+                workon_cargo_disk_preflight(&repo.repo_path, &wt_path, &mut stdout)?;
                 workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.base.as_deref(), options.layout)?;
                 let suffix = if branch_exists { ", reused branch" } else { "" };
                 let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
@@ -893,11 +895,102 @@ fn workon_write_cargo_target_config(
     };
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("workon: create {}: {error}", parent.display()))?;
-    let target_dir = workon_toml_basic_string(&main_path.join("target").to_string_lossy());
+    let target_dir = workon_toml_basic_string(&workon_cargo_target_dir(wt_path)?.to_string_lossy());
     let body = format!("[build]\ntarget-dir = \"{target_dir}\"\n");
     std::fs::write(&config, body)
         .map_err(|error| format!("workon: write {}: {error}", config.display()))?;
     Ok(true)
+}
+
+fn workon_cargo_target_dir(wt_path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let slug = wt_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("workon: could not derive target directory from {}", wt_path.display()))?;
+    Ok(workon_cargo_target_root().join(format!("maw-rs-target-{slug}")))
+}
+
+fn workon_cargo_disk_preflight(
+    main_path: &std::path::Path,
+    wt_path: &std::path::Path,
+    stdout: &mut String,
+) -> Result<(), String> {
+    if !main_path.join("Cargo.toml").is_file() {
+        return Ok(());
+    }
+    let target_dir = workon_cargo_target_dir(wt_path)?;
+    let volume = target_dir.parent().ok_or_else(|| format!("workon: target has no parent: {}", target_dir.display()))?;
+    let free_bytes = match workon_df_free_bytes(volume) {
+        Ok(free_bytes) => free_bytes,
+        Err(error) => {
+            let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: disk preflight unavailable for {}: {error}", volume.display());
+            return Ok(());
+        }
+    };
+    if let Some(warning) = workon_disk_preflight_message(free_bytes, &target_dir, workon_min_free_gb())? {
+        let _ = writeln!(stdout, "\x1b[1;33m⚠ {warning}\x1b[0m");
+    }
+    Ok(())
+}
+
+fn workon_df_free_bytes(volume: &std::path::Path) -> Result<u64, String> {
+    let output = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(volume)
+        .output()
+        .map_err(|error| format!("run df: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .ok_or_else(|| "df returned no filesystem row".to_owned())?;
+    let blocks = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| format!("could not parse df free blocks from {line:?}"))?
+        .parse::<u64>()
+        .map_err(|error| format!("could not parse df free blocks: {error}"))?;
+    Ok(blocks.saturating_mul(1024))
+}
+
+fn workon_min_free_gb() -> u64 {
+    std::env::var("MAW_MIN_FREE_GB")
+        .ok()
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30)
+}
+
+fn workon_disk_preflight_message(
+    free_bytes: u64,
+    target_dir: &std::path::Path,
+    min_free_gb: u64,
+) -> Result<Option<String>, String> {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const HARD_FLOOR_GB: u64 = 5;
+    let free_gb = free_bytes / GIB;
+    if free_bytes < HARD_FLOOR_GB * GIB {
+        return Err(format!(
+            "workon: LOW DISK SPACE: {free_gb} GiB free for {} (hard floor: {HARD_FLOOR_GB} GiB). Run `maw cleanup` before creating a worktree.",
+            target_dir.display()
+        ));
+    }
+    if free_bytes < min_free_gb.saturating_mul(GIB) {
+        return Ok(Some(format!(
+            "LOW DISK SPACE: {free_gb} GiB free for {} (MAW_MIN_FREE_GB={min_free_gb}). Run `maw cleanup` to reclaim completed worktree targets.",
+            target_dir.display()
+        )));
+    }
+    Ok(None)
+}
+
+fn workon_cargo_target_root() -> std::path::PathBuf {
+    if cfg!(unix) { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
 }
 
 fn workon_toml_basic_string(value: &str) -> String {
@@ -1383,6 +1476,41 @@ mod workon_tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp root");
         path
+    }
+
+    #[test]
+    fn workon_writes_an_isolated_target_for_each_worktree() {
+        let root = workon_temp_root("isolated-target");
+        let main = root.join("main");
+        let worktree = main.join("agents/issue-61");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        std::fs::write(main.join("Cargo.toml"), "[workspace]\n").expect("manifest");
+
+        assert!(workon_write_cargo_target_config(&main, &worktree).expect("target config"));
+
+        let config = std::fs::read_to_string(worktree.join(".cargo/config.toml")).expect("target config body");
+        let expected = std::path::PathBuf::from("/tmp/maw-rs-target-issue-61");
+        assert!(config.contains(&expected.display().to_string()), "{config}");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_disk_preflight_warns_below_configured_threshold() {
+        let target = std::path::Path::new("/tmp/maw-rs-target-issue-61");
+
+        let warning = workon_disk_preflight_message(29 * 1024 * 1024 * 1024, target, 30)
+            .expect("warning is not a hard-floor failure")
+            .expect("warning below threshold");
+
+        assert!(warning.contains("LOW DISK SPACE"), "{warning}");
+        assert!(warning.contains("29 GiB"), "{warning}");
+        assert!(warning.contains("MAW_MIN_FREE_GB=30"), "{warning}");
+        assert!(warning.contains("maw cleanup"), "{warning}");
+
+        let hard_floor_error = workon_disk_preflight_message(4 * 1024 * 1024 * 1024, target, 1)
+            .expect_err("hard floor should override a lower configured warning threshold");
+        assert!(hard_floor_error.contains("hard floor: 5 GiB"), "{hard_floor_error}");
     }
 
     #[cfg(unix)]

@@ -587,6 +587,7 @@ fn done_remove_selected_worktree(worktree: &DoneWorktree, options: &DoneOptions,
 fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
     done_validate_exec_path(&worktree.main_path)?;
     done_validate_exec_path(&worktree.full_path)?;
+    let cargo_target_dir = done_managed_cargo_target_dir(&worktree.full_path);
     let branch = local.done_git(&["-C".to_owned(), worktree.full_path.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
     let mut remove_args = vec!["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "remove".to_owned()];
     if options.force {
@@ -594,10 +595,90 @@ fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &
     }
     remove_args.extend(["--".to_owned(), worktree.full_path.display().to_string()]);
     local.done_git(&remove_args)?;
+    if let Some(target_dir) = cargo_target_dir {
+        done_reclaim_cargo_target_dir(&target_dir, stdout);
+    }
     local.done_git(&["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "prune".to_owned()])?;
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m removed worktree {}", worktree.label);
     done_cleanup_branch(&worktree.main_path, &branch, options, local, stdout);
     Ok(())
+}
+
+fn done_managed_cargo_target_dir(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let target_dir = done_cargo_target_dir(worktree_path)?;
+    (Some(&target_dir) == done_expected_cargo_target_dir(worktree_path).as_ref()).then_some(target_dir)
+}
+
+fn done_cargo_target_dir(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let config = std::fs::read_to_string(worktree_path.join(".cargo/config.toml")).ok()?;
+    let mut in_build = false;
+    for raw_line in config.lines() {
+        let line = raw_line.split_once('#').map_or(raw_line, |(before, _)| before).trim();
+        if line.starts_with('[') {
+            in_build = line == "[build]";
+            continue;
+        }
+        if !in_build {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "target-dir" {
+            continue;
+        }
+        let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+        return Some(std::path::PathBuf::from(value));
+    }
+    None
+}
+
+fn done_expected_cargo_target_dir(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let slug = worktree_path.file_name()?.to_str()?;
+    (!slug.is_empty()).then(|| done_cargo_target_root().join(format!("maw-rs-target-{slug}")))
+}
+
+fn done_cargo_target_root() -> std::path::PathBuf {
+    if cfg!(unix) { std::path::PathBuf::from("/tmp") } else { std::env::temp_dir() }
+}
+
+fn done_reclaim_cargo_target_dir(target_dir: &std::path::Path, stdout: &mut String) {
+    if std::fs::symlink_metadata(target_dir).is_err() {
+        return;
+    }
+    let freed = done_path_size_bytes(target_dir).map(done_format_reclaimed_bytes);
+    match std::fs::remove_dir_all(target_dir) {
+        Ok(()) => {
+            let freed = freed.unwrap_or_else(|| "size unavailable".to_owned());
+            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m reclaimed CARGO_TARGET_DIR {} ({freed} freed)", target_dir.display());
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not reclaim CARGO_TARGET_DIR {}: {error}", target_dir.display());
+        }
+    }
+}
+
+fn done_path_size_bytes(path: &std::path::Path) -> Option<u64> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        return Some(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Some(0);
+    }
+    std::fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .try_fold(0_u64, |total, entry| done_path_size_bytes(&entry.path()).map(|size| total.saturating_add(size)))
+}
+
+fn done_format_reclaimed_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
 }
 
 fn done_cleanup_branch(main_path: &std::path::Path, branch: &str, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) {
@@ -1035,6 +1116,39 @@ mod done_tests {
         assert!(remove < branch_delete, "{:#?}", runtime.git_calls);
         assert_eq!(runtime.git_calls[remove][1], main.display().to_string());
         assert_eq!(runtime.git_calls[branch_delete][1], main.display().to_string());
+    }
+
+    #[test]
+    fn done_reclaims_the_worktree_isolated_cargo_target() {
+        let root = DoneTempRoot::new("reclaim-target");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let slug = root.path.file_name().expect("root name").to_string_lossy();
+        let live = main.join("agents").join(slug.as_ref());
+        let target = std::path::PathBuf::from("/tmp").join(format!("maw-rs-target-{slug}"));
+        std::fs::create_dir_all(live.join(".cargo")).expect("worktree cargo config dir");
+        std::fs::create_dir_all(&target).expect("isolated target dir");
+        std::fs::write(target.join("artifact"), "test artifact").expect("target artifact");
+        std::fs::write(
+            live.join(".cargo/config.toml"),
+            format!("[build]\ntarget-dir = \"{}\"\n", target.display()),
+        )
+        .expect("target config");
+
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![done_test_window("lead"), done_test_window("worker")],
+            ..DoneFakeRuntime::default()
+        };
+        runtime
+            .pane_info
+            .insert("s:worker".to_owned(), ("codex".to_owned(), live.display().to_string()));
+        runtime.register_worktree(&main, &live);
+
+        let out = done_run_with_context(&done_args(&["worker", "--force"]), &mut runtime, &context)
+            .expect("done");
+
+        assert!(!target.exists(), "target should be reclaimed: {}", target.display());
+        assert!(out.contains("reclaimed CARGO_TARGET_DIR"), "{out}");
     }
 
     #[test]
