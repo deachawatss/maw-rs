@@ -1,5 +1,15 @@
 import { expect, test } from "bun:test";
-import handler, { DEFAULT_SIGNAL_URL, VIEWER_PORT, getFlag, loadWerift, parseShareOptions } from "./plugin";
+import handler, {
+  DEFAULT_SIGNAL_URL,
+  UNAUTHENTICATED_RISK_FLAG,
+  VIEWER_PORT,
+  getFlag,
+  handleP2pShare,
+  loadWerift,
+  parseShareOptions,
+  requiresUnauthenticatedRiskAcknowledgement,
+  sendDataChannelTextToPane,
+} from "./plugin";
 
 async function run(args: string[]) {
   return handler({ source: "cli", args });
@@ -26,6 +36,21 @@ test("share without pane prints pane usage error", async () => {
   expect(result.exitCode).toBe(1);
   expect(result.output).toContain("Usage: maw p2p-share share <pane>");
   expect(result.error).toContain("Usage: maw p2p-share share <pane>");
+});
+
+test("unauthenticated share requires explicit risk acknowledgement", async () => {
+  const output: string[] = [];
+  const exitCode = await handleP2pShare(["share", "session:0.0"], (line) => output.push(line), "");
+
+  expect(exitCode).toBe(1);
+  expect(output.join("\n")).toContain("SECURITY BLOCK");
+  expect(output.join("\n")).toContain("Remote viewers can send keystrokes");
+  expect(output.join("\n")).toContain(UNAUTHENTICATED_RISK_FLAG);
+  expect(requiresUnauthenticatedRiskAcknowledgement(["share", "pane"], "secret")).toBe(false);
+  expect(requiresUnauthenticatedRiskAcknowledgement(
+    ["share", "pane", UNAUTHENTICATED_RISK_FLAG],
+    "",
+  )).toBe(false);
 });
 
 test("flag and share option parsing returns explicit values and defaults", () => {
@@ -63,4 +88,35 @@ test("loadWerift reports missing dependency with install hint", async () => {
   await expect(loadWerift(async () => {
     throw new Error("Cannot find package 'werift'");
   })).rejects.toThrow(/missing dependency 'werift'.*Run `bun install` in fleet-plugins\/p2p-share/s);
+});
+
+test("DataChannel text is sent literally to tmux and newlines become Enter", () => {
+  const calls: string[][] = [];
+  const spawnSync = (cmd: string[]) => {
+    calls.push(cmd);
+    return { exitCode: 0, stderr: { toString: () => "" } };
+  };
+
+  sendDataChannelTextToPane("session:window.0", "echo FLEETPAD_E2E_123\r\npwd", () => {}, spawnSync);
+
+  expect(calls).toEqual([
+    ["tmux", "send-keys", "-t", "session:window.0", "-l", "--", "echo FLEETPAD_E2E_123"],
+    ["tmux", "send-keys", "-t", "session:window.0", "Enter"],
+    ["tmux", "send-keys", "-t", "session:window.0", "-l", "--", "pwd"],
+  ]);
+});
+
+test("DataChannel binary payload is decoded before tmux input", () => {
+  const calls: string[][] = [];
+  const payload = new TextEncoder().encode("hello\n").buffer;
+
+  sendDataChannelTextToPane("pane", payload, () => {}, (cmd: string[]) => {
+    calls.push(cmd);
+    return { exitCode: 0, stderr: { toString: () => "" } };
+  });
+
+  expect(calls).toEqual([
+    ["tmux", "send-keys", "-t", "pane", "-l", "--", "hello"],
+    ["tmux", "send-keys", "-t", "pane", "Enter"],
+  ]);
 });

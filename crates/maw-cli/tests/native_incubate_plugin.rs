@@ -8,6 +8,10 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_maw-rs"))
 }
 
+fn plugin_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-incubate")
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -34,7 +38,7 @@ fn write_shell(path: &Path, body: &str) {
 }
 
 fn write_fake_bud_tools(bin_dir: &Path) {
-    for program in ["gh", "ghq", "git"] {
+    for program in ["gh", "ghq", "git", "direnv"] {
         write_shell(
             &bin_dir.join(program),
             &format!(
@@ -123,9 +127,11 @@ fn run(root: &Path, args: &[&str]) -> std::process::Output {
         .env("XDG_STATE_HOME", &xdg_state)
         .env("GHQ_ROOT", &ghq_root)
         .env("MAW_BUD_OWNER", "org")
+        .env("CLAUDE_TOKEN_NAME", "duo")
         .env("TMUX", root.join("tmux-socket"))
         .env("MAW_JS_REF_DIR", "/nonexistent")
         .env("MAW_RS_SELF_BIN", bin_dir.join("fake-self"))
+        .env("MAW_PLUGINS_DIR", plugin_dir())
         .env("MAW_INCUBATE_BUD_LOG", root.join("bud.log"))
         .env("MAW_INCUBATE_SELF_LOG", root.join("self.log"))
         .env("MAW_INCUBATE_TMUX_LOG", root.join("tmux.log"))
@@ -140,7 +146,7 @@ fn normalize_stdout(root: &Path, stdout: Vec<u8>) -> String {
 }
 
 #[test]
-fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
+fn incubate_plugin_dry_run_matches_native_golden_and_is_hermetic() {
     let root = temp_dir("dry-run");
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -177,7 +183,7 @@ fn native_incubate_dry_run_matches_committed_golden_and_is_hermetic() {
 }
 
 #[test]
-fn native_incubate_dispatches_trigger_after_in_process_bud_and_guards_options() {
+fn incubate_plugin_preserves_bud_subdispatch_tmux_send_and_guards() {
     let root = temp_dir("send");
     let bin_dir = root.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir");
@@ -186,7 +192,7 @@ fn native_incubate_dispatches_trigger_after_in_process_bud_and_guards_options() 
     write_fake_tmux(&bin_dir);
     seed_config(&root);
 
-    assert_eq!(dispatcher_status("incubate"), DispatchKind::Native);
+    assert_eq!(dispatcher_status("incubate"), DispatchKind::NativeError);
 
     let output = run(&root, &["incubate", "org/widgets", "--contribute"]);
     assert!(
@@ -203,6 +209,7 @@ fn native_incubate_dispatches_trigger_after_in_process_bud_and_guards_options() 
     assert!(bud_log.contains("gh repo view org/widgets-oracle --json name"));
     assert!(bud_log.contains("ghq get github.com/org/widgets-oracle"));
     assert!(bud_log.contains("git -C "));
+    assert!(bud_log.contains("direnv allow "));
     assert!(
         !bud_log.contains(" maw ") && !bud_log.starts_with("maw "),
         "incubate must not shell PATH maw; bud_log={bud_log}"

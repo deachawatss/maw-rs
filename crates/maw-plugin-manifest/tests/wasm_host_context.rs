@@ -64,6 +64,18 @@ fn paths_get_returns_allowlisted_names() {
     assert_eq!(cwd["ok"], true, "{cwd}");
     assert_eq!(cwd["value"]["path"], "/work/here");
 
+    let shell = call(&host, "maw.paths.get", &json!({ "name": "shell" }));
+    let shell = shell["value"]["path"].as_str().expect("safe shell path");
+    assert!(shell.starts_with('/'), "{shell}");
+    assert!(!shell.contains(".."), "{shell}");
+    assert!(
+        shell
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '_' | '-' | '.')),
+        "{shell}"
+    );
+
     let teams = call(&host, "maw.paths.get", &json!({ "name": "teams" }));
     assert_eq!(teams["ok"], true, "{teams}");
     assert_eq!(teams["value"]["path"], "/home/tester/.claude/teams");

@@ -14,6 +14,7 @@ declare const process: any;
 type Log = (msg: string) => void;
 type Dims = { cols: number; rows: number };
 type PtyStream = { stop: () => void };
+type SpawnSync = (cmd: string[]) => { exitCode?: number; stderr?: { toString(): string } };
 type Werift = {
   RTCPeerConnection: any;
   RTCSessionDescription: any;
@@ -22,6 +23,7 @@ type Werift = {
 
 export const VIEWER_PORT = 7742;
 export const DEFAULT_SIGNAL_URL = "wss://phd-signaling.laris.workers.dev/ws";
+export const UNAUTHENTICATED_RISK_FLAG = "--i-understand-the-risk";
 
 export const command = {
   name: "p2p-share",
@@ -35,6 +37,7 @@ function usage(log: Log): void {
   log("");
   log("Usage:");
   log("  maw p2p-share share <pane> [--signal <url>] [--name <name>] [--port <port>]");
+  log(`    [${UNAUTHENTICATED_RISK_FLAG}]`);
   log("  maw p2p-share status");
 }
 
@@ -64,6 +67,10 @@ export function parseShareOptions(args: string[]): {
   return { target, signalUrl, peerName, port };
 }
 
+export function requiresUnauthenticatedRiskAcknowledgement(args: string[], authKey: string): boolean {
+  return !authKey && !args.includes(UNAUTHENTICATED_RISK_FLAG);
+}
+
 function sanitizeTmpSuffix(value: string): string {
   return value.replace(/[^A-Za-z0-9_-]/g, "-").replace(/-+/g, "-").slice(0, 80) || "pane";
 }
@@ -79,6 +86,45 @@ function captureSnapshot(target: string): string {
   const r = Bun.spawnSync(["tmux", "capture-pane", "-t", target, "-e", "-p"]);
   if (r.exitCode !== 0) return "";
   return r.stdout.toString().replace(/\n/g, "\r\n");
+}
+
+function dataChannelPayloadToText(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (data instanceof Buffer) return data.toString("utf8");
+  if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+  return "";
+}
+
+function runTmuxInput(target: string, args: string[], action: string, log: Log, spawnSync: SpawnSync): void {
+  const r = spawnSync(["tmux", "send-keys", "-t", target, ...args]);
+  if (r.exitCode !== 0) log(`tmux ${action} failed: ${r.stderr?.toString() || "unknown error"}`);
+}
+
+export function sendDataChannelTextToPane(
+  target: string,
+  data: unknown,
+  log: Log = () => {},
+  spawnSync: SpawnSync = Bun.spawnSync,
+): void {
+  const text = dataChannelPayloadToText(data);
+  if (!text) return;
+
+  let literal = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch !== "\n" && ch !== "\r") {
+      literal += ch;
+      continue;
+    }
+
+    if (literal) runTmuxInput(target, ["-l", "--", literal], "literal input", log, spawnSync);
+    literal = "";
+    runTmuxInput(target, ["Enter"], "enter", log, spawnSync);
+    if (ch === "\r" && text[i + 1] === "\n") i += 1;
+  }
+
+  if (literal) runTmuxInput(target, ["-l", "--", literal], "literal input", log, spawnSync);
 }
 
 function startPtyStream(
@@ -209,6 +255,9 @@ async function startSharePeer(opts: {
     });
 
     const dc = pc.createDataChannel("pty-stream", { ordered: true });
+    dc.onmessage = (event: { data?: unknown }) => {
+      sendDataChannelTextToPane(target, event?.data, log);
+    };
     dc.stateChanged.subscribe?.((state: string) => {
       log(`DataChannel state: ${state} (viewer ${msg.from})`);
       if (state === "open") {
@@ -310,7 +359,11 @@ async function startSharePeer(opts: {
   await new Promise(() => {});
 }
 
-async function handleP2pShare(args: string[], log: Log): Promise<number> {
+export async function handleP2pShare(
+  args: string[],
+  log: Log,
+  authKey = process.env.P2P_SHARE_KEY || process.env.AUTH_KEY || "",
+): Promise<number> {
   const subcommand = args[0] || "status";
 
   if (subcommand === "status" || subcommand === "help" || subcommand === "-h" || subcommand === "--help") {
@@ -331,8 +384,17 @@ async function handleP2pShare(args: string[], log: Log): Promise<number> {
     return 1;
   }
 
+  if (requiresUnauthenticatedRiskAcknowledgement(args, authKey)) {
+    log("SECURITY BLOCK: p2p-share has no authentication key.");
+    log("Remote viewers can send keystrokes directly to the live pane.");
+    log(`Set P2P_SHARE_KEY (recommended), or rerun with ${UNAUTHENTICATED_RISK_FLAG}.`);
+    return 1;
+  }
+
   const { signalUrl, peerName, port } = parseShareOptions(args);
-  const authKey = process.env.P2P_SHARE_KEY || process.env.AUTH_KEY || "";
+  if (!authKey) {
+    log("WARNING: AUTHENTICATION DISABLED. Remote viewers can type into the live pane.");
+  }
 
   log("P2P Share starting...");
   log(`  Pane:   ${target}`);
@@ -359,7 +421,7 @@ async function handleP2pShare(args: string[], log: Log): Promise<number> {
   log("Viewer ready:");
   log(`  Local: http://localhost:${port}`);
   log(`  Share: http://localhost:${port}/?peer=${encodeURIComponent(peerName)}`);
-  log("  Anyone with this link + signaling access can view (read-only)");
+  log("  Anyone with this link + signaling access can view and type into the shared pane");
   log("");
 
   try {

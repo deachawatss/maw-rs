@@ -75,29 +75,6 @@ fn native_scope_list_empty_matches_committed_maw_js_golden_without_ref_checkout(
 }
 
 #[test]
-fn native_token_current_matches_committed_maw_js_golden_without_ref_checkout() {
-    let root = temp_dir("token-current");
-    let maw_home = root.join("home");
-    let ghq = root.join("ghq");
-    let cwd = root.join("repo");
-    fs::create_dir_all(&cwd).expect("cwd");
-    fs::write(cwd.join(".envrc"), "export CLAUDE_TOKEN_NAME=\"nova\"\n").expect("envrc");
-
-    let output = run(&["token", "current"], &cwd, &maw_home, &ghq);
-
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout"),
-        include_str!("fixtures/native-orchestration/token-current.stdout")
-    );
-    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
-}
-
-#[test]
 fn native_about_matches_committed_maw_js_golden_without_ref_checkout() {
     let root = temp_dir("about-beta");
     let cwd = root.join("cwd");
@@ -163,10 +140,6 @@ fn native_dispatcher_registers_orchestration_plugins() {
     );
     assert_eq!(
         maw_cli::dispatcher_status("find"),
-        maw_cli::DispatchKind::Native
-    );
-    assert_eq!(
-        maw_cli::dispatcher_status("token"),
         maw_cli::DispatchKind::Native
     );
     assert_eq!(

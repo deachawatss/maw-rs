@@ -79,9 +79,11 @@ impl PluginInvokeRuntime for ExtismWasmInvokeRuntime {
 }
 
 pub const HOST_FN_NAMES: &[&str] = &[
+    "maw.cli.run",
     "maw.exec.run",
     "maw.exec.spawn",
     "maw.paths.get",
+    "maw.time.now",
     "maw.config.get",
     "maw.config.set",
     "maw.consent.read",
@@ -92,6 +94,7 @@ pub const HOST_FN_NAMES: &[&str] = &[
     "maw.fs.list",
     "maw.fs.stat",
     "maw.http.request",
+    "maw.net.fetch",
     "maw.localserver.request",
     "maw.http.peer_send",
     "maw.http.peer_wake",
@@ -99,6 +102,7 @@ pub const HOST_FN_NAMES: &[&str] = &[
     "maw.tmux.capture",
     "maw.tmux.send_keys",
     "maw.tmux.run",
+    "maw.tmux.command",
     "maw.tmux.send_enter",
     "maw.tmux.tags_read",
     "maw.tmux.tags_write",

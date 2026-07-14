@@ -1,0 +1,33 @@
+{
+  "artifact": {
+    "path": "./plugin.wasm",
+    "sha256": "sha256:dc1b378a13916fd2d8d9b86e7b9bf696efaf339ed079fc9cdcfebba24bf0ce37"
+  },
+  "author": "Soul-Brews-Studio",
+  "capabilities": [
+    "exec:home",
+    "fs:read:repos",
+    "proc:exec:date",
+    "proc:exec:gh",
+    "proc:exec:git",
+    "proc:exec:maw",
+    "tmux:read"
+  ],
+  "cli": {
+    "command": "pulse",
+    "help": "maw pulse <add|ls|cleanup|active|stale|orphan> [opts]"
+  },
+  "description": "Manage the Pulse issue board and stale agent worktrees.",
+  "entry": {
+    "export": "handle",
+    "kind": "wasm",
+    "path": "plugin.wasm"
+  },
+  "name": "pulse",
+  "schemaVersion": 1,
+  "sdk": "^1.0.0",
+  "target": "wasm",
+  "version": "1.0.0",
+  "wasm": "plugin.wasm",
+  "weight": 20
+}

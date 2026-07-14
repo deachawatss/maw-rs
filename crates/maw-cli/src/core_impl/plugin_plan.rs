@@ -60,21 +60,22 @@ fn run_plugin_plan(argv: &[String]) -> CliOutput {
             },
             Err(message) => plugin_usage_error(&message),
         },
-        PluginAction::Install { source, install_root, plan_json } => {
+        PluginAction::Install { source, install_root, plan_json, force } => {
             let install_root = install_root.unwrap_or_else(resolve_default_plugin_root);
             let result = match source {
-                InstallSource::Local(source_dir) => install_built_plugin_dir(&source_dir, &install_root),
-                InstallSource::Git { url, reference } => {
-                    install_from_git(&url, reference.as_deref(), &install_root, true)
+                InstallSource::Local(source_dir) => install_plugin_dir(&source_dir, &install_root, force)
+                    .map(|summary| PluginInstallOutcome { summary, warning: None }),
+                InstallSource::Git { url, reference, sha256, warn_unpinned, subpath } => {
+                    install_from_git(&url, reference.as_deref(), sha256.as_deref(), warn_unpinned, subpath.as_deref(), &install_root, force)
                 }
             };
             match result {
-                Ok(summary) => CliOutput {
+                Ok(outcome) => CliOutput {
                     code: 0,
-                    stdout: render_plugin_install_summary(&summary, plan_json),
-                    stderr: String::new(),
+                    stdout: render_plugin_install_summary(&outcome.summary, plan_json),
+                    stderr: outcome.warning.map_or_else(String::new, |warning| format!("{warning}\n")),
                 },
-                Err(message) => plugin_usage_error(&message),
+                Err(message) => plugin_install_error(&message),
             }
         }
     }
@@ -85,8 +86,16 @@ enum InstallSource {
     Git {
         url: String,
         reference: Option<String>,
+        sha256: Option<String>,
+        warn_unpinned: bool,
+        subpath: Option<std::path::PathBuf>,
     },
     Local(std::path::PathBuf),
+}
+
+struct PluginInstallOutcome {
+    summary: maw_plugin_manifest::PluginInstallSummary,
+    warning: Option<String>,
 }
 
 enum PluginAction {
@@ -97,7 +106,7 @@ enum PluginAction {
     InferCapabilities { source: String, plan_json: bool },
     Build { dir: std::path::PathBuf, emit_types: bool, plan_json: bool },
     Init { name: String, dir: std::path::PathBuf, plan_json: bool },
-    Install { source: InstallSource, install_root: Option<std::path::PathBuf>, plan_json: bool },
+    Install { source: InstallSource, install_root: Option<std::path::PathBuf>, plan_json: bool, force: bool },
 }
 
 #[derive(Default)]
@@ -204,17 +213,30 @@ fn parse_plugin_install_args(argv: &[String]) -> Result<PluginAction, PluginPars
     let mut source = None;
     let mut install_root = None;
     let mut reference = None;
+    let mut sha256 = None;
+    let mut subpath = None;
     let mut plan_json = false;
+    let mut force = false;
     let mut index = 0;
     while index < argv.len() {
         match argv[index].as_str() {
             "--plan-json" => plan_json = true,
+            "--force" => force = true,
             "--root" => {
                 install_root = Some(take_plugin_manifest_path(argv, index, "--root").map_err(PluginParseError::Usage)?);
                 index += 1;
             }
             "--ref" => {
                 reference = Some(take_plugin_manifest_value(argv, index, "--ref").map_err(PluginParseError::Usage)?);
+                index += 1;
+            }
+            "--sha256" => {
+                let value = take_plugin_manifest_value(argv, index, "--sha256").map_err(PluginParseError::Usage)?;
+                sha256 = Some(normalize_plugin_install_sha256(&value).map_err(PluginParseError::Usage)?);
+                index += 1;
+            }
+            "--path" => {
+                subpath = Some(take_plugin_manifest_path(argv, index, "--path").map_err(PluginParseError::Usage)?);
                 index += 1;
             }
             other if !other.starts_with('-') && source.is_none() => source = Some(other.to_owned()),
@@ -224,33 +246,67 @@ fn parse_plugin_install_args(argv: &[String]) -> Result<PluginAction, PluginPars
     }
     let source = source.ok_or_else(|| PluginParseError::Usage("plugin install: source dir or git url is required".to_owned()))?;
     Ok(PluginAction::Install {
-        source: classify_plugin_install_source(&source, reference).map_err(PluginParseError::Usage)?,
+        source: classify_plugin_install_source_with_subpath(&source, reference, sha256, subpath)
+            .map_err(PluginParseError::Usage)?,
         install_root,
         plan_json,
+        force,
     })
 }
 
+#[cfg(test)]
 fn classify_plugin_install_source(
     value: &str,
     reference: Option<String>,
+    sha256: Option<String>,
+) -> Result<InstallSource, String> {
+    classify_plugin_install_source_with_subpath(value, reference, sha256, None)
+}
+
+fn classify_plugin_install_source_with_subpath(
+    value: &str,
+    reference: Option<String>,
+    sha256: Option<String>,
+    requested_subpath: Option<std::path::PathBuf>,
 ) -> Result<InstallSource, String> {
     if is_explicit_git_install_source(value) {
         return Ok(InstallSource::Git {
             url: value.to_owned(),
             reference,
+            sha256,
+            warn_unpinned: false,
+            subpath: requested_subpath.map(normalize_plugin_install_subpath).transpose()?,
         });
     }
 
     let path = std::path::PathBuf::from(value);
-    if is_github_shorthand_install_source(value, &path) {
+    if let Some((github, inline_ref, derived_subpath)) = parse_github_shorthand_install_source(value, &path) {
+        if reference.is_some() && inline_ref.is_some() {
+            return Err("plugin install: use either owner/repo@ref or --ref, not both".to_owned());
+        }
+        if requested_subpath.is_some() && derived_subpath.is_some() {
+            return Err("plugin install: use either owner/repo/subpath or --path, not both".to_owned());
+        }
+        let reference = reference.or(inline_ref);
+        let warn_unpinned = reference.is_none() && sha256.is_none();
         return Ok(InstallSource::Git {
-            url: format!("https://github.com/{value}"),
+            url: format!("https://github.com/{github}"),
             reference,
+            sha256,
+            warn_unpinned,
+            subpath: requested_subpath.or(derived_subpath)
+                .map(normalize_plugin_install_subpath).transpose()?,
         });
     }
 
     if reference.is_some() {
         return Err("plugin install: --ref is only supported for git sources".to_owned());
+    }
+    if sha256.is_some() {
+        return Err("plugin install: --sha256 is only supported for git sources".to_owned());
+    }
+    if requested_subpath.is_some() {
+        return Err("plugin install: --path is only supported for git sources".to_owned());
     }
     Ok(InstallSource::Local(path))
 }
@@ -264,7 +320,10 @@ fn is_explicit_git_install_source(value: &str) -> bool {
         || value.contains("://")
 }
 
-fn is_github_shorthand_install_source(value: &str, path: &std::path::Path) -> bool {
+fn parse_github_shorthand_install_source(
+    value: &str,
+    path: &std::path::Path,
+) -> Option<(String, Option<String>, Option<std::path::PathBuf>)> {
     if path.exists()
         || value.starts_with('/')
         || value.starts_with("./")
@@ -272,36 +331,81 @@ fn is_github_shorthand_install_source(value: &str, path: &std::path::Path) -> bo
         || value.starts_with("~/")
         || value.contains('\\')
     {
-        return false;
+        return None;
     }
     let mut parts = value.split('/');
-    let Some(owner) = parts.next() else {
-        return false;
-    };
-    let Some(repo) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && !owner.is_empty()
+    let owner = parts.next()?;
+    let raw_repo = parts.next()?;
+    let tail = parts.collect::<Vec<_>>();
+    let (repo, reference) = raw_repo
+        .split_once('@')
+        .map_or((raw_repo, None), |(repo, reference)| (repo, Some(reference.to_owned())));
+    (!owner.is_empty()
         && !repo.is_empty()
+        && reference.as_ref().is_none_or(|value| !value.is_empty())
         && owner != "."
         && owner != ".."
         && repo != "."
         && repo != ".."
+        && tail.iter().all(|part| !part.is_empty()))
+    .then(|| {
+        let subpath = (!tail.is_empty()).then(|| tail.iter().collect());
+        (format!("{owner}/{repo}"), reference, subpath)
+    })
+}
+
+fn normalize_plugin_install_subpath(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+    let valid = !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path.components().all(|component| matches!(component, std::path::Component::Normal(_)));
+    if valid {
+        Ok(path)
+    } else {
+        Err("plugin install: --path must be a non-empty relative directory without '.' or '..'".to_owned())
+    }
 }
 
 fn resolve_default_plugin_root() -> std::path::PathBuf {
     maw_data_path(&real_xdg_env(), &["plugins"])
 }
 
+fn install_plugin_dir(
+    source: &std::path::Path,
+    root: &std::path::Path,
+    force: bool,
+) -> Result<maw_plugin_manifest::PluginInstallSummary, String> {
+    let plugin = load_manifest_from_dir(source)?
+        .ok_or_else(|| format!("no plugin.json in {}", source.display()))?;
+    let destination = root.join(&plugin.manifest.name);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(_) if !force => {
+            return Err(format!(
+                "plugin '{}' is already installed; use --force to reinstall",
+                plugin.manifest.name
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(&destination)
+            .map_err(|error| format!("plugin install: remove existing failed: {error}"))?,
+        Ok(_) => std::fs::remove_file(&destination)
+            .map_err(|error| format!("plugin install: remove existing failed: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("plugin install: inspect destination failed: {error}")),
+    }
+    install_built_plugin_dir(source, root)
+}
+
 fn install_from_git(
     url: &str,
     reference: Option<&str>,
+    expected_sha256: Option<&str>,
+    warn_unpinned: bool,
+    subpath: Option<&std::path::Path>,
     root: &std::path::Path,
-    build: bool,
-) -> Result<maw_plugin_manifest::PluginInstallSummary, String> {
+    force: bool,
+) -> Result<PluginInstallOutcome, String> {
     let tmp = create_plugin_install_temp_dir()?;
-    let result = install_from_git_in_temp(url, reference, root, build, &tmp);
+    let target = PluginInstallTarget { root, force };
+    let result = install_from_git_in_temp(url, reference, expected_sha256, warn_unpinned, subpath, target, &tmp);
     let cleanup = std::fs::remove_dir_all(&tmp);
     match (result, cleanup) {
         (Ok(summary), Ok(())) => Ok(summary),
@@ -310,18 +414,96 @@ fn install_from_git(
     }
 }
 
+#[derive(Clone, Copy)]
+struct PluginInstallTarget<'a> {
+    root: &'a std::path::Path,
+    force: bool,
+}
+
 fn install_from_git_in_temp(
     url: &str,
     reference: Option<&str>,
-    root: &std::path::Path,
-    build: bool,
+    expected_sha256: Option<&str>,
+    warn_unpinned: bool,
+    subpath: Option<&std::path::Path>,
+    target: PluginInstallTarget<'_>,
     tmp: &std::path::Path,
-) -> Result<maw_plugin_manifest::PluginInstallSummary, String> {
+) -> Result<PluginInstallOutcome, String> {
     git_clone_plugin_repo(url, reference, tmp)?;
-    if build {
-        build_js_plugin_dir(tmp, false)?;
+    let source = subpath.map_or_else(|| tmp.to_owned(), |path| tmp.join(path));
+    if !source.is_dir() {
+        return Err(format!("plugin install: subpath not found: {}", source.display()));
     }
-    install_built_plugin_dir(tmp, root)
+    let build = build_js_plugin_dir(&source, false)?;
+    let warning = verify_plugin_install_pin(
+        &build.name,
+        &build.version,
+        Some(&build.sha256),
+        expected_sha256,
+        warn_unpinned,
+    )?;
+    let summary = install_plugin_dir(&source, target.root, target.force)?;
+    Ok(PluginInstallOutcome { summary, warning })
+}
+
+fn normalize_plugin_install_sha256(value: &str) -> Result<String, String> {
+    let hex = value.strip_prefix("sha256:").unwrap_or(value);
+    if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()) {
+        Ok(format!("sha256:{hex}"))
+    } else {
+        Err("plugin install: --sha256 must be 64 lowercase hex chars".to_owned())
+    }
+}
+
+fn verify_plugin_install_pin(
+    name: &str,
+    version: &str,
+    observed_sha256: Option<&str>,
+    expected_sha256: Option<&str>,
+    warn_unpinned: bool,
+) -> Result<Option<String>, String> {
+    let observed = observed_sha256.ok_or_else(|| "plugin install: sha256 unavailable after build".to_owned())?;
+    let locked = read_plugin_lock_entry(name)?;
+    if let Some(entry) = &locked {
+        if entry.version != version {
+            return Err(format!("plugin '{name}' version mismatch: plugins.lock={} install={version}", entry.version));
+        }
+        if entry.sha256 != observed {
+            return Err(format!("plugin '{name}' sha256 mismatch — refusing to install.\n  plugins.lock: {}\n  install:      {observed}", entry.sha256));
+        }
+    }
+    if let Some(expected) = expected_sha256 {
+        if expected != observed {
+            return Err(format!("plugin '{name}' sha256 mismatch — refusing to install.\n  expected: {expected}\n  install:  {observed}"));
+        }
+    }
+    Ok((locked.is_none() && expected_sha256.is_none() && warn_unpinned).then(|| {
+        format!("warning: plugin install {name} is unpinned; use owner/repo@ref and --sha256 {observed}")
+    }))
+}
+
+struct PluginLockEntry { version: String, sha256: String }
+
+fn read_plugin_lock_entry(name: &str) -> Result<Option<PluginLockEntry>, String> {
+    let path = std::env::var_os("MAW_PLUGINS_LOCK").map_or_else(
+        || maw_data_path(&real_xdg_env(), &["plugins.lock"]),
+        std::path::PathBuf::from,
+    );
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("plugins.lock: read {}: {error}", path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("plugins.lock: invalid JSON at {}: {error}", path.display()))?;
+    let plugins = json.get("plugins").and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "plugins.lock: 'plugins' must be an object".to_owned())?;
+    let Some(entry) = plugins.get(name) else { return Ok(None); };
+    let version = entry.get("version").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("plugins.lock: entry '{name}' missing version"))?;
+    let sha256 = normalize_plugin_install_sha256(entry.get("sha256").and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("plugins.lock: entry '{name}' missing sha256"))?)?;
+    Ok(Some(PluginLockEntry { version: version.to_owned(), sha256 }))
 }
 
 fn create_plugin_install_temp_dir() -> Result<std::path::PathBuf, String> {
@@ -404,7 +586,13 @@ fn render_plugin_install_summary(
 
 #[cfg(test)]
 mod plugin_install_tests {
-    use super::{classify_plugin_install_source, InstallSource};
+    use super::{classify_plugin_install_source, verify_plugin_install_pin, InstallSource};
+    use std::sync::{Mutex, OnceLock};
+
+    fn lock_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn temp_existing_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -419,35 +607,48 @@ mod plugin_install_tests {
     #[test]
     fn classifier_accepts_explicit_git_url_forms() {
         assert_eq!(
-            classify_plugin_install_source("https://github.com/owner/repo", None).expect("https"),
+            classify_plugin_install_source("https://github.com/owner/repo", None, None).expect("https"),
             InstallSource::Git {
                 url: "https://github.com/owner/repo".to_owned(),
                 reference: None,
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
             }
         );
         assert_eq!(
             classify_plugin_install_source(
                 "git@github.com:owner/repo.git",
                 Some("main".to_owned()),
+                None,
             )
             .expect("ssh"),
             InstallSource::Git {
                 url: "git@github.com:owner/repo.git".to_owned(),
                 reference: Some("main".to_owned()),
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
             }
         );
         assert_eq!(
-            classify_plugin_install_source("file:///tmp/plugin-fixture", None).expect("file"),
+            classify_plugin_install_source("file:///tmp/plugin-fixture", None, None).expect("file"),
             InstallSource::Git {
                 url: "file:///tmp/plugin-fixture".to_owned(),
                 reference: None,
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
             }
         );
         assert_eq!(
-            classify_plugin_install_source("owner/repo.git", None).expect("suffix"),
+            classify_plugin_install_source("owner/repo.git", None, None).expect("suffix"),
             InstallSource::Git {
                 url: "owner/repo.git".to_owned(),
                 reference: None,
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
             }
         );
     }
@@ -455,11 +656,36 @@ mod plugin_install_tests {
     #[test]
     fn classifier_maps_owner_repo_shorthand_to_github_when_not_local() {
         assert_eq!(
-            classify_plugin_install_source("Soul-Brews-Studio/maw-js", Some("alpha".to_owned()))
+            classify_plugin_install_source("Soul-Brews-Studio/maw-js", Some("alpha".to_owned()), None)
                 .expect("shorthand"),
             InstallSource::Git {
                 url: "https://github.com/Soul-Brews-Studio/maw-js".to_owned(),
                 reference: Some("alpha".to_owned()),
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
+            }
+        );
+        assert_eq!(
+            classify_plugin_install_source("Soul-Brews-Studio/maw-js@v1", None, None)
+                .expect("inline ref"),
+            InstallSource::Git {
+                url: "https://github.com/Soul-Brews-Studio/maw-js".to_owned(),
+                reference: Some("v1".to_owned()),
+                sha256: None,
+                warn_unpinned: false,
+                subpath: None,
+            }
+        );
+        assert_eq!(
+            classify_plugin_install_source("Soul-Brews-Studio/maw-plugins/packages/costs", None, None)
+                .expect("monorepo shorthand"),
+            InstallSource::Git {
+                url: "https://github.com/Soul-Brews-Studio/maw-plugins".to_owned(),
+                reference: None,
+                sha256: None,
+                warn_unpinned: true,
+                subpath: Some(std::path::PathBuf::from("packages/costs")),
             }
         );
     }
@@ -467,19 +693,19 @@ mod plugin_install_tests {
     #[test]
     fn classifier_keeps_local_paths_local() {
         assert_eq!(
-            classify_plugin_install_source("local-plugin", None).expect("plain local"),
+            classify_plugin_install_source("local-plugin", None, None).expect("plain local"),
             InstallSource::Local(std::path::PathBuf::from("local-plugin"))
         );
 
         let dir = temp_existing_dir("existing");
         assert_eq!(
-            classify_plugin_install_source(&dir.display().to_string(), None).expect("existing"),
+            classify_plugin_install_source(&dir.display().to_string(), None, None).expect("existing"),
             InstallSource::Local(dir.clone())
         );
 
         let pathish = "./missing-plugin";
         assert_eq!(
-            classify_plugin_install_source(pathish, None).expect("pathish"),
+            classify_plugin_install_source(pathish, None, None).expect("pathish"),
             InstallSource::Local(std::path::PathBuf::from(pathish))
         );
 
@@ -488,9 +714,28 @@ mod plugin_install_tests {
 
     #[test]
     fn classifier_rejects_ref_for_local_source() {
-        let error = classify_plugin_install_source("local-plugin", Some("main".to_owned()))
+        let error = classify_plugin_install_source("local-plugin", Some("main".to_owned()), None)
             .expect_err("local ref rejected");
         assert!(error.contains("--ref is only supported for git sources"));
+    }
+
+    #[test]
+    fn pin_verifier_matches_mismatches_warns_and_checks_lock() {
+        let _guard = lock_guard();
+        let old = std::env::var_os("MAW_PLUGINS_LOCK");
+        let path = temp_existing_dir("lock").join("plugins.lock");
+        std::env::set_var("MAW_PLUGINS_LOCK", &path);
+        let sha = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(verify_plugin_install_pin("demo", "0.1.0", Some(sha), Some(sha), true).expect("match"), None);
+        let err = verify_plugin_install_pin("demo", "0.1.0", Some(sha), Some("sha256:1111111111111111111111111111111111111111111111111111111111111111"), false).expect_err("mismatch");
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert!(verify_plugin_install_pin("demo", "0.1.0", Some(sha), None, true).expect("warn").expect("warning").contains("unpinned"));
+        let locked = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(&path, format!(r#"{{"schema":1,"plugins":{{"demo":{{"version":"0.1.0","sha256":"{locked}","source":"github:o/r@v1"}}}}}}"#)).expect("lock");
+        assert_eq!(verify_plugin_install_pin("demo", "0.1.0", Some(locked), None, true).expect("lock match"), None);
+        let err = verify_plugin_install_pin("demo", "0.1.0", Some(sha), None, false).expect_err("lock mismatch");
+        assert!(err.contains("plugins.lock"), "{err}");
+        match old { Some(value) => std::env::set_var("MAW_PLUGINS_LOCK", value), None => std::env::remove_var("MAW_PLUGINS_LOCK") }
     }
 }
 
@@ -552,6 +797,14 @@ fn plugin_usage_error(message: &str) -> CliOutput {
         stderr: format!(
             "{message}\nusage: maw-rs plugin ls [-v|--verbose] [--core] [--standard] [--extra] [--api] [--scan-dir <dir>]... [--disabled <name>]... [--runtime-version <version>] [--use-cache]\n       maw-rs plugin <infer-capabilities|build|init|install> [args]\n"
         ),
+    }
+}
+
+fn plugin_install_error(message: &str) -> CliOutput {
+    CliOutput {
+        code: 2,
+        stdout: String::new(),
+        stderr: format!("{message}\n"),
     }
 }
 

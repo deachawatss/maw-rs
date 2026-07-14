@@ -44,22 +44,11 @@ fn optional_string_field(
 }
 
 fn invoke_context_json(ctx: &InvokeContext) -> String {
-    // cwd/home are additive maw-rs context fields. Emit them only when known so
-    // the default `{source,args}` shape stays byte-identical to maw-js (and the
-    // committed wasm-parity goldens) for plugins that don't need them.
-    let mut value = serde_json::json!({
+    serde_json::json!({
         "source": ctx.source.as_str(),
         "args": ctx.args,
-    });
-    if let Some(map) = value.as_object_mut() {
-        if let Some(cwd) = &ctx.cwd {
-            map.insert("cwd".to_owned(), serde_json::Value::from(cwd.as_str()));
-        }
-        if let Some(home) = &ctx.home {
-            map.insert("home".to_owned(), serde_json::Value::from(home.as_str()));
-        }
-    }
-    value.to_string()
+    })
+    .to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +114,9 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
     let (capabilities, capability_warnings) = capabilities.map_or((None, Vec::new()), |parsed| {
         (Some(parsed.capabilities), parsed.warnings)
     });
+    let endpoints = parse_endpoints(&raw)?;
+    let secrets = parse_secrets(&raw)?;
+    validate_endpoint_capabilities(capabilities.as_deref(), endpoints.as_ref(), secrets.as_ref())?;
 
     Ok(PluginManifest {
         name,
@@ -153,6 +145,8 @@ pub fn parse_manifest(json_text: &str, dir: &Path) -> Result<PluginManifest, Str
         target,
         capability_namespaces,
         capabilities,
+        endpoints,
+        secrets,
         capability_warnings,
         dependencies: parse_dependencies(&raw)?,
         artifact: parse_artifact(&raw)?,
@@ -450,10 +444,39 @@ where
         return runtime.invoke_ts(plugin, ctx);
     }
 
+    if let Some(url) = serve_only_plugin_url(plugin, ctx) {
+        return InvokeResult::output(url);
+    }
+
     match std::fs::read(&plugin.wasm_path) {
         Ok(wasm_bytes) => runtime.invoke_wasm(plugin, ctx, &wasm_bytes),
         Err(error) => InvokeResult::error(format!("failed to read wasm: {error}")),
     }
+}
+
+fn serve_only_plugin_url(plugin: &LoadedPlugin, ctx: &InvokeContext) -> Option<String> {
+    if ctx.source != InvokeSource::Cli
+        || !ctx.args.is_empty()
+        || plugin.entry_path.is_some()
+        || !plugin.wasm_path.as_os_str().is_empty()
+    {
+        return None;
+    }
+    let prefix = plugin
+        .manifest
+        .engine
+        .as_ref()?
+        .serve
+        .as_ref()?
+        .prefix
+        .as_deref()?
+        .trim_end_matches('/');
+    let port = std::env::var("MAW_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(3456);
+    Some(format!("http://localhost:{port}{prefix}/"))
 }
 
 /// Default plugin scan roots.
@@ -661,18 +684,17 @@ mod part03_coverage_tests {
     }
 
     #[test]
-    fn invoke_context_json_includes_cwd_and_home() {
+    fn invoke_context_json_ignores_host_process_fields() {
         let ctx = InvokeContext {
             source: InvokeSource::Cli,
             args: vec!["start".to_owned()],
             cwd: Some("/work/here".to_owned()),
             home: Some("/home/nat".to_owned()),
         };
-        let value: serde_json::Value =
-            serde_json::from_str(&invoke_context_json(&ctx)).expect("context json");
-        assert_eq!(value["source"], "cli");
-        assert_eq!(value["cwd"], "/work/here");
-        assert_eq!(value["home"], "/home/nat");
+        assert_eq!(
+            invoke_context_json(&ctx),
+            r#"{"args":["start"],"source":"cli"}"#
+        );
     }
 
     #[test]
