@@ -866,7 +866,7 @@ fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence)
         sections.push(body.trim().to_owned());
     }
 
-    let trace = format!("Closes #{}\nREQ: #{}", delivery.issue, delivery.issue);
+    let trace = wind_pr_default_trace(delivery.issue);
     if !sections.iter().any(|section| section.contains(&format!("Closes #{}", delivery.issue)))
         || !sections.iter().any(|section| section.contains(&format!("REQ: #{}", delivery.issue)))
     {

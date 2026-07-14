@@ -173,63 +173,8 @@ fn run_project_command(argv: &[String]) -> CliOutput {
 // park implementation lives in part292.rs (run_park_command, resolve_park,
 // time_ago_ms, and helpers). All are in scope via include!.
 
-const CLEANUP_USAGE: &str =
-    "usage: maw cleanup [--zombie-agents] [--teams] [--fix|--yes]  (no scope flag runs both; --fix kills zombie panes, team prune is always safe)";
-
-/// Fleet-wide cleanup. Delegates to the proven `view --zombie-agents` and
-/// `team prune` handlers so behavior (and their guards) stay in one place:
-///   --zombie-agents  preview orphaned agent panes; with --fix/--yes, kill them
-///   --teams          prune empty/inactive team registry dirs (always safe)
-/// With no scope flag, both run. `maw cleanup --zombie-agents --fix` and
-/// `maw cleanup --teams --yes` are the documented L1 daily-loop invocations.
 fn run_cleanup_command(argv: &[String]) -> CliOutput {
-    let (mut zombie, mut teams, mut apply) = (false, false, false);
-    for arg in argv {
-        match arg.as_str() {
-            "--zombie-agents" | "--zombies" => zombie = true,
-            "--teams" => teams = true,
-            "--fix" | "--yes" | "-y" => apply = true,
-            "--help" | "-h" => {
-                return CliOutput { code: 0, stdout: format!("{CLEANUP_USAGE}\n"), stderr: String::new() };
-            }
-            other => {
-                return CliOutput {
-                    code: 2,
-                    stdout: String::new(),
-                    stderr: format!("cleanup: unexpected argument {other}\n{CLEANUP_USAGE}\n"),
-                };
-            }
-        }
-    }
-    if !zombie && !teams {
-        zombie = true;
-        teams = true;
-    }
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut code = 0;
-    if zombie {
-        let mut view_args = vec!["--zombie-agents".to_owned()];
-        if apply {
-            view_args.push("--yes".to_owned());
-        }
-        let result = view_run_command(&view_args);
-        stdout.push_str(&result.stdout);
-        stderr.push_str(&result.stderr);
-        if result.code != 0 {
-            code = result.code;
-        }
-    }
-    if teams {
-        let result = team_run_command(&["prune".to_owned()]);
-        stdout.push_str(&result.stdout);
-        stderr.push_str(&result.stderr);
-        if result.code != 0 {
-            code = result.code;
-        }
-    }
-    CliOutput { code, stdout, stderr }
+    wind_cleanup_command(argv)
 }
 
 fn learn_parse(argv: &[String]) -> Result<LearnOptions, String> {
