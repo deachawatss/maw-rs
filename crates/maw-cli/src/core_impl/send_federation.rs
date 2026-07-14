@@ -64,7 +64,7 @@ async fn run_send_like_async_impl(command: &str, raw_args: &[String]) -> CliOutp
     run_send_like_async_with_args(command, send_args, false, audit_args).await
 }
 
-async fn run_hey_in_process(query: &str, message: &str, acl_bypass: bool) -> CliOutput {
+pub(super) async fn run_hey_in_process(query: &str, message: &str, acl_bypass: bool) -> CliOutput {
     let send_args = send_args_for_inbox_hey(query, message);
     run_send_like_async_with_args("hey", send_args, acl_bypass, vec!["hey".to_owned(), query.to_owned(), message.to_owned()]).await
 }

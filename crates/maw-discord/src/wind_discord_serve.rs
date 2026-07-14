@@ -1,5 +1,5 @@
 use super::*;
-use std::{collections::BTreeMap, fs, process::Command};
+use std::{collections::BTreeMap, fs};
 use twilight_model::gateway::{event::Event, Intents};
 
 const MAP_FILE: &str = "ψ/memory/discord-channel-map.json";
@@ -22,6 +22,7 @@ pub(super) async fn serve(
     env: &DiscordEnv,
     rest: &dyn DiscordRest,
     args: &[String],
+    relay: &dyn DiscordPaneRelay,
     log: &mut Vec<String>,
 ) -> bool {
     let Ok((oracle, dry_run, channel, message)) = parse_args(args) else {
@@ -46,23 +47,12 @@ pub(super) async fn serve(
     if let (Some(channel), Some(message)) = (channel, message) {
         return post_mapped_message(env, rest, &oracle, &config, &channel, &message, log).await;
     }
-    run_gateway(env, &oracle, &config, log).await
+    run_gateway(env, &oracle, &config, relay, log).await
 }
 
 fn parse_args(args: &[String]) -> Result<(String, bool, Option<String>, Option<String>), ()> {
-    let Some(raw_oracle) = args.first() else {
-        return Err(());
-    };
-    let oracle = raw_oracle.strip_suffix("-oracle").unwrap_or(raw_oracle);
-    if oracle.is_empty()
-        || !oracle
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-    {
-        return Err(());
-    }
-    let (mut dry_run, mut channel, mut message) = (false, None, None);
-    let mut index = 1;
+    let (mut oracle, mut dry_run, mut channel, mut message) = (None, false, None, None);
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--dry-run" => dry_run = true,
@@ -77,14 +67,30 @@ fn parse_args(args: &[String]) -> Result<(String, bool, Option<String>, Option<S
                 }
                 index += 1;
             }
-            _ => return Err(()),
+            raw_oracle if raw_oracle.starts_with("--") => return Err(()),
+            raw_oracle => {
+                if oracle.is_some() {
+                    return Err(());
+                }
+                let normalized = raw_oracle.strip_suffix("-oracle").unwrap_or(raw_oracle);
+                if normalized.is_empty()
+                    || !normalized
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                {
+                    return Err(());
+                }
+                oracle = Some(normalized.to_owned());
+            }
         }
         index += 1;
     }
     if channel.is_some() != message.is_some() {
         return Err(());
     }
-    Ok((oracle.to_owned(), dry_run, channel, message))
+    oracle
+        .map(|oracle| (oracle, dry_run, channel, message))
+        .ok_or(())
 }
 
 fn load_config(env: &DiscordEnv, oracle: &str) -> Result<Config, String> {
@@ -161,7 +167,7 @@ async fn post_mapped_message(
     }
     let token = match gateway::resolve_gateway_token(
         env,
-        &gateway::GatewayConfig::new(oracle, Intents::GUILD_MESSAGES),
+        &gateway::GatewayConfig::new(format!("{oracle}-oracle"), Intents::GUILD_MESSAGES),
     ) {
         Ok(token) => token.into_inner(),
         Err(error) => {
@@ -196,11 +202,15 @@ async fn run_gateway(
     env: &DiscordEnv,
     oracle: &str,
     config: &Config,
+    relay: &dyn DiscordPaneRelay,
     log: &mut Vec<String>,
 ) -> bool {
     let handle = match gateway::spawn_gateway(
         env,
-        gateway::GatewayConfig::new(oracle, Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT),
+        gateway::GatewayConfig::new(
+            format!("{oracle}-oracle"),
+            Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT,
+        ),
     ) {
         Ok(handle) => handle,
         Err(error) => {
@@ -218,7 +228,7 @@ async fn run_gateway(
             event = events.recv() => if let Ok(event) = event {
                 if let Some(inbound) = inbound(&event.event) {
                     if let Some((target, body)) = pane_message(config, oracle, &inbound) {
-                        if let Err(error) = relay_to_pane(&target, &body) { eprintln!("maw discord serve: {error}"); }
+                        if let Err(error) = relay.relay(&target, &body).await { eprintln!("maw discord serve: {error}"); }
                     }
                 }
             },
@@ -269,19 +279,6 @@ fn clean_pane_content(content: &str) -> Option<String> {
     }
     let clean = clean.trim();
     (!clean.is_empty()).then(|| clean.to_owned())
-}
-
-fn relay_to_pane(target: &str, body: &str) -> Result<(), String> {
-    Command::new("maw")
-        .args(["hey", target, body])
-        .status()
-        .map_err(|_| "could not invoke maw hey".to_owned())
-        .and_then(|status| {
-            status
-                .success()
-                .then_some(())
-                .ok_or_else(|| "maw hey failed".to_owned())
-        })
 }
 
 #[cfg(test)]
@@ -337,6 +334,26 @@ mod tests {
         .await;
 
         assert!(out.stdout.contains("native gateway"));
+    }
+
+    #[test]
+    fn parse_args_accepts_dry_run_before_the_oracle() {
+        let args = ["--dry-run", "gale-oracle"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(parse_args(&args), Ok(("gale".to_owned(), true, None, None)));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flags_as_oracles() {
+        let args = ["--host"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+
+        assert_eq!(parse_args(&args), Err(()));
     }
 
     #[test]

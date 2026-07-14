@@ -35,11 +35,21 @@ mod tokens;
 mod validation;
 mod wind_discord_serve;
 
-pub use self::command_dispatch::{run_discord_command, run_discord_command_with};
+pub use self::command_dispatch::{
+    run_discord_command, run_discord_command_with, run_discord_command_with_pane_relay,
+};
 pub use self::discord_runtime::{
     DiscordEnv, DiscordHttpResponse, DiscordOutput, DiscordRest, ReqwestDiscordRest, TokenEntry,
 };
 pub use self::discord_state_helpers::is_numeric_snowflake;
+
+pub trait DiscordPaneRelay: Send + Sync {
+    fn relay<'a>(
+        &'a self,
+        target: &'a str,
+        body: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
 
 use self::{
     access_core::*, access_read::*, access_write::*, bind::*, discord_runtime::*,

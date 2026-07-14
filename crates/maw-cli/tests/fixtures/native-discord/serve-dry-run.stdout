@@ -1,3 +1,1 @@
-🛰 maw discord serve listening on 127.0.0.1:3457
-  bind: 127.0.0.1 only (fleet-safe)
-  [dry-run] listener not started
+🛰 maw discord serve nova: native gateway dry-run

@@ -26,7 +26,7 @@ use maw_bind::{resolve_bind_host, BindConfig, BindHostResult};
 use maw_bring::{parse_bring_args, ParsedBringArgs};
 use maw_calver::{compute_version, Channel, ComputeArgs, DateParts};
 use maw_feed::{active_oracles_at, describe_activity, parse_line, FeedEvent};
-use maw_discord::run_discord_command;
+use maw_discord::{run_discord_command, run_discord_command_with_pane_relay, DiscordPaneRelay};
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
 use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
@@ -632,13 +632,30 @@ fn run_async_handler_blocking(handler: AsyncHandler, args: &[String]) -> CliOutp
 
 fn run_discord_async(args: Vec<String>) -> Pin<Box<dyn Future<Output = CliOutput> + Send>> {
     Box::pin(async move {
-        let output = run_discord_command(args).await;
+        let output = run_discord_command_with_pane_relay(args, &InProcessDiscordPaneRelay).await;
         CliOutput {
             code: output.code,
             stdout: output.stdout,
             stderr: output.stderr,
         }
     })
+}
+
+struct InProcessDiscordPaneRelay;
+
+impl DiscordPaneRelay for InProcessDiscordPaneRelay {
+    fn relay<'a>(
+        &'a self,
+        target: &'a str,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let output = run_hey_in_process(target, body, false).await;
+            (output.code == 0)
+                .then_some(())
+                .ok_or_else(|| "in-process Discord pane relay failed".to_owned())
+        })
+    }
 }
 
 #[cfg(test)]
