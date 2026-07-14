@@ -45,7 +45,9 @@ pub async fn run_discord_command_with(
         Some(sub) if sub == "inventory" => inventory(env, rest, &args[1..], &mut logs).await,
         Some(sub) if sub == "pair" => pair(env, &args[1..], &mut logs),
         Some(sub) if sub == "route" => route(env, &args[1..], &mut logs),
-        Some(sub) if sub == "serve" => serve(env, rest, &args[1..], &mut logs).await,
+        Some(sub) if sub == "serve" => {
+            wind_discord_serve::serve(env, rest, &args[1..], &mut logs).await
+        }
         Some(sub) => {
             logs.push(format!("unknown subcommand: {sub}"));
             usage(&mut logs);

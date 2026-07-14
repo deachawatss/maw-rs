@@ -27,11 +27,13 @@ mod discord_state_helpers;
 mod pair_route;
 mod rest_commands;
 mod rest_helpers;
+#[allow(dead_code)]
 mod serve;
 mod status;
 mod status_emit;
 mod tokens;
 mod validation;
+mod wind_discord_serve;
 
 pub use self::command_dispatch::{run_discord_command, run_discord_command_with};
 pub use self::discord_runtime::{
@@ -41,8 +43,8 @@ pub use self::discord_state_helpers::is_numeric_snowflake;
 
 use self::{
     access_core::*, access_read::*, access_write::*, bind::*, discord_runtime::*,
-    discord_state_helpers::*, pair_route::*, rest_commands::*, rest_helpers::*, serve::*,
-    status::*, status_emit::*, tokens::*, validation::*,
+    discord_state_helpers::*, pair_route::*, rest_commands::*, rest_helpers::*, status::*,
+    status_emit::*, tokens::*, validation::*,
 };
 
 #[cfg(test)]
