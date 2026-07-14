@@ -316,7 +316,7 @@ fn run_pr_command(argv: &[String]) -> CliOutput {
 fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut P) -> Result<String, String> {
     let options = pr_parse_args(argv)?;
     if options.reconcile {
-        return pr_reconcile_pending_reviews(process);
+        return pr_reconcile_reviews(process);
     }
     let cwd = pr_resolve_cwd(options.window.as_deref(), tmux)?;
     if options.show_current {
@@ -449,14 +449,14 @@ fn pr_enqueue_global_review(request: &PrReviewRequest) -> Result<(), String> {
     pr_write_queue_lines(&root, "pr-queue.jsonl", &lines)
 }
 
-fn pr_reconcile_pending_reviews<P: PrProcess>(process: &mut P) -> Result<String, String> {
+fn pr_reconcile_reviews<P: PrProcess>(process: &mut P) -> Result<String, String> {
     let root = pr_review_queue_root()?;
-    let pending = pr_load_pending_global_reviews(&root)?;
+    let queued = pr_load_global_reviews(&root)?;
     let cwd = std::env::current_dir().map_err(|error| format!("pr: resolve reconciliation directory: {error}"))?;
     let mut archived = std::collections::BTreeMap::new();
     let mut out = String::new();
 
-    for request in pending {
+    for request in queued {
         match process.pr_gh_review_state(&request.repo, request.pr_number) {
             Ok(PrGithubState::Merged) => {
                 archived.insert(pr_review_queue_key(&request), "merged".to_owned());
@@ -499,7 +499,7 @@ fn pr_reconcile_pending_reviews<P: PrProcess>(process: &mut P) -> Result<String,
 
     let archived_count = pr_finalize_global_reconciliation(&root, &archived)?;
     if out.is_empty() {
-        let _ = writeln!(out, "No pending PR handoffs to reconcile.");
+        let _ = writeln!(out, "No PR handoffs to reconcile.");
     } else if archived_count > 0 {
         let _ = writeln!(out, "Archived {archived_count} completed PR handoff(s).");
     }
@@ -515,17 +515,17 @@ fn pr_review_queue_root() -> Result<std::path::PathBuf, String> {
     Ok(root)
 }
 
-fn pr_load_pending_global_reviews(root: &std::path::Path) -> Result<Vec<PrReviewRequest>, String> {
+fn pr_load_global_reviews(root: &std::path::Path) -> Result<Vec<PrReviewRequest>, String> {
     let _lock = PrQueueLock::acquire(root)?;
     let mut seen = std::collections::HashSet::new();
-    let mut pending = Vec::new();
+    let mut queued = Vec::new();
     for line in pr_read_queue_lines(root, "pr-queue.jsonl")? {
         let Ok(request) = serde_json::from_str::<PrReviewRequest>(&line) else { continue };
-        if request.status == "pending" && seen.insert(pr_review_queue_key(&request)) {
-            pending.push(request);
+        if seen.insert(pr_review_queue_key(&request)) {
+            queued.push(request);
         }
     }
-    Ok(pending)
+    Ok(queued)
 }
 
 fn pr_finalize_global_reconciliation(
@@ -577,7 +577,7 @@ fn pr_finalize_global_reconciliation(
 }
 
 fn pr_review_queue_key(request: &PrReviewRequest) -> String {
-    request.pr_url.trim_end_matches('/').to_owned()
+    format!("{}#{}", request.repo.trim().to_ascii_lowercase(), request.pr_number)
 }
 
 fn pr_read_queue_lines(root: &std::path::Path, name: &str) -> Result<Vec<String>, String> {
@@ -1577,6 +1577,53 @@ mod pr_tests {
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
         assert_eq!(serde_json::from_str::<PrReviewRequest>(rows.trim()).expect("pending row"), request);
         assert!(!state.join("pr-queue.jsonl.archived").exists());
+    }
+
+    #[test]
+    fn pr_reconcile_archives_notified_merged_review_and_deduplicates_by_repo_and_number() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
+        let state = pr_temp_dir("reconcile-notified-merged");
+        std::env::set_var("MAW_STATE_DIR", &state);
+        let request = PrReviewRequest {
+            version: 1,
+            pr_url: "https://github.com/acme/demo/pull/58".to_owned(),
+            pr_number: 58,
+            repo: "acme/demo".to_owned(),
+            branch: "agents/issue-58-notified".to_owned(),
+            status: "notified".to_owned(),
+            notified: true,
+            notified_at: Some("2026-07-14T00:00:00Z".to_owned()),
+            notifier: Some("maw-pr".to_owned()),
+            l1_oracle: Some("01-gale".to_owned()),
+            l1_pane: Some("%58".to_owned()),
+        };
+        let mut duplicate = request.clone();
+        duplicate.pr_url = "https://legacy.example.invalid/acme/demo/pull/58".to_owned();
+        let row = pr_render_queue_row(&request).expect("notified row");
+        let duplicate_row = pr_render_queue_row(&duplicate).expect("duplicate row");
+        std::fs::write(state.join("pr-queue.jsonl"), format!("{row}\n{duplicate_row}\n"))
+            .expect("queue stale notified duplicates");
+        let mut tmux = PrMockTmux::default();
+        let mut process = PrMockProcess {
+            review_state_results: [Ok(PrGithubState::Merged)].into(),
+            ..PrMockProcess::default()
+        };
+
+        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process)
+            .expect("reconcile stale notified PR");
+
+        assert!(output.contains("PR #58 merged; archiving queued handoff"), "{output}");
+        assert!(process.review_state_results.is_empty(), "duplicate must not trigger a second GitHub check");
+        assert!(process.resurfaced.is_empty());
+        assert!(std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue").is_empty());
+        let archived = std::fs::read_to_string(state.join("pr-queue.jsonl.archived")).expect("archive");
+        assert_eq!(archived.lines().count(), 1);
+        let archived_request = serde_json::from_str::<PrReviewRequest>(archived.trim()).expect("archive row");
+        assert_eq!(archived_request.status, "merged");
+        assert!(!archived_request.notified);
+        assert_eq!(archived_request.repo, request.repo);
+        assert_eq!(archived_request.pr_number, request.pr_number);
     }
 
     #[test]
