@@ -503,7 +503,7 @@ mod config_tests {
 
     #[test]
     fn config_set_uses_weighted_target_when_present() {
-        let _lock = super::env_test_lock().lock().expect("env lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("MAW_HOME");
         let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let root = std::env::temp_dir().join(format!("maw-rs-config-unit-{}", std::process::id()));
@@ -529,7 +529,7 @@ mod config_tests {
 
     #[test]
     fn config_show_redacts_federation_token_by_default() {
-        let _lock = super::env_test_lock().lock().expect("env lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("MAW_HOME");
         let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let root = config_seed_secret_fixture("redact-default");
@@ -544,7 +544,7 @@ mod config_tests {
 
     #[test]
     fn config_show_reveal_prints_raw_secret_when_explicit() {
-        let _lock = super::env_test_lock().lock().expect("env lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("MAW_HOME");
         let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let root = config_seed_secret_fixture("reveal");
@@ -557,7 +557,7 @@ mod config_tests {
 
     #[test]
     fn config_show_json_remains_parseable_after_redaction() {
-        let _lock = super::env_test_lock().lock().expect("env lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("MAW_HOME");
         let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let root = config_seed_secret_fixture("json");
@@ -570,7 +570,7 @@ mod config_tests {
 
     #[test]
     fn config_show_redacts_nested_secret_keys_but_keeps_key_prefix_visible() {
-        let _lock = super::env_test_lock().lock().expect("env lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _home = EnvVarRestore::capture("MAW_HOME");
         let _config = EnvVarRestore::capture("MAW_CONFIG_DIR");
         let root = config_seed_secret_fixture("nested");

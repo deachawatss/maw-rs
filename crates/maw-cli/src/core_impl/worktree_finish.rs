@@ -1326,7 +1326,7 @@ mod done_tests {
 
     #[test]
     fn done_removes_a_solo_worktree_and_releases_its_lease_without_fleet_config() {
-        let _lock = env_test_lock().lock().expect("env lock");
+        let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _state = EnvVarRestore::capture("MAW_STATE_DIR");
         let root = DoneTempRoot::new("solo-lease");
         std::env::set_var("MAW_STATE_DIR", root.path.join("state"));
