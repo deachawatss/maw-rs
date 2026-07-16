@@ -37,8 +37,18 @@ fn solo_run<R: maw_tmux::TmuxRunner>(argv: &[String], runner: &mut R) -> Result<
         &window_name,
         &SoloLeaseTarget { path: &lease, holder: &holder },
     );
-    if result.is_err() { let _ = std::fs::remove_file(&lease); }
-    result
+    solo_finish(&lease, result)
+}
+
+fn solo_finish(lease: &std::path::Path, result: Result<String, String>) -> Result<String, String> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) => match std::fs::remove_file(lease) {
+            Ok(()) => Err(error),
+            Err(release_error) if release_error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(release_error) => Err(format!("{error}\nsolo: release lease {}: {release_error}", lease.display())),
+        },
+    }
 }
 
 fn solo_parse_args(argv: &[String]) -> Result<(String, String, Option<String>), String> {
@@ -96,14 +106,27 @@ fn solo_create_window<R: maw_tmux::TmuxRunner>(
     workon_send_window_command_to_target(runner, &window, "claude", &repo.repo_path, Some("claude"), Some("Issue delivery lead: inspect the issue and coordinate the Codex worktree pane."))?;
     let codex_pane = workon_tmux_run(runner, "split-window", &["-h", "-P", "-F", "#{pane_id}", "-t", &window, "-c", workon_path_str(&target_path)?])?;
     workon_wait_for_shell_prompt(runner, &codex_pane)?;
-    solo_send_command(runner, &codex_pane, &solo_append_profile("codex", profile))?;
+    solo_launch_l2(runner, &codex_pane, &target_path, profile)?;
     Ok(format!("solo '{window_name}' in {session} (L1: {}, L2: {})\n", repo.repo_path.display(), target_path.display()))
 }
 
-fn solo_send_command<R: maw_tmux::TmuxRunner>(runner: &mut R, pane: &str, command: &str) -> Result<(), String> {
-    runner.run("send-keys", &maw_tmux::tmux_send_keys_literal_args(pane, command)).map_err(|error| error.message)?;
-    runner.run("send-keys", &maw_tmux::tmux_send_enter_args(pane)).map_err(|error| error.message)?;
-    Ok(())
+fn solo_launch_l2<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    pane: &str,
+    target_path: &std::path::Path,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    let engine = solo_append_profile("codex", profile);
+    if let Err(error) = workon_send_window_command_to_target(runner, pane, "codex", target_path, Some(&engine), None) {
+        return Err(solo_launch_failure(runner, pane, &error));
+    }
+    workon_wait_for_launch(runner, pane).map_err(|error| solo_launch_failure(runner, pane, &error))
+}
+
+fn solo_launch_failure<R: maw_tmux::TmuxRunner>(runner: &mut R, pane: &str, error: &str) -> String {
+    let capture = workon_tmux_run(runner, "capture-pane", &["-t", pane, "-p", "-S", "-20"]).unwrap_or_default();
+    let message = format!("solo: L2 engine failed to start in {pane}: {error}");
+    if capture.is_empty() { message } else { format!("{message}\npane output:\n{capture}") }
 }
 
 fn solo_append_profile(command: &str, profile: Option<&str>) -> String {
@@ -203,6 +226,22 @@ fn solo_lease_allows_session(holder: &str, session: Option<&str>) -> bool {
 mod solo_tests {
     use super::*;
 
+    struct SoloLaunchMockTmux {
+        capture_responses: std::collections::VecDeque<String>,
+    }
+
+    impl maw_tmux::TmuxRunner for SoloLaunchMockTmux {
+        fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> {
+            match subcommand {
+                "display-message" if args.iter().any(|arg| arg == "#{pane_current_command}") => Ok("zsh\n".to_owned()),
+                "display-message" => Ok("0\n".to_owned()),
+                "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "codex: profile fast is invalid\n$".to_owned())),
+                "send-keys" => Ok(String::new()),
+                other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
+            }
+        }
+    }
+
     #[test]
     fn solo_profiles_are_forwarded_only_to_codex_family_engines() {
         assert_eq!(solo_append_profile("codex", Some("xhigh")), "codex -p xhigh");
@@ -244,5 +283,22 @@ mod solo_tests {
         assert!(solo_lease_allows_session("01-gale:maw-rs-revsolo", Some("01-gale")));
         assert!(!solo_lease_allows_session("01-gale:maw-rs-revsolo", Some("02-other")));
         assert!(!solo_lease_allows_session("01-gale:maw-rs-revsolo", None));
+    }
+
+    #[test]
+    fn solo_failed_l2_launch_surfaces_pane_error_and_releases_lease() {
+        let root = std::env::temp_dir().join(format!("maw-solo-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let lease = root.join("maw-rs.json");
+        solo_acquire_lease(&lease, "01-gale:maw-rs-73", |_| true).expect("lease acquired");
+        let mut runner = SoloLaunchMockTmux {
+            capture_responses: std::collections::VecDeque::from(["$\n".to_owned(), "$\n".to_owned(), "codex: profile fast is invalid\n$".to_owned()]),
+        };
+
+        let error = solo_launch_l2(&mut runner, "%2", &root, Some("fast")).expect_err("failed engine launch");
+        assert!(error.contains("profile fast is invalid"), "{error}");
+        assert!(solo_finish(&lease, Err(error)).is_err());
+        assert!(!lease.exists(), "failed launch releases its lease");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
