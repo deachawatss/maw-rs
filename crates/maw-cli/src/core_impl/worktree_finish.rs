@@ -152,7 +152,10 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     } else if options.dry_run {
         let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] window '{target}' not running — nothing to auto-save");
     }
-    if let Some(window) = &matched { done_kill_window(window, options, local, &mut stdout); } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running"); }
+    if let Some(window) = &matched {
+        done_kill_window(window, options, local, &mut stdout);
+        if !options.dry_run { solo_release_holder(&done_tmux_target(window)); }
+    } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running"); }
     let removed_worktree = if let Some(worktree) = &selected_worktree {
         done_remove_selected_worktree(worktree, options, local, &mut stdout)?;
         true
