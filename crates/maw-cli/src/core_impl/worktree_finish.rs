@@ -293,7 +293,11 @@ fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], loca
         stdout.push_str("  \x1b[90m  run maw done from the lead/parent pane after the DONE ping\x1b[0m\n");
         return Err(message);
     }
-    let Some(lead) = done_lead_window(windows, &window.session) else { return Ok(()); };
+    let Some(lead) = done_lead_window(windows, &window.session) else {
+        let message = format!("refusing to done window '{}' because the lead window for session '{}' could not be identified", window.name, window.session);
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        return Err(message);
+    };
     if lead.index != window.index { return Ok(()); }
     let message = format!("refusing to done lead window '{}' in session '{}' from a non-lead context", window.name, window.session);
     let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
@@ -302,7 +306,11 @@ fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], loca
 }
 
 fn done_lead_window(windows: &[DoneWindow], session: &str) -> Option<DoneWindow> {
-    windows.iter().filter(|window| window.session == session).min_by_key(|window| window.index).cloned()
+    let session_stem = done_session_stem(session);
+    windows
+        .iter()
+        .find(|window| window.session == session && done_session_stem(&window.name) == session_stem)
+        .cloned()
 }
 
 fn done_non_lead_windows(windows: &[DoneWindow], session: &str) -> Vec<DoneWindow> {
@@ -936,11 +944,13 @@ mod done_tests {
     }
 
     fn done_test_window(name: &str) -> DoneWindow {
-        DoneWindow { session: "s".to_owned(), index: if name == "lead" { 1 } else { 2 }, name: name.to_owned(), cwd: None }
+        let name = if name == "lead" { "s" } else { name };
+        DoneWindow { session: "s".to_owned(), index: if name == "s" { 1 } else { 2 }, name: name.to_owned(), cwd: None }
     }
 
     fn done_test_window_with_cwd(name: &str, cwd: &std::path::Path) -> DoneWindow {
-        DoneWindow { session: "s".to_owned(), index: if name == "lead" { 1 } else { 2 }, name: name.to_owned(), cwd: Some(cwd.display().to_string()) }
+        let name = if name == "lead" { "s" } else { name };
+        DoneWindow { session: "s".to_owned(), index: if name == "s" { 1 } else { 2 }, name: name.to_owned(), cwd: Some(cwd.display().to_string()) }
     }
 
     fn done_write_fleet(root: &DoneTempRoot, window: &str, repo: &str) {
@@ -960,6 +970,61 @@ mod done_tests {
     fn done_parse_matches_js_extra_positionals() {
         let err = done_parse_args(&["all".to_owned(), "x".to_owned()]).unwrap_err();
         assert!(err.contains("did you mean `maw done --all`?"), "{err}");
+    }
+
+    #[test]
+    fn done_all_uses_session_identity_not_lowest_window_index() {
+        let root = DoneTempRoot::new("inverted-window-order");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![
+                DoneWindow { session: "01-gale".to_owned(), index: 1, name: "finished-worker".to_owned(), cwd: None },
+                DoneWindow { session: "01-gale".to_owned(), index: 2, name: "gale".to_owned(), cwd: None },
+                DoneWindow { session: "01-gale".to_owned(), index: 3, name: "active-worker".to_owned(), cwd: None },
+            ],
+            current: Some(("01-gale".to_owned(), 2)),
+            ..DoneFakeRuntime::default()
+        };
+
+        let out = done_run_with_context(&done_args(&["--all", "--dry-run"]), &mut runtime, &root.context()).expect("done --all");
+
+        assert!(out.contains("done 01-gale:finished-worker"), "{out}");
+        assert!(out.contains("done 01-gale:active-worker"), "{out}");
+        assert!(!out.contains("done 01-gale:gale"), "{out}");
+        assert!(out.contains("done --all would process 2 window(s)"), "{out}");
+    }
+
+    #[test]
+    fn done_allows_lowest_index_worker_when_session_lead_is_higher() {
+        let root = DoneTempRoot::new("lowest-worker");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![
+                DoneWindow { session: "01-gale".to_owned(), index: 1, name: "finished-worker".to_owned(), cwd: None },
+                DoneWindow { session: "01-gale".to_owned(), index: 2, name: "gale".to_owned(), cwd: None },
+            ],
+            current: Some(("01-gale".to_owned(), 2)),
+            ..DoneFakeRuntime::default()
+        };
+
+        let out = done_run_with_context(&done_args(&["finished-worker", "--dry-run"]), &mut runtime, &root.context()).expect("done worker");
+
+        assert!(out.contains("would kill window 01-gale:finished-worker"), "{out}");
+    }
+
+    #[test]
+    fn done_still_refuses_self_invocation_with_inverted_window_order() {
+        let root = DoneTempRoot::new("self-invocation");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![
+                DoneWindow { session: "01-gale".to_owned(), index: 1, name: "finished-worker".to_owned(), cwd: None },
+                DoneWindow { session: "01-gale".to_owned(), index: 2, name: "gale".to_owned(), cwd: None },
+            ],
+            current: Some(("01-gale".to_owned(), 2)),
+            ..DoneFakeRuntime::default()
+        };
+
+        let error = done_run_with_context(&done_args(&["gale", "--dry-run"]), &mut runtime, &root.context()).expect_err("self invocation rejected");
+
+        assert_eq!(error, "refusing to done current window 'gale' in session '01-gale'");
     }
 
     #[test]
