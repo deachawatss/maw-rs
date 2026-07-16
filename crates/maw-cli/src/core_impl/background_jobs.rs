@@ -5,8 +5,9 @@ const DISPATCH_88: &[DispatcherEntry] = &[DispatcherEntry {
 
 const BG_PREFIX: &str = "maw-bg-";
 const BG_HELP: &str = "maw bg — run long commands in detached tmux without blocking the current pane\n\nusage:\n  maw bg \"<cmd>\" [--name X]              spawn detached tmux session\n  maw bg ls [--json]                     list active maw-bg-* sessions\n  maw bg tail <slug> [--lines N] [--follow]\n                                         sample last N lines (default 200)\n  maw bg attach <slug>                   attach (or switch-client inside tmux)\n  maw bg kill <slug> | --all             reap session(s)\n  maw bg gc [--dry-run] [--older-than DUR]\n                                         reap stale \"done\" sessions (default 24h)\n\nslug refs accept full slug, hash suffix (4 hex), or unique stem prefix.\n";
-const BG_LIST_FORMAT: &str = "#{session_name}\t#{session_created}\t#{pane_current_command}";
+const BG_LIST_FORMAT: &str = "#{session_name}\t#{session_created}";
 const BG_DEFAULT_TAIL_LINES: u32 = 200;
+const BG_STATUS_TAIL_LINES: u32 = 20;
 const BG_DEFAULT_GC_SECONDS: u64 = 24 * 60 * 60;
 const BG_FLAG_FOLLOW: u8 = 1 << 0;
 const BG_FLAG_DRY_RUN: u8 = 1 << 1;
@@ -517,15 +518,15 @@ fn bg_session_from_line(
     }
     bg_validate_session_name(name)?;
     let created = fields.next().and_then(|raw| raw.parse::<u64>().ok()).unwrap_or_else(now);
-    let command = fields.next().unwrap_or_default();
     let slug = bg_session_slug(name).unwrap_or_default();
     bg_validate_ref(&slug)?;
+    let (last_line, exit_code) = bg_pane_snapshot_of(&slug, tmux).unwrap_or_default();
     Ok(Some(BgSession {
         slug: slug.clone(),
         session: name.to_owned(),
         age_seconds: now().saturating_sub(created),
-        status: bg_status_from_pane_command(command),
-        last_line: bg_last_line_of(&slug, tmux).unwrap_or_default(),
+        status: bg_status_from_exit_code(exit_code),
+        last_line,
     }))
 }
 
@@ -535,14 +536,23 @@ fn bg_list_error_is_empty(result: &BgTmuxResult) -> bool {
         || result.stderr.contains("no current session")
 }
 
-fn bg_status_from_pane_command(command: &str) -> BgSessionStatus {
-    match command.trim().to_ascii_lowercase().as_str() {
-        "" | "read" | "sleep" | "sh" => BgSessionStatus::Done,
-        _ => BgSessionStatus::Running,
+fn bg_status_from_exit_code(exit_code: Option<u8>) -> BgSessionStatus {
+    if exit_code.is_some() {
+        BgSessionStatus::Done
+    } else {
+        BgSessionStatus::Running
     }
 }
 
-fn bg_last_line_of(slug: &str, tmux: &mut impl BgTmux) -> Result<String, String> {
+fn bg_exit_code_from_completion_marker(last_line: &str) -> Option<u8> {
+    last_line
+        .strip_prefix("[done — exit ")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+fn bg_pane_snapshot_of(slug: &str, tmux: &mut impl BgTmux) -> Result<(String, Option<u8>), String> {
     bg_validate_ref(slug)?;
     let session = bg_session_name(slug);
     bg_validate_session_name(&session)?;
@@ -552,15 +562,22 @@ fn bg_last_line_of(slug: &str, tmux: &mut impl BgTmux) -> Result<String, String>
         "-t".to_owned(),
         session,
         "-S".to_owned(),
-        "-1".to_owned(),
-        "-E".to_owned(),
-        "-1".to_owned(),
+        format!("-{BG_STATUS_TAIL_LINES}"),
     ];
     let result = tmux.bg_run("capture-pane", &args)?;
     if result.status == 0 {
-        Ok(result.stdout.trim_end_matches('\n').trim().to_owned())
+        let mut last_line = String::new();
+        let mut exit_code = None;
+        for line in result.stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if let Some(code) = bg_exit_code_from_completion_marker(line) {
+                exit_code = Some(code);
+            } else {
+                line.clone_into(&mut last_line);
+            }
+        }
+        Ok((last_line, exit_code))
     } else {
-        Ok(String::new())
+        Ok((String::new(), None))
     }
 }
 
@@ -925,7 +942,7 @@ mod bg_tests {
     #[test]
     fn bg_list_formats_sessions_and_captures_last_lines() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![
-            bg_ok("maw-bg-build-a1b2\t1699999940\tcargo\nmaw-bg-done-b2c3\t1699996400\tsleep\nother\t1\tsh\n"),
+            bg_ok("maw-bg-build-a1b2\t1699999940\tbash\nmaw-bg-done-b2c3\t1699996400\tbash\nother\t1\tsh\n"),
             bg_ok("building\n"),
             bg_ok("[done — exit 0]\n"),
         ]);
@@ -937,10 +954,40 @@ mod bg_tests {
 
     #[test]
     fn bg_json_list_is_camel_case_like_js() {
-        let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_ok("maw-bg-build-a1b2\t1699999990\tread\n"), bg_ok("tail\n")]);
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_ok("maw-bg-build-a1b2\t1699999990\tbash\n"), bg_ok("tail\n")]);
         let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
         assert!(output.1.contains("\"ageSeconds\": 10"));
-        assert!(output.1.contains("\"status\": \"done\""));
+        assert!(output.1.contains("\"status\": \"running\""));
+    }
+
+    #[test]
+    fn bg_running_jobs_without_completion_marker_remain_running() {
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-sleep-a1b2\t1699999990\tbash\nmaw-bg-read-b2c3\t1699999990\tbash\n"),
+            bg_ok("sleeping\n"),
+            bg_ok("waiting\n"),
+        ]);
+        let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
+        assert_eq!(output.1.matches("\"status\": \"running\"").count(), 2, "{output:?}");
+    }
+
+    #[test]
+    fn bg_completion_marker_requires_a_numeric_exit_code() {
+        assert_eq!(bg_exit_code_from_completion_marker("[done — exit 0]"), Some(0));
+        assert_eq!(bg_exit_code_from_completion_marker("[done — exit 127]"), Some(127));
+        assert_eq!(bg_exit_code_from_completion_marker("[done — exit failed]"), None);
+        assert_eq!(bg_exit_code_from_completion_marker("still running"), None);
+    }
+
+    #[test]
+    fn bg_finished_job_uses_completion_marker_in_recent_pane_tail() {
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-done-a1b2\t1699999990\tbash\n"),
+            bg_ok("finished\n\n[done — exit 0]\n"),
+        ]);
+        let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
+        assert!(output.1.contains("\"status\": \"done\""), "{}", output.1);
+        assert!(output.1.contains("\"lastLine\": \"finished\""), "{}", output.1);
     }
 
     #[test]
@@ -974,8 +1021,8 @@ mod bg_tests {
     #[test]
     fn bg_gc_dry_run_does_not_kill() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![
-            bg_ok("maw-bg-old-a111\t1699900000\tsleep\nmaw-bg-new-b222\t1699999990\tcargo\n"),
-            bg_ok("old done\n"),
+            bg_ok("maw-bg-old-a111\t1699900000\tbash\nmaw-bg-new-b222\t1699999990\tbash\n"),
+            bg_ok("[done — exit 0]\n"),
             bg_ok("new run\n"),
         ]);
         let output = bg_run(&bg_strings(&["gc", "--dry-run", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
@@ -983,6 +1030,19 @@ mod bg_tests {
         assert!(output.1.contains("would reap: old-a111"));
         assert!(output.1.contains("kept:    new-b222"));
         assert!(!tmux.calls.iter().any(|call| call.subcommand == "kill-session"));
+    }
+
+    #[test]
+    fn bg_gc_reaps_finished_shell_session() {
+        let mut tmux = BgFakeTmux::bg_with_responses(vec![
+            bg_ok("maw-bg-old-a111\t1699900000\tbash\n"),
+            bg_ok("[done — exit 0]\n"),
+            bg_ok_empty(),
+        ]);
+        let output = bg_run(&bg_strings(&["gc", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
+            .expect("gc");
+        assert!(output.1.contains("reaped: old-a111"), "{}", output.1);
+        assert!(tmux.calls.iter().any(|call| call.subcommand == "kill-session"));
     }
 
     #[test]
