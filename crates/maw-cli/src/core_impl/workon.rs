@@ -11,6 +11,7 @@ struct WorkonOptions {
     name: Option<String>,
     base: Option<String>,
     engine: Option<String>,
+    profile: Option<String>,
     layout: WorkonLayout,
     prompt: Option<String>,
     oracle: Option<String>,
@@ -88,6 +89,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
     let mut name = None;
     let mut base = None;
     let mut engine = None;
+    let mut profile = None;
     let mut prompt = None;
     let mut oracle = None;
     let mut index = 0;
@@ -98,6 +100,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
             continue;
         }
         if workon_parse_base_flag(argv, &mut base, &mut index)? { continue; }
+        if workon_parse_profile_flag(argv, &mut profile, &mut index)? { continue; }
         match argv[index].as_str() {
             "--help" | "-h" => return Err(workon_usage()),
             "--layout" => {
@@ -153,14 +156,8 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
                 engine = Some(value.to_owned());
                 index += 1;
             }
-            "--codex" => {
-                engine = Some("codex".to_owned());
-                index += 1;
-            }
-            "--claude" => {
-                engine = Some("claude".to_owned());
-                index += 1;
-            }
+            "--codex" => { engine = Some("codex".to_owned()); index += 1; }
+            "--claude" => { engine = Some("claude".to_owned()); index += 1; }
             "--prompt" => {
                 let tail: Vec<_> = argv[index + 1..].to_vec();
                 if tail.is_empty() { return Err("workon: --prompt requires text".to_owned()); }
@@ -177,7 +174,10 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
         }
     }
     let repo = workon_parse_repo(&positional, wt.as_ref(), fresh, name.as_ref())?;
-    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, base, engine, layout, prompt, oracle })
+    if let (Some(profile_name), Some(engine_name)) = (profile.as_deref(), engine.as_mut()) {
+        if solo_is_codex_family(engine_name) { *engine_name = solo_append_profile(engine_name, Some(profile_name)); }
+    }
+    Ok(WorkonOptions { repo, task: positional.get(1).cloned(), wt, fresh, name, base, engine, profile, layout, prompt, oracle })
 }
 
 fn workon_parse_target_session(argv: &[String], index: usize) -> Result<Option<(String, usize)>, String> {
@@ -224,6 +224,28 @@ fn workon_parse_base_flag(
     Ok(true)
 }
 
+fn workon_parse_profile_flag(
+    argv: &[String],
+    profile: &mut Option<String>,
+    index: &mut usize,
+) -> Result<bool, String> {
+    let flag = &argv[*index];
+    let (value, next_index) = match flag.as_str() {
+        "--profile" => {
+            let Some(value) = argv.get(*index + 1) else { return Err("workon: --profile requires a value".to_owned()); };
+            (value.clone(), *index + 2)
+        }
+        value => {
+            let Some(value) = value.strip_prefix("--profile=") else { return Ok(false) };
+            (value.to_owned(), *index + 1)
+        }
+    };
+    workon_validate_query(&value, "profile")?;
+    *profile = Some(value);
+    *index = next_index;
+    Ok(true)
+}
+
 fn workon_parse_repo(
     positional: &[String],
     wt: Option<&WorkonWorktreeRequest>,
@@ -250,16 +272,20 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--profile <name>] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
-    &["--layout", "--name", "--base", "-e", "--engine", "--oracle", "--session", "--prompt"]
+    &["--layout", "--name", "--base", "-e", "--engine", "--profile", "--oracle", "--session", "--prompt"]
 }
 
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
     let repo = workon_resolve_repo(&options.repo)?;
-    let (stdout, attach_session) = workon_cmd_with_runner(options, &repo, &mut maw_tmux::CommandTmuxRunner::new())?;
+    if options.profile.is_some() && options.engine.as_deref().is_some_and(|engine| engine == "claude") {
+        eprintln!("workon: --profile is ignored for claude");
+    }
+    let mut runner = maw_tmux::CommandTmuxRunner::new();
+    let (stdout, attach_session) = workon_cmd_with_runner(options, &repo, &mut runner)?;
     let Some(session) = attach_session else { return Ok(stdout) };
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return Ok(format!("{stdout}run: tmux attach -t {session}\n"));
@@ -319,6 +345,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut window_name = repo.repo_name.clone();
     let mut taskless_oracle = false;
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
+    solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
     if let Some(request) = workon_resolve_worktree_name(options)? {
         let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
@@ -1268,10 +1295,13 @@ fn workon_build_command_in_dir(agent_name: &str, cwd: &std::path::Path, engine: 
     let config = merged_config_value_in_dir(cwd);
     let commands = config.get("commands");
     let command = if let Some(engine) = engine {
-        commands
+        let (engine, profile) = engine.split_once(" -p ").unwrap_or((engine, ""));
+        let command = commands
             .and_then(|commands| commands.get(engine))
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| engine.to_owned(), str::to_owned)
+            ;
+        if profile.is_empty() { command } else { format!("{command} -p {profile}") }
     } else {
         commands
             .and_then(|commands| {
@@ -1426,6 +1456,7 @@ mod workon_tests {
             name: None,
             base: None,
             engine: None,
+            profile: None,
             layout: WorkonLayout::Nested,
             prompt: None,
             oracle: None,
@@ -1609,6 +1640,33 @@ mod workon_tests {
         assert!(error.contains("01-gale"), "{error}");
         assert_eq!(runner.calls, vec![("has-session".to_owned(), workon_strings(&["-t", "=01-gale"]))]);
         assert!(!runner.calls.iter().any(|(command, _)| command == "new-session"));
+    }
+
+    #[test]
+    fn workon_refuses_a_live_solo_lease_owned_by_a_different_session() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _tmux = EnvVarRestore::capture("TMUX");
+        let root = workon_temp_root("cross-session-lease");
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::remove_var("TMUX");
+        let lease = solo_lease_path("demo");
+        solo_acquire_lease(&lease, "01-gale:demo-solo", |_| true).expect("lease");
+        let repo = workon_test_repo(&root);
+        let mut options = workon_test_options("demo", Some("task"));
+        options.oracle = Some("02-other".to_owned());
+        options.engine = Some("codex".to_owned());
+        let mut runner = WorkonMockTmux {
+            has_session: true,
+            windows: "01-gale:demo-solo\n".to_owned(),
+            ..Default::default()
+        };
+
+        let error = workon_cmd_with_runner(&options, &repo, &mut runner).expect_err("cross-session lease");
+
+        assert!(error.contains("01-gale:demo-solo"), "{error}");
+        assert!(!runner.calls.iter().any(|(command, _)| command == "new-window"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
