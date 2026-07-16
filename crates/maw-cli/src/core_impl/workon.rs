@@ -285,9 +285,6 @@ fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
         eprintln!("workon: --profile is ignored for claude");
     }
     let mut runner = maw_tmux::CommandTmuxRunner::new();
-    if options.task.is_none() && options.wt.is_none() && options.engine.as_deref() == Some("claude") {
-        solo_require_unleased(&repo.repo_name, &mut runner)?;
-    }
     let (stdout, attach_session) = workon_cmd_with_runner(options, &repo, &mut runner)?;
     let Some(session) = attach_session else { return Ok(stdout) };
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
@@ -348,6 +345,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut window_name = repo.repo_name.clone();
     let mut taskless_oracle = false;
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
+    solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
     if let Some(request) = workon_resolve_worktree_name(options)? {
         let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
@@ -1642,6 +1640,33 @@ mod workon_tests {
         assert!(error.contains("01-gale"), "{error}");
         assert_eq!(runner.calls, vec![("has-session".to_owned(), workon_strings(&["-t", "=01-gale"]))]);
         assert!(!runner.calls.iter().any(|(command, _)| command == "new-session"));
+    }
+
+    #[test]
+    fn workon_refuses_a_live_solo_lease_owned_by_a_different_session() {
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _tmux = EnvVarRestore::capture("TMUX");
+        let root = workon_temp_root("cross-session-lease");
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::remove_var("TMUX");
+        let lease = solo_lease_path("demo");
+        solo_acquire_lease(&lease, "01-gale:demo-solo", |_| true).expect("lease");
+        let repo = workon_test_repo(&root);
+        let mut options = workon_test_options("demo", Some("task"));
+        options.oracle = Some("02-other".to_owned());
+        options.engine = Some("codex".to_owned());
+        let mut runner = WorkonMockTmux {
+            has_session: true,
+            windows: "01-gale:demo-solo\n".to_owned(),
+            ..Default::default()
+        };
+
+        let error = workon_cmd_with_runner(&options, &repo, &mut runner).expect_err("cross-session lease");
+
+        assert!(error.contains("01-gale:demo-solo"), "{error}");
+        assert!(!runner.calls.iter().any(|(command, _)| command == "new-window"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -139,7 +139,12 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     let matched = done_find_window(&sessions, &target_lower, session_filter);
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
     let pane_info = matched.as_ref().and_then(|window| done_live_pane_info(window, local));
-    let selected_worktree = done_select_worktree(target, &target_lower, options, pane_info.as_ref(), local, context, &mut stdout)?;
+    let solo_worktree = matched.as_ref().and_then(|window| solo_worktree_for_holder(&done_tmux_target(window)));
+    let selected_worktree = if let Some(path) = solo_worktree {
+        done_resolve_registered_worktree(local, &path, context)?
+    } else {
+        done_select_worktree(target, &target_lower, options, pane_info.as_ref(), local, context, &mut stdout)?
+    };
     if !options.dry_run {
         if let Some(worktree) = &selected_worktree {
             done_rescue_psi_notes(worktree, &mut stdout);
@@ -154,7 +159,6 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     }
     if let Some(window) = &matched {
         done_kill_window(window, options, local, &mut stdout);
-        if !options.dry_run { solo_release_holder(&done_tmux_target(window)); }
     } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running"); }
     let removed_worktree = if let Some(worktree) = &selected_worktree {
         done_remove_selected_worktree(worktree, options, local, &mut stdout)?;
@@ -162,6 +166,9 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     } else {
         false
     };
+    if !options.dry_run {
+        if let Some(window) = &matched { solo_release_holder(&done_tmux_target(window)); }
+    }
     if !removed_worktree { stdout.push_str("  \x1b[90m○\x1b[0m no worktree to remove (may be a main window)\n"); }
     if options.dry_run {
         if matched.is_none() && !removed_worktree { done_fail_missing_target(target)?; }
@@ -1250,5 +1257,27 @@ mod done_tests {
             "{:#?}",
             runtime.git_calls
         );
+    }
+
+    #[test]
+    fn done_removes_a_solo_worktree_and_releases_its_lease_without_fleet_config() {
+        let _lock = env_test_lock().lock().expect("env lock");
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let root = DoneTempRoot::new("solo-lease");
+        std::env::set_var("MAW_STATE_DIR", root.path.join("state"));
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/solo-task");
+        let lease = solo_lease_path("app");
+        solo_acquire_lease(&lease, "s:worker", |_| true).expect("lease");
+        solo_set_lease_worktree(&lease, "s:worker", &worktree).expect("worktree record");
+
+        let mut runtime = DoneFakeRuntime { windows: vec![done_test_window("lead"), done_test_window("worker")], ..DoneFakeRuntime::default() };
+        runtime.register_worktree(&main, &worktree);
+
+        done_run_with_context(&done_args(&["worker", "--force"]), &mut runtime, &context).expect("done solo");
+
+        assert!(!lease.exists(), "done must release the solo lease");
+        assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove") && args.iter().any(|arg| arg == &worktree.display().to_string())), "{:#?}", runtime.git_calls);
     }
 }
