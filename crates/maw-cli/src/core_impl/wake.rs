@@ -1,5 +1,4 @@
 const DISPATCH_64: &[DispatcherEntry] = &[DispatcherEntry { command: "wake", handler: Handler::Async(wake_async_native) }];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct WakeOptionsNative {
@@ -98,11 +97,8 @@ trait WakeTmuxNative {
     fn wake_has_session(&mut self, name: &str) -> bool;
     fn wake_new_session(&mut self, name: &str, window: &str, cwd: &std::path::Path) -> Result<(), String>;
     fn wake_new_window(&mut self, session: &str, window: &str, cwd: &std::path::Path) -> Result<(), String>;
-    fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String>;
-    fn wake_send_text_detached(&mut self, target: String, text: String) -> Result<Option<std::thread::JoinHandle<()>>, String> {
-        self.wake_send_text(&target, &text)?;
-        Ok(None)
-    }
+    fn wake_launch_engine(&mut self, target: &str, command: &str) -> Result<(), String>;
+    fn wake_wait_for_engine(&mut self, target: &str) -> Result<(), String>;
     fn wake_select_window(&mut self, target: &str) -> Result<(), String>;
 }
 
@@ -135,37 +131,34 @@ impl WakeTmuxNative for WakeNativeTmux {
         TmuxClient::local().new_window(session, window, Some(&cwd.display().to_string())).map_err(|error| error.to_string())
     }
 
-    fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
+    fn wake_launch_engine(&mut self, target: &str, command: &str) -> Result<(), String> {
         wake_validate_tmux_target(target)?;
-        // wake injects the initial engine command into a freshly created shell
-        // pane — no agent is running yet and there is no prompt to poll for, so
-        // the hardened send_text readiness gate (45s timeout) would hang. Keep
-        // the robust delivery shape (bracketed paste-buffer for multi-line/long
-        // briefs so newlines in the engine prompt paste atomically instead of
-        // relying on readline continuation; literal send-keys for short
-        // single-line commands) but submit with a single Enter — no confirm
-        // poll. The readiness gate belongs on the hey/send delivery seam to an
-        // *active* agent, not wake's first inject.
-        let mut tmux = TmuxClient::local();
-        if text.contains('\n') || text.len() > 500 {
-            tmux.load_buffer(text).map_err(|error| error.to_string())?;
-            tmux.paste_buffer(target).map_err(|error| error.to_string())?;
-        } else {
-            tmux.send_keys_literal(target, text).map_err(|error| error.to_string())?;
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        workon_wait_for_shell_prompt(&mut runner, target)
+            .map_err(|error| format!("wake: engine launch failed for '{target}': {error}"))?;
+        let report = sendtext_send_text_with_execution_confirm(
+            &mut runner,
+            target,
+            command,
+            std::thread::sleep,
+            workon_launch_started,
+        )
+        .map_err(|error| format!("wake: engine launch failed for '{target}': {}", error.message))?;
+        if report.warned_pending
+            && !workon_launch_started(&mut runner, target)
+                .map_err(|error| format!("wake: could not verify engine launch for '{target}': {}", error.message))?
+        {
+            return Err(format!(
+                "wake: engine did not start for '{target}': launch submission could not be confirmed"
+            ));
         }
-        tmux.send_enter(target).map_err(|error| error.to_string())
+        self.wake_wait_for_engine(target)
     }
 
-    fn wake_send_text_detached(&mut self, target: String, text: String) -> Result<Option<std::thread::JoinHandle<()>>, String> {
-        wake_validate_tmux_target(&target)?;
-        std::thread::Builder::new()
-            .name("maw-wake-send-text".to_owned())
-            .spawn(move || {
-                let mut tmux = WakeNativeTmux;
-                let _ = tmux.wake_send_text(&target, &text);
-            })
-            .map(Some)
-            .map_err(|error| format!("wake: failed to spawn engine sender: {error}"))
+    fn wake_wait_for_engine(&mut self, target: &str) -> Result<(), String> {
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        workon_wait_for_launch(&mut runner, target)
+            .map_err(|error| format!("wake: engine did not start for '{target}': {error}"))
     }
 
     fn wake_select_window(&mut self, target: &str) -> Result<(), String> {
@@ -1263,22 +1256,22 @@ fn wake_apply(
     let session_exists = tmux.wake_has_session(&resolved.session);
     wake_record_phase(resolved, "session-probe", wake_elapsed_ms(started), out, true);
     let started = std::time::Instant::now();
-    let deferred_send = if session_exists {
+    let should_launch = if session_exists {
         wake_create_or_reuse_window(options, resolved, tmux, out)?
     } else {
         wake_create_session(options, resolved, tmux, out)?
     };
     wake_record_phase(resolved, "first-window", wake_elapsed_ms(started), out, true);
+    let started = std::time::Instant::now();
+    if should_launch {
+        tmux.wake_launch_engine(&resolved.target, &resolved.command)?;
+    } else {
+        tmux.wake_wait_for_engine(&resolved.target)?;
+    }
+    wake_record_phase(resolved, "engine-verify", wake_elapsed_ms(started), out, true);
     if options.attach {
-        let send_thread = if deferred_send {
-            tmux.wake_send_text_detached(resolved.target.clone(), resolved.command.clone())?
-        } else { None };
         wake_record_phase(resolved, "attach", 0, out, false);
-        let attach_result = tmux.wake_select_window(&resolved.target);
-        if let Some(send_thread) = send_thread {
-            send_thread.join().map_err(|_| "wake: engine sender thread panicked".to_owned())?;
-        }
-        attach_result?;
+        tmux.wake_select_window(&resolved.target)?;
     }
     let started = std::time::Instant::now();
     wake_register_fleet_session(resolved, tmux)?;
@@ -1289,7 +1282,6 @@ fn wake_apply(
     wake_record_phase(resolved, "post-wake-hooks", wake_elapsed_ms(started), out, false);
     Ok(())
 }
-
 
 fn wake_post_wake_hooks(options: &WakeOptionsNative) -> Vec<String> {
     let mut hooks = wake_config_post_wake_hooks();
@@ -1331,9 +1323,8 @@ fn wake_create_session(options: &WakeOptionsNative, resolved: &WakeResolvedNativ
         let _ = writeln!(out, "\x1b[32m+\x1b[0m created session '{}' (main: {})", resolved.session, resolved.window);
         return Ok(true);
     }
-    tmux.wake_send_text(&resolved.target, &resolved.command)?;
     let _ = writeln!(out, "\x1b[32m+\x1b[0m created session '{}' (attach: maw a {})", resolved.session, resolved.session);
-    Ok(false)
+    Ok(true)
 }
 
 fn wake_create_or_reuse_window(
@@ -1352,9 +1343,8 @@ fn wake_create_or_reuse_window(
         let _ = writeln!(out, "\x1b[32m✅\x1b[0m woke '{}' in {} → {}", resolved.window, resolved.session, resolved.repo_path.display());
         return Ok(true);
     }
-    tmux.wake_send_text(&resolved.target, &resolved.command)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m woke '{}' in {} → {}", resolved.window, resolved.session, resolved.repo_path.display());
-    Ok(false)
+    Ok(true)
 }
 
 fn wake_register_fleet_session(
@@ -1399,9 +1389,9 @@ mod wake_tests {
     struct WakeMockTmux {
         sessions: Vec<TmuxSession>,
         actions: Vec<String>,
+        pane_commands: std::collections::VecDeque<Result<String, String>>,
+        unconfirmed_submission: bool,
         fail_select: bool,
-        detached_delay_ms: u64,
-        detached_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl WakeTmuxNative for WakeMockTmux {
@@ -1424,18 +1414,24 @@ mod wake_tests {
             }
             Ok(())
         }
-        fn wake_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
+        fn wake_launch_engine(&mut self, target: &str, text: &str) -> Result<(), String> {
             self.actions.push(format!("send {target} {text}"));
-            Ok(())
+            if self.unconfirmed_submission {
+                return Err(format!(
+                    "wake: engine launch failed for '{target}': \
+                     ⚠ submission could not be confirmed after 4 Enter attempts: no shell prompt detected"
+                ));
+            }
+            self.wake_wait_for_engine(target)
         }
-        fn wake_send_text_detached(&mut self, target: String, text: String) -> Result<Option<std::thread::JoinHandle<()>>, String> {
-            self.actions.push(format!("send-detached {target} {text}"));
-            let delay_ms = self.detached_delay_ms;
-            let finished = std::sync::Arc::clone(&self.detached_finished);
-            Ok(Some(std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                finished.store(true, std::sync::atomic::Ordering::SeqCst);
-            })))
+        fn wake_wait_for_engine(&mut self, target: &str) -> Result<(), String> {
+            self.actions.push(format!("pane-command {target}"));
+            let command = self.pane_commands.pop_front().unwrap_or_else(|| Ok("codex".to_owned()))?;
+            if workon_launch_started_command(&command) {
+                Ok(())
+            } else {
+                Err(format!("wake: engine did not start for '{target}': pane is still running '{command}'"))
+            }
         }
         fn wake_select_window(&mut self, target: &str) -> Result<(), String> {
             self.actions.push(format!("select {target}"));
@@ -1963,6 +1959,7 @@ mod wake_tests {
             let (code, stdout) = wake_run(&wake_strings(&[oracle, "--no-attach"]), &mut tmux).expect("run");
             assert_eq!(code, 0, "{stdout}");
             assert!(tmux.actions.iter().any(|action| action.starts_with("new-session")));
+            assert!(tmux.actions.iter().any(|action| action.starts_with("send ")));
             assert!(
                 !tmux.actions.iter().any(|action| action.starts_with(&format!("new-session {occupied_slot:02}-{oracle}"))),
                 "{stdout}"
@@ -2076,14 +2073,74 @@ mod wake_tests {
     }
 
     #[test]
+    fn wake_reports_failure_when_new_session_never_starts_engine() {
+        fn no_fleet_wake(_: &[String]) -> CliOutput {
+            CliOutput { code: 1, stdout: String::new(), stderr: String::new() }
+        }
+
+        wake_with_fixture(|_| {
+            let mut tmux = WakeMockTmux {
+                pane_commands: std::collections::VecDeque::from([
+                    Ok("zsh".to_owned()),
+                    Err("pane is gone".to_owned()),
+                ]),
+                ..WakeMockTmux::default()
+            };
+
+            let mut fleet_wake = no_fleet_wake;
+            let output = run_wake_command_with(
+                &wake_strings(&["neo", "--no-attach"]),
+                &mut tmux,
+                &mut fleet_wake,
+            );
+
+            assert_eq!(output.code, 1, "{}{}", output.stdout, output.stderr);
+            assert!(output.stdout.is_empty(), "{}", output.stdout);
+            assert!(output.stderr.contains("wake: engine did not start for"), "{}", output.stderr);
+            assert!(output.stderr.contains("zsh"), "{}", output.stderr);
+        });
+    }
+
+    #[test]
+    fn wake_does_not_report_success_when_engine_submission_is_unconfirmed() {
+        fn no_fleet_wake(_: &[String]) -> CliOutput {
+            CliOutput { code: 1, stdout: String::new(), stderr: String::new() }
+        }
+
+        wake_with_fixture(|_| {
+            let mut tmux = WakeMockTmux {
+                unconfirmed_submission: true,
+                ..WakeMockTmux::default()
+            };
+            let mut fleet_wake = no_fleet_wake;
+            let output = run_wake_command_with(
+                &wake_strings(&["neo", "--no-attach"]),
+                &mut tmux,
+                &mut fleet_wake,
+            );
+
+            assert_eq!(output.code, 1, "{}{}", output.stdout, output.stderr);
+            assert!(output.stdout.is_empty(), "{}", output.stdout);
+            assert!(output.stderr.contains("submission could not be confirmed"), "{}", output.stderr);
+            let target = tmux
+                .actions
+                .iter()
+                .find_map(|action| action.strip_prefix("send ").and_then(|rest| rest.split_whitespace().next()))
+                .expect("wake launch target");
+            assert!(output.stderr.contains(&format!("for '{target}'")), "{}", output.stderr);
+        });
+    }
+
+    #[test]
     fn wake_attach_selects_before_post_attach_work_and_audits_phases() {
         wake_with_fixture(|root| {
             let mut tmux = WakeMockTmux::default();
             let (code, stdout) = wake_run(&wake_strings(&["neo", "--attach"]), &mut tmux).expect("run");
             assert_eq!(code, 0, "{stdout}");
             assert_eq!(tmux.actions[0].split_whitespace().next(), Some("new-session"));
-            assert_eq!(tmux.actions[1].split_whitespace().next(), Some("send-detached"));
-            assert_eq!(tmux.actions[2].split_whitespace().next(), Some("select"));
+            assert_eq!(tmux.actions[1].split_whitespace().next(), Some("send"));
+            assert_eq!(tmux.actions[2].split_whitespace().next(), Some("pane-command"));
+            assert_eq!(tmux.actions[3].split_whitespace().next(), Some("select"));
             let audit = std::fs::read_to_string(root.join("state/audit.jsonl")).expect("audit");
             assert!(audit.contains(r#""event":"wake.phase""#), "{audit}");
             assert!(audit.contains(r#""phase":"first-window""#), "{audit}");
@@ -2092,22 +2149,6 @@ mod wake_tests {
             let fleet = audit.find(r#""phase":"fleet-upsert""#).expect("fleet phase");
             assert!(first < attach && attach < fleet, "{audit}");
             assert!(audit.contains(r#""phase":"fleet-upsert""#), "{audit}");
-        });
-    }
-
-    #[test]
-    fn wake_fast_attach_failure_waits_for_detached_engine_send() {
-        wake_with_fixture(|_| {
-            let mut tmux = WakeMockTmux {
-                fail_select: true,
-                detached_delay_ms: 50,
-                ..WakeMockTmux::default()
-            };
-
-            let error = wake_run(&wake_strings(&["neo", "--attach"]), &mut tmux).expect_err("attach failure");
-
-            assert!(error.contains("mock attach failed"), "{error}");
-            assert!(tmux.detached_finished.load(std::sync::atomic::Ordering::SeqCst));
         });
     }
 
