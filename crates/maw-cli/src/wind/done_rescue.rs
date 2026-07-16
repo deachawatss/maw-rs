@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// # Errors
 ///
-/// Returns an error when git status fails or when a rescue copy cannot be completed.
+/// Returns an error when Git inspection fails or when a rescue copy cannot be completed.
 pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec<PathBuf>, String> {
     let status = git(&[
         "-C".to_owned(),
@@ -22,7 +23,18 @@ pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec
         "--".to_owned(),
         "ψ/".to_owned(),
     ])?;
-    let sources = uncommitted_psi_sources(worktree_path, &status)?;
+    let tracked = tracked_psi_paths(worktree_path)?;
+    let changed = status_psi_paths(&status);
+    let mut sources = Vec::new();
+    collect_psi_source(
+        &worktree_path.join("ψ"),
+        worktree_path,
+        &tracked,
+        &changed,
+        &mut sources,
+    )?;
+    sources.sort();
+    sources.dedup();
     if sources.is_empty() {
         return Ok(Vec::new());
     }
@@ -55,20 +67,40 @@ fn main_path_from_git(worktree_path: &Path, fallback: &Path) -> PathBuf {
     } else {
         worktree_path.join(path)
     };
-    absolute
+    let main_path = absolute
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| fallback.to_path_buf(), Path::to_path_buf)
+        .map_or_else(|| fallback.to_path_buf(), Path::to_path_buf);
+    if main_path
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        fallback.to_path_buf()
+    } else {
+        main_path
+    }
 }
 
-fn uncommitted_psi_sources(worktree_path: &Path, status: &str) -> Result<Vec<PathBuf>, String> {
-    let mut sources = Vec::new();
-    for relative in status.lines().filter_map(status_psi_path) {
-        collect_psi_source(&worktree_path.join(relative), &mut sources)?;
-    }
-    sources.sort();
-    sources.dedup();
-    Ok(sources)
+fn tracked_psi_paths(worktree_path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    git(&[
+        "-C".to_owned(),
+        worktree_path.display().to_string(),
+        "ls-files".to_owned(),
+        "-z".to_owned(),
+        "--".to_owned(),
+        "ψ/".to_owned(),
+    ])
+    .map(|paths| {
+        paths
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    })
+}
+
+fn status_psi_paths(status: &str) -> BTreeSet<PathBuf> {
+    status.lines().filter_map(status_psi_path).collect()
 }
 
 fn status_psi_path(line: &str) -> Option<PathBuf> {
@@ -80,7 +112,13 @@ fn status_psi_path(line: &str) -> Option<PathBuf> {
     (path == "ψ" || path.starts_with("ψ/")).then(|| PathBuf::from(path))
 }
 
-fn collect_psi_source(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_psi_source(
+    path: &Path,
+    worktree_path: &Path,
+    tracked: &BTreeSet<PathBuf>,
+    changed: &BTreeSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), String> {
     // lstat, never stat: a symlink must NOT be followed. A planted
     // `ψ/leak -> ~/.ssh/id_rsa` (or any link outside the worktree) would
     // otherwise be dereferenced and its target's contents copied into the
@@ -94,7 +132,20 @@ fn collect_psi_source(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
         return Ok(());
     }
     if file_type.is_file() {
-        out.push(path.to_path_buf());
+        let relative = path.strip_prefix(worktree_path).map_err(|_| {
+            format!(
+                "ψ rescue source escaped worktree '{}': {}",
+                worktree_path.display(),
+                path.display()
+            )
+        })?;
+        if !tracked.contains(relative)
+            || changed
+                .iter()
+                .any(|changed_path| relative.starts_with(changed_path))
+        {
+            out.push(path.to_path_buf());
+        }
         return Ok(());
     }
     if !file_type.is_dir() {
@@ -105,7 +156,7 @@ fn collect_psi_source(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
     for entry in entries {
         let entry =
             entry.map_err(|error| format!("read ψ rescue entry '{}': {error}", path.display()))?;
-        collect_psi_source(&entry.path(), out)?;
+        collect_psi_source(&entry.path(), worktree_path, tracked, changed, out)?;
     }
     Ok(())
 }

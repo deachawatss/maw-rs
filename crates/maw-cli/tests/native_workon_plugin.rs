@@ -75,6 +75,7 @@ if [ "$3" = "for-each-ref" ]; then
   if [ -f "$2/.maw-test-existing-agent-branch" ]; then printf 'agents/feat\n'; fi
   exit 0
 fi
+if [ "$3" = "ls-files" ]; then exit 0; fi
 if [ "$3" = "fetch" ] && [ "$4" = "origin" ]; then
   if [ "${MAW_FAKE_GIT_FETCH_FAIL:-0}" = "1" ]; then
     printf 'fatal: Authentication failed for origin\n' >&2
