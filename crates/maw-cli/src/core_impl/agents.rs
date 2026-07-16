@@ -252,18 +252,11 @@ fn agents_window_name(
 }
 
 fn agents_state(command: &str) -> String {
-    if agents_is_shell_command(command) {
+    if workon_is_shell_command(command) {
         "idle".to_owned()
     } else {
         "active".to_owned()
     }
-}
-
-fn agents_is_shell_command(command: &str) -> bool {
-    matches!(
-        command.to_ascii_lowercase().as_str(),
-        "zsh" | "bash" | "sh" | "fish" | "dash"
-    )
 }
 
 fn agents_build_node_rows(routes: &HashMap<String, String>, requested_node: &str, local_node: &str) -> Vec<AgentsRow> {

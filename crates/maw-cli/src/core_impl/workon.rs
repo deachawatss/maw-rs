@@ -597,8 +597,8 @@ fn workon_launch_started_command(command: &str) -> bool {
     !command.is_empty() && !workon_is_shell_command(command)
 }
 
-fn workon_is_shell_command(command: &str) -> bool {
-    let command = command.rsplit('/').next().unwrap_or(command).to_ascii_lowercase();
+pub(crate) fn workon_is_shell_command(command: &str) -> bool {
+    let command = command.trim().rsplit('/').next().unwrap_or(command).to_ascii_lowercase();
     matches!(command.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh" | "tcsh" | "csh")
 }
 
@@ -1463,6 +1463,18 @@ mod workon_tests {
             2
         );
         assert_eq!(sleeps, vec![std::time::Duration::from_millis(250)]);
+    }
+
+    #[test]
+    fn workon_shell_predicate_recognizes_the_canonical_set_and_paths() {
+        for shell in ["sh", "bash", "zsh", "dash", "fish", "ksh", "tcsh", "csh"] {
+            assert!(workon_is_shell_command(shell), "{shell}");
+        }
+        for shell in ["/bin/bash", "/usr/bin/zsh"] {
+            assert!(workon_is_shell_command(shell), "{shell}");
+        }
+        assert!(!workon_is_shell_command("sleep"));
+        assert!(!workon_is_shell_command("read"));
     }
 
     fn workon_branch_set(values: &[&str]) -> std::collections::BTreeSet<String> {
