@@ -191,7 +191,7 @@ mod capture_tests {
 
     #[test]
     fn capture_tail_defaults_to_first_window_and_fifty_lines() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: "03-neo|||2|||main|||1|||\n".to_owned(),
@@ -218,7 +218,7 @@ mod capture_tests {
 
     #[test]
     fn capture_full_and_pane_override_lines() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux { windows: "neo|||1|||zsh|||1|||\n".to_owned(), ..CaptureMockTmux::default() };
         let args = capture_strings(&["neo:1", "--pane", "3", "--lines", "7", "--full"]);
@@ -247,7 +247,7 @@ mod capture_tests {
 
     #[test]
     fn capture_resolves_window_name_alias_and_reports_tmux_failure() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: "03-neo|||0|||main|||1|||\n03-neo|||1|||neo-oracle|||0|||\n".to_owned(),
@@ -295,7 +295,7 @@ mod capture_tests {
 
     #[test]
     fn capture_cross_window_returns_target_content_not_invoking_pane() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut content = std::collections::BTreeMap::new();
         content.insert("dev:0".to_owned(), "invoking pane output\n".to_owned());
@@ -325,7 +325,7 @@ mod capture_tests {
 
     #[test]
     fn capture_cross_session_window_returns_target_content() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut content = std::collections::BTreeMap::new();
         content.insert("alpha:0".to_owned(), "alpha main content\n".to_owned());
@@ -357,7 +357,7 @@ mod capture_tests {
 
     #[test]
     fn capture_explicit_session_window_pins_duplicate_window_names() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: concat!(
@@ -381,7 +381,7 @@ mod capture_tests {
 
     #[test]
     fn capture_explicit_session_window_miss_is_loud_without_cross_session_fallback() {
-        let _lock = super::env_test_lock().lock().expect("lock");
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: concat!(

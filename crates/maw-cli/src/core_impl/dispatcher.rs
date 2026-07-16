@@ -242,7 +242,7 @@ mod async_dispatch_tests {
 
 #[cfg(test)]
 mod dispatcher_fragment_tests {
-    use super::{cli_dispatch_log_command, cli_dispatch_now_iso, current_xdg_env, env_test_lock};
+    use super::{cli_dispatch_log_command_for_env, cli_dispatch_now_iso, env_test_lock};
     use super::{
         dispatcher_entries, dispatcher_status, run_cli, DispatchKind, MAW_RS_VERSION_STRING,
     };
@@ -293,11 +293,10 @@ mod dispatcher_fragment_tests {
 
     #[test]
     fn dispatch_logs_native_commands_to_audit_jsonl() {
-        let _guard = env_test_lock().lock().expect("env lock");
-        let (_state_root, _restores) = cli_dispatch_test_env();
-        let output = run_cli(&["version".to_owned()]);
+        let env = cli_dispatch_audit_test_env();
+        let output = super::run_cli_with_audit_env(&["version".to_owned()], &env);
         assert_eq!(output.code, 0, "{output:?}");
-        let path = super::audit_jsonl_path(&current_xdg_env());
+        let path = super::audit_jsonl_path(&env);
         let text = fs::read_to_string(path).expect("audit log");
         let rows: Vec<_> = text
             .lines()
@@ -315,36 +314,37 @@ mod dispatcher_fragment_tests {
             row.get("version").and_then(serde_json::Value::as_str),
             Some(super::MAW_RS_BUILD_VERSION)
         );
-        let config_path = super::maw_config_path(&current_xdg_env(), &["audit.jsonl"]);
+        let config_path = super::maw_config_path(&env, &["audit.jsonl"]);
         assert!(!config_path.exists(), "audit must use state, not config: {config_path:?}");
     }
 
     #[test]
     fn concurrent_dispatch_audit_appends_remain_parseable_jsonl() {
-        let _guard = env_test_lock().lock().expect("env lock");
-        let (_state_root, _restores) = cli_dispatch_test_env();
+        let env = cli_dispatch_audit_test_env();
         let workers = 32;
         let rows_per_worker = 32;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
         let payload = "x".repeat(2_048);
 
         std::thread::scope(|scope| {
+            let audit_env = &env;
             for worker in 0..workers {
                 let barrier = std::sync::Arc::clone(&barrier);
                 let payload = &payload;
                 scope.spawn(move || {
                     barrier.wait();
                     for row in 0..rows_per_worker {
-                        cli_dispatch_log_command(
+                        cli_dispatch_log_command_for_env(
                             "audit-concurrency-test",
                             &[format!("{worker}-{row}-{payload}")],
+                            audit_env,
                         );
                     }
                 });
             }
         });
 
-        let path = super::audit_jsonl_path(&current_xdg_env());
+        let path = super::audit_jsonl_path(&env);
         let text = fs::read_to_string(path).expect("audit log");
         let rows: Vec<_> = text.lines().collect();
         assert_eq!(rows.len(), workers * rows_per_worker, "{text}");
@@ -356,7 +356,7 @@ mod dispatcher_fragment_tests {
 
     #[test]
     fn dispatch_audit_write_errors_are_best_effort_for_native_commands() {
-        let _guard = env_test_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state_root, _restores) = cli_dispatch_test_env();
         let blocked_root = state_root.join("blocked");
         fs::write(&blocked_root, b"blocked").expect("blocked state root");
@@ -370,7 +370,7 @@ mod dispatcher_fragment_tests {
 
     #[test]
     fn cli_dispatch_now_iso_uses_fixed_epoch_millis_when_present() {
-        let _guard = env_test_lock().lock().expect("env lock");
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         std::env::remove_var("MAW_AUDIT_TEST_NOW_MS");
         std::env::set_var("MAW_AUDIT_TEST_NOW_MS", "0");
         assert_eq!(cli_dispatch_now_iso(), "1970-01-01T00:00:00.000Z");
@@ -409,6 +409,20 @@ mod dispatcher_fragment_tests {
         std::env::remove_var("MAW_STATE_DIR");
         (state, restores)
     }
+
+    fn cli_dispatch_audit_test_env() -> maw_xdg::MawXdgEnv {
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-dispatch-audit-isolated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos())
+        ));
+        maw_xdg::MawXdgEnv::with_vars(
+            root.join("home"),
+            [("MAW_STATE_DIR", root.join("state").display().to_string())],
+        )
+    }
 }
 
 #[must_use]
@@ -444,13 +458,18 @@ fn version_handler(_: &[String]) -> CliOutput {
 /// Run the current maw-rs CLI parser/renderer over argv without process exit.
 #[must_use]
 pub fn run_cli(argv: &[String]) -> CliOutput {
+    let audit_env = current_xdg_env();
+    run_cli_with_audit_env(argv, &audit_env)
+}
+
+fn run_cli_with_audit_env(argv: &[String], audit_env: &MawXdgEnv) -> CliOutput {
     let Some(command) = argv.first().map(String::as_str) else {
         return usage_ok();
     };
 
     match dispatcher_target(command) {
         DispatchTarget::Native(handler) => {
-            cli_dispatch_log_command(command, &argv[1..]);
+            cli_dispatch_log_command_for_env(command, &argv[1..], audit_env);
             if let Some(gate_output) = run_plugin_gate(command, argv) {
                 return gate_output;
             }
@@ -526,6 +545,10 @@ fn native_plugin_fallthrough_command(command: &str) -> bool {
 }
 
 fn cli_dispatch_log_command(command: &str, args: &[String]) {
+    cli_dispatch_log_command_for_env(command, args, &current_xdg_env());
+}
+
+fn cli_dispatch_log_command_for_env(command: &str, args: &[String], env: &MawXdgEnv) {
     let row = serde_json::json!({
         "ts": cli_dispatch_now_iso(),
         "cmd": command,
@@ -533,7 +556,7 @@ fn cli_dispatch_log_command(command: &str, args: &[String]) {
         "binary": "maw-rs",
         "version": MAW_RS_BUILD_VERSION,
     });
-    let path = audit_jsonl_path(&current_xdg_env());
+    let path = audit_jsonl_path(env);
     let _ = append_jsonl_atomic(&path, &row);
 }
 
