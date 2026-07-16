@@ -4,6 +4,7 @@ const DISPATCH_88: &[DispatcherEntry] = &[DispatcherEntry {
 }];
 
 const BG_PREFIX: &str = "maw-bg-";
+const BG_STATE_DIR: &str = "bg";
 const BG_HELP: &str = "maw bg — run long commands in detached tmux without blocking the current pane\n\nusage:\n  maw bg \"<cmd>\" [--name X]              spawn detached tmux session\n  maw bg ls [--json]                     list active maw-bg-* sessions\n  maw bg tail <slug> [--lines N] [--follow]\n                                         sample last N lines (default 200)\n  maw bg attach <slug>                   attach (or switch-client inside tmux)\n  maw bg kill <slug> | --all             reap session(s)\n  maw bg gc [--dry-run] [--older-than DUR]\n                                         reap stale \"done\" sessions (default 24h)\n\nslug refs accept full slug, hash suffix (4 hex), or unique stem prefix.\n";
 const BG_LIST_FORMAT: &str = "#{session_name}\t#{session_created}";
 const BG_DEFAULT_TAIL_LINES: u32 = 200;
@@ -29,15 +30,47 @@ struct BgTmuxResult {
 struct BgSession {
     slug: String,
     session: String,
+    created: u64,
     age_seconds: u64,
     status: BgSessionStatus,
+    exit_code: Option<u8>,
     last_line: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum BgSessionStatus {
     Running,
     Done,
+    Failed,
+    Killed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BgStateRecord {
+    slug: String,
+    session: String,
+    created: u64,
+    status: BgSessionStatus,
+    exit_code: Option<u8>,
+}
+
+trait BgStateStore {
+    fn read_states(&mut self) -> Result<Vec<BgStateRecord>, String>;
+    fn write_state(&mut self, state: &BgStateRecord) -> Result<(), String>;
+}
+
+struct BgFileState;
+
+impl BgStateStore for BgFileState {
+    fn read_states(&mut self) -> Result<Vec<BgStateRecord>, String> {
+        bg_read_states()
+    }
+
+    fn write_state(&mut self, state: &BgStateRecord) -> Result<(), String> {
+        bg_write_state(state)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,7 +137,8 @@ fn bg_run_command_with(
     now: BgNow,
     inside_tmux: BgInsideTmux,
 ) -> CliOutput {
-    match bg_run(argv, tmux, now, inside_tmux) {
+    let mut state = BgFileState;
+    match bg_run(argv, tmux, now, inside_tmux, &mut state) {
         Ok((code, stdout)) => CliOutput {
             code,
             stdout,
@@ -123,6 +157,7 @@ fn bg_run(
     tmux: &mut impl BgTmux,
     now: BgNow,
     inside_tmux: BgInsideTmux,
+    state: &mut impl BgStateStore,
 ) -> Result<(i32, String), (i32, String)> {
     if argv.is_empty() || argv[0] == "--help" || argv[0] == "-h" {
         return Ok((0, BG_HELP.to_owned()));
@@ -130,16 +165,21 @@ fn bg_run(
     let sub = argv[0].as_str();
     let rest = &argv[1..];
     match sub {
-        "ls" | "list" => bg_run_list(rest, tmux, now),
+        "ls" | "list" => bg_run_list(rest, tmux, now, state),
         "tail" => bg_run_tail(rest, tmux, now),
         "attach" => bg_run_attach(rest, tmux, now, inside_tmux),
-        "kill" => bg_run_kill(rest, tmux, now),
-        "gc" => bg_run_gc(rest, tmux, now),
-        _ => bg_run_spawn(argv, tmux),
+        "kill" => bg_run_kill(rest, tmux, now, state),
+        "gc" => bg_run_gc(rest, tmux, now, state),
+        _ => bg_run_spawn(argv, tmux, now, state),
     }
 }
 
-fn bg_run_spawn(argv: &[String], tmux: &mut impl BgTmux) -> Result<(i32, String), (i32, String)> {
+fn bg_run_spawn(
+    argv: &[String],
+    tmux: &mut impl BgTmux,
+    now: BgNow,
+    state: &mut impl BgStateStore,
+) -> Result<(i32, String), (i32, String)> {
     let flags = bg_parse_flags(argv).map_err(|message| (1, message))?;
     if bg_flags_has(&flags, BG_FLAG_HELP) {
         return Ok((0, BG_HELP.to_owned()));
@@ -156,6 +196,15 @@ fn bg_run_spawn(argv: &[String], tmux: &mut impl BgTmux) -> Result<(i32, String)
     if result.status != 0 {
         return Err((3, bg_tmux_failure("new-session", result.status, &result.stderr)));
     }
+    state
+        .write_state(&BgStateRecord {
+        slug: slug.clone(),
+        session: session.clone(),
+        created: now(),
+        status: BgSessionStatus::Running,
+        exit_code: None,
+    })
+        .map_err(|message| (1, message))?;
     Ok((0, format!("{slug}\t{session}\n")))
 }
 
@@ -163,9 +212,10 @@ fn bg_run_list(
     argv: &[String],
     tmux: &mut impl BgTmux,
     now: BgNow,
+    state: &mut impl BgStateStore,
 ) -> Result<(i32, String), (i32, String)> {
     let flags = bg_parse_flags(argv).map_err(|message| (1, message))?;
-    let sessions = bg_list_sessions(tmux, now).map_err(|message| (1, message))?;
+    let sessions = bg_list_sessions(tmux, now, state).map_err(|message| (1, message))?;
     if bg_flags_has(&flags, BG_FLAG_JSON) {
         return bg_list_json(&sessions).map(|stdout| (0, stdout)).map_err(|message| (1, message));
     }
@@ -207,9 +257,11 @@ fn bg_run_kill(
     argv: &[String],
     tmux: &mut impl BgTmux,
     now: BgNow,
+    state: &mut impl BgStateStore,
 ) -> Result<(i32, String), (i32, String)> {
     let flags = bg_parse_flags(argv).map_err(|message| (1, message))?;
-    let killed = bg_kill(flags.positionals.first(), bg_flags_has(&flags, BG_FLAG_ALL), tmux, now).map_err(|message| (1, message))?;
+    let killed = bg_kill(flags.positionals.first(), bg_flags_has(&flags, BG_FLAG_ALL), tmux, now, state)
+        .map_err(|message| (1, message))?;
     if killed.is_empty() {
         Ok((0, "(no sessions to kill)\n".to_owned()))
     } else {
@@ -221,19 +273,20 @@ fn bg_run_gc(
     argv: &[String],
     tmux: &mut impl BgTmux,
     now: BgNow,
+    state: &mut impl BgStateStore,
 ) -> Result<(i32, String), (i32, String)> {
     let flags = bg_parse_flags(argv).map_err(|message| (1, message))?;
     let threshold = match flags.older_than.as_deref() {
         Some(value) => bg_parse_duration(value).map_err(|message| (1, message))?,
         None => BG_DEFAULT_GC_SECONDS,
     };
-    let sessions = bg_list_sessions(tmux, now).map_err(|message| (1, message))?;
+    let sessions = bg_list_live_sessions(tmux, now).map_err(|message| (1, message))?;
     let mut reaped = Vec::new();
     let mut kept = Vec::new();
     for session in sessions {
-        if session.status == BgSessionStatus::Done && session.age_seconds >= threshold {
+        if bg_status_is_complete(&session.status) && session.age_seconds >= threshold {
             if !bg_flags_has(&flags, BG_FLAG_DRY_RUN) {
-                bg_kill_session(&session.slug, tmux).map_err(|message| (1, message))?;
+                bg_kill_session(&session, tmux, state).map_err(|message| (1, message))?;
             }
             reaped.push(session.slug);
         } else {
@@ -480,7 +533,7 @@ fn bg_new_session_args(session: &str, command: &str) -> Result<Vec<String>, Stri
 }
 
 fn bg_holds_open(command: &str) -> String {
-    format!("{command}; rc=$?; printf '\\n[done — exit %d]\\n' \"$rc\"; while :; do read -r _ 2>/dev/null || sleep 3600; done")
+    format!("({command}); rc=$?; printf '\\n[done — exit %d]\\n' \"$rc\"; while :; do read -r _ 2>/dev/null || sleep 3600; done")
 }
 
 fn bg_session_exists(slug: &str, tmux: &mut impl BgTmux) -> Result<bool, String> {
@@ -491,7 +544,30 @@ fn bg_session_exists(slug: &str, tmux: &mut impl BgTmux) -> Result<bool, String>
     Ok(tmux.bg_run("has-session", &args)?.status == 0)
 }
 
-fn bg_list_sessions(tmux: &mut impl BgTmux, now: BgNow) -> Result<Vec<BgSession>, String> {
+fn bg_list_sessions(
+    tmux: &mut impl BgTmux,
+    now: BgNow,
+    state_store: &mut impl BgStateStore,
+) -> Result<Vec<BgSession>, String> {
+    let mut sessions = bg_list_live_sessions(tmux, now)?;
+    for session in &sessions {
+        state_store.write_state(&bg_state_from_session(session))?;
+    }
+    for mut state in state_store.read_states()? {
+        if sessions.iter().any(|session| session.slug == state.slug) {
+            continue;
+        }
+        if state.status == BgSessionStatus::Running {
+            state.status = BgSessionStatus::Killed;
+            state_store.write_state(&state)?;
+        }
+        sessions.push(bg_session_from_state(&state, now));
+    }
+    sessions.sort_by(|left, right| left.slug.cmp(&right.slug));
+    Ok(sessions)
+}
+
+fn bg_list_live_sessions(tmux: &mut impl BgTmux, now: BgNow) -> Result<Vec<BgSession>, String> {
     let args = vec!["-F".to_owned(), BG_LIST_FORMAT.to_owned()];
     let result = tmux.bg_run("list-sessions", &args)?;
     if result.status != 0 && bg_list_error_is_empty(&result) {
@@ -524,8 +600,10 @@ fn bg_session_from_line(
     Ok(Some(BgSession {
         slug: slug.clone(),
         session: name.to_owned(),
+        created,
         age_seconds: now().saturating_sub(created),
         status: bg_status_from_exit_code(exit_code),
+        exit_code,
         last_line,
     }))
 }
@@ -537,11 +615,75 @@ fn bg_list_error_is_empty(result: &BgTmuxResult) -> bool {
 }
 
 fn bg_status_from_exit_code(exit_code: Option<u8>) -> BgSessionStatus {
-    if exit_code.is_some() {
-        BgSessionStatus::Done
-    } else {
-        BgSessionStatus::Running
+    match exit_code {
+        Some(0) => BgSessionStatus::Done,
+        Some(_) => BgSessionStatus::Failed,
+        None => BgSessionStatus::Running,
     }
+}
+
+fn bg_status_is_complete(status: &BgSessionStatus) -> bool {
+    matches!(status, BgSessionStatus::Done | BgSessionStatus::Failed)
+}
+
+fn bg_state_from_session(session: &BgSession) -> BgStateRecord {
+    BgStateRecord {
+        slug: session.slug.clone(),
+        session: session.session.clone(),
+        created: session.created,
+        status: session.status.clone(),
+        exit_code: session.exit_code,
+    }
+}
+
+fn bg_session_from_state(state: &BgStateRecord, now: BgNow) -> BgSession {
+    BgSession {
+        slug: state.slug.clone(),
+        session: state.session.clone(),
+        created: state.created,
+        age_seconds: now().saturating_sub(state.created),
+        status: state.status.clone(),
+        exit_code: state.exit_code,
+        last_line: String::new(),
+    }
+}
+
+fn bg_state_path(slug: &str) -> Result<std::path::PathBuf, String> {
+    bg_validate_ref(slug)?;
+    Ok(maw_state_path(&current_xdg_env(), &[BG_STATE_DIR, &format!("{slug}.json")]))
+}
+
+fn bg_write_state(state: &BgStateRecord) -> Result<(), String> {
+    bg_validate_ref(&state.slug)?;
+    bg_validate_session_name(&state.session)?;
+    let path = bg_state_path(&state.slug)?;
+    let parent = path.parent().ok_or_else(|| "bg: state path has no parent".to_owned())?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("bg: create state directory: {error}"))?;
+    let body = serde_json::to_string(state).map_err(|error| format!("bg: encode state: {error}"))?;
+    std::fs::write(path, body).map_err(|error| format!("bg: write state: {error}"))
+}
+
+fn bg_read_states() -> Result<Vec<BgStateRecord>, String> {
+    let directory = maw_state_path(&current_xdg_env(), &[BG_STATE_DIR]);
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("bg: read state directory: {error}")),
+    };
+    let mut states = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|error| format!("bg: read state entry: {error}"))?.path();
+        if path.extension().and_then(std::ffi::OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).map_err(|error| format!("bg: read state {}: {error}", path.display()))?;
+        let state = serde_json::from_str::<BgStateRecord>(&body)
+            .map_err(|error| format!("bg: parse state {}: {error}", path.display()))?;
+        bg_validate_ref(&state.slug)?;
+        bg_validate_session_name(&state.session)?;
+        states.push(state);
+    }
+    Ok(states)
 }
 
 fn bg_exit_code_from_completion_marker(last_line: &str) -> Option<u8> {
@@ -582,7 +724,7 @@ fn bg_pane_snapshot_of(slug: &str, tmux: &mut impl BgTmux) -> Result<(String, Op
 }
 
 fn bg_list_slugs(tmux: &mut impl BgTmux, now: BgNow) -> Result<Vec<String>, String> {
-    Ok(bg_list_sessions(tmux, now)?.into_iter().map(|session| session.slug).collect())
+    Ok(bg_list_live_sessions(tmux, now)?.into_iter().map(|session| session.slug).collect())
 }
 
 fn bg_resolve_slug(reference: &str, live: &[String]) -> Result<String, String> {
@@ -646,30 +788,36 @@ fn bg_kill(
     all: bool,
     tmux: &mut impl BgTmux,
     now: BgNow,
+    state: &mut impl BgStateStore,
 ) -> Result<Vec<String>, String> {
+    let sessions = bg_list_live_sessions(tmux, now)?;
     if all {
-        let slugs = bg_list_slugs(tmux, now)?;
-        for slug in &slugs {
-            bg_kill_session(slug, tmux)?;
+        for session in &sessions {
+            bg_kill_session(session, tmux, state)?;
         }
-        return Ok(slugs);
+        return Ok(sessions.into_iter().map(|session| session.slug).collect());
     }
     let slug_ref = slug.ok_or_else(|| "bg kill: missing <slug> (or --all)".to_owned())?;
     bg_validate_ref(slug_ref)?;
-    let resolved = bg_resolve_slug(slug_ref, &bg_list_slugs(tmux, now)?)?;
-    bg_kill_session(&resolved, tmux)?;
+    let slugs = sessions.iter().map(|session| session.slug.clone()).collect::<Vec<_>>();
+    let resolved = bg_resolve_slug(slug_ref, &slugs)?;
+    let session = sessions.into_iter().find(|session| session.slug == resolved).ok_or_else(|| "bg: resolved session disappeared".to_owned())?;
+    bg_kill_session(&session, tmux, state)?;
     Ok(vec![resolved])
 }
 
-fn bg_kill_session(slug: &str, tmux: &mut impl BgTmux) -> Result<(), String> {
-    bg_validate_ref(slug)?;
-    let session = bg_session_name(slug);
-    bg_validate_session_name(&session)?;
-    let result = tmux.bg_run("kill-session", &["-t".to_owned(), session])?;
+fn bg_kill_session(session: &BgSession, tmux: &mut impl BgTmux, state_store: &mut impl BgStateStore) -> Result<(), String> {
+    bg_validate_ref(&session.slug)?;
+    bg_validate_session_name(&session.session)?;
+    let result = tmux.bg_run("kill-session", &["-t".to_owned(), session.session.clone()])?;
     if result.status != 0 {
-        return Err(format!("bg: kill-session failed for {slug}: {}", bg_stderr_or_placeholder(&result.stderr)));
+        return Err(format!("bg: kill-session failed for {}: {}", session.slug, bg_stderr_or_placeholder(&result.stderr)));
     }
-    Ok(())
+    let mut state = bg_state_from_session(session);
+    if state.status == BgSessionStatus::Running {
+        state.status = BgSessionStatus::Killed;
+    }
+    state_store.write_state(&state)
 }
 
 fn bg_parse_duration(value: &str) -> Result<u64, String> {
@@ -726,7 +874,7 @@ fn bg_format_list(sessions: &[BgSession]) -> String {
 fn bg_format_row_parts(session: &BgSession) -> [String; 4] {
     [
         session.slug.clone(),
-        bg_status_text(&session.status).to_owned(),
+        bg_status_display(session),
         bg_format_age(session.age_seconds),
         bg_truncate_last_line(&session.last_line),
     ]
@@ -746,6 +894,15 @@ fn bg_status_text(status: &BgSessionStatus) -> &'static str {
     match status {
         BgSessionStatus::Running => "running",
         BgSessionStatus::Done => "done",
+        BgSessionStatus::Failed => "failed",
+        BgSessionStatus::Killed => "killed",
+    }
+}
+
+fn bg_status_display(session: &BgSession) -> String {
+    match session.exit_code {
+        Some(code) => format!("{} (exit {code})", bg_status_text(&session.status)),
+        None => bg_status_text(&session.status).to_owned(),
     }
 }
 
@@ -778,6 +935,7 @@ fn bg_list_json(sessions: &[BgSession]) -> Result<String, String> {
                 "session": session.session,
                 "ageSeconds": session.age_seconds,
                 "status": bg_status_text(&session.status),
+                "exitCode": session.exit_code,
                 "lastLine": session.last_line,
             })
         })
@@ -904,6 +1062,35 @@ mod bg_tests {
         true
     }
 
+    #[derive(Default)]
+    struct BgMemoryState {
+        records: Vec<BgStateRecord>,
+    }
+
+    impl BgStateStore for BgMemoryState {
+        fn read_states(&mut self) -> Result<Vec<BgStateRecord>, String> {
+            Ok(self.records.clone())
+        }
+
+        fn write_state(&mut self, state: &BgStateRecord) -> Result<(), String> {
+            if let Some(existing) = self.records.iter_mut().find(|existing| existing.slug == state.slug) {
+                *existing = state.clone();
+            } else {
+                self.records.push(state.clone());
+            }
+            Ok(())
+        }
+    }
+
+    fn bg_test_run(
+        argv: &[String],
+        tmux: &mut impl BgTmux,
+        now: BgNow,
+        inside_tmux: BgInsideTmux,
+    ) -> Result<(i32, String), (i32, String)> {
+        bg_run(argv, tmux, now, inside_tmux, &mut BgMemoryState::default())
+    }
+
     #[test]
     fn bg_dispatch_registers_bg() {
         assert_eq!(DISPATCH_88[0].command, "bg");
@@ -912,7 +1099,7 @@ mod bg_tests {
     #[test]
     fn bg_spawn_builds_safe_new_session_after_has_session() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_fail("missing"), bg_ok_empty()]);
-        let output = bg_run(&bg_strings(&["cargo", "test", "--name", "cargo-test"]), &mut tmux, bg_now, bg_not_tmux)
+        let output = bg_test_run(&bg_strings(&["cargo", "test", "--name", "cargo-test"]), &mut tmux, bg_now, bg_not_tmux)
             .expect("spawn");
         assert_eq!(output.0, 0);
         assert_eq!(output.1, "cargo-test\tmaw-bg-cargo-test\n");
@@ -925,7 +1112,7 @@ mod bg_tests {
     #[test]
     fn bg_rejects_leading_dash_command_before_spawn() {
         let mut tmux = BgFakeTmux::default();
-        let error = bg_run(&bg_strings(&["--bad"]), &mut tmux, bg_now, bg_not_tmux).expect_err("bad");
+        let error = bg_test_run(&bg_strings(&["--bad"]), &mut tmux, bg_now, bg_not_tmux).expect_err("bad");
         assert!(error.1.contains("command must"));
         assert!(tmux.calls.is_empty());
     }
@@ -933,7 +1120,7 @@ mod bg_tests {
     #[test]
     fn bg_rejects_bad_name_before_tmux() {
         let mut tmux = BgFakeTmux::default();
-        let error = bg_run(&bg_strings(&["echo", "hi", "--name=-bad"]), &mut tmux, bg_now, bg_not_tmux)
+        let error = bg_test_run(&bg_strings(&["echo", "hi", "--name=-bad"]), &mut tmux, bg_now, bg_not_tmux)
             .expect_err("bad name");
         assert!(error.1.contains("invalid --name"));
         assert!(tmux.calls.is_empty());
@@ -946,16 +1133,16 @@ mod bg_tests {
             bg_ok("building\n"),
             bg_ok("[done — exit 0]\n"),
         ]);
-        let output = bg_run(&bg_strings(&["ls"]), &mut tmux, bg_now, bg_not_tmux).expect("ls");
-        assert!(output.1.contains("build-a1b2  running  1m"));
-        assert!(output.1.contains("done-b2c3   done     1h"));
+        let output = bg_test_run(&bg_strings(&["ls"]), &mut tmux, bg_now, bg_not_tmux).expect("ls");
+        assert!(output.1.contains("build-a1b2") && output.1.contains("running"), "{}", output.1);
+        assert!(output.1.contains("done-b2c3") && output.1.contains("done (exit 0)"), "{}", output.1);
         assert_eq!(tmux.calls[0].subcommand, "list-sessions");
     }
 
     #[test]
     fn bg_json_list_is_camel_case_like_js() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_ok("maw-bg-build-a1b2\t1699999990\tbash\n"), bg_ok("tail\n")]);
-        let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
+        let output = bg_test_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
         assert!(output.1.contains("\"ageSeconds\": 10"));
         assert!(output.1.contains("\"status\": \"running\""));
     }
@@ -967,7 +1154,7 @@ mod bg_tests {
             bg_ok("sleeping\n"),
             bg_ok("waiting\n"),
         ]);
-        let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
+        let output = bg_test_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
         assert_eq!(output.1.matches("\"status\": \"running\"").count(), 2, "{output:?}");
     }
 
@@ -985,7 +1172,7 @@ mod bg_tests {
             bg_ok("maw-bg-done-a1b2\t1699999990\tbash\n"),
             bg_ok("finished\n\n[done — exit 0]\n"),
         ]);
-        let output = bg_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
+        let output = bg_test_run(&bg_strings(&["list", "--json"]), &mut tmux, bg_now, bg_not_tmux).expect("json");
         assert!(output.1.contains("\"status\": \"done\""), "{}", output.1);
         assert!(output.1.contains("\"lastLine\": \"finished\""), "{}", output.1);
     }
@@ -997,7 +1184,7 @@ mod bg_tests {
             bg_ok("last\n"),
             bg_ok("one\ntwo\n"),
         ]);
-        let output = bg_run(&bg_strings(&["tail", "a1b2", "--lines", "2"]), &mut tmux, bg_now, bg_not_tmux).expect("tail");
+        let output = bg_test_run(&bg_strings(&["tail", "a1b2", "--lines", "2"]), &mut tmux, bg_now, bg_not_tmux).expect("tail");
         assert_eq!(output.1, "one\ntwo");
         let tail = tmux.calls.last().expect("tail call");
         assert_eq!(tail.subcommand, "capture-pane");
@@ -1013,7 +1200,7 @@ mod bg_tests {
             bg_ok_empty(),
             bg_ok_empty(),
         ]);
-        let output = bg_run(&bg_strings(&["kill", "--all"]), &mut tmux, bg_now, bg_not_tmux).expect("kill");
+        let output = bg_test_run(&bg_strings(&["kill", "--all"]), &mut tmux, bg_now, bg_not_tmux).expect("kill");
         assert!(output.1.contains("killed: one-a111, two-b222"));
         assert_eq!(tmux.calls.iter().filter(|call| call.subcommand == "kill-session").count(), 2);
     }
@@ -1025,7 +1212,7 @@ mod bg_tests {
             bg_ok("[done — exit 0]\n"),
             bg_ok("new run\n"),
         ]);
-        let output = bg_run(&bg_strings(&["gc", "--dry-run", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
+        let output = bg_test_run(&bg_strings(&["gc", "--dry-run", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
             .expect("gc");
         assert!(output.1.contains("would reap: old-a111"));
         assert!(output.1.contains("kept:    new-b222"));
@@ -1039,7 +1226,7 @@ mod bg_tests {
             bg_ok("[done — exit 0]\n"),
             bg_ok_empty(),
         ]);
-        let output = bg_run(&bg_strings(&["gc", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
+        let output = bg_test_run(&bg_strings(&["gc", "--older-than", "1h"]), &mut tmux, bg_now, bg_not_tmux)
             .expect("gc");
         assert!(output.1.contains("reaped: old-a111"), "{}", output.1);
         assert!(tmux.calls.iter().any(|call| call.subcommand == "kill-session"));
@@ -1048,7 +1235,7 @@ mod bg_tests {
     #[test]
     fn bg_attach_switches_inside_tmux_without_real_spawn() {
         let mut tmux = BgFakeTmux::bg_with_responses(vec![bg_ok("maw-bg-one-a111\t1\tcargo\n"), bg_ok("tail\n")]);
-        let output = bg_run(&bg_strings(&["attach", "one"]), &mut tmux, bg_now, bg_in_tmux).expect("attach");
+        let output = bg_test_run(&bg_strings(&["attach", "one"]), &mut tmux, bg_now, bg_in_tmux).expect("attach");
         assert_eq!(output.0, 0);
         assert_eq!(tmux.attach_calls[0][0], "switch-client");
         assert_eq!(tmux.attach_calls[0][2], "maw-bg-one-a111");
@@ -1061,7 +1248,7 @@ mod bg_tests {
             bg_ok("a\n"),
             bg_ok("b\n"),
         ]);
-        let error = bg_run(&bg_strings(&["kill", "one"]), &mut tmux, bg_now, bg_not_tmux).expect_err("ambiguous");
+        let error = bg_test_run(&bg_strings(&["kill", "one"]), &mut tmux, bg_now, bg_not_tmux).expect_err("ambiguous");
         assert!(error.1.contains("matches 2 sessions"));
         assert!(!tmux.calls.iter().any(|call| call.subcommand == "kill-session"));
     }
