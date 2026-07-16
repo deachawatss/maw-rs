@@ -67,10 +67,18 @@ fn main_path_from_git(worktree_path: &Path, fallback: &Path) -> PathBuf {
     } else {
         worktree_path.join(path)
     };
-    absolute
+    let main_path = absolute
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(|| fallback.to_path_buf(), Path::to_path_buf)
+        .map_or_else(|| fallback.to_path_buf(), Path::to_path_buf);
+    if main_path
+        .components()
+        .any(|component| component.as_os_str() == ".git")
+    {
+        fallback.to_path_buf()
+    } else {
+        main_path
+    }
 }
 
 fn tracked_psi_paths(worktree_path: &Path) -> Result<BTreeSet<PathBuf>, String> {

@@ -53,8 +53,10 @@ printf '%s
 case "$*" in
   *"rev-parse --abbrev-ref HEAD"*) printf 'main
 ' ;;
-  *"rev-parse --git-common-dir"*) printf '%s/.git
-' "$DONE_MAIN" ;;
+  *"rev-parse --git-common-dir"*)
+    if [ -n "$DONE_COMMON_DIR" ]; then printf '%s
+' "$DONE_COMMON_DIR"; else printf '%s/.git
+' "$DONE_MAIN"; fi ;;
   *"rev-parse --show-toplevel"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf '%s
 ' "$DONE_WORKTREE"; fi ;;
   *"worktree list --porcelain"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf 'worktree %s
@@ -178,6 +180,37 @@ esac
         assert_eq!(
             std::fs::read_to_string(&rescued[0]).expect("rescued file"),
             "worktree copy"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn psi_rescue_uses_fallback_outside_submodule_git_metadata() {
+        let _guard = env_lock().lock().expect("env lock");
+        let root = unique_root("psi-submodule");
+        let bin = root.join("bin");
+        let main = root.join("main");
+        let worktree = root.join("worktree");
+        let metadata_parent = root.join("wind/.git/modules/repos");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        write_fake_git(&bin);
+        write_file(&worktree.join("ψ/memory/probe.md"), "worktree note");
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("DONE_MAIN", &main);
+        std::env::set_var("DONE_COMMON_DIR", metadata_parent.join("maw-rs"));
+        std::env::set_var("DONE_STATUS_PSI", "none");
+        std::env::set_var("DONE_TRACKED_PSI", "none");
+        std::env::set_var("DONE_GIT_LOG", root.join("git.log"));
+
+        let rescued = rescue_psi(&worktree, &main).expect("rescue ok");
+        assert_eq!(rescued, vec![main.join("ψ/memory/probe.md")]);
+        assert_eq!(
+            std::fs::read_to_string(main.join("ψ/memory/probe.md")).expect("rescued file"),
+            "worktree note"
+        );
+        assert!(
+            !metadata_parent.join("ψ/memory/probe.md").exists(),
+            "rescue must not write beneath .git metadata"
         );
         let _ = std::fs::remove_dir_all(root);
     }
