@@ -60,11 +60,14 @@ case "$*" in
   *"worktree list --porcelain"*) if [ "$DONE_FAKE_WORKTREE" = "1" ]; then printf 'worktree %s
 ' "$DONE_WORKTREE"; fi ;;
   *"status --porcelain -- ψ/"*)
-    if [ "$DONE_STATUS_PSI" = "test" ]; then printf '?? ψ/test.md
+    if [ "$DONE_STATUS_PSI" = "modified" ]; then printf ' M ψ/test.md
 '; fi
     if [ "$DONE_STATUS_PSI" = "symlink" ]; then printf '?? ψ/note.md
 ?? ψ/leak.md
 '; fi ;;
+  *"ls-files -z -- ψ/"*)
+    if [ "$DONE_TRACKED_PSI" = "team" ]; then printf 'ψ/teams/team.yaml\000'; fi
+    if [ "$DONE_TRACKED_PSI" = "test" ]; then printf 'ψ/test.md\000'; fi ;;
   *) exit 0 ;;
 esac
 "#,
@@ -139,7 +142,7 @@ esac
     }
 
     #[test]
-    fn psi_rescue_copies_uncommitted_files_without_overwrite() {
+    fn psi_rescue_copies_modified_tracked_files_without_overwrite() {
         let _guard = env_lock().lock().expect("env lock");
         let root = unique_root("psi");
         let bin = root.join("bin");
@@ -151,7 +154,8 @@ esac
         write_file(&worktree.join("ψ/test.md"), "worktree copy");
         std::env::set_var("PATH", &bin);
         std::env::set_var("DONE_MAIN", &main);
-        std::env::set_var("DONE_STATUS_PSI", "test");
+        std::env::set_var("DONE_STATUS_PSI", "modified");
+        std::env::set_var("DONE_TRACKED_PSI", "test");
         std::env::set_var("DONE_GIT_LOG", root.join("git.log"));
 
         let rescued = rescue_psi(&worktree, &main).expect("rescue ok");
@@ -235,16 +239,21 @@ esac
     }
 
     #[test]
-    fn done_rescues_uncommitted_psi_through_compiled_binary() {
-        // Wiring guard (not the isolated rescue_psi unit test above): the compiled
-        // `maw done` MUST rescue uncommitted ψ/ notes to main BEFORE it removes the
-        // worktree / force-deletes the branch. Drives the real binary end-to-end.
+    fn done_rescues_gitignored_psi_before_removing_worktree() {
+        // Wiring guard: the compiled `maw done` MUST rescue a gitignored ψ/ note
+        // before it removes the worktree. A clean tracked ψ/teams file is present
+        // too, and must not be copied into main as though it were a note.
         let (root, bin, main, worktree) = seed_done_fixture("psi-wire");
-        // Fake git reports ψ/test.md as uncommitted (DONE_STATUS_PSI=test); the
-        // physical file must exist in the worktree for rescue_psi to copy it.
-        write_file(&worktree.join("ψ/test.md"), "worktree note worth keeping");
+        write_file(
+            &worktree.join("ψ/memory/retrospectives/probe.md"),
+            "worktree note worth keeping",
+        );
+        write_file(
+            &worktree.join("ψ/teams/team.yaml"),
+            "checked-out team state",
+        );
         let output = done_command(&root, &bin, &main, &worktree)
-            .env("DONE_STATUS_PSI", "test")
+            .env("DONE_TRACKED_PSI", "team")
             .env("DONE_FAKE_WORKTREE", "1")
             .args([
                 "done",
@@ -264,10 +273,15 @@ esac
             stdout.contains("rescued"),
             "expected rescue line; stdout={stdout}"
         );
-        // main had no ψ/test.md, so it is copied there verbatim before removal.
+        // The ignored note survives in main before removal.
         assert_eq!(
-            std::fs::read_to_string(main.join("ψ/test.md")).expect("rescued main file"),
+            std::fs::read_to_string(main.join("ψ/memory/retrospectives/probe.md"))
+                .expect("rescued main file"),
             "worktree note worth keeping"
+        );
+        assert!(
+            !main.join("ψ/teams/team.yaml").exists(),
+            "clean tracked ψ file must not be copied as a rescue note"
         );
         let _ = std::fs::remove_dir_all(root);
     }
