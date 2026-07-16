@@ -668,6 +668,67 @@ exit 9
     }
 
     #[test]
+    fn explicit_codex_engine_trust_uses_logical_key_for_all_scoped_config_paths() {
+        for config in [
+            r#"{"commands":{"default":"claude","codex":"codex-launch --full-auto"},"engineTrustedRepos":{"codex":["acme/demo"]}}"#,
+            r#"{"commands":{"default":"claude","codex":"codex-launch --full-auto"},"engines":{"codex":{"trustedRepos":["acme/demo"]}}}"#,
+        ] {
+            let root = temp_dir("explicit-codex-engine");
+            let bin_dir = seed_root(&root, Some(config));
+            let output = run(
+                &root,
+                &bin_dir,
+                &["workon", "demo", "issue-76", "--engine", "codex"],
+            );
+
+            assert_success(&output);
+            assert!(sent_command(&root).contains("-l codex-launch --full-auto"));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("not trusted"), "{stdout}");
+        }
+    }
+
+    #[test]
+    fn explicit_codex_engine_trust_keeps_binary_name_key_compatible() {
+        let root = temp_dir("explicit-codex-binary-key");
+        let bin_dir = seed_root(
+            &root,
+            Some(
+                r#"{"commands":{"default":"claude","codex":"codex-launch --full-auto"},"engineTrustedRepos":{"codex-launch":["acme/demo"]}}"#,
+            ),
+        );
+        let output = run(
+            &root,
+            &bin_dir,
+            &["workon", "demo", "issue-76", "--engine", "codex"],
+        );
+
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!stdout.contains("not trusted"), "{stdout}");
+    }
+
+    #[test]
+    fn explicit_codex_engine_trust_fails_closed_for_unmatched_key() {
+        let root = temp_dir("explicit-codex-unmatched-key");
+        let bin_dir = seed_root(
+            &root,
+            Some(
+                r#"{"commands":{"default":"claude","codex":"codex-launch --full-auto"},"engines":{"other":{"trustedRepos":["acme/demo"]}}}"#,
+            ),
+        );
+        let output = run(
+            &root,
+            &bin_dir,
+            &["workon", "demo", "issue-76", "--engine", "codex"],
+        );
+
+        assert_success(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("not trusted"), "{stdout}");
+    }
+
+    #[test]
     fn fresh_worktree_sanitizes_stale_state() {
         let root = temp_dir("fresh-sanitize");
         let bin_dir = seed_root(&root, Some(r#"{"commands":{"default":"claude"}}"#));

@@ -64,7 +64,15 @@ pub(crate) fn prepare_engine(
     let config = load_config(cwd);
     let command = resolve_engine_command(&config, window_name, explicit_engine);
     let engine = detect_engine_name(&command);
-    let warning = engine_warning(&config, &engine, repo_id_from_path(cwd).as_deref());
+    let logical_engine = explicit_engine
+        .map(str::trim)
+        .filter(|engine| !engine.is_empty());
+    let warning = engine_warning(
+        &config,
+        &engine,
+        logical_engine,
+        repo_id_from_path(cwd).as_deref(),
+    );
     let resolution = EngineResolution {
         engine,
         command,
@@ -216,25 +224,48 @@ fn is_env_assignment(token: &str) -> bool {
     })
 }
 
-fn engine_warning(config: &serde_json::Value, engine: &str, repo: Option<&str>) -> Option<String> {
-    if engine == "claude" || repo.is_some_and(|repo| repo_is_trusted(config, engine, repo)) {
+fn engine_warning(
+    config: &serde_json::Value,
+    binary_engine: &str,
+    logical_engine: Option<&str>,
+    repo: Option<&str>,
+) -> Option<String> {
+    if binary_engine == "claude"
+        || repo.is_some_and(|repo| repo_is_trusted(config, logical_engine, binary_engine, repo))
+    {
         return None;
     }
     let repo = repo.unwrap_or("unknown repo");
     Some(format!(
-        "non-Claude engine '{engine}' is not trusted for {repo}; Claude hook gates may not apply"
+        "non-Claude engine '{binary_engine}' is not trusted for {repo}; Claude hook gates may not apply"
     ))
 }
 
-fn repo_is_trusted(config: &serde_json::Value, engine: &str, repo: &str) -> bool {
+fn repo_is_trusted(
+    config: &serde_json::Value,
+    logical_engine: Option<&str>,
+    binary_engine: &str,
+    repo: &str,
+) -> bool {
     [
         config.get("trustedRepos"),
         config.pointer("/workon/trustedRepos"),
-        config.pointer(&format!("/engineTrustedRepos/{engine}")),
-        config.pointer(&format!("/engines/{engine}/trustedRepos")),
     ]
     .into_iter()
     .any(|value| trust_array_matches(value, repo))
+        // Logical names are the config contract; binary names remain an explicit
+        // compatibility fallback. Both scoped paths use the same identity keys.
+        || [logical_engine, Some(binary_engine)]
+            .into_iter()
+            .flatten()
+            .any(|engine| {
+                [
+                    config.pointer(&format!("/engineTrustedRepos/{engine}")),
+                    config.pointer(&format!("/engines/{engine}/trustedRepos")),
+                ]
+                .into_iter()
+                .any(|value| trust_array_matches(value, repo))
+            })
 }
 
 #[rustfmt::skip]
