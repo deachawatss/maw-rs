@@ -870,6 +870,9 @@ fn workon_link_shared_psi(
     if !source.is_dir() {
         return Ok(false);
     }
+    if workon_psi_has_tracked_entries(main_path)? {
+        return Ok(false);
+    }
     let target = wt_path.join("ψ");
     if let Ok(existing) = std::fs::symlink_metadata(&target) {
         if existing.file_type().is_symlink() && std::fs::read_link(&target).ok().as_deref() == Some(source.as_path()) {
@@ -879,6 +882,11 @@ fn workon_link_shared_psi(
     }
     workon_symlink_dir(&source, &target)?;
     Ok(true)
+}
+
+fn workon_psi_has_tracked_entries(repo_path: &std::path::Path) -> Result<bool, String> {
+    workon_git(repo_path, &["ls-files", "--", "ψ"])
+        .map(|paths| paths.lines().any(|path| !path.is_empty()))
 }
 
 fn workon_preserve_existing_psi(
@@ -1558,12 +1566,85 @@ mod workon_tests {
 
     #[cfg(unix)]
     #[test]
+    fn link_shared_psi_keeps_tracked_worktree_psi_real() {
+        let root = workon_temp_root("tracked-psi");
+        let main = root.join("main");
+        let wt = main.join("agents/feat");
+        let git = |path: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        std::fs::create_dir_all(main.join("ψ/teams")).expect("main psi");
+        std::fs::write(main.join("ψ/teams/team.yaml"), "team: test\n").expect("team");
+        git(&main, &["init", "-q"]);
+        git(&main, &["config", "user.email", "test@example.com"]);
+        git(&main, &["config", "user.name", "Test User"]);
+        git(&main, &["add", "ψ/teams/team.yaml"]);
+        git(&main, &["commit", "-qm", "tracked psi"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "agents/feat",
+                wt.to_str().expect("worktree path"),
+                "main",
+            ],
+        );
+
+        assert!(!workon_link_shared_psi(&main, &wt).expect("shared psi"));
+        assert!(std::fs::symlink_metadata(wt.join("ψ"))
+            .expect("psi metadata")
+            .file_type()
+            .is_dir());
+        assert!(git(&wt, &["status", "--porcelain", "--", "ψ"]).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(main.join("ψ/teams/team.yaml")).expect("main psi"),
+            "team: test\n"
+        );
+        assert!(git(&main, &["status", "--porcelain", "--", "ψ"]).is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn link_shared_psi_preserves_existing_worktree_psi() {
         let root = workon_temp_root("shared-psi");
         let main = root.join("main");
         let wt = root.join("main/agents/feat");
         std::fs::create_dir_all(main.join("ψ/memory")).expect("main psi");
         std::fs::write(main.join("ψ/memory/main.md"), "main\n").expect("main memory");
+        std::fs::write(main.join("README.md"), "main\n").expect("readme");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&main)
+                    .args(args)
+                    .status()
+                    .expect("run git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test User"]);
+        git(&["add", "README.md"]);
+        git(&["commit", "-qm", "untracked psi"]);
         std::fs::create_dir_all(wt.join("ψ/memory")).expect("worktree psi");
         std::fs::write(wt.join("ψ/memory/local.md"), "local\n").expect("local memory");
 
