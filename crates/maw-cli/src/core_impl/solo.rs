@@ -101,13 +101,10 @@ fn solo_create_window<R: maw_tmux::TmuxRunner>(
         }
     };
     solo_set_lease_worktree(lease.path, lease.holder, &target_path)?;
-    let window = workon_new_window(runner, session, window_name, &repo.repo_path)?;
-    workon_wait_for_shell_prompt(runner, &window)?;
-    workon_send_window_command_to_target(runner, &window, "claude", &repo.repo_path, Some("claude"), Some("Issue delivery lead: inspect the issue and coordinate the Codex worktree pane."))?;
-    let codex_pane = workon_tmux_run(runner, "split-window", &["-h", "-P", "-F", "#{pane_id}", "-t", &window, "-c", workon_path_str(&target_path)?])?;
+    let codex_pane = workon_new_window(runner, session, window_name, &target_path)?;
     workon_wait_for_shell_prompt(runner, &codex_pane)?;
     solo_launch_l2(runner, &codex_pane, &target_path, profile)?;
-    Ok(format!("solo '{window_name}' in {session} (L1: {}, L2: {})\n", repo.repo_path.display(), target_path.display()))
+    Ok(format!("solo '{window_name}' in {session} (L1: current pane, L2: {})\n", target_path.display()))
 }
 
 fn solo_launch_l2<R: maw_tmux::TmuxRunner>(

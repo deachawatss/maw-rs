@@ -671,26 +671,31 @@ fn workon_send_window_command_to_target<R: maw_tmux::TmuxRunner>(
 fn workon_new_window<R: maw_tmux::TmuxRunner>(
     runner: &mut R,
     session: &str,
-    window_name: &str,
+    _window_name: &str,
     target_path: &std::path::Path,
 ) -> Result<String, String> {
-    let session_target = format!("{session}:");
-    let window_id = workon_tmux_run(
+    let current_pane = workon_tmux_run(runner, "display-message", &["-p", "#{pane_id}"])?;
+    let split_target = if current_pane.is_empty() { format!("{session}:") } else { current_pane };
+    let pane_id = workon_tmux_run(
         runner,
-        "new-window",
+        "split-window",
         &[
+            "-h",
+            "-l",
+            "60%",
             "-P",
             "-F",
-            "#{window_id}",
+            "#{pane_id}",
             "-t",
-            &session_target,
-            "-n",
-            window_name,
+            &split_target,
             "-c",
             workon_path_str(target_path)?,
         ],
     )?;
-    Ok(if window_id.is_empty() { format!("{session}:{window_name}") } else { window_id })
+    if pane_id.is_empty() {
+        return Err("workon: split-window returned no pane id".to_owned());
+    }
+    Ok(pane_id)
 }
 
 fn workon_resolve_worktree_name(options: &WorkonOptions) -> Result<Option<WorkonResolvedWorktreeName>, String> {
