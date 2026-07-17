@@ -7,11 +7,24 @@ For repo-wide agent execution conventions, read `AGENTS.md` first; this file rem
 ## Build Gate
 
 ```bash
-cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Both must pass before any PR.
+Clippy must pass before any PR.
+
+**Testing rule: scope tests to what you changed.**
+- Changed one crate? `cargo test -p <crate>`.
+- Changed one module/function? `cargo test -p <crate> -- <test_name>`.
+- Never run `cargo test --workspace` in a worktree — it takes minutes and
+  blocks parallel L2s. L1 runs the full workspace gate after merge.
+
+**Local-resource rule (Wind, 2026-07-16): never cold-build this workspace
+just to test a change.** Even a scoped `cargo test -p <crate>` compiles the
+entire dependency tree when the target dir is cold — a fresh worktree means
+10+ minutes of full-machine CPU for a one-file change. Instead:
+- reuse the warm cache: `CARGO_TARGET_DIR=$(git rev-parse --git-common-dir)/../target cargo test -p <crate> -- <test_name>` (single test, warm cache only);
+- or push the branch and let GitHub CI do the compile — Wind's machine is
+  not the build farm.
 
 ## Branches
 
