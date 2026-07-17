@@ -15,22 +15,26 @@ Clippy must pass before any PR.
 **Testing rule: scope tests to what you changed.**
 - Changed one crate? `cargo test -p <crate>`.
 - Changed one module/function? `cargo test -p <crate> -- <test_name>`.
-- Never run `cargo test --workspace` in a worktree — it takes minutes and
-  blocks parallel L2s. L1 runs the full workspace gate after merge.
+- Never run `cargo test --workspace` for a single change — full suite runs
+  in CI after push.
 
-**Local-resource rule (Wind, 2026-07-16): never cold-build this workspace
-just to test a change.** Even a scoped `cargo test -p <crate>` compiles the
-entire dependency tree when the target dir is cold — a fresh worktree means
-10+ minutes of full-machine CPU for a one-file change. Instead:
-- reuse the warm cache: `CARGO_TARGET_DIR=$(git rev-parse --git-common-dir)/../target cargo test -p <crate> -- <test_name>` (single test, warm cache only);
-- or push the branch and let GitHub CI do the compile — Wind's machine is
-  not the build farm.
+## Development Lane — Lightweight / L1 Direct
+
+maw-rs is infra. **Do not use `maw workon` or L2 worktrees.** Fix directly
+on the working branch, commit, push. Worktrees duplicate the entire Cargo
+dependency tree (~100GB) and are not worth the cost for this repo.
+
+- Edit on `main` (or `alpha` for pre-release), commit, push.
+- Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`) — not
+  inside the repo. Cleaned automatically on reboot; never accumulates.
+- Only test the crate you touched: `cargo test -p <crate> -- <test_name>`.
+- Let CI run the full workspace gate — Wind's machine is not the build farm.
 
 ## Branches
 
-- `main` — stable, protected. Never push or merge directly.
-- `alpha` — integration branch. All PRs target `alpha`.
-- `agents/*` — throwaway worktree branches for agent/coder work.
+- `main` — the only development branch. All work here, direct push.
+- `alpha` — upstream sync only (`upstream/alpha` from Soul-Brews-Studio).
+  Used for fetching upstream changes, not for development.
 
 ## Releases (CalVer)
 
