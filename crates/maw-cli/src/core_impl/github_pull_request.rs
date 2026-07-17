@@ -122,11 +122,24 @@ struct PrNativeTmux;
 
 impl PrTmux for PrNativeTmux {
     fn pr_current_path(&mut self) -> Result<String, String> {
-        pr_tmux_output(&["display-message", "-p", "#{pane_current_path}"])
+        // The caller's own working directory is ground truth. Asking tmux via
+        // `display-message` with no target resolves to the attached client's
+        // active pane whenever TMUX_PANE is absent (codex background
+        // terminals scrub it), silently reading another pane's repo/branch.
+        std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .map_err(|error| format!("could not detect working directory: {error}"))
     }
 
     fn pr_current_session(&mut self) -> Result<String, String> {
-        pr_tmux_output(&["display-message", "-p", "#{session_name}"])
+        // Pin the lookup to the invoking pane when TMUX_PANE is available;
+        // untargeted display-message falls back to the focused client's pane.
+        match std::env::var("TMUX_PANE") {
+            Ok(pane) if !pane.is_empty() => {
+                pr_tmux_output(&["display-message", "-t", &pane, "-p", "#{session_name}"])
+            }
+            _ => pr_tmux_output(&["display-message", "-p", "#{session_name}"]),
+        }
     }
 
     fn pr_window_path(&mut self, target: &str) -> Result<String, String> {
@@ -1120,6 +1133,16 @@ mod pr_tests {
             assert!(!target.starts_with('-'));
             Ok(self.window_path.clone())
         }
+    }
+
+    #[test]
+    fn pr_native_current_path_is_the_callers_cwd_not_a_tmux_pane() {
+        // Regression for issue #92: resolving the caller's own cwd through
+        // `tmux display-message` (no target) returns the attached client's
+        // active pane when TMUX_PANE is absent — another pane's repo/branch.
+        let cwd = std::env::current_dir().expect("cwd").display().to_string();
+        let mut tmux = PrNativeTmux;
+        assert_eq!(tmux.pr_current_path().expect("current path"), cwd);
     }
 
     #[derive(Default)]
