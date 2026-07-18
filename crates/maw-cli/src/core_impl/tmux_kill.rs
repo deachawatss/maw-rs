@@ -113,11 +113,30 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
     let pane = tmux_kill_resolve_pane(&args.target, &panes)?;
     tmux_kill_validate_resolved_target(&pane.id, "resolved pane id")?;
     tmux_kill_validate_resolved_target(&pane.session, "resolved pane session")?;
-    tmux_kill_refuse_protected_session(&pane.session, args.force)?;
+    let is_last_pane_in_window = panes
+        .iter()
+        .filter(|p| p.session == pane.session && p.window_index == pane.window_index)
+        .count()
+        <= 1;
+    if is_last_pane_in_window {
+        tmux_kill_refuse_protected_session(&pane.session, args.force)?;
+    }
     reap_tmux_target(runner, &pane.id)?;
     runner
         .run("kill-pane", &tmux_kill_strings(&["-t", &pane.id]))
         .map_err(|error| format!("tmux kill-pane failed: {}", error.message))?;
+    let after = runner
+        .run(
+            "list-panes",
+            &tmux_kill_strings(&["-a", "-F", TMUX_KILL_PANE_FORMAT]),
+        )
+        .unwrap_or_default();
+    if tmux_kill_parse_panes(&after).iter().any(|p| p.id == pane.id) {
+        return Err(format!(
+            "pane {} still exists after kill-pane (remain-on-exit or respawn active)",
+            pane.id
+        ));
+    }
     Ok(format!("  \x1b[32m✓\x1b[0m killed pane {}\n", pane.id))
 }
 
@@ -302,6 +321,7 @@ mod tmux_kill_tests {
         sessions: String,
         panes: String,
         calls: Vec<TmuxKillCall>,
+        killed_panes: Vec<String>,
     }
 
     impl maw_tmux::TmuxRunner for TmuxKillFakeRunner {
@@ -316,8 +336,26 @@ mod tmux_kill_tests {
             });
             Ok(match subcommand {
                 "list-sessions" => self.sessions.clone(),
-                "list-panes" => self.panes.clone(),
-                "kill-session" | "kill-pane" => String::new(),
+                "list-panes" => {
+                    let raw = self.panes.clone();
+                    if self.killed_panes.is_empty() {
+                        raw
+                    } else {
+                        raw.lines()
+                            .filter(|line| {
+                                !self.killed_panes.iter().any(|id| line.starts_with(id))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }
+                "kill-pane" => {
+                    if let Some(target) = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)) {
+                        self.killed_panes.push(target.clone());
+                    }
+                    String::new()
+                }
+                "kill-session" => String::new(),
                 other => panic!("unexpected tmux subcommand: {other}"),
             })
         }
@@ -332,6 +370,7 @@ mod tmux_kill_tests {
             sessions: "scratch\n".to_owned(),
             panes: "%42|||scratch:1.2|||scratch|||1|||2\n".to_owned(),
             calls: Vec::new(),
+            killed_panes: Vec::new(),
         }
     }
 
@@ -347,12 +386,13 @@ mod tmux_kill_tests {
         let mut runner = fake_runner();
         let output = tmux_kill_run_with(&fake_args(&["%42"]), &mut runner).expect("kill pane");
         assert_eq!(output, "  \x1b[32m✓\x1b[0m killed pane %42\n");
-        assert_eq!(runner.calls.len(), 3);
+        assert_eq!(runner.calls.len(), 4);
         assert_eq!(runner.calls[0].subcommand, "list-panes");
         assert_eq!(runner.calls[1].subcommand, "list-panes");
         assert_eq!(runner.calls[1].args, fake_args(&["-t", "%42", "-F", "#{pane_pid}"]));
         assert_eq!(runner.calls[2].subcommand, "kill-pane");
         assert_eq!(runner.calls[2].args, fake_args(&["-t", "%42"]));
+        assert_eq!(runner.calls[3].subcommand, "list-panes");
     }
 
     #[test]
@@ -407,6 +447,30 @@ mod tmux_kill_tests {
             .expect_err("protected pane session refused");
         assert!(error.contains("protected fleet/view session"));
         assert_eq!(runner.calls.len(), 1);
+        assert!(!runner.calls.iter().any(|call| call.subcommand == "kill-pane"));
+    }
+
+    #[test]
+    fn tmux_kill_allows_non_last_pane_in_protected_session_without_force() {
+        let mut runner = TmuxKillFakeRunner {
+            panes: "%7|||01-gale:1.0|||01-gale|||1|||0\n%8|||01-gale:1.1|||01-gale|||1|||1\n".to_owned(),
+            ..TmuxKillFakeRunner::default()
+        };
+        let output = tmux_kill_run_with(&fake_args(&["%8"]), &mut runner)
+            .expect("non-last pane in protected session should succeed");
+        assert!(output.contains("killed pane %8"));
+        assert!(runner.calls.iter().any(|call| call.subcommand == "kill-pane"));
+    }
+
+    #[test]
+    fn tmux_kill_still_guards_last_pane_in_protected_session() {
+        let mut runner = TmuxKillFakeRunner {
+            panes: "%9|||01-gale:1.0|||01-gale|||1|||0\n".to_owned(),
+            ..TmuxKillFakeRunner::default()
+        };
+        let error = tmux_kill_run_with(&fake_args(&["%9"]), &mut runner)
+            .expect_err("last pane in protected session should be guarded");
+        assert!(error.contains("protected fleet/view session"));
         assert!(!runner.calls.iter().any(|call| call.subcommand == "kill-pane"));
     }
 
