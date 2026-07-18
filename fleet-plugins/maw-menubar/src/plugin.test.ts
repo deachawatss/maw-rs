@@ -64,7 +64,7 @@ test("install renders a valid plist and uses structural argv", async () => {
   const runtime = fakeRuntime(home, calls, null);
   expect(await lifecycle("install", () => {}, runtime)).toBe(0);
   const plist = join(home, "Library", "LaunchAgents", `${LABEL}.plist`);
-  expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
+  if (process.platform === "darwin") expect(Bun.spawnSync(["/usr/bin/plutil", "-lint", plist]).exitCode).toBe(0);
   expect(readFileSync(plist, "utf8")).toBe(renderPlist(runtime.helper, runtime.maw, home));
   expect(calls).toContainEqual(["/usr/bin/plutil", "-lint", `${plist}.tmp-${process.pid}`]);
   expect(calls).toContainEqual(["/bin/launchctl", "bootstrap", "gui/501", plist]);
