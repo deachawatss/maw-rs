@@ -347,26 +347,31 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
     solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
+    let lane = crate::wind::workon::repo_lane(&repo.repo_path, &repo.repo_name);
     if let Some(request) = workon_resolve_worktree_name(options)? {
-        let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
-        let branches = workon_agent_branches(&repo.repo_path)?;
-        match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
-            WorkonWorktreePlan::Reuse { path } => {
-                workon_cargo_disk_preflight(&repo.repo_path, &path, &mut stdout)?;
-                workon_restore_shared_worktree_state(&repo.repo_path, &path)?;
-                let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing worktree: {}", path.display());
-                target_path = path;
+        if lane == crate::wind::workon::RepoLane::Lightweight {
+            window_name = format!("{}-{}", repo.repo_name, request.slug);
+        } else {
+            let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
+            let branches = workon_agent_branches(&repo.repo_path)?;
+            match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
+                WorkonWorktreePlan::Reuse { path } => {
+                    workon_cargo_disk_preflight(&repo.repo_path, &path, &mut stdout)?;
+                    workon_restore_shared_worktree_state(&repo.repo_path, &path)?;
+                    let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing worktree: {}", path.display());
+                    target_path = path;
+                }
+                WorkonWorktreePlan::Create { wt_path, branch, branch_exists, .. } => {
+                    workon_cargo_disk_preflight(&repo.repo_path, &wt_path, &mut stdout)?;
+                    workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.base.as_deref(), options.layout)?;
+                    let suffix = if branch_exists { ", reused branch" } else { "" };
+                    let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
+                    workon_finish_created_worktree(repo, &wt_path, &mut stdout)?;
+                    target_path = wt_path;
+                }
             }
-            WorkonWorktreePlan::Create { wt_path, branch, branch_exists, .. } => {
-                workon_cargo_disk_preflight(&repo.repo_path, &wt_path, &mut stdout)?;
-                workon_create_worktree(repo, &wt_path, &branch, branch_exists, options.base.as_deref(), options.layout)?;
-                let suffix = if branch_exists { ", reused branch" } else { "" };
-                let _ = writeln!(stdout, "\x1b[32m+\x1b[0m worktree: {} ({branch}{suffix})", wt_path.display());
-                workon_finish_created_worktree(repo, &wt_path, &mut stdout)?;
-                target_path = wt_path;
-            }
+            window_name = format!("{}-{}", repo.repo_name, request.slug);
         }
-        window_name = format!("{}-{}", repo.repo_name, request.slug);
     } else if native_repo_path_is_oracle(&repo.repo_path, &repo.repo_name) {
         taskless_oracle = true;
     }
