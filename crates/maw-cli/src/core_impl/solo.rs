@@ -102,6 +102,7 @@ fn solo_create_window<R: maw_tmux::TmuxRunner>(
     };
     solo_set_lease_worktree(lease.path, lease.holder, &target_path)?;
     let codex_pane = workon_new_window(runner, session, window_name, &target_path)?;
+    workon_record_pane_id(&target_path, &codex_pane)?;
     workon_wait_for_shell_prompt(runner, &codex_pane)?;
     solo_launch_l2(runner, &codex_pane, &target_path, profile)?;
     Ok(format!("solo '{window_name}' in {session} (L1: current pane, L2: {})\n", target_path.display()))
