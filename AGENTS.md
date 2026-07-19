@@ -6,12 +6,14 @@ For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 
 ## Build gate
 
-Every PR must be green on:
+Test only the crate you changed, not the full workspace:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo test -p maw-cli --test <relevant_test>
+CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo clippy -p maw-cli --all-targets -- -D warnings
 ```
+
+The full `cargo test --workspace` is L1's post-merge gate — not the L2 author gate.
 
 Plugin artifact work also needs:
 
@@ -42,12 +44,11 @@ per-worktree CARGO_TARGET_DIR above, not by queueing.
 
 ## Branch and PR rules
 
-- `main` is stable/protected. Never push or merge directly.
-- `alpha` is the integration branch. Open all PRs against `alpha`; squash-merge there.
-- Create work branches from `origin/alpha` as `agents/<type>-<issue>-<slug>`.
+- Open all PRs against `main`; merge there.
+- Create work branches from `origin/main` as `agents/<type>-<issue>-<slug>`.
 - Put `Fixes #N` in the PR body.
-- GitHub auto-closes issues only on default-branch merges; close issues by hand after the
-  PR lands on `alpha`.
+- Do NOT fetch or rebase against `upstream/alpha` — only work with `origin/main`.
+  Upstream sync is a separate task Wind controls.
 
 ## Diff budget
 
