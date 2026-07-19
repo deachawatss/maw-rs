@@ -18,6 +18,7 @@ agents/
 .maw/l1-review-request.json
 .maw/delivery-notified
 .maw/l1-oracle
+.maw/pane-id
 .maw/auto-done-pinged
 .maw/phase.json
 .maw/lane

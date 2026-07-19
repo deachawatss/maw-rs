@@ -110,7 +110,7 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
         )
         .map_err(|error| format!("tmux list-panes failed: {}", error.message))?;
     let panes = tmux_kill_parse_panes(&raw);
-    let pane = tmux_kill_resolve_pane(&args.target, &panes)?;
+    let pane = tmux_kill_resolve_pane(&args.target, &panes, &raw)?;
     tmux_kill_validate_resolved_target(&pane.id, "resolved pane id")?;
     tmux_kill_validate_resolved_target(&pane.session, "resolved pane session")?;
     let is_last_pane_in_window = panes
@@ -140,8 +140,7 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
     Ok(format!("  \x1b[32m✓\x1b[0m killed pane {}\n", pane.id))
 }
 
-const TMUX_KILL_PANE_FORMAT: &str =
-    "#{pane_id}|||#{session_name}:#{window_index}.#{pane_index}|||#{session_name}|||#{window_index}|||#{pane_index}";
+const TMUX_KILL_PANE_FORMAT: &str = maw_tmux::PANE_TARGET_FORMAT;
 
 fn tmux_kill_list_sessions<R: maw_tmux::TmuxRunner>(runner: &mut R) -> Result<Vec<String>, String> {
     runner
@@ -172,9 +171,11 @@ fn tmux_kill_parse_panes(raw: &str) -> Vec<TmuxKillPane> {
             let mut parts = line.split("|||");
             let id = parts.next()?.trim();
             let target = parts.next().unwrap_or_default().trim();
-            let session = parts.next().unwrap_or_default().trim();
-            let window_index = parts.next().unwrap_or_default().trim();
-            let pane_index = parts.next().unwrap_or_default().trim();
+            let _title = parts.next();
+            let _role = parts.next();
+            let _cwd = parts.next();
+            let (session, window_and_pane) = target.split_once(':')?;
+            let (window_index, pane_index) = window_and_pane.split_once('.')?;
             if id.is_empty() || session.is_empty() {
                 return None;
             }
@@ -189,7 +190,7 @@ fn tmux_kill_parse_panes(raw: &str) -> Vec<TmuxKillPane> {
         .collect()
 }
 
-fn tmux_kill_resolve_pane(target: &str, panes: &[TmuxKillPane]) -> Result<TmuxKillPane, String> {
+fn tmux_kill_resolve_pane(target: &str, panes: &[TmuxKillPane], raw: &str) -> Result<TmuxKillPane, String> {
     let exact = panes
         .iter()
         .filter(|pane| tmux_kill_pane_matches(target, pane))
@@ -198,12 +199,7 @@ fn tmux_kill_resolve_pane(target: &str, panes: &[TmuxKillPane]) -> Result<TmuxKi
     match exact.as_slice() {
         [single] => Ok(single.clone()),
         [] => {
-            let raw = panes
-                .iter()
-                .map(|pane| format!("{}|||{}|||{}|||role|||", pane.id, pane.target, pane.id))
-                .collect::<Vec<_>>()
-                .join("\n");
-            match maw_tmux::resolve_pane_target_from_list_panes_output(target, &raw) {
+            match maw_tmux::resolve_pane_target_from_list_panes_output(target, raw) {
                 maw_tmux::PaneTargetResolution::Match { candidate } => panes
                     .iter()
                     .find(|pane| pane.id == candidate.resolved)
@@ -550,5 +546,22 @@ mod tmux_kill_tests {
             .expect("kill pane by canonical target");
         assert!(output.contains("killed pane %42"));
         assert!(!runner.calls.iter().any(|call| call.subcommand == "bun"));
+    }
+
+    #[test]
+    fn tmux_kill_resolves_a_pane_by_its_worktree_name() {
+        let mut runner = TmuxKillFakeRunner {
+            panes: "%41|||01-gale:1.1|||lead|||role|||/tmp/demo\n%42|||01-gale:1.2|||worker|||role|||/tmp/demo/agents/issue-94\n".to_owned(),
+            ..TmuxKillFakeRunner::default()
+        };
+
+        let output = tmux_kill_run_with(&fake_args(&["issue-94"]), &mut runner)
+            .expect("worktree pane resolves");
+
+        assert!(output.contains("killed pane %42"));
+        assert_eq!(
+            runner.calls[0].args,
+            fake_args(&["-a", "-F", maw_tmux::PANE_TARGET_FORMAT])
+        );
     }
 }

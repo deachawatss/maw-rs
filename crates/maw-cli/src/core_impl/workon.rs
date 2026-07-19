@@ -512,6 +512,7 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     }
 
     let new_target = workon_new_window(runner, session, window_name, target_path)?;
+    workon_record_pane_id(target_path, &new_target)?;
     workon_wait_for_shell_prompt(runner, &new_target)?;
     workon_send_window_command_to_target(runner, &new_target, window_name, target_path, engine, prompt)?;
     workon_wait_for_launch(runner, &new_target)?;
@@ -696,6 +697,17 @@ fn workon_new_window<R: maw_tmux::TmuxRunner>(
         return Err("workon: split-window returned no pane id".to_owned());
     }
     Ok(pane_id)
+}
+
+fn workon_record_pane_id(target_path: &std::path::Path, pane_id: &str) -> Result<(), String> {
+    if !pane_id.starts_with('%') || pane_id.len() == 1 {
+        return Err("workon: split-window returned an invalid pane id".to_owned());
+    }
+    let marker_dir = target_path.join(".maw");
+    std::fs::create_dir_all(&marker_dir)
+        .map_err(|error| format!("workon: create {}: {error}", marker_dir.display()))?;
+    std::fs::write(marker_dir.join("pane-id"), format!("{pane_id}\n"))
+        .map_err(|error| format!("workon: write pane id: {error}"))
 }
 
 fn workon_resolve_worktree_name(options: &WorkonOptions) -> Result<Option<WorkonResolvedWorktreeName>, String> {
@@ -1442,6 +1454,7 @@ mod workon_tests {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
                 "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$".to_owned())),
+                "split-window" => Ok("%42\n".to_owned()),
                 "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
@@ -1548,6 +1561,16 @@ mod workon_tests {
         let expected = std::path::PathBuf::from("/tmp/maw-rs-target-issue-61");
         assert!(config.contains(&expected.display().to_string()), "{config}");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_records_the_split_pane_id_in_the_worktree() {
+        let root = workon_temp_root("pane-id");
+        workon_record_pane_id(&root, "%42").expect("record pane id");
+
+        assert_eq!(std::fs::read_to_string(root.join(".maw/pane-id")).expect("pane id"), "%42\n");
+        assert!(workon_record_pane_id(&root, "42").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1703,7 +1726,7 @@ mod workon_tests {
         assert_eq!(runner.calls[0], ("has-session".to_owned(), workon_strings(&["-t", "=01-gale"])));
         assert_eq!(runner.calls[1], ("list-windows".to_owned(), workon_strings(&["-t", "01-gale", "-F", "#{window_name}"])));
         assert!(runner.calls.iter().any(|(command, args)| {
-            command == "new-window"
+            command == "split-window"
                 && args.iter().position(|arg| arg == "-t").and_then(|index| args.get(index + 1)) == Some(&"01-gale:".to_owned())
         }));
         assert!(!runner.calls.iter().any(|(command, _)| command == "new-session"));

@@ -159,7 +159,11 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     }
     if let Some(window) = &matched {
         done_kill_window(window, options, local, &mut stdout);
-    } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running"); }
+    } else if let Some(worktree) = &selected_worktree {
+        done_kill_worktree_pane(worktree, options, local, &mut stdout)?;
+    } else {
+        let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running");
+    }
     let removed_worktree = if let Some(worktree) = &selected_worktree {
         done_remove_selected_worktree(worktree, options, local, &mut stdout)?;
         true
@@ -437,6 +441,36 @@ fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut impl
     let target = done_tmux_target(window);
     if options.dry_run { let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would kill window {target}"); return; }
     match local.done_reap_target(&target).and_then(|()| local.done_tmux("kill-window", &["-t".to_owned(), target.clone()])) { Ok(_) => { let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed window {target}"); }, Err(_) => stdout.push_str("  \x1b[33m⚠\x1b[0m could not kill window (may already be closed)\n") }
+}
+
+fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+    let marker = worktree.full_path.join(".maw/pane-id");
+    let Ok(pane_id) = std::fs::read_to_string(&marker) else {
+        let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{}' not running", worktree.label);
+        return Ok(());
+    };
+    let pane_id = pane_id.trim();
+    done_validate_tmux_target(pane_id)?;
+    if options.dry_run {
+        let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would kill split pane {pane_id}");
+        return Ok(());
+    }
+    let details = local.done_tmux(
+        "display-message",
+        &["-t".to_owned(), pane_id.to_owned(), "-p".to_owned(), "#{window_panes}\t#{pane_current_path}".to_owned()],
+    )?;
+    let (count, cwd) = details.trim_end().split_once('\t').ok_or_else(|| format!("done: could not inspect split pane {pane_id}"))?;
+    let count = count.parse::<u32>().map_err(|_| format!("done: invalid pane count for {pane_id}"))?;
+    if count <= 1 {
+        return Err(format!("done: refusing to kill sole pane {pane_id}; it no longer has a split-pane parent"));
+    }
+    if !done_same_path(std::path::Path::new(cwd), &worktree.full_path) {
+        return Err(format!("done: pane {pane_id} cwd does not match worktree {}; refusing cleanup", worktree.full_path.display()));
+    }
+    local.done_reap_target(pane_id)?;
+    local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.to_owned()])?;
+    let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed split pane {pane_id}");
+    Ok(())
 }
 
 fn done_retrospective_command(_command: &str) -> Option<&'static str> {
@@ -812,6 +846,7 @@ mod done_tests {
         registered: std::collections::BTreeMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
         branches: std::collections::BTreeMap<std::path::PathBuf, String>,
         dirty_removals: std::collections::BTreeSet<std::path::PathBuf>,
+        tmux_responses: std::collections::BTreeMap<String, String>,
         git_calls: Vec<Vec<String>>,
         tmux_calls: Vec<(String, Vec<String>)>,
         sent_text: Vec<(String, String)>,
@@ -844,7 +879,7 @@ mod done_tests {
 
         fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
             self.tmux_calls.push((command.to_owned(), args.to_vec()));
-            Ok(String::new())
+            Ok(self.tmux_responses.get(command).cloned().unwrap_or_default())
         }
 
         fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String> {
@@ -1239,6 +1274,29 @@ mod done_tests {
         assert!(!out.contains("using live pane cwd"), "{out}");
         assert!(out.contains("window 'worker' not running"), "{out}");
         assert!(out.contains(&stale.display().to_string()) || out.contains("acme/app/agents/stale-task"), "{out}");
+    }
+
+    #[test]
+    fn done_kills_only_the_recorded_split_pane_before_removing_its_worktree() {
+        let root = DoneTempRoot::new("split-pane");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-94");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        done_write_fleet(&root, "issue-94", "acme/app/agents/issue-94");
+
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.register_worktree(&main, &worktree);
+        runtime.tmux_responses.insert("display-message".to_owned(), format!("2\t{}\n", worktree.display()));
+
+        let output = done_run_with_context(&done_args(&["issue-94", "--force"]), &mut runtime, &context)
+            .expect("done split pane");
+
+        assert!(output.contains("killed split pane %42"), "{output}");
+        assert!(runtime.tmux_calls.iter().any(|(command, args)| command == "kill-pane" && args == &done_args(&["-t", "%42"])));
+        assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
+        assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
     }
 
     #[test]
