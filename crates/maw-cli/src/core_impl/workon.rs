@@ -516,6 +516,18 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         return Ok(());
     }
 
+    // A split-created pane never renames its window, so the name check above
+    // cannot detect a re-run of the same task. The recorded pane id is the
+    // durable identity: re-focus that live pane instead of stacking a duplicate.
+    if !force_new_window {
+        if let Some(pane_id) = workon_reusable_pane(runner, target_path) {
+            workon_tmux_run(runner, "select-window", &["-t", &pane_id])?;
+            workon_tmux_run(runner, "select-pane", &["-t", &pane_id])?;
+            let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing existing pane {pane_id} for '{window_name}'");
+            return Ok(());
+        }
+    }
+
     let new_target = workon_new_window(runner, session, window_name, target_path)?;
     workon_record_pane_id(target_path, &new_target)?;
     workon_wait_for_shell_prompt(runner, &new_target)?;
@@ -677,23 +689,23 @@ fn workon_send_window_command_to_target<R: maw_tmux::TmuxRunner>(
 fn workon_new_window<R: maw_tmux::TmuxRunner>(
     runner: &mut R,
     session: &str,
-    _window_name: &str,
+    window_name: &str,
     target_path: &std::path::Path,
 ) -> Result<String, String> {
-    let current_pane = workon_tmux_run(runner, "display-message", &["-p", "#{pane_id}"])?;
-    let split_target = if current_pane.is_empty() { format!("{session}:") } else { current_pane };
+    let panes = workon_list_panes(runner, session)?;
+    let plan = workon_split_plan(session, &panes);
     let pane_id = workon_tmux_run(
         runner,
         "split-window",
         &[
-            "-h",
+            plan.flag,
             "-l",
-            "60%",
+            plan.size,
             "-P",
             "-F",
             "#{pane_id}",
             "-t",
-            &split_target,
+            &plan.target,
             "-c",
             workon_path_str(target_path)?,
         ],
@@ -701,7 +713,112 @@ fn workon_new_window<R: maw_tmux::TmuxRunner>(
     if pane_id.is_empty() {
         return Err("workon: split-window returned no pane id".to_owned());
     }
+    workon_label_pane(runner, session, &pane_id, window_name);
     Ok(pane_id)
+}
+
+/// A tmux pane's id and screen offset, parsed from `list-panes`.
+struct WorkonPane {
+    id: String,
+    left: i64,
+    top: i64,
+}
+
+/// The next split: which pane to split, the orientation flag, and the new
+/// pane's size.
+struct WorkonSplit {
+    target: String,
+    flag: &'static str,
+    size: &'static str,
+}
+
+/// List the panes in `session`'s current window.
+///
+/// Uses an explicit `-t {session}:` target rather than a bare `display-message`
+/// query: tmux resolves a target-less query against the attached client's
+/// focused pane, and `split-window` moves focus to the new pane — so after the
+/// first split an ambient query would make the next `workon` split the wrong
+/// pane instead of stacking beside/under the intended one.
+fn workon_list_panes<R: maw_tmux::TmuxRunner>(runner: &mut R, session: &str) -> Result<Vec<WorkonPane>, String> {
+    let raw = workon_tmux_run(
+        runner,
+        "list-panes",
+        &["-t", &format!("{session}:"), "-F", "#{pane_id} #{pane_left} #{pane_top}"],
+    )?;
+    Ok(raw.lines().filter_map(workon_parse_pane_line).collect())
+}
+
+fn workon_parse_pane_line(line: &str) -> Option<WorkonPane> {
+    let mut fields = line.trim().split(' ');
+    let id = fields.next()?;
+    if !id.starts_with('%') {
+        return None;
+    }
+    let left = fields.next()?.trim().parse().ok()?;
+    let top = fields.next()?.trim().parse().ok()?;
+    Some(WorkonPane { id: id.to_owned(), left, top })
+}
+
+/// Decide how to split for the next L2 pane.
+///
+/// Layout target: L1 is a full-height 40% column on the left; L2 workers live in
+/// the right 60% column, stacked top/bottom (`L1 40% | L2a` over `L2b`).
+///
+/// The sole L1 pane splits horizontally (`-h`, side by side) so L1 keeps ~40% on
+/// the left and the first L2 opens as a 60% right column. Every additional L2
+/// splits the bottom-most right-column pane vertically (`-v`, stacked) so workers
+/// pile up under each other and L1 stays a full-height column. An empty list
+/// (should not happen for a live window) falls back to the session's current
+/// window with a horizontal split.
+fn workon_split_plan(session: &str, panes: &[WorkonPane]) -> WorkonSplit {
+    let Some(leftmost) = panes.iter().map(|pane| pane.left).min() else {
+        return WorkonSplit { target: format!("{session}:"), flag: "-h", size: "60%" };
+    };
+    // Right-column panes are everything not in L1's leftmost column; stack the
+    // new L2 under the bottom-most one.
+    if let Some(bottom) = panes.iter().filter(|pane| pane.left > leftmost).max_by_key(|pane| pane.top) {
+        WorkonSplit { target: bottom.id.clone(), flag: "-v", size: "50%" }
+    } else {
+        let l1 = panes.iter().min_by_key(|pane| pane.left).expect("panes is non-empty");
+        WorkonSplit { target: l1.id.clone(), flag: "-h", size: "60%" }
+    }
+}
+
+/// Label the new pane's border with the task name so side-by-side L2 panes are
+/// distinguishable. Best-effort: a labeling failure must not fail the launch.
+fn workon_label_pane<R: maw_tmux::TmuxRunner>(runner: &mut R, session: &str, pane_id: &str, window_name: &str) {
+    let _ = workon_tmux_run(runner, "select-pane", &["-t", pane_id, "-T", window_name]);
+    let _ = workon_tmux_run(runner, "set-window-option", &["-t", &format!("{session}:"), "pane-border-status", "top"]);
+}
+
+/// Return the recorded split-pane id from `.maw/pane-id` when it is still a live
+/// pane whose cwd matches the worktree, so a repeat `workon` re-focuses that pane
+/// instead of stacking another split. A missing marker, an invalid id, a dead
+/// pane, or a cwd mismatch (a tmux pane id recycled after a server restart)
+/// returns `None`, falling through to a fresh split.
+fn workon_reusable_pane<R: maw_tmux::TmuxRunner>(runner: &mut R, target_path: &std::path::Path) -> Option<String> {
+    let marker = target_path.join(".maw").join("pane-id");
+    let raw = std::fs::read_to_string(&marker).ok()?;
+    let pane_id = raw.trim();
+    if !crate::wind::team::is_valid_pane_id(pane_id) {
+        return None;
+    }
+    // display-message errors when the pane no longer exists → treat as not reusable.
+    let cwd = workon_tmux_run(runner, "display-message", &["-t", pane_id, "-p", "#{pane_current_path}"]).ok()?;
+    if cwd.is_empty() || !workon_same_path(std::path::Path::new(&cwd), target_path) {
+        return None;
+    }
+    Some(pane_id.to_owned())
+}
+
+fn workon_same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn workon_record_pane_id(target_path: &std::path::Path, pane_id: &str) -> Result<(), String> {
@@ -1440,6 +1557,9 @@ mod workon_tests {
         session: String,
         sessions: String,
         windows: String,
+        panes: String,
+        pane_path: String,
+        pane_missing: bool,
         has_session: bool,
         pane_command: String,
         capture_responses: std::collections::VecDeque<String>,
@@ -1452,15 +1572,21 @@ mod workon_tests {
                 "display-message" if args.iter().any(|arg| arg == "#{pane_current_command}") => {
                     Ok(if self.pane_command.is_empty() { "node\n".to_owned() } else { self.pane_command.clone() })
                 }
+                "display-message" if args.iter().any(|arg| arg == "#{pane_current_path}") => {
+                    if self.pane_missing { Err(maw_tmux::TmuxError::new("can't find pane")) } else { Ok(self.pane_path.clone()) }
+                }
                 "display-message" => Ok(self.session.clone()),
                 "list-sessions" => Ok(self.sessions.clone()),
                 "list-windows" => Ok(self.windows.clone()),
+                "list-panes" => Ok(self.panes.clone()),
                 "has-session" => {
                     if self.has_session { Ok(String::new()) } else { Err(maw_tmux::TmuxError::new("no session")) }
                 }
                 "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$".to_owned())),
                 "split-window" => Ok("%42\n".to_owned()),
-                "new-window" | "new-session" | "send-keys" | "select-window" => Ok(String::new()),
+                "new-window" | "new-session" | "send-keys" | "select-window" | "select-pane" | "set-window-option" => {
+                    Ok(String::new())
+                }
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }
         }
@@ -1576,6 +1702,107 @@ mod workon_tests {
 
         assert_eq!(std::fs::read_to_string(root.join(".maw/pane-id")).expect("pane id"), "%42\n");
         assert!(workon_record_pane_id(&root, "42").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn workon_flag_value<'a>(args: &'a [String], flag: &str) -> &'a str {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| args.get(index + 1))
+            .map_or("", String::as_str)
+    }
+
+    #[test]
+    fn workon_split_plan_opens_right_column_then_stacks_l2s() {
+        // No panes recorded → fall back to the session's current window, horizontal.
+        let empty = workon_split_plan("01-gale", &[]);
+        assert_eq!((empty.target.as_str(), empty.flag, empty.size), ("01-gale:", "-h", "60%"));
+        // Sole L1 pane → split L1 horizontally so L1 keeps ~40% left, L2 opens 60% right.
+        let l1 = [WorkonPane { id: "%1".to_owned(), left: 0, top: 0 }];
+        let first = workon_split_plan("01-gale", &l1);
+        assert_eq!((first.target.as_str(), first.flag, first.size), ("%1", "-h", "60%"));
+        // L1 + one L2 → split the right-column pane VERTICALLY so L2s stack top/bottom.
+        let l1_l2 = [WorkonPane { id: "%1".to_owned(), left: 0, top: 0 }, WorkonPane { id: "%2".to_owned(), left: 80, top: 0 }];
+        let stacked = workon_split_plan("01-gale", &l1_l2);
+        assert_eq!((stacked.target.as_str(), stacked.flag, stacked.size), ("%2", "-v", "50%"));
+        // L1 + two stacked L2s → split the BOTTOM-most right-column pane, still vertical.
+        let l1_l2_l2 = [
+            WorkonPane { id: "%1".to_owned(), left: 0, top: 0 },
+            WorkonPane { id: "%2".to_owned(), left: 80, top: 0 },
+            WorkonPane { id: "%3".to_owned(), left: 80, top: 34 },
+        ];
+        let third = workon_split_plan("01-gale", &l1_l2_l2);
+        assert_eq!((third.target.as_str(), third.flag, third.size), ("%3", "-v", "50%"));
+    }
+
+    #[test]
+    fn workon_parse_pane_line_reads_id_left_and_top() {
+        let pane = workon_parse_pane_line("%3 120 34").expect("valid pane line");
+        assert_eq!(pane.id, "%3");
+        assert_eq!(pane.left, 120);
+        assert_eq!(pane.top, 34);
+        assert!(workon_parse_pane_line("bogus 0 0").is_none());
+        assert!(workon_parse_pane_line("%3 120").is_none());
+        assert!(workon_parse_pane_line("%3 notanumber 0").is_none());
+    }
+
+    #[test]
+    fn workon_new_window_opens_right_column_then_stacks_l2s() {
+        let root = workon_temp_root("multi-l2");
+        let target = root.join("agents/feat");
+        std::fs::create_dir_all(&target).expect("worktree");
+
+        // Sole L1 → split L1 horizontally, new L2 gets the 60% right column.
+        let mut single = WorkonMockTmux { panes: "%1 0 0\n".to_owned(), ..Default::default() };
+        workon_new_window(&mut single, "01-gale", "demo-feat", &target).expect("first split");
+        let split = single.calls.iter().find(|(command, _)| command == "split-window").expect("split-window issued");
+        assert_eq!(workon_flag_value(&split.1, "-t"), "%1");
+        assert_eq!(workon_flag_value(&split.1, "-l"), "60%");
+        assert!(split.1.iter().any(|arg| arg == "-h"), "first L2 opens the right column side by side");
+        assert!(!split.1.iter().any(|arg| arg == "-v"), "first split is horizontal, not vertical");
+
+        // L1 + L2 in the right column → stack the new L2 vertically under it.
+        let mut multi = WorkonMockTmux { panes: "%1 0 0\n%2 80 0\n".to_owned(), ..Default::default() };
+        workon_new_window(&mut multi, "01-gale", "demo-feat2", &target).expect("second split");
+        let split = multi.calls.iter().find(|(command, _)| command == "split-window").expect("split-window issued");
+        assert_eq!(workon_flag_value(&split.1, "-t"), "%2");
+        assert_eq!(workon_flag_value(&split.1, "-l"), "50%");
+        assert!(split.1.iter().any(|arg| arg == "-v"), "additional L2 stacks vertically in the right column");
+        assert!(!split.1.iter().any(|arg| arg == "-h"), "additional L2 is not a new side-by-side column");
+        assert!(multi.calls.iter().any(|(command, _)| command == "select-pane"), "new pane labeled");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_reusable_pane_reuses_a_live_matching_pane() {
+        let root = workon_temp_root("reuse-pane");
+        let worktree = root.join("agents/feat");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("worktree .maw");
+        std::fs::write(worktree.join(".maw/pane-id"), "%7\n").expect("pane id");
+
+        let mut runner = WorkonMockTmux { pane_path: worktree.to_str().expect("utf8").to_owned(), ..Default::default() };
+        assert_eq!(workon_reusable_pane(&mut runner, &worktree), Some("%7".to_owned()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_reusable_pane_declines_dead_or_mismatched_panes() {
+        let root = workon_temp_root("reuse-pane-miss");
+        let worktree = root.join("agents/feat");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("worktree .maw");
+        std::fs::write(worktree.join(".maw/pane-id"), "%7\n").expect("pane id");
+
+        // Missing marker → None.
+        assert_eq!(workon_reusable_pane(&mut WorkonMockTmux::default(), &root), None);
+        // Dead pane (display-message errors) → None.
+        let mut dead = WorkonMockTmux { pane_missing: true, ..Default::default() };
+        assert_eq!(workon_reusable_pane(&mut dead, &worktree), None);
+        // A pane id recycled onto an unrelated worktree → None.
+        let mut mismatch = WorkonMockTmux { pane_path: "/somewhere/else".to_owned(), ..Default::default() };
+        assert_eq!(workon_reusable_pane(&mut mismatch, &worktree), None);
+
         let _ = std::fs::remove_dir_all(root);
     }
 

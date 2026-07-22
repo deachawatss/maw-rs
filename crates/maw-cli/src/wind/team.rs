@@ -184,7 +184,7 @@ fn validate_public_pane_id(pane_id: &str) -> Result<(), String> {
     }
 }
 
-fn is_valid_pane_id(value: &str) -> bool {
+pub(crate) fn is_valid_pane_id(value: &str) -> bool {
     !value.is_empty()
         && value.starts_with('%')
         && !value.starts_with("%-")
