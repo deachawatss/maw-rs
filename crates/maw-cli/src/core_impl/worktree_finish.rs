@@ -52,6 +52,7 @@ trait DoneRuntime {
     fn done_current_identity(&mut self) -> Option<(String, i32)>;
     fn done_pane_info(&mut self, target: &str) -> Option<(String, String)>;
     fn done_reap_target(&mut self, target: &str) -> Result<(), String>;
+    fn done_reap_pane(&mut self, pane_id: &str) -> Result<(), String>;
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String>;
     fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String>;
     fn done_git(&mut self, args: &[String]) -> Result<String, String>;
@@ -233,6 +234,11 @@ impl DoneRuntime for DoneLocal {
     fn done_reap_target(&mut self, target: &str) -> Result<(), String> {
         done_validate_tmux_target(target)?;
         reap_tmux_target(&mut self.runner, target)
+    }
+
+    fn done_reap_pane(&mut self, pane_id: &str) -> Result<(), String> {
+        done_validate_tmux_target(pane_id)?;
+        reap_tmux_pane(&mut self.runner, pane_id)
     }
 
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
@@ -467,7 +473,7 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     if !done_same_path(std::path::Path::new(cwd), &worktree.full_path) {
         return Err(format!("done: pane {pane_id} cwd does not match worktree {}; refusing cleanup", worktree.full_path.display()));
     }
-    local.done_reap_target(pane_id)?;
+    local.done_reap_pane(pane_id)?;
     local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.to_owned()])?;
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed split pane {pane_id}");
     Ok(())
@@ -877,6 +883,8 @@ mod done_tests {
 
         fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Ok(()) }
 
+        fn done_reap_pane(&mut self, _pane_id: &str) -> Result<(), String> { Ok(()) }
+
         fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
             self.tmux_calls.push((command.to_owned(), args.to_vec()));
             Ok(self.tmux_responses.get(command).cloned().unwrap_or_default())
@@ -942,6 +950,8 @@ mod done_tests {
         fn done_pane_info(&mut self, _target: &str) -> Option<(String, String)> { None }
 
         fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
+
+        fn done_reap_pane(&mut self, _pane_id: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
 
         fn done_tmux(&mut self, _command: &str, _args: &[String]) -> Result<String, String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
 

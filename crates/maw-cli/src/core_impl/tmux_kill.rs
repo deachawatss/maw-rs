@@ -121,7 +121,7 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
     if is_last_pane_in_window {
         tmux_kill_refuse_protected_session(&pane.session, args.force)?;
     }
-    reap_tmux_target(runner, &pane.id)?;
+    reap_tmux_pane(runner, &pane.id)?;
     runner
         .run("kill-pane", &tmux_kill_strings(&["-t", &pane.id]))
         .map_err(|error| format!("tmux kill-pane failed: {}", error.message))?;
@@ -351,7 +351,9 @@ mod tmux_kill_tests {
                     }
                     String::new()
                 }
-                "kill-session" => String::new(),
+                // display-message: single-pane reaper resolves the pane's pid;
+                // empty output → reap is a no-op (no real process tree touched in tests).
+                "kill-session" | "display-message" => String::new(),
                 other => panic!("unexpected tmux subcommand: {other}"),
             })
         }
@@ -384,8 +386,10 @@ mod tmux_kill_tests {
         assert_eq!(output, "  \x1b[32m✓\x1b[0m killed pane %42\n");
         assert_eq!(runner.calls.len(), 4);
         assert_eq!(runner.calls[0].subcommand, "list-panes");
-        assert_eq!(runner.calls[1].subcommand, "list-panes");
-        assert_eq!(runner.calls[1].args, fake_args(&["-t", "%42", "-F", "#{pane_pid}"]));
+        // Pane reap resolves ONE pane's pid via display-message — NOT list-panes,
+        // which lists the pane's whole window and would reap sibling panes' engines.
+        assert_eq!(runner.calls[1].subcommand, "display-message");
+        assert_eq!(runner.calls[1].args, fake_args(&["-t", "%42", "-p", "#{pane_pid}"]));
         assert_eq!(runner.calls[2].subcommand, "kill-pane");
         assert_eq!(runner.calls[2].args, fake_args(&["-t", "%42"]));
         assert_eq!(runner.calls[3].subcommand, "list-panes");

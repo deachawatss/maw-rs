@@ -109,7 +109,12 @@ fn reap_pane_descendants(
     Ok(())
 }
 
-/// Resolve the exact panes for one already-validated tmux target, then reap their descendants.
+/// Reap descendants for a WHOLE session or window target.
+///
+/// `list-panes -t <target>` lists every pane in the target session/window, so
+/// this reaps ALL of their descendants — correct for `kill-session`/`kill-window`
+/// (whole-target shutdown). For a single pane use [`reap_tmux_pane`] instead:
+/// `list-panes -t <pane>` resolves to the pane's WINDOW and would reap siblings.
 fn reap_tmux_target<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Result<(), String> {
     let raw = runner
         .run(
@@ -127,6 +132,32 @@ fn reap_tmux_target<R: maw_tmux::TmuxRunner>(runner: &mut R, target: &str) -> Re
                 error.message
             )
         })?;
+    let pane_pids = pane_tree_parse_pids(&raw);
+    if pane_pids.is_empty() {
+        return Ok(());
+    }
+    reap_pane_descendants(&mut SystemPaneTreeRuntime, &pane_pids)
+}
+
+/// Reap the descendants of exactly ONE pane.
+///
+/// Unlike [`reap_tmux_target`], this resolves the single target pane's pid with
+/// `display-message` (which addresses one pane), NOT `list-panes -t <pane>`
+/// (which lists the pane's whole window). Using `list-panes` here would reap the
+/// descendants of every sibling pane in the window — e.g. killing other L2
+/// worker engines when only one worker was being torn down.
+fn reap_tmux_pane<R: maw_tmux::TmuxRunner>(runner: &mut R, pane_id: &str) -> Result<(), String> {
+    let raw = runner
+        .run(
+            "display-message",
+            &[
+                "-t".to_owned(),
+                pane_id.to_owned(),
+                "-p".to_owned(),
+                PANE_TREE_PID_FORMAT.to_owned(),
+            ],
+        )
+        .map_err(|error| format!("pane reaper: resolve pid for {pane_id} failed: {}", error.message))?;
     let pane_pids = pane_tree_parse_pids(&raw);
     if pane_pids.is_empty() {
         return Ok(());
@@ -368,5 +399,35 @@ mod pane_tree_reaper_tests {
         SystemPaneTreeRuntime
             .pane_tree_signal(ProcessSignal::Kill, &[999_999_999])
             .expect("an already-dead SIGKILL target is a successful reap");
+    }
+
+    #[derive(Default)]
+    struct ReaperMockTmux {
+        calls: Vec<(String, Vec<String>)>,
+    }
+
+    impl maw_tmux::TmuxRunner for ReaperMockTmux {
+        fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> {
+            self.calls.push((subcommand.to_owned(), args.to_vec()));
+            // Empty pid list → reap returns early, before touching the real system.
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn single_pane_reap_uses_display_message_not_list_panes() {
+        // A single-pane reap must address exactly one pane via display-message;
+        // `list-panes -t <pane>` would expand to the whole window and reap siblings.
+        let mut pane = ReaperMockTmux::default();
+        reap_tmux_pane(&mut pane, "%42").expect("reap single pane");
+        assert_eq!(pane.calls.len(), 1);
+        assert_eq!(pane.calls[0].0, "display-message", "single-pane reap must NOT use list-panes");
+        assert!(pane.calls[0].1.iter().any(|a| a == "%42"), "must target the exact pane id");
+        assert!(pane.calls[0].1.iter().any(|a| a == "#{pane_pid}"));
+
+        // Contrast: a whole session/window reap legitimately uses list-panes.
+        let mut window = ReaperMockTmux::default();
+        reap_tmux_target(&mut window, "01-gale:1").expect("reap window");
+        assert_eq!(window.calls[0].0, "list-panes", "session/window reap uses list-panes");
     }
 }
