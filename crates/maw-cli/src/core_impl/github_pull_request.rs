@@ -1095,8 +1095,9 @@ mod pr_tests {
         path
     }
 
-    fn pr_write_delivery(repo: &std::path::Path, issue: u64) {
+    fn pr_write_delivery(repo: &std::path::Path, issue: u64) -> EnvVarRestore {
         std::fs::create_dir_all(repo.join(".maw")).expect("maw dir");
+        let restore = EnvVarRestore::capture("MAW_STATE_DIR");
         std::env::set_var("MAW_STATE_DIR", repo.join(".maw-test-state"));
         std::fs::write(repo.join(".maw/l1-oracle"), "01-gale\n").expect("l1 oracle");
         let delivery = serde_json::json!({
@@ -1115,6 +1116,7 @@ mod pr_tests {
             });
         let body = serde_json::to_string_pretty(&delivery).expect("render delivery") + "\n";
         std::fs::write(repo.join(".maw/delivery.json"), body).expect("delivery");
+        restore
     }
 
     #[test]
@@ -1142,7 +1144,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("create");
-        pr_write_delivery(&repo, 140);
+        let _state = pr_write_delivery(&repo, 140);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess { branch: "agents/issue-140-pr-native".to_owned(), ..Default::default() };
 
@@ -1182,7 +1184,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("unacknowledged-notify");
-        pr_write_delivery(&repo, 55);
+        let _state = pr_write_delivery(&repo, 55);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess { branch: "agents/issue-55-l1-notify-ack".to_owned(), ..Default::default() };
 
@@ -1207,7 +1209,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("durable-l1-target");
-        pr_write_delivery(&repo, 55);
+        let _state = pr_write_delivery(&repo, 55);
         std::fs::write(repo.join(".maw/l1-oracle"), "01-gale\n").expect("oracle target");
         std::fs::write(repo.join(".maw/l1-pane"), "%55\n").expect("pane target");
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
@@ -1242,7 +1244,7 @@ mod pr_tests {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
-        pr_write_delivery(&repo, 32);
+        let _state = pr_write_delivery(&repo, 32);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess { branch: "agents/issue-32-pr-durable-notification".to_owned(), ..PrMockProcess::default() };
 
@@ -1284,7 +1286,7 @@ mod pr_tests {
     #[test]
     fn pr_overrides_title_body_and_rejects_detached_head() {
         let repo = pr_temp_dir("override");
-        pr_write_delivery(&repo, 42);
+        let _state = pr_write_delivery(&repo, 42);
         let options = PrOptions {
             window: None,
             title: Some("Custom".to_owned()),
@@ -1317,7 +1319,7 @@ mod pr_tests {
         .expect_err("missing delivery blocked");
         assert!(missing.contains(".maw/delivery.json"), "{missing}");
 
-        pr_write_delivery(&repo, 41);
+        let _state = pr_write_delivery(&repo, 41);
         let mismatch = pr_build_plan(
             repo.clone(),
             "agents/issue-42-demo".to_owned(),
@@ -1328,7 +1330,7 @@ mod pr_tests {
         .expect_err("mismatched issue blocked");
         assert!(mismatch.contains("delivery issue 41 does not match branch issue 42"), "{mismatch}");
 
-        pr_write_delivery(&repo, 42);
+        let _state = pr_write_delivery(&repo, 42);
         let path = repo.join(".maw/delivery.json");
         let mut delivery: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
@@ -1351,7 +1353,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("delivery-rerun-failure");
-        pr_write_delivery(&repo, 53);
+        let _state = pr_write_delivery(&repo, 53);
         let path = repo.join(".maw/delivery.json");
         let mut delivery: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
@@ -1378,7 +1380,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("delivery-skip");
-        pr_write_delivery(&repo, 53);
+        let _state = pr_write_delivery(&repo, 53);
         let path = repo.join(".maw/delivery.json");
         let mut delivery: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
@@ -1402,7 +1404,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("delivery-timeout");
-        pr_write_delivery(&repo, 53);
+        let _state = pr_write_delivery(&repo, 53);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess {
             branch: "agents/issue-53-delivery-timeout".to_owned(),
@@ -1663,7 +1665,7 @@ mod pr_tests {
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("fork-target");
-        pr_write_delivery(&repo, 17);
+        let _state = pr_write_delivery(&repo, 17);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess {
             branch: "agents/issue-17-help".to_owned(),
