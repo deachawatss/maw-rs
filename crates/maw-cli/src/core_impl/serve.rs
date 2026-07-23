@@ -28,6 +28,7 @@ const SERVE_LOG_TEXT_MAX: usize = 2_000;
 const SERVE_LOG_ERROR_MAX: usize = 1_000;
 const DEFAULT_MIRROR_LINES: u32 = 40;
 const DELIVERY_IDEMPOTENCY_TTL_SECONDS: i64 = 24 * 60 * 60;
+const DELIVERY_IDEMPOTENCY_FILE: &str = "serve-delivery-idempotency.jsonl";
 #[cfg(test)]
 const NON_LOOPBACK_TEST_PEER: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 49_152);
@@ -41,6 +42,7 @@ struct ServeState {
     delivery: Arc<dyn ServeDelivery>,
     receiver_inbox: Arc<dyn ServeReceiverInbox>,
     delivery_idempotency: Mutex<DeliveryIdempotencyStore>,
+    delivery_idempotency_root: Option<PathBuf>,
     feed: Mutex<Vec<Value>>,
     #[cfg(test)]
     peer_addr_override: Option<SocketAddr>,
@@ -231,6 +233,20 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         Ok(addr) => addr,
         Err(message) => return serve_usage_error(&message),
     };
+    let delivery_idempotency_root = serve_delivery_idempotency_root();
+    let delivery_idempotency = match serve_delivery_idempotency_load(
+        &delivery_idempotency_root,
+        i64::try_from(current_epoch_seconds()).unwrap_or(i64::MAX),
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("serve: failed to load delivery idempotency state: {error}\n"),
+            }
+        }
+    };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -270,7 +286,8 @@ async fn run_serve_async_impl(raw_args: &[String]) -> CliOutput {
         requests: Mutex::new(RequestReplyStore::default()),
         delivery: Arc::new(ServeSystemDelivery),
         receiver_inbox: Arc::new(ServeSystemReceiverInbox::default()),
-        delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+        delivery_idempotency: Mutex::new(delivery_idempotency),
+        delivery_idempotency_root: Some(delivery_idempotency_root),
         feed: Mutex::new(Vec::new()),
         #[cfg(test)]
         peer_addr_override: None,
@@ -975,13 +992,16 @@ fn serve_deliver_inbox(
         ReceiverInboxResult::Ok(inbox) => {
             let reason = "--inbox requested; pane injection skipped";
             if let Some(key) = idempotency_key.clone() {
-                serve_delivery_idempotency_complete(
+                if let Err(error) = serve_delivery_idempotency_complete(
                     state,
-                    key,
+                    &key,
                     &resolved,
                     "queued",
                     serve_delivery_idempotency_now(state),
-                );
+                ) {
+                    serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "idempotency-record");
+                    return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "delivery-record-failed", &resolved, &error);
+                }
             }
             serve_log_lifecycle(
                 state,
@@ -1086,7 +1106,8 @@ enum ReceiverInboxResult {
     Err { oracle: Option<String>, reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DeliveryIdempotencyKey {
     source: String,
     target: String,
@@ -1126,9 +1147,22 @@ impl DeliveryIdempotencyRecord {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DeliveryIdempotencyStore {
     records: HashMap<DeliveryIdempotencyKey, DeliveryIdempotencyRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryIdempotencyDurableRecord {
+    version: u8,
+    source: String,
+    target: String,
+    payload_hash: String,
+    logical_ts: String,
+    response_target: String,
+    state: String,
+    seen_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1192,23 +1226,25 @@ fn serve_delivery_idempotency_claim(
 
 fn serve_delivery_idempotency_complete(
     state: &ServeState,
-    key: DeliveryIdempotencyKey,
+    key: &DeliveryIdempotencyKey,
     target: &str,
     state_name: &str,
     now: i64,
-) {
+) -> Result<(), String> {
+    let record = DeliveryIdempotencyRecord::Complete {
+        target: target.to_owned(),
+        state: state_name.to_owned(),
+        seen_at: now,
+    };
     let mut store = state
         .delivery_idempotency
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    store.records.insert(
-        key,
-        DeliveryIdempotencyRecord::Complete {
-            target: target.to_owned(),
-            state: state_name.to_owned(),
-            seen_at: now,
-        },
-    );
+    store.records.insert(key.clone(), record.clone());
+    if let Some(root) = state.delivery_idempotency_root.as_deref() {
+        serve_delivery_idempotency_persist_complete(root, key, &record, now)?;
+    }
+    Ok(())
 }
 
 fn serve_delivery_idempotency_cancel(state: &ServeState, key: &DeliveryIdempotencyKey) {
@@ -1226,6 +1262,116 @@ fn serve_delivery_idempotency_prune(store: &mut DeliveryIdempotencyStore, now: i
         let age = now.saturating_sub(record.seen_at());
         age <= DELIVERY_IDEMPOTENCY_TTL_SECONDS
     });
+}
+
+fn serve_delivery_idempotency_root() -> PathBuf {
+    maw_state_path(&current_xdg_env(), &[])
+}
+
+fn serve_delivery_idempotency_load(
+    root: &std::path::Path,
+    now: i64,
+) -> Result<DeliveryIdempotencyStore, String> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("create delivery idempotency state {}: {error}", root.display()))?;
+    let _lock = PrQueueLock::acquire(root)?;
+    let store = serve_delivery_idempotency_read(root, now)?;
+    serve_delivery_idempotency_write(root, &store)?;
+    Ok(store)
+}
+
+fn serve_delivery_idempotency_persist_complete(
+    root: &std::path::Path,
+    key: &DeliveryIdempotencyKey,
+    record: &DeliveryIdempotencyRecord,
+    now: i64,
+) -> Result<(), String> {
+    std::fs::create_dir_all(root)
+        .map_err(|error| format!("create delivery idempotency state {}: {error}", root.display()))?;
+    let _lock = PrQueueLock::acquire(root)?;
+    let mut store = serve_delivery_idempotency_read(root, now)?;
+    store.records.insert(key.clone(), record.clone());
+    serve_delivery_idempotency_prune(&mut store, now);
+    serve_delivery_idempotency_write(root, &store)
+}
+
+fn serve_delivery_idempotency_read(
+    root: &std::path::Path,
+    now: i64,
+) -> Result<DeliveryIdempotencyStore, String> {
+    let mut store = DeliveryIdempotencyStore::default();
+    for line in pr_read_queue_lines(root, DELIVERY_IDEMPOTENCY_FILE)? {
+        let persisted = serde_json::from_str::<DeliveryIdempotencyDurableRecord>(&line)
+            .map_err(|error| format!("parse delivery idempotency state: {error}"))?;
+        if persisted.version != 1 {
+            return Err(format!(
+                "unsupported delivery idempotency state version {}",
+                persisted.version
+            ));
+        }
+        if now.saturating_sub(persisted.seen_at) <= DELIVERY_IDEMPOTENCY_TTL_SECONDS {
+            store.records.insert(
+                DeliveryIdempotencyKey {
+                    source: persisted.source,
+                    target: persisted.target,
+                    payload_hash: persisted.payload_hash,
+                    logical_ts: persisted.logical_ts,
+                },
+                DeliveryIdempotencyRecord::Complete {
+                    target: persisted.response_target,
+                    state: persisted.state,
+                    seen_at: persisted.seen_at,
+                },
+            );
+        }
+    }
+    Ok(store)
+}
+
+fn serve_delivery_idempotency_write(
+    root: &std::path::Path,
+    store: &DeliveryIdempotencyStore,
+) -> Result<(), String> {
+    let mut rows = store
+        .records
+        .iter()
+        .filter_map(|(key, record)| match record {
+            DeliveryIdempotencyRecord::Complete {
+                target,
+                state,
+                seen_at,
+            } => Some(DeliveryIdempotencyDurableRecord {
+                version: 1,
+                source: key.source.clone(),
+                target: key.target.clone(),
+                payload_hash: key.payload_hash.clone(),
+                logical_ts: key.logical_ts.clone(),
+                response_target: target.clone(),
+                state: state.clone(),
+                seen_at: *seen_at,
+            }),
+            DeliveryIdempotencyRecord::InFlight { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (
+            &left.source,
+            &left.target,
+            &left.payload_hash,
+            &left.logical_ts,
+        )
+            .cmp(&(
+                &right.source,
+                &right.target,
+                &right.payload_hash,
+                &right.logical_ts,
+            ))
+    });
+    let lines = rows
+        .into_iter()
+        .map(|row| serde_json::to_string(&row).map_err(|error| format!("render delivery idempotency state: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    pr_write_queue_lines(root, DELIVERY_IDEMPOTENCY_FILE, &lines)
 }
 
 fn serve_delivery_idempotency_now(state: &ServeState) -> i64 {
@@ -1313,17 +1459,8 @@ fn serve_deliver_local(
     state: &ServeState,
     context: &ServeDeliverContext<'_>,
 ) -> axum::response::Response {
-    let fresh_sessions = match state.delivery.route_sessions() {
-        Ok(sessions) => sessions,
-        Err(error) => {
-            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou-list");
-            return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", context.requested, &error);
-        }
-    };
-    if !serve_resolved_target_exists(&fresh_sessions, context.resolved) {
-        let error = format!("target disappeared before delivery: {}", context.resolved);
-        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
-        return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", context.requested, &error);
+    if let Some(response) = serve_validate_delivery_target(state, context) {
+        return response;
     }
     let delivery_target = match serve_resolve_delivery_target(state, context) {
         Ok(target) => target,
@@ -1370,21 +1507,29 @@ fn serve_deliver_local(
 
     let capture = match state.delivery.capture_tail(&delivery_target, 8) {
         Ok(capture) => capture,
-        Err(error) => return serve_delivery_unconfirmed(state, context, idempotency_key, &delivery_target, &error),
+        Err(error) => {
+            return serve_delivery_unconfirmed(
+                state,
+                context,
+                idempotency_key.as_ref(),
+                &delivery_target,
+                &error,
+            )
+        }
     };
     let state_name = if capture.contains("Press up to edit queued messages") {
         "queued"
     } else {
         "delivered"
     };
-    if let Some(key) = idempotency_key {
-        serve_delivery_idempotency_complete(
-            state,
-            key,
-            &delivery_target,
-            state_name,
-            serve_delivery_idempotency_now(state),
-        );
+    if let Some(response) = serve_delivery_idempotency_complete_or_error(
+        state,
+        idempotency_key.as_ref(),
+        &delivery_target,
+        state_name,
+        context,
+    ) {
+        return response;
     }
     let last_line = serve_last_nonempty_line(&capture);
     serve_log_lifecycle(
@@ -1415,21 +1560,50 @@ fn serve_deliver_local(
     .into_response()
 }
 
+fn serve_validate_delivery_target(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+) -> Option<axum::response::Response> {
+    let fresh_sessions = match state.delivery.route_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou-list");
+            return Some(serve_delivery_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "route-list-failed",
+                context.requested,
+                &error,
+            ));
+        }
+    };
+    if !serve_resolved_target_exists(&fresh_sessions, context.resolved) {
+        let error = format!("target disappeared before delivery: {}", context.resolved);
+        serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
+        return Some(serve_delivery_error(
+            StatusCode::NOT_FOUND,
+            "target-disappeared",
+            context.requested,
+            &error,
+        ));
+    }
+    None
+}
+
 fn serve_delivery_unconfirmed(
     state: &ServeState,
     context: &ServeDeliverContext<'_>,
-    idempotency_key: Option<DeliveryIdempotencyKey>,
+    idempotency_key: Option<&DeliveryIdempotencyKey>,
     delivery_target: &str,
     error: &str,
 ) -> axum::response::Response {
-    if let Some(key) = idempotency_key {
-        serve_delivery_idempotency_complete(
-            state,
-            key,
-            delivery_target,
-            "delivered",
-            serve_delivery_idempotency_now(state),
-        );
+    if let Some(response) = serve_delivery_idempotency_complete_or_error(
+        state,
+        idempotency_key,
+        delivery_target,
+        "delivered",
+        context,
+    ) {
+        return response;
     }
     let warning = format!("capture confirmation unavailable: {error}");
     serve_log_lifecycle(
@@ -1460,6 +1634,39 @@ fn serve_delivery_unconfirmed(
         "warning": warning,
     }))
     .into_response()
+}
+
+fn serve_delivery_idempotency_complete_or_error(
+    state: &ServeState,
+    key: Option<&DeliveryIdempotencyKey>,
+    delivery_target: &str,
+    state_name: &str,
+    context: &ServeDeliverContext<'_>,
+) -> Option<axum::response::Response> {
+    let key = key?;
+    let error = serve_delivery_idempotency_complete(
+        state,
+        key,
+        delivery_target,
+        state_name,
+        serve_delivery_idempotency_now(state),
+    )
+    .err()?;
+    serve_log_delivery_failed(
+        state,
+        context.requested,
+        context.message,
+        context.log_from,
+        context.log_to,
+        &error,
+        "idempotency-record",
+    );
+    Some(serve_delivery_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "delivery-record-failed",
+        delivery_target,
+        &error,
+    ))
 }
 
 fn serve_resolve_delivery_target(
@@ -2727,7 +2934,7 @@ fn serve_route_pane_error(
         .and_then(|hint| hint.strip_prefix("candidates: "))
         .map(|raw| raw.split(", ").map(ToOwned::to_owned).collect::<Vec<_>>())
         .unwrap_or_default();
-    let status = if error.reason == "pane_target_ambiguous" {
+    let status = if matches!(error.reason.as_str(), "pane_target_ambiguous" | "pane_target_not_found") {
         StatusCode::CONFLICT
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -3984,6 +4191,10 @@ mod serve_tests {
             ]]);
             fake.set_capture("capture-agent:0", "[capture] delivered\n");
             fake.set_capture("remote-oracle:0", "[capture] delivered\n");
+            fake.set_panes(vec![
+                serve_test_agent_pane("%1", "codex", "capture-agent:0.0"),
+                serve_test_agent_pane("%2", "codex", "remote-oracle:0.0"),
+            ]);
             fake
         }
 
@@ -4160,6 +4371,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -4180,6 +4392,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -4200,6 +4413,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -4296,6 +4510,45 @@ mod serve_tests {
             delivery,
             serve_test_receiver_inbox(),
         )
+    }
+
+    fn serve_test_idempotency_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "maw-rs-delivery-idempotency-{label}-{}-{}",
+            std::process::id(),
+            random_hex(4)
+        ));
+        std::fs::create_dir_all(&root).expect("idempotency state root");
+        root
+    }
+
+    fn serve_test_app_with_o6_keys_delivery_and_idempotency_root(
+        keys: Vec<ServePeerPubkey>,
+        now: i64,
+        peer_addr_override: Option<SocketAddr>,
+        delivery: Arc<dyn ServeDelivery>,
+        delivery_idempotency_root: PathBuf,
+    ) -> Router {
+        let store = serve_delivery_idempotency_load(&delivery_idempotency_root, now)
+            .expect("load delivery idempotency state");
+        serve_router(ServeState {
+            cached_pubkey: None,
+            peer_pubkeys: keys,
+            workspace_key: Some("capture-test-token-393av2".to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            delivery,
+            receiver_inbox: serve_test_receiver_inbox(),
+            delivery_idempotency: Mutex::new(store),
+            delivery_idempotency_root: Some(delivery_idempotency_root),
+            feed: Mutex::new(Vec::new()),
+            peer_addr_override,
+            now_override: Some(now),
+            serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("o6-idempotency"),
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
+        })
     }
 
     #[tokio::test]
@@ -4500,6 +4753,7 @@ mod serve_tests {
             delivery,
             receiver_inbox,
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override,
             now_override: Some(now),
@@ -4629,6 +4883,39 @@ mod serve_tests {
     }
 
     #[tokio::test]
+    async fn serve_api_send_refuses_multiple_unrecognized_panes_before_injection() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_panes(vec![
+            serve_test_agent_pane("%1", "zsh", "capture-agent:0.0"),
+            serve_test_agent_pane("%2", "bash", "capture-agent:0.1"),
+        ]);
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(signed_api_send_json_request(
+                r#"{"target":"capture-agent","text":"must not use active shell"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+        assert_eq!(payload["error"], "pane_target_not_found");
+        assert_eq!(payload["candidates"], json!(["capture-agent:0.0", "capture-agent:0.1"]));
+        assert!(delivery.sends().is_empty());
+        assert!(delivery.capture_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn serve_api_send_resolves_a_single_agent_pane_before_injection() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         delivery.set_panes(vec![serve_test_agent_pane("%2", "codex", "capture-agent:0.1")]);
@@ -4703,6 +4990,44 @@ mod serve_tests {
         assert_eq!(duplicate_status, StatusCode::OK, "{duplicate_payload}");
         assert_eq!(duplicate_payload["state"], "delivered");
         assert_eq!(duplicate_payload["deduped"], true);
+        assert_eq!(delivery.sends().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_dedups_completed_delivery_after_restart() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        let body = r#"{"target":"capture-agent","text":"must not reinject after restart"}"#;
+        let idempotency_root = serve_test_idempotency_root("restart");
+        let first_app = serve_test_app_with_o6_keys_delivery_and_idempotency_root(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            idempotency_root.clone(),
+        );
+
+        let first = first_app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("first response");
+        let first_payload = response_json(first).await;
+        assert_eq!(first_payload["state"], "delivered");
+
+        let restarted_app = serve_test_app_with_o6_keys_delivery_and_idempotency_root(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            idempotency_root,
+        );
+        let retry = restarted_app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("retry response");
+        let retry_payload = response_json(retry).await;
+
+        assert_eq!(retry_payload["deduped"], true);
+        assert_eq!(retry_payload["state"], "delivered");
         assert_eq!(delivery.sends().len(), 1);
     }
 
@@ -4856,10 +5181,10 @@ mod serve_tests {
         let payload = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(payload["state"], "delivered");
-        assert_eq!(payload["target"], "capture-agent:0");
+        assert_eq!(payload["target"], "capture-agent:0.0");
         let sends = delivery.sends();
         assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].0, "capture-agent:0");
+        assert_eq!(sends[0].0, "capture-agent:0.0");
         assert_eq!(sends[0].1, "[alloy:bigboy-vps] hello node fallback");
     }
 
@@ -4929,14 +5254,14 @@ mod serve_tests {
         assert_eq!(
             sends[0],
             (
-                "capture-agent:0".to_owned(),
+                "capture-agent:0.0".to_owned(),
                 "[alloy:bigboy-vps] codex-2 DONE #87 full suite green".to_owned()
             )
         );
         assert_eq!(
             sends[1],
             (
-                "capture-agent:0".to_owned(),
+                "capture-agent:0.0".to_owned(),
                 "[alloy:bigboy-vps] another turn between duplicate emissions".to_owned()
             )
         );
@@ -4988,10 +5313,10 @@ mod serve_tests {
         let payload = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(payload["state"], "delivered");
-        assert_eq!(payload["target"], "capture-agent:0");
+        assert_eq!(payload["target"], "capture-agent:0.0");
         let sends = delivery.sends();
         assert_eq!(sends.len(), 1);
-        assert_eq!(sends[0].0, "capture-agent:0");
+        assert_eq!(sends[0].0, "capture-agent:0.0");
         assert_eq!(sends[0].1, "[alloy:bigboy-vps] hello nested identity");
     }
 
@@ -5106,7 +5431,7 @@ mod serve_tests {
         assert_eq!(status, StatusCode::OK, "{payload}");
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["state"], "delivered");
-        assert_eq!(payload["target"], "capture-agent:0");
+        assert_eq!(payload["target"], "capture-agent:0.0");
     }
 
     #[tokio::test]
@@ -5840,7 +6165,7 @@ mod serve_tests {
         assert_eq!(
             delivery.sends(),
             vec![(
-                "capture-agent:0".to_owned(),
+                "capture-agent:0.0".to_owned(),
                 "[sender-oracle:sender-node] signed".to_owned()
             )]
         );
@@ -6039,6 +6364,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
@@ -6550,6 +6876,7 @@ mod serve_tests {
             delivery: serve_test_delivery(),
             receiver_inbox: serve_test_receiver_inbox(),
             delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: None,
             feed: Mutex::new(Vec::new()),
             peer_addr_override: Some(NON_LOOPBACK_TEST_PEER),
             now_override: Some(1_782_277_200),
