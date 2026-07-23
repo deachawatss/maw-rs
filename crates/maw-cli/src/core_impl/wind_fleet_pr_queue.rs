@@ -13,17 +13,17 @@ fn wind_pr_queue_run(argv: &[String]) -> Result<(i32, String), String> {
         }
     }
 
-    let l2_messages = l2_drain_events()?;
     pr_reconcile_reviews(&mut PrNativeProcess, true)?;
     let pending = pr_load_global_reviews(&pr_review_queue_root()?)?;
-    if pending.is_empty() && l2_messages.is_empty() {
+    let l2_events = l2_drain_events()?;
+    if pending.is_empty() && l2_events.is_empty() {
         return Ok((0, "  \x1b[32m✓\x1b[0m No pending PRs in queue.\n".to_owned()));
     }
 
     let mut output = String::new();
-    if !l2_messages.is_empty() {
-        let _ = writeln!(output, "\n  \x1b[34m\x1b[1mL2 Events\x1b[0m  {} new\n", l2_messages.len());
-        for message in l2_messages { let _ = writeln!(output, "  \x1b[33m●\x1b[0m {message}"); }
+    if !l2_events.is_empty() {
+        let _ = writeln!(output, "\n  \x1b[34m\x1b[1mL2 Events\x1b[0m  {} new\n", l2_events.len());
+        for event in &l2_events { let _ = writeln!(output, "  \x1b[33m●\x1b[0m {}", event.message); }
         output.push('\n');
     }
     if !pending.is_empty() {
@@ -39,6 +39,7 @@ fn wind_pr_queue_run(argv: &[String]) -> Result<(i32, String), String> {
         );
     }
     if !output.ends_with("\n\n") { output.push('\n'); }
+    l2_acknowledge_events(&l2_events)?;
     Ok((0, output))
 }
 

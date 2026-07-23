@@ -73,12 +73,14 @@ fn swarm_with_runner(
     swarm_apply_layout(runner, &window, options.tiled, anchor.is_some()).map_err(|error| swarm_tmux_error(&error))?;
     let mut stdout = String::new();
     let mut members = Vec::new();
+    let l1_oracle = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session);
+    let cwd = std::env::current_dir().map_err(|error| (1, format!("swarm: resolve cwd: {error}")))?;
     for (agent, pane) in agents.iter().zip(panes.iter()) {
-        swarm_start_agent(runner, agent, pane, &options).map_err(|error| swarm_tmux_error(&error))?;
-        if let Some(l1_oracle) = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session) {
-            let cwd = std::env::current_dir().map_err(|error| (1, format!("swarm: resolve cwd: {error}")))?;
-            l2_prepare_observer(&cwd, pane, &l1_oracle, options.parent_session_id.as_deref()).map_err(|error| (1, error))?;
+        if let Some(l1_oracle) = &l1_oracle {
+            l2_prepare_observer(&cwd, pane, l1_oracle, options.parent_session_id.as_deref(), Some(pane))
+                .map_err(|error| (1, error))?;
         }
+        swarm_start_agent(runner, agent, pane, &options).map_err(|error| swarm_tmux_error(&error))?;
         stdout.push_str(&swarm_agent_line(agent, pane));
         members.push(swarm_member(agent, pane));
     }
@@ -224,7 +226,7 @@ fn swarm_start_agent(
 ) -> Result<(), maw_tmux::TmuxError> {
     let label = format!("{} ({})", agent.name, agent.label);
     runner.run("select-pane", &["-t".to_owned(), pane.to_owned(), "-T".to_owned(), label])?;
-    let command = swarm_command_with_env(agent, options);
+    let command = swarm_command_with_env(agent, options, pane);
     let shell_line = format!(
         "{}; printf '\\e[?1049l'; clear; {}",
         swarm_shell_quote(&command),
@@ -234,8 +236,8 @@ fn swarm_start_agent(
     Ok(())
 }
 
-fn swarm_command_with_env(agent: &SwarmAgent, options: &SwarmOptions) -> String {
-    let mut envs = Vec::new();
+fn swarm_command_with_env(agent: &SwarmAgent, options: &SwarmOptions, pane: &str) -> String {
+    let mut envs = vec![format!("MAW_L2_PANE_ID={}", swarm_shell_quote(pane))];
     if let Some(parent) = &options.parent_session_id { envs.push(format!("MAW_PARENT_SESSION_ID={}", swarm_shell_quote(parent))); }
     if options.agents.len() == 1 {
         if let Some(session) = &options.session_id { envs.push(format!("MAW_SESSION_ID={}", swarm_shell_quote(session))); }

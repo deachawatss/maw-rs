@@ -241,16 +241,13 @@ fn wake_run_options(options: &WakeOptionsNative, sessions: &[TmuxSession], tmux:
     wake_apply(options, &resolved, tmux, &mut out)?;
     if options.parent_session_id.is_some() || options.session_id.is_some() {
         let l1_oracle = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session);
-        let metadata = L2ParentMetadata {
-            parent_session_id: options.parent_session_id.clone(),
-            session_id: options.session_id.clone(),
-            l1_oracle: l1_oracle.clone(),
-            l1_session: options.parent_session_id.clone(),
-            l2_pane: Some(resolved.target.clone()),
-            repo: resolved.repo_path.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_owned),
-        };
-        l2_record_parent_metadata(&resolved.repo_path, &metadata)?;
-        l2_arm_observer(&resolved.repo_path, &resolved.target)?;
+        l2_prepare_observer(
+            &resolved.repo_path,
+            &resolved.target,
+            l1_oracle.as_deref().unwrap_or("unknown"),
+            options.parent_session_id.as_deref(),
+            options.session_id.as_deref(),
+        )?;
     }
     Ok((0, out))
 }
