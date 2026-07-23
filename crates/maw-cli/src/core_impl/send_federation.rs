@@ -107,8 +107,7 @@ async fn run_send_like_async_with_args(
         std::env::var_os("TMUX").is_some(),
         &mut runner,
     );
-    let result =
-        route_result_prefer_pane_zero_for_ambiguous_agent(&send_args.target, result, &mut runner);
+    let result = route_result_refuse_ambiguous_agent_panes(&routing_target, result, &mut runner);
     if send_args.dry_run {
         return send_dry_run_output(command, &send_args, &result);
     }
@@ -142,10 +141,20 @@ async fn run_send_like_async_with_args(
             )
             .await
         }
-        RouteResult::Error { detail, hint, .. } => CliOutput {
+        RouteResult::Error {
+            reason,
+            detail,
+            hint,
+        } => CliOutput {
             code: send_error_code(command),
             stdout: String::new(),
-            stderr: send_route_error(command, &send_args.target, &detail, hint.as_deref()),
+            stderr: send_route_error(
+                command,
+                &send_args.target,
+                &reason,
+                &detail,
+                hint.as_deref(),
+            ),
         },
     }
 }
@@ -500,8 +509,21 @@ fn send_usage(command: &str) -> String {
 
 fn send_error_code(command: &str) -> i32 { if command == "hey" { 1 } else { 2 } }
 
-fn send_route_error(command: &str, query: &str, detail: &str, hint: Option<&str>) -> String {
+fn send_route_error(
+    command: &str,
+    query: &str,
+    reason: &str,
+    detail: &str,
+    hint: Option<&str>,
+) -> String {
     if command == "hey" {
+        if matches!(
+            reason,
+            "pane_target_ambiguous" | "pane_inventory_unavailable"
+        ) {
+            let hint = hint.map_or_else(String::new, |hint| format!("hint:  {hint}\n"));
+            return format!("error: {detail}\n{hint}");
+        }
         if !query.is_empty() && !query.contains(':') && !query.contains('/') {
             return format!("error: bare target '{query}' not found locally\n\n  same-node targets:\n    maw hey local:{query} \"...\"\n    or copy a TARGET from `maw ls -v`\n\n  cross-node targets:\n    maw hey <node>:{query} \"...\"\n    maw hey <node>:<session>:<window> \"...\"\n\n  bare names are local-only; run `maw locate {query}` to enumerate federation candidates\n");
         }
@@ -730,10 +752,14 @@ fn send_dry_run_output(command: &str, args: &SendArgs, result: &RouteResult) -> 
             ),
             stderr: String::new(),
         },
-        RouteResult::Error { detail, hint, .. } => CliOutput {
+        RouteResult::Error {
+            reason,
+            detail,
+            hint,
+        } => CliOutput {
             code: send_error_code(command),
             stdout: String::new(),
-            stderr: send_route_error(command, &args.target, detail, hint.as_deref()),
+            stderr: send_route_error(command, &args.target, reason, detail, hint.as_deref()),
         },
     }
 }
@@ -1793,6 +1819,7 @@ mod send_acl_hotpath_tests {
         current_session: Option<Result<String, String>>,
         caller_window: Option<Result<String, String>>,
         focused_window: Option<Result<String, String>>,
+        panes: String,
         calls: Vec<(String, Vec<String>)>,
     }
 
@@ -1816,6 +1843,7 @@ mod send_acl_hotpath_tests {
                     .clone()
                     .unwrap_or_else(|| Ok(String::new()))
                     .map_err(maw_tmux::TmuxError::new),
+                "list-panes" => Ok(self.panes.clone()),
                 other => Err(maw_tmux::TmuxError::new(format!(
                     "unexpected tmux command {other}"
                 ))),
@@ -1959,6 +1987,44 @@ mod send_acl_hotpath_tests {
     }
 
     #[test]
+    fn hey_me_inside_tmux_skips_ambiguous_agent_pane_refusal() {
+        let sessions = vec![send_route_session(
+            "188-maw-rs",
+            vec![send_route_window(1, "maw-rs-oracle")],
+        )];
+        let mut runner = SendFakeTmuxRunner {
+            current_session: Some(Ok("188-maw-rs\n".to_owned())),
+            panes: [
+                "%1|||codex|||188-maw-rs:1.0|||codex-1|||101|||/tmp|||0",
+                "%2|||claude|||188-maw-rs:1.1|||maw-rs-oracle|||102|||/tmp|||0",
+            ]
+            .join("\n"),
+            ..SendFakeTmuxRunner::default()
+        };
+        let result = resolve_send_route_target(
+            "me",
+            &RouteConfig::default(),
+            &sessions,
+            true,
+            &mut runner,
+        );
+
+        assert_eq!(
+            route_result_refuse_ambiguous_agent_panes("me", result, &mut runner),
+            RouteResult::Local {
+                target: "188-maw-rs:1".to_owned()
+            }
+        );
+        assert_eq!(
+            runner.calls,
+            vec![(
+                "display-message".to_owned(),
+                vec!["-p".to_owned(), "#{session_name}".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
     fn send_self_alias_outside_tmux_does_not_match_literal_me_window() {
         let sessions = vec![send_route_session(
             "scratch",
@@ -2001,6 +2067,22 @@ mod send_acl_hotpath_tests {
         );
         assert_eq!(output.code, 0);
         assert_eq!(output.stdout, "dry-run: hey me -> local 188-maw-rs:1\n");
+    }
+
+    #[test]
+    fn hey_bare_ambiguous_target_renders_refusal_and_candidates() {
+        let error = send_route_error(
+            "hey",
+            "01-gale",
+            "pane_target_ambiguous",
+            "target '01-gale:1' resolves to multiple agent panes; refusing to guess a pane",
+            Some("candidates: 01-gale:1.0, 01-gale:1.1, 01-gale:1.2"),
+        );
+
+        assert_eq!(
+            error,
+            "error: target '01-gale:1' resolves to multiple agent panes; refusing to guess a pane\nhint:  candidates: 01-gale:1.0, 01-gale:1.1, 01-gale:1.2\n"
+        );
     }
 
     #[test]
@@ -2475,7 +2557,7 @@ mod send_acl_hotpath_tests {
         assert_output(route, CliOutput {
             code: send_error_code("hey"),
             stdout: String::new(),
-            stderr: send_route_error("hey", route["target"].as_str().unwrap(), "", None),
+            stderr: send_route_error("hey", route["target"].as_str().unwrap(), "", "", None),
         });
 
         let success = &fixture["localSuccess"];

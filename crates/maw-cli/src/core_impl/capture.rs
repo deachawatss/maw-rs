@@ -35,6 +35,9 @@ fn capture_with_runner<R: maw_tmux::TmuxRunner>(
         resolve_local_tmux_runner_target(runner, &options.target, "capture")?,
         options.pane,
     );
+    let target = resolve_window_agent_pane_target_with_runner(&target, runner).map_err(|error| {
+        error.hint.map_or(error.detail.clone(), |hint| format!("{}; {hint}", error.detail))
+    })?;
     capture_validate_tmux_target(&target)?;
     let raw = capture_capture_pane(runner, &target, &options)?;
     Ok(CliOutput {
@@ -135,6 +138,7 @@ mod capture_tests {
     struct CaptureMockTmux {
         calls: Vec<(String, Vec<String>)>,
         windows: String,
+        panes: String,
         capture: String,
         fail_capture: bool,
     }
@@ -144,6 +148,7 @@ mod capture_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             match subcommand {
                 "list-windows" => Ok(self.windows.clone()),
+                "list-panes" => Ok(self.panes.clone()),
                 "capture-pane" if self.fail_capture => Err(maw_tmux::TmuxError::new("no pane")),
                 "capture-pane" => Ok(self.capture.clone()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
@@ -213,7 +218,31 @@ mod capture_tests {
                 ]),
             )
         );
-        assert_eq!(tmux.calls[1], ("capture-pane".to_owned(), capture_strings(&["-t", "03-neo:2", "-p", "-S", "-50"])));
+        assert_eq!(tmux.calls[2], ("capture-pane".to_owned(), capture_strings(&["-t", "03-neo:2", "-p", "-S", "-50"])));
+    }
+
+    #[test]
+    fn capture_refuses_ambiguous_agent_panes_before_reading_active_pane() {
+        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = CaptureEnvGuard::new();
+        let mut tmux = CaptureMockTmux {
+            windows: "01-gale|||1|||gale-oracle|||1|||\n".to_owned(),
+            panes: [
+                "%1|||claude|||01-gale:1.0|||gale-oracle|||101|||/tmp|||0",
+                "%2|||codex|||01-gale:1.1|||bulk-codex|||102|||/tmp|||0",
+                "%3|||codex|||01-gale:1.2|||partial-codex|||103|||/tmp|||0",
+            ]
+            .join("\n"),
+            ..CaptureMockTmux::default()
+        };
+
+        let error =
+            capture_with_runner(&capture_strings(&["01-gale"]), &mut tmux).expect_err("refuse");
+
+        assert_eq!(
+            error,
+            "target '01-gale:1' resolves to multiple agent panes; refusing to guess a pane; candidates: 01-gale:1.0, 01-gale:1.1, 01-gale:1.2"
+        );
     }
 
     #[test]
@@ -258,7 +287,7 @@ mod capture_tests {
         let error = capture_with_runner(&capture_strings(&["neo-oracle"]), &mut tmux).expect_err("fail");
 
         assert_eq!(error, "capture failed: no pane");
-        assert_eq!(tmux.calls[1].1, capture_strings(&["-t", "03-neo:1", "-p", "-S", "-50"]));
+        assert_eq!(tmux.calls[2].1, capture_strings(&["-t", "03-neo:1", "-p", "-S", "-50"]));
     }
 
     #[derive(Debug, Default)]
@@ -277,6 +306,7 @@ mod capture_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             match subcommand {
                 "list-windows" => Ok(self.windows.clone()),
+                "list-panes" => Ok(String::new()),
                 "capture-pane" => {
                     let target = args
                         .windows(2)
@@ -310,7 +340,7 @@ mod capture_tests {
             capture_with_runner(&capture_strings(&["dev:worker"]), &mut tmux).expect("capture");
 
         assert_eq!(output.stdout, "target window output\n");
-        let capture_call = &tmux.calls[1];
+        let capture_call = &tmux.calls[2];
         assert_eq!(capture_call.0, "capture-pane");
         assert!(
             capture_call.1.contains(&"-t".to_owned()),
@@ -340,7 +370,7 @@ mod capture_tests {
             capture_with_runner(&capture_strings(&["beta:worker"]), &mut tmux).expect("capture");
 
         assert_eq!(output.stdout, "beta worker content\n");
-        let capture_call = &tmux.calls[1];
+        let capture_call = &tmux.calls[2];
         assert_eq!(capture_call.0, "capture-pane");
         assert!(
             capture_call.1.contains(&"beta:2".to_owned()),
@@ -374,7 +404,7 @@ mod capture_tests {
 
         assert_eq!(output.stdout, "right pane\n");
         assert_eq!(
-            tmux.calls[1],
+            tmux.calls[2],
             ("capture-pane".to_owned(), capture_strings(&["-t", "webhook-relay-v3:2", "-p", "-S", "-50"]))
         );
     }

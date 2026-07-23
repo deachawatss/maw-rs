@@ -70,19 +70,103 @@ fn resolve_local_tmux_target_from_sessions(
     }
 }
 
-fn route_result_prefer_pane_zero_for_ambiguous_agent<R: maw_tmux::TmuxRunner>(
+const ROUTE_AGENT_PANE_FORMAT: &str =
+    "#{pane_id}|||#{pane_current_command}|||#{session_name}:#{window_index}.#{pane_index}|||#{pane_title}|||#{pane_pid}|||#{pane_current_path}|||#{window_activity}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutePaneError {
+    reason: String,
+    detail: String,
+    hint: Option<String>,
+}
+
+fn route_result_refuse_ambiguous_agent_panes<R: maw_tmux::TmuxRunner>(
     query: &str,
     result: RouteResult,
     runner: &mut R,
 ) -> RouteResult {
+    if is_self_target_alias(query) {
+        return result;
+    }
     match result {
-        RouteResult::Local { target } => RouteResult::Local {
-            target: prefer_pane_zero_for_ambiguous_agent(query, &target, runner),
-        },
-        RouteResult::SelfNode { target } => RouteResult::SelfNode {
-            target: prefer_pane_zero_for_ambiguous_agent(query, &target, runner),
-        },
+        RouteResult::Local { target } => {
+            match resolve_window_agent_pane_target_with_runner(&target, runner) {
+                Ok(target) => RouteResult::Local { target },
+                Err(error) => route_pane_error(error),
+            }
+        }
+        RouteResult::SelfNode { target } => {
+            match resolve_window_agent_pane_target_with_runner(&target, runner) {
+                Ok(target) => RouteResult::SelfNode { target },
+                Err(error) => route_pane_error(error),
+            }
+        }
         other => other,
+    }
+}
+
+fn resolve_window_agent_pane_target_with_runner<R: maw_tmux::TmuxRunner>(
+    target: &str,
+    runner: &mut R,
+) -> Result<String, RoutePaneError> {
+    if route_window_target_without_pane(target).is_none() {
+        return Ok(target.to_owned());
+    }
+    let raw = runner
+        .run(
+            "list-panes",
+            &[
+                "-a".to_owned(),
+                "-F".to_owned(),
+                ROUTE_AGENT_PANE_FORMAT.to_owned(),
+            ],
+        )
+        .map_err(|error| RoutePaneError {
+            reason: "pane_inventory_unavailable".to_owned(),
+            detail: format!(
+                "could not enumerate panes for target '{target}'; refusing to guess a pane: {}",
+                error.message
+            ),
+            hint: None,
+        })?;
+    resolve_window_agent_pane_target(target, &maw_tmux::parse_list_panes(&raw))
+}
+
+fn resolve_window_agent_pane_target(
+    target: &str,
+    panes: &[TmuxPane],
+) -> Result<String, RoutePaneError> {
+    let Some(window_target) = route_window_target_without_pane(target) else {
+        return Ok(target.to_owned());
+    };
+    let mut candidates = panes
+        .iter()
+        .filter(|pane| {
+            is_ls_agent_command(&pane.command)
+                && candidate_window_target(&pane.target).as_deref() == Some(window_target)
+        })
+        .map(|pane| pane.target.clone())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [candidate] => Ok(candidate.clone()),
+        [] => Ok(target.to_owned()),
+        _ => Err(RoutePaneError {
+            reason: "pane_target_ambiguous".to_owned(),
+            detail: format!(
+                "target '{target}' resolves to multiple agent panes; refusing to guess a pane"
+            ),
+            hint: Some(format!("candidates: {}", candidates.join(", "))),
+        }),
+    }
+}
+
+fn route_pane_error(error: RoutePaneError) -> RouteResult {
+    RouteResult::Error {
+        reason: error.reason,
+        detail: error.detail,
+        hint: error.hint,
     }
 }
 
@@ -180,25 +264,67 @@ mod target_resolver_tests {
     }
 
     #[test]
-    fn ambiguous_agent_name_in_one_window_prefers_pane_zero() {
+    fn ambiguous_agent_panes_in_one_window_refuse_and_list_candidates() {
         let mut runner = FakeRunner {
             raw: [
-                "%1|||81-kru32:0.2|||kru32-oracle||||||/tmp",
-                "%2|||81-kru32:0.0|||kru32-oracle||||||/tmp",
-                "%3|||81-kru32:0.1|||kru32-oracle||||||/tmp",
+                "%1|||codex|||81-kru32:0.2|||codex-2|||101|||/tmp|||0",
+                "%2|||claude|||81-kru32:0.0|||kru32-oracle|||102|||/tmp|||0",
+                "%3|||codex|||81-kru32:0.1|||codex-1|||103|||/tmp|||0",
             ]
             .join("\n"),
             ..FakeRunner::default()
         };
 
-        let result = route_result_prefer_pane_zero_for_ambiguous_agent(
-            "81-kru32:kru32-oracle",
+        let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
             RouteResult::Local { target: "81-kru32:0".to_owned() },
             &mut runner,
         );
 
-        assert_eq!(result, RouteResult::Local { target: "81-kru32:0.0".to_owned() });
-        assert_eq!(runner.calls, 1);
+        assert_eq!(
+            result,
+            RouteResult::Error {
+                reason: "pane_target_ambiguous".to_owned(),
+                detail: "target '81-kru32:0' resolves to multiple agent panes; refusing to guess a pane"
+                    .to_owned(),
+                hint: Some(
+                    "candidates: 81-kru32:0.0, 81-kru32:0.1, 81-kru32:0.2".to_owned()
+                ),
+            }
+        );
+    }
+
+    #[test]
+    fn single_agent_pane_in_window_resolves_explicitly() {
+        let mut runner = FakeRunner {
+            raw: [
+                "%1|||zsh|||81-kru32:0.0|||shell|||101|||/tmp|||0",
+                "%2|||codex|||81-kru32:0.1|||codex-1|||102|||/tmp|||0",
+            ]
+            .join("\n"),
+            ..FakeRunner::default()
+        };
+
+        let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
+            RouteResult::Local {
+                target: "81-kru32:0".to_owned(),
+            },
+            &mut runner,
+        );
+
+        assert_eq!(
+            result,
+            RouteResult::Local {
+                target: "81-kru32:0.1".to_owned()
+            }
+        );
+        for target in ["81-kru32:0.2", "%42"] {
+            assert_eq!(
+                resolve_window_agent_pane_target(target, &[]),
+                Ok(target.to_owned())
+            );
+        }
     }
 
     #[test]
