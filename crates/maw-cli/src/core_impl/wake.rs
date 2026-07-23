@@ -11,6 +11,8 @@ struct WakeOptionsNative {
     pr: Option<String>,
     incubate: Option<String>,
     parent: Option<String>,
+    parent_session_id: Option<String>,
+    session_id: Option<String>,
     peer: Option<String>,
     layout: Option<String>,
     from: Option<String>,
@@ -237,6 +239,19 @@ fn wake_run_options(options: &WakeOptionsNative, sessions: &[TmuxSession], tmux:
     wake_record_phase(&resolved, "resolve", wake_elapsed_ms(started), &mut out, true);
     if options.dry_run { return Ok((0, wake_render_dry_run(options, &resolved))); }
     wake_apply(options, &resolved, tmux, &mut out)?;
+    if options.parent_session_id.is_some() || options.session_id.is_some() {
+        let l1_oracle = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session);
+        let metadata = L2ParentMetadata {
+            parent_session_id: options.parent_session_id.clone(),
+            session_id: options.session_id.clone(),
+            l1_oracle: l1_oracle.clone(),
+            l1_session: options.parent_session_id.clone(),
+            l2_pane: Some(resolved.target.clone()),
+            repo: resolved.repo_path.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_owned),
+        };
+        l2_record_parent_metadata(&resolved.repo_path, &metadata)?;
+        l2_arm_observer(&resolved.repo_path, &resolved.target)?;
+    }
     Ok((0, out))
 }
 
@@ -397,7 +412,7 @@ fn wake_parse_args(argv: &[String]) -> Result<WakeOptionsNative, String> {
 fn wake_default_options() -> WakeOptionsNative {
     WakeOptionsNative {
         target: String::new(), task: None, wt: None, prompt: None, repo: None, issue: None, pr: None,
-        incubate: None, parent: None, peer: None, layout: None, from: None, snapshot: None, engine: None,
+        incubate: None, parent: None, parent_session_id: None, session_id: None, peer: None, layout: None, from: None, snapshot: None, engine: None,
         name: None, repo_path: None, on_ready: Vec::new(), all: false, all_local: false, attach: true, dry_run: false, fresh: false,
         from_snapshot: false, kill: false, list: false, main: false, new_window: false, no_attach: false,
         pick: false, resume: false, solo: false, split: false, bud: false, channels: false, wait: false, yes: false,
@@ -415,6 +430,8 @@ fn wake_parse_value_arg(argv: &[String], index: usize, options: &mut WakeOptions
         "--pr" => { options.pr = Some(wake_take_value(argv, index, "--pr", wake_validate_issue)?); 2 }
         "--incubate" => { options.incubate = Some(wake_take_value(argv, index, "--incubate", wake_validate_repo)?); 2 }
         "--parent" | "--session" => { options.parent = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
+        "--parent-session-id" => { options.parent_session_id = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
+        "--session-id" => { options.session_id = Some(wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--peer" | "--from" => { wake_set_peer_or_from(options, arg, &wake_take_value(argv, index, arg, wake_validate_target_value)?); 2 }
         "--layout" => { options.layout = Some(wake_take_value(argv, index, "--layout", wake_validate_layout)?); 2 }
         "--snapshot" => { options.snapshot = Some(wake_take_value(argv, index, "--snapshot", wake_validate_target_value)?); 2 }
@@ -447,6 +464,8 @@ fn wake_equals_setters() -> Vec<(&'static str, WakeEqualsSetter)> {
         ("--pr=", |o, v| { wake_validate_issue(v, "--pr")?; o.pr = Some(v.to_owned()); Ok(()) }),
         ("--incubate=", |o, v| { wake_validate_repo(v, "--incubate")?; o.incubate = Some(v.to_owned()); Ok(()) }),
         ("--parent=", |o, v| { wake_validate_target_value(v, "--parent")?; o.parent = Some(v.to_owned()); Ok(()) }),
+        ("--parent-session-id=", |o, v| { wake_validate_target_value(v, "--parent-session-id")?; o.parent_session_id = Some(v.to_owned()); Ok(()) }),
+        ("--session-id=", |o, v| { wake_validate_target_value(v, "--session-id")?; o.session_id = Some(v.to_owned()); Ok(()) }),
         ("--peer=", |o, v| { wake_validate_target_value(v, "--peer")?; o.peer = Some(v.to_owned()); Ok(()) }),
         ("--from=", |o, v| { wake_validate_target_value(v, "--from")?; o.from = Some(v.to_owned()); Ok(()) }),
         ("--layout=", |o, v| { wake_validate_layout(v, "--layout")?; o.layout = Some(v.to_owned()); Ok(()) }),
@@ -514,7 +533,7 @@ fn wake_finalize_options(mut options: WakeOptionsNative, positionals: &[String])
 }
 
 fn wake_usage() -> String {
-    "usage: maw wake <target|all> [--task <slug>|--wt <slug>] [--repo <org/repo>] [--prompt <text>] [--on-ready <cmd>] [--all --all-local --attach|-a --no-attach --dry-run --fresh --from-snapshot --kill --layout <nested|legacy> --list --main --new --parent <session> --peer <node> --pick --resume --snapshot <id> --solo --split --yes|-y]".to_owned()
+    "usage: maw wake <target|all> [--task <slug>|--wt <slug>] [--repo <org/repo>] [--prompt <text>] [--on-ready <cmd>] [--all --all-local --attach|-a --no-attach --dry-run --fresh --from-snapshot --kill --layout <nested|legacy> --list --main --new --parent <session> --parent-session-id <id> --session-id <id> --peer <node> --pick --resume --snapshot <id> --solo --split --yes|-y]".to_owned()
 }
 
 fn wake_help_value_flags() -> &'static [&'static str] {
@@ -528,6 +547,8 @@ fn wake_help_value_flags() -> &'static [&'static str] {
         "--incubate",
         "--parent",
         "--session",
+        "--parent-session-id",
+        "--session-id",
         "--peer",
         "--from",
         "--layout",
@@ -1503,6 +1524,28 @@ mod wake_tests {
         assert!(wake_parse_args(&wake_strings(&["neo", "--yes"])).expect("parse yes").yes);
         assert!(wake_parse_args(&wake_strings(&["--", "neo"])).expect_err("separator guard").contains("unknown argument"));
         assert!(wake_parse_args(&wake_strings(&["neo", "--task", "-bad"])).expect_err("value guard").contains("must not start"));
+    }
+
+    #[test]
+    fn wake_records_parent_session_metadata_for_l2_observer() {
+        wake_with_fixture(|root| {
+            let repo = root.join("ghq/github.com/acme/coder");
+            std::fs::create_dir_all(&repo).expect("coder repo");
+            let mut tmux = WakeMockTmux::default();
+
+            let (code, _) = wake_run(
+                &wake_strings(&["coder", "--parent-session-id", "parent-1"]),
+                &mut tmux,
+            )
+            .expect("maw wake coder --parent-session-id parent-1");
+
+            assert_eq!(code, 0);
+            let metadata = std::fs::read_to_string(repo.join(".maw/l2-meta.json"))
+                .expect("observer parent metadata");
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata).expect("metadata json");
+            assert_eq!(metadata["parentSessionId"], "parent-1");
+            assert!(metadata["l2Pane"].as_str().is_some_and(|pane| pane.ends_with(":coder")));
+        });
     }
 
     #[test]

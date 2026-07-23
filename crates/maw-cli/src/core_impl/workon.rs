@@ -523,6 +523,8 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         if let Some(pane_id) = workon_reusable_pane(runner, target_path) {
             workon_tmux_run(runner, "select-window", &["-t", &pane_id])?;
             workon_tmux_run(runner, "select-pane", &["-t", &pane_id])?;
+            let l1_session = ["CLAUDE_SESSION_ID", "MAW_SESSION_ID"].iter().find_map(|key| std::env::var(key).ok());
+            l2_prepare_observer(target_path, &pane_id, session, l1_session.as_deref())?;
             let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing existing pane {pane_id} for '{window_name}'");
             return Ok(());
         }
@@ -533,6 +535,8 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     workon_wait_for_shell_prompt(runner, &new_target)?;
     workon_send_window_command_to_target(runner, &new_target, window_name, target_path, engine, prompt)?;
     workon_wait_for_launch(runner, &new_target)?;
+    let l1_session = ["CLAUDE_SESSION_ID", "MAW_SESSION_ID"].iter().find_map(|key| std::env::var(key).ok());
+    l2_prepare_observer(target_path, &new_target, session, l1_session.as_deref())?;
 
     if taskless_oracle {
         if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(session, window_name, target_path)? {

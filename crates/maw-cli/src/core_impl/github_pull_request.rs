@@ -105,13 +105,6 @@ enum PrReconciliationUpdate {
     Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-enum PrL1Notification {
-    #[default]
-    Hey,
-    LegacyPaneFallback,
-}
-
 trait PrTmux {
     fn pr_current_path(&mut self) -> Result<String, String>;
     fn pr_current_session(&mut self) -> Result<String, String>;
@@ -161,13 +154,6 @@ trait PrProcess {
     fn pr_gh_review_state(&mut self, repo: &str, pr_number: u64) -> Result<PrGithubState, String>;
     fn pr_reconcile_review_queue(&mut self, quiet: bool) -> Result<String, String>;
     fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String>;
-    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String>;
-    fn pr_resurface_l1(
-        &mut self,
-        cwd: &std::path::Path,
-        request: &PrReviewRequest,
-        message: &str,
-    ) -> Result<PrL1Notification, String>;
 }
 
 struct PrNativeProcess;
@@ -290,52 +276,6 @@ impl PrProcess for PrNativeProcess {
         pr_enqueue_global_review(request)
     }
 
-    fn pr_notify_l1(&mut self, cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String> {
-        let oracle = pr_l1_oracle(cwd);
-        let pane = pr_l1_pane(cwd);
-        pr_notify_l1_target(oracle.as_deref(), pane.as_deref(), message)
-    }
-
-    fn pr_resurface_l1(
-        &mut self,
-        cwd: &std::path::Path,
-        request: &PrReviewRequest,
-        message: &str,
-    ) -> Result<PrL1Notification, String> {
-        let oracle = request.l1_oracle.clone().or_else(|| pr_l1_oracle(cwd));
-        let pane = request.l1_pane.clone().or_else(|| pr_l1_pane(cwd));
-        pr_notify_l1_target(oracle.as_deref(), pane.as_deref(), message)
-    }
-}
-
-fn pr_notify_l1_target(
-    oracle: Option<&str>,
-    pane: Option<&str>,
-    message: &str,
-) -> Result<PrL1Notification, String> {
-    if let Some(oracle) = oracle.filter(|value| pr_valid_oracle_name(value)) {
-        pr_notify_l1_with_hey(oracle, message)?;
-        return Ok(PrL1Notification::Hey);
-    }
-    let pane = pane
-        .filter(|value| pr_valid_pane_id(value))
-        .ok_or_else(|| "pr: L1 oracle unavailable and legacy pane unavailable; queued for hook recovery".to_owned())?;
-    let literal = std::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane, "-l", message])
-        .output()
-        .map_err(|error| format!("pr: notify L1: {error}"))?;
-    if !literal.status.success() {
-        return Err("pr: notify L1 literal send failed; queued for hook recovery".to_owned());
-    }
-    let enter = std::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane, "Enter"])
-        .output()
-        .map_err(|error| format!("pr: notify L1 enter: {error}"))?;
-    if enter.status.success() {
-        Ok(PrL1Notification::LegacyPaneFallback)
-    } else {
-        Err("pr: notify L1 enter failed; queued for hook recovery".to_owned())
-    }
 }
 
 fn run_pr_command(argv: &[String]) -> CliOutput {
@@ -381,18 +321,10 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     };
     pr_write_review_request(&plan.cwd, &request)?;
     process.pr_enqueue_review(&request)?;
-    let issue = pr_extract_issue_num(&plan.branch).unwrap_or_default();
-    let message = format!("[codex] PR #{pr_number} ready for issue #{issue}. {url}");
-    match process.pr_notify_l1(&plan.cwd, &message) {
-        Ok(notification) => {
-            if notification == PrL1Notification::LegacyPaneFallback {
-                let _ = writeln!(out, "\x1b[33m⚠\x1b[0m pr: L1 oracle metadata unavailable; used legacy .maw/l1-pane fallback");
-            }
-            let _ = writeln!(out, "\x1b[33m⚠\x1b[0m L1 handoff queued; awaiting GitHub reconciliation");
-        }
-        Err(error) => {
-            let _ = writeln!(out, "\x1b[33m⚠\x1b[0m {error}; handoff remains pending in the review queue");
-        }
+    if let Err(error) = l2_emit_pr_event(&plan.cwd, pr_number, &url) {
+        let _ = writeln!(out, "\x1b[33m⚠\x1b[0m {error}; PR remains pending in the review queue");
+    } else {
+        let _ = writeln!(out, "\x1b[33m⚠\x1b[0m L1 handoff queued for the next hook drain");
     }
     Ok(out)
 }
@@ -417,33 +349,6 @@ fn pr_valid_oracle_name(value: &str) -> bool {
         && value.trim() == value
         && !value.starts_with('-')
         && value.chars().all(|ch| !ch.is_control() && !ch.is_whitespace())
-}
-
-fn pr_notify_l1_with_hey(oracle: &str, message: &str) -> Result<(), String> {
-    let oracle = oracle.to_owned();
-    let message = message.to_owned();
-    let worker = std::thread::Builder::new()
-        .name("maw-pr-l1-notify".to_owned())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| format!("pr: start L1 notify runtime: {error}"))?;
-            Ok::<CliOutput, String>(runtime.block_on(run_hey_in_process(&oracle, &message, false)))
-        })
-        .map_err(|error| format!("pr: start L1 notify worker: {error}"))?;
-    let output = worker
-        .join()
-        .map_err(|_| "pr: L1 notify worker panicked".to_owned())??;
-    if output.code == 0 {
-        return Ok(());
-    }
-    let detail = if output.stderr.trim().is_empty() {
-        output.stdout.trim()
-    } else {
-        output.stderr.trim()
-    };
-    Err(format!("pr: notify L1 via maw hey failed: {detail}"))
 }
 
 fn pr_write_review_request(cwd: &std::path::Path, request: &PrReviewRequest) -> Result<(), String> {
@@ -487,7 +392,6 @@ fn pr_enqueue_global_review(request: &PrReviewRequest) -> Result<(), String> {
 fn pr_reconcile_reviews<P: PrProcess>(process: &mut P, quiet: bool) -> Result<String, String> {
     let root = pr_review_queue_root()?;
     let queued = pr_load_global_reviews(&root)?;
-    let cwd = std::env::current_dir().map_err(|error| format!("pr: resolve reconciliation directory: {error}"))?;
     let mut updates = std::collections::BTreeMap::new();
     let mut out = String::new();
 
@@ -507,27 +411,8 @@ fn pr_reconcile_reviews<P: PrProcess>(process: &mut P, quiet: bool) -> Result<St
             }
             Ok(PrGithubState::Open) => {
                 updates.insert(pr_review_queue_key(&request), PrReconciliationUpdate::Keep);
-                let message = format!(
-                    "[maw] PR #{} is still open; re-surfacing L1 review. {}",
-                    request.pr_number, request.pr_url
-                );
-                match process.pr_resurface_l1(&cwd, &request, &message) {
-                    Ok(PrL1Notification::Hey) if !quiet => {
-                        let _ = writeln!(out, "\x1b[32m✅\x1b[0m PR #{} still open; re-surfaced L1 review", request.pr_number);
-                    }
-                    Ok(PrL1Notification::LegacyPaneFallback) if !quiet => {
-                        let _ = writeln!(out, "\x1b[33m⚠\x1b[0m PR #{} still open; re-surfaced via legacy L1 pane", request.pr_number);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        if !quiet {
-                            let _ = writeln!(
-                                out,
-                                "\x1b[33m⚠\x1b[0m PR #{} still open; re-surface deferred: {error}",
-                                request.pr_number
-                            );
-                        }
-                    }
+                if !quiet {
+                    let _ = writeln!(out, "PR #{} is still open; durable handoff retained", request.pr_number);
                 }
             }
             Err(error) => {
@@ -1156,10 +1041,6 @@ mod pr_tests {
         review_state_results: std::collections::VecDeque<Result<PrGithubState, String>>,
         reconcile_quiet: Vec<bool>,
         enqueued: Vec<PrReviewRequest>,
-        notifications: Vec<String>,
-        resurfaced: Vec<(PrReviewRequest, String)>,
-        resurface_error: Option<String>,
-        notification: PrL1Notification,
     }
 
     impl PrProcess for PrMockProcess {
@@ -1201,19 +1082,6 @@ mod pr_tests {
             }
             Ok(())
         }
-        fn pr_notify_l1(&mut self, _cwd: &std::path::Path, message: &str) -> Result<PrL1Notification, String> {
-            self.notifications.push(message.to_owned());
-            Ok(self.notification)
-        }
-        fn pr_resurface_l1(
-            &mut self,
-            _cwd: &std::path::Path,
-            request: &PrReviewRequest,
-            message: &str,
-        ) -> Result<PrL1Notification, String> {
-            self.resurfaced.push((request.clone(), message.to_owned()));
-            self.resurface_error.clone().map_or(Ok(self.notification), Err)
-        }
     }
 
     fn pr_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
@@ -1229,6 +1097,8 @@ mod pr_tests {
 
     fn pr_write_delivery(repo: &std::path::Path, issue: u64) {
         std::fs::create_dir_all(repo.join(".maw")).expect("maw dir");
+        std::env::set_var("MAW_STATE_DIR", repo.join(".maw-test-state"));
+        std::fs::write(repo.join(".maw/l1-oracle"), "01-gale\n").expect("l1 oracle");
         let delivery = serde_json::json!({
                 "version": 1,
                 "issue": issue,
@@ -1292,7 +1162,9 @@ mod pr_tests {
         assert_eq!(process.enqueued.len(), 1);
         assert_eq!(process.reconcile_quiet, vec![true]);
         assert!(!process.enqueued[0].notified);
-        assert_eq!(process.notifications, vec!["[codex] PR #7 ready for issue #140. https://github.com/acme/demo/pull/7"]);
+        let events = std::fs::read_to_string(repo.join(".maw-test-state/l2-events.jsonl")).expect("l2 event queue");
+        assert!(events.contains("[01-gale:"), "{events}");
+        assert!(events.contains("READY issue #140 (standard/api)"), "{events}");
         let request = serde_json::from_str::<PrReviewRequest>(
             &std::fs::read_to_string(repo.join(".maw/l1-review-request.json")).expect("request"),
         )
@@ -1305,7 +1177,7 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_successful_send_stays_pending_until_github_reconciliation() {
+    fn pr_handoff_is_durable_without_sending_keys() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
@@ -1316,8 +1188,7 @@ mod pr_tests {
 
         let output = pr_run(&[], &mut tmux, &mut process).expect("PR creation remains recoverable");
 
-        assert!(output.contains("L1 handoff queued; awaiting GitHub reconciliation"), "{output}");
-        assert_eq!(process.notifications.len(), 1);
+        assert!(output.contains("L1 handoff queued for the next hook drain"), "{output}");
         assert_eq!(process.enqueued.len(), 1);
         assert!(!process.enqueued[0].notified);
         assert_eq!(process.enqueued[0].status, "pending");
@@ -1366,23 +1237,18 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_marks_legacy_pane_fallback() {
+    fn pr_without_pane_metadata_still_queues_durable_handoff() {
         let repo = pr_temp_dir("l1-pane-fallback");
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         pr_write_delivery(&repo, 32);
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
-        let mut process = PrMockProcess {
-            branch: "agents/issue-32-pr-hey-notification".to_owned(),
-            notification: PrL1Notification::LegacyPaneFallback,
-            ..PrMockProcess::default()
-        };
+        let mut process = PrMockProcess { branch: "agents/issue-32-pr-durable-notification".to_owned(), ..PrMockProcess::default() };
 
         let output = pr_run(&[], &mut tmux, &mut process).expect("run");
 
-        assert!(output.contains("L1 oracle metadata unavailable; used legacy .maw/l1-pane fallback"), "{output}");
-        assert!(output.contains("L1 handoff queued; awaiting GitHub reconciliation"), "{output}");
+        assert!(output.contains("L1 handoff queued for the next hook drain"), "{output}");
     }
 
     #[test]
@@ -1602,7 +1468,7 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_reconcile_open_review_resurfaces_once_and_deduplicates_queue() {
+    fn pr_reconcile_open_review_retains_durable_row_and_deduplicates_queue() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-open");
@@ -1629,9 +1495,7 @@ mod pr_tests {
 
         let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("reconcile open PR");
 
-        assert!(output.contains("PR #55 still open; re-surfaced L1 review"), "{output}");
-        assert_eq!(process.resurfaced.len(), 1);
-        assert!(process.resurfaced[0].1.contains("https://github.com/acme/demo/pull/55"));
+        assert!(output.contains("PR #55 is still open; durable handoff retained"), "{output}");
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
         assert_eq!(rows.lines().count(), 1);
         assert_eq!(serde_json::from_str::<PrReviewRequest>(rows.trim()).expect("row"), request);
@@ -1639,7 +1503,7 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_reconcile_open_review_keeps_pending_entry_when_notification_is_busy() {
+    fn pr_reconcile_open_review_never_requires_live_pane_delivery() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-open-busy");
@@ -1661,15 +1525,11 @@ mod pr_tests {
         };
         pr_enqueue_global_review(&request).expect("enqueue");
         let mut tmux = PrMockTmux::default();
-        let mut process = PrMockProcess {
-            resurface_error: Some("pane is busy".to_owned()),
-            ..PrMockProcess::default()
-        };
+        let mut process = PrMockProcess::default();
 
-        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("deferred re-notification");
+        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("durable reconciliation");
 
-        assert!(output.contains("PR #57 still open; re-surface deferred: pane is busy"), "{output}");
-        assert_eq!(process.resurfaced.len(), 1);
+        assert!(output.contains("PR #57 is still open; durable handoff retained"), "{output}");
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
         assert_eq!(serde_json::from_str::<PrReviewRequest>(rows.trim()).expect("pending row"), request);
         assert!(!state.join("pr-queue.jsonl.archived").exists());
@@ -1713,7 +1573,6 @@ mod pr_tests {
 
         assert!(output.contains("PR #58 merged; archiving queued handoff"), "{output}");
         assert!(process.review_state_results.is_empty(), "duplicate must not trigger a second GitHub check");
-        assert!(process.resurfaced.is_empty());
         assert!(std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue").is_empty());
         let archived = std::fs::read_to_string(state.join("pr-queue.jsonl.archived")).expect("archive");
         assert_eq!(archived.lines().count(), 1);
@@ -1755,7 +1614,6 @@ mod pr_tests {
         let output = pr_run(&pr_strings(&["--reconcile", "--quiet"]), &mut tmux, &mut process).expect("quiet reconcile merged PR");
 
         assert!(output.is_empty(), "{output}");
-        assert!(process.resurfaced.is_empty());
         assert!(std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue").is_empty());
         let archived = std::fs::read_to_string(state.join("pr-queue.jsonl.archived")).expect("archive");
         let archived_request = serde_json::from_str::<PrReviewRequest>(archived.trim()).expect("archive row");
@@ -1795,7 +1653,6 @@ mod pr_tests {
         let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("reconcile closed PR");
 
         assert!(output.contains("PR #56 closed; archiving queued handoff"), "{output}");
-        assert!(process.resurfaced.is_empty());
         let archived = std::fs::read_to_string(state.join("pr-queue.jsonl.archived")).expect("archive");
         assert_eq!(serde_json::from_str::<PrReviewRequest>(archived.trim()).expect("archive row").status, "closed");
     }

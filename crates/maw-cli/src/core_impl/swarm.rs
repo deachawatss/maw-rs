@@ -75,6 +75,10 @@ fn swarm_with_runner(
     let mut members = Vec::new();
     for (agent, pane) in agents.iter().zip(panes.iter()) {
         swarm_start_agent(runner, agent, pane, &options).map_err(|error| swarm_tmux_error(&error))?;
+        if let Some(l1_oracle) = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session) {
+            let cwd = std::env::current_dir().map_err(|error| (1, format!("swarm: resolve cwd: {error}")))?;
+            l2_prepare_observer(&cwd, pane, &l1_oracle, options.parent_session_id.as_deref()).map_err(|error| (1, error))?;
+        }
         stdout.push_str(&swarm_agent_line(agent, pane));
         members.push(swarm_member(agent, pane));
     }
