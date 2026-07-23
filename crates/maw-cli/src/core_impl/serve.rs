@@ -4224,6 +4224,7 @@ mod serve_tests {
     fn serve_mirror_capture_uses_the_same_live_resolution_as_maw_capture() {
         let mut runner = MirrorCaptureMockTmux {
             windows: "01-gale|||1|||gale|||1|||\n".to_owned(),
+            panes: "%1|||codex|||01-gale:1.0|||gale-oracle|||101|||/tmp|||0\n".to_owned(),
             capture: "live gale pane\n".to_owned(),
             ..Default::default()
         };
@@ -4244,10 +4245,18 @@ mod serve_tests {
                     ],
                 ),
                 (
+                    "list-panes".to_owned(),
+                    vec![
+                        "-a".to_owned(),
+                        "-F".to_owned(),
+                        ROUTE_AGENT_PANE_FORMAT.to_owned(),
+                    ],
+                ),
+                (
                     "capture-pane".to_owned(),
                     vec![
                         "-t".to_owned(),
-                        "01-gale:1".to_owned(),
+                        "01-gale:1.0".to_owned(),
                         "-p".to_owned(),
                         "-S".to_owned(),
                         "-15".to_owned(),
@@ -4261,6 +4270,7 @@ mod serve_tests {
     struct MirrorCaptureMockTmux {
         calls: Vec<(String, Vec<String>)>,
         windows: String,
+        panes: String,
         capture: String,
     }
 
@@ -4273,6 +4283,7 @@ mod serve_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             match subcommand {
                 "list-windows" => Ok(self.windows.clone()),
+                "list-panes" => Ok(self.panes.clone()),
                 "capture-pane" => Ok(self.capture.clone()),
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
             }

@@ -107,7 +107,7 @@ async fn run_send_like_async_with_args(
         std::env::var_os("TMUX").is_some(),
         &mut runner,
     );
-    let result = route_result_refuse_ambiguous_agent_panes(result, &mut runner);
+    let result = route_result_refuse_ambiguous_agent_panes(&routing_target, result, &mut runner);
     if send_args.dry_run {
         return send_dry_run_output(command, &send_args, &result);
     }
@@ -1819,6 +1819,7 @@ mod send_acl_hotpath_tests {
         current_session: Option<Result<String, String>>,
         caller_window: Option<Result<String, String>>,
         focused_window: Option<Result<String, String>>,
+        panes: String,
         calls: Vec<(String, Vec<String>)>,
     }
 
@@ -1842,6 +1843,7 @@ mod send_acl_hotpath_tests {
                     .clone()
                     .unwrap_or_else(|| Ok(String::new()))
                     .map_err(maw_tmux::TmuxError::new),
+                "list-panes" => Ok(self.panes.clone()),
                 other => Err(maw_tmux::TmuxError::new(format!(
                     "unexpected tmux command {other}"
                 ))),
@@ -1971,6 +1973,44 @@ mod send_acl_hotpath_tests {
                 true,
                 &mut runner
             ),
+            RouteResult::Local {
+                target: "188-maw-rs:1".to_owned()
+            }
+        );
+        assert_eq!(
+            runner.calls,
+            vec![(
+                "display-message".to_owned(),
+                vec!["-p".to_owned(), "#{session_name}".to_owned()]
+            )]
+        );
+    }
+
+    #[test]
+    fn hey_me_inside_tmux_skips_ambiguous_agent_pane_refusal() {
+        let sessions = vec![send_route_session(
+            "188-maw-rs",
+            vec![send_route_window(1, "maw-rs-oracle")],
+        )];
+        let mut runner = SendFakeTmuxRunner {
+            current_session: Some(Ok("188-maw-rs\n".to_owned())),
+            panes: [
+                "%1|||codex|||188-maw-rs:1.0|||codex-1|||101|||/tmp|||0",
+                "%2|||claude|||188-maw-rs:1.1|||maw-rs-oracle|||102|||/tmp|||0",
+            ]
+            .join("\n"),
+            ..SendFakeTmuxRunner::default()
+        };
+        let result = resolve_send_route_target(
+            "me",
+            &RouteConfig::default(),
+            &sessions,
+            true,
+            &mut runner,
+        );
+
+        assert_eq!(
+            route_result_refuse_ambiguous_agent_panes("me", result, &mut runner),
             RouteResult::Local {
                 target: "188-maw-rs:1".to_owned()
             }

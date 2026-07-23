@@ -170,6 +170,7 @@ fn run_run_with_from(
     run_validate_command_text(&parsed.text).map_err(|message| (2, message))?;
     match resolve_route_target(&parsed.target, &config.route, &tmux.run_sessions()) {
         RouteResult::Local { target } | RouteResult::SelfNode { target } => {
+            // `maw run` retains its established pane-zero policy; #100 changes hey/capture/send only.
             let target = run_prefer_pane_zero_for_ambiguous_agent(&parsed.target, &target, tmux);
             run_local(&target, &parsed.text, tmux)
         }

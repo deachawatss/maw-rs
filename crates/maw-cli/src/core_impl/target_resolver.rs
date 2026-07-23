@@ -81,9 +81,13 @@ struct RoutePaneError {
 }
 
 fn route_result_refuse_ambiguous_agent_panes<R: maw_tmux::TmuxRunner>(
+    query: &str,
     result: RouteResult,
     runner: &mut R,
 ) -> RouteResult {
+    if is_self_target_alias(query) {
+        return result;
+    }
     match result {
         RouteResult::Local { target } => {
             match resolve_window_agent_pane_target_with_runner(&target, runner) {
@@ -272,6 +276,7 @@ mod target_resolver_tests {
         };
 
         let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
             RouteResult::Local { target: "81-kru32:0".to_owned() },
             &mut runner,
         );
@@ -301,6 +306,7 @@ mod target_resolver_tests {
         };
 
         let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
             RouteResult::Local {
                 target: "81-kru32:0".to_owned(),
             },
