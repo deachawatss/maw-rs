@@ -991,6 +991,7 @@ fn serve_deliver_inbox(
     }) {
         ReceiverInboxResult::Ok(inbox) => {
             let reason = "--inbox requested; pane injection skipped";
+            let mut durability_warning: Option<String> = None;
             if let Some(key) = idempotency_key.clone() {
                 if let Err(error) = serve_delivery_idempotency_complete(
                     state,
@@ -1000,7 +1001,7 @@ fn serve_deliver_inbox(
                     serve_delivery_idempotency_now(state),
                 ) {
                     serve_log_delivery_failed(state, target, message, log_from, log_to, &error, "idempotency-record");
-                    return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "delivery-record-failed", &resolved, &error);
+                    durability_warning = Some(serve_delivery_durability_warning(&error));
                 }
             }
             serve_log_lifecycle(
@@ -1021,7 +1022,7 @@ fn serve_deliver_inbox(
                     "source": "maw-rs-native",
                 }),
             );
-            Json(json!({
+            let mut body = json!({
                 "ok": true,
                 "target": resolved,
                 "text": parsed.text.clone().unwrap_or_default(),
@@ -1030,8 +1031,11 @@ fn serve_deliver_inbox(
                 "inbox": inbox.path.display().to_string(),
                 "reason": reason,
                 "receipt": ["fallback_queued"],
-            }))
-            .into_response()
+            });
+            if let Some(warning) = durability_warning {
+                body["warning"] = json!(warning);
+            }
+            Json(body).into_response()
         }
         ReceiverInboxResult::Err { oracle: _, reason } => {
             if let Some(key) = idempotency_key.as_ref() {
@@ -1522,15 +1526,13 @@ fn serve_deliver_local(
     } else {
         "delivered"
     };
-    if let Some(response) = serve_delivery_idempotency_complete_or_error(
+    let durability_warning = serve_delivery_idempotency_complete_or_warn(
         state,
         idempotency_key.as_ref(),
         &delivery_target,
         state_name,
         context,
-    ) {
-        return response;
-    }
+    );
     let last_line = serve_last_nonempty_line(&capture);
     serve_log_lifecycle(
         state,
@@ -1549,15 +1551,18 @@ fn serve_deliver_local(
             "source": "maw-rs-native",
         }),
     );
-    Json(json!({
+    let mut body = json!({
         "ok": true,
         "target": &delivery_target,
         "text": context.message,
         "source": "maw-rs",
         "state": state_name,
         "lastLine": last_line,
-    }))
-    .into_response()
+    });
+    if let Some(warning) = durability_warning {
+        body["warning"] = json!(warning);
+    }
+    Json(body).into_response()
 }
 
 fn serve_validate_delivery_target(
@@ -1596,16 +1601,17 @@ fn serve_delivery_unconfirmed(
     delivery_target: &str,
     error: &str,
 ) -> axum::response::Response {
-    if let Some(response) = serve_delivery_idempotency_complete_or_error(
+    let durability_warning = serve_delivery_idempotency_complete_or_warn(
         state,
         idempotency_key,
         delivery_target,
         "delivered",
         context,
-    ) {
-        return response;
+    );
+    let mut warning = format!("capture confirmation unavailable: {error}");
+    if let Some(durability) = durability_warning {
+        warning = format!("{warning}; {durability}");
     }
-    let warning = format!("capture confirmation unavailable: {error}");
     serve_log_lifecycle(
         state,
         json!({
@@ -1636,13 +1642,13 @@ fn serve_delivery_unconfirmed(
     .into_response()
 }
 
-fn serve_delivery_idempotency_complete_or_error(
+fn serve_delivery_idempotency_complete_or_warn(
     state: &ServeState,
     key: Option<&DeliveryIdempotencyKey>,
     delivery_target: &str,
     state_name: &str,
     context: &ServeDeliverContext<'_>,
-) -> Option<axum::response::Response> {
+) -> Option<String> {
     let key = key?;
     let error = serve_delivery_idempotency_complete(
         state,
@@ -1661,12 +1667,15 @@ fn serve_delivery_idempotency_complete_or_error(
         &error,
         "idempotency-record",
     );
-    Some(serve_delivery_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "delivery-record-failed",
-        delivery_target,
-        &error,
-    ))
+    Some(serve_delivery_durability_warning(&error))
+}
+
+// A durable idempotency-record write can fail after the message has already
+// been injected (an irreversible side-effect). Per the R4 invariant, that must
+// resolve as delivered-with-warning, never a hard error that both misreports a
+// delivered message and invites a retry that double-delivers after a restart.
+fn serve_delivery_durability_warning(error: &str) -> String {
+    format!("durability record failed; a restart may allow a duplicate: {error}")
 }
 
 fn serve_resolve_delivery_target(
@@ -4551,6 +4560,36 @@ mod serve_tests {
         })
     }
 
+    // Builds the app WITHOUT loading the durable store, so a caller can point
+    // `delivery_idempotency_root` at a bad path to force a persist failure at
+    // completion time (load would otherwise reject the bad path up front).
+    fn serve_test_app_with_o6_keys_delivery_and_raw_idempotency_root(
+        keys: Vec<ServePeerPubkey>,
+        now: i64,
+        peer_addr_override: Option<SocketAddr>,
+        delivery: Arc<dyn ServeDelivery>,
+        delivery_idempotency_root: PathBuf,
+    ) -> Router {
+        serve_router(ServeState {
+            cached_pubkey: None,
+            peer_pubkeys: keys,
+            workspace_key: Some("capture-test-token-393av2".to_owned()),
+            workspaces: Mutex::new(WorkspaceStore::default()),
+            requests: Mutex::new(RequestReplyStore::default()),
+            delivery,
+            receiver_inbox: serve_test_receiver_inbox(),
+            delivery_idempotency: Mutex::new(DeliveryIdempotencyStore::default()),
+            delivery_idempotency_root: Some(delivery_idempotency_root),
+            feed: Mutex::new(Vec::new()),
+            peer_addr_override,
+            now_override: Some(now),
+            serve_core_state_override: None,
+            trust_store_path: serve_test_trust_store_path("o6-persistfail"),
+            plugin_serve_routes: Vec::new(),
+            api_token_auth: ServeApiTokenAuth::open(),
+        })
+    }
+
     #[tokio::test]
     async fn serve_api_mirror_returns_text_uses_requested_lines_and_reports_missing_panes() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
@@ -5029,6 +5068,57 @@ mod serve_tests {
         assert_eq!(retry_payload["deduped"], true);
         assert_eq!(retry_payload["state"], "delivered");
         assert_eq!(delivery.sends().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_delivers_with_warning_when_durable_persist_fails() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        // Point the durable idempotency root at a regular file so persistence
+        // (create_dir_all) fails at completion time, after the message is injected.
+        let bad_root = std::env::temp_dir().join(format!(
+            "maw-rs-delivery-idempotency-persistfail-{}-{}",
+            std::process::id(),
+            random_hex(4)
+        ));
+        std::fs::write(&bad_root, b"not-a-dir").expect("seed bad root file");
+        let app = serve_test_app_with_o6_keys_delivery_and_raw_idempotency_root(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+            bad_root.clone(),
+        );
+        let body = r#"{"target":"capture-agent","text":"deliver despite persist failure"}"#;
+
+        let first = app
+            .clone()
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("first response");
+        let first_status = first.status();
+        let first_payload = response_json(first).await;
+        assert_eq!(first_status, StatusCode::OK, "{first_payload}");
+        assert_eq!(first_payload["state"], "delivered");
+        assert!(
+            first_payload["warning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durability"),
+            "expected durability warning, got: {first_payload}"
+        );
+        assert_eq!(delivery.sends().len(), 1);
+
+        // Same-process retry still dedupes via the in-memory Complete even though
+        // the durable record could not be written (no second injection).
+        let retry = app
+            .oneshot(signed_api_send_json_request(body, KEY, FROM, 1_782_277_200))
+            .await
+            .expect("retry response");
+        let retry_payload = response_json(retry).await;
+        assert_eq!(retry_payload["deduped"], true, "{retry_payload}");
+        assert_eq!(delivery.sends().len(), 1);
+
+        let _ = std::fs::remove_file(&bad_root);
     }
 
     #[tokio::test]
