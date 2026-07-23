@@ -99,7 +99,9 @@ impl ServeApiTokenAuth {
 
 trait ServeDelivery: Send + Sync {
     fn route_sessions(&self) -> Result<Vec<RouteSession>, String>;
+    fn route_panes(&self) -> Result<Vec<TmuxPane>, String>;
     fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String>;
+    fn capture_full(&self, target: &str) -> Result<String, String>;
     fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String>;
 }
 
@@ -167,9 +169,29 @@ impl ServeDelivery for ServeSystemDelivery {
         Ok(route_sessions_from_tmux(&mut tmux))
     }
 
+    fn route_panes(&self) -> Result<Vec<TmuxPane>, String> {
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        maw_tmux::TmuxRunner::run(
+            &mut runner,
+            "list-panes",
+            &[
+                "-a".to_owned(),
+                "-F".to_owned(),
+                ROUTE_AGENT_PANE_FORMAT.to_owned(),
+            ],
+        )
+        .map(|raw| maw_tmux::parse_list_panes(&raw))
+        .map_err(|error| error.message)
+    }
+
     fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
         let mut tmux = TmuxClient::local();
         tmux.send_text_ungated(target, text).map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    fn capture_full(&self, target: &str) -> Result<String, String> {
+        let mut tmux = TmuxClient::local();
+        tmux.capture(target, None).map_err(|error| error.to_string())
     }
 
     fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
@@ -1303,6 +1325,10 @@ fn serve_deliver_local(
         serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "toctou");
         return serve_delivery_error(StatusCode::NOT_FOUND, "target-disappeared", context.requested, &error);
     }
+    let delivery_target = match serve_resolve_delivery_target(state, context) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
 
     let idempotency_key = context.idempotency_key.clone();
     if let Some(key) = idempotency_key.clone() {
@@ -1334,15 +1360,21 @@ fn serve_deliver_local(
         context.sender_oracle,
         context.from,
     );
-    if let Err(error) = state.delivery.send_literal_enter(context.resolved, &outbound) {
+    if let Err(error) = state.delivery.send_literal_enter(&delivery_target, &outbound) {
         if let Some(key) = idempotency_key.as_ref() {
             serve_delivery_idempotency_cancel(state, key);
         }
         serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-send");
-        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", context.resolved, &error);
+        return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-send-failed", &delivery_target, &error);
     }
 
-    let capture = state.delivery.capture_tail(context.resolved, 8).unwrap_or_default();
+    let capture = match state.delivery.capture_tail(&delivery_target, 8) {
+        Ok(capture) => capture,
+        Err(error) => {
+            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-capture");
+            return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-capture-failed", &delivery_target, &error);
+        }
+    };
     let state_name = if capture.contains("Press up to edit queued messages") {
         "queued"
     } else {
@@ -1352,7 +1384,7 @@ fn serve_deliver_local(
         serve_delivery_idempotency_complete(
             state,
             key,
-            context.resolved,
+            &delivery_target,
             state_name,
             serve_delivery_idempotency_now(state),
         );
@@ -1367,7 +1399,7 @@ fn serve_deliver_local(
             "route": "local",
             "context.from": serve_truncate(context.log_from, SERVE_LOG_TEXT_MAX),
             "to": serve_truncate(context.log_to, SERVE_LOG_TEXT_MAX),
-            "target": context.resolved,
+            "target": &delivery_target,
             "requestedTarget": context.requested,
             "text": serve_truncate(context.message, SERVE_LOG_TEXT_MAX),
             "oracle": serve_oracle_from_target(context.requested),
@@ -1377,13 +1409,31 @@ fn serve_deliver_local(
     );
     Json(json!({
         "ok": true,
-        "target": context.resolved,
+        "target": &delivery_target,
         "text": context.message,
         "source": "maw-rs",
         "state": state_name,
         "lastLine": last_line,
     }))
     .into_response()
+}
+
+fn serve_resolve_delivery_target(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+) -> Result<String, Box<axum::response::Response>> {
+    serve_resolve_pane_target(state, context.resolved).map_err(|error| {
+        serve_log_delivery_failed(
+            state,
+            context.requested,
+            context.message,
+            context.log_from,
+            context.log_to,
+            &error.detail,
+            "pane-resolution",
+        );
+        Box::new(serve_route_pane_error(context.requested, context.resolved, &error))
+    })
 }
 
 fn serve_delivery_error(
@@ -1980,15 +2030,25 @@ async fn api_sessions(Query(query): Query<SessionsQuery>) -> impl IntoResponse {
     Json(sessions)
 }
 
-async fn api_capture(Query(query): Query<CaptureQuery>) -> impl IntoResponse {
+async fn api_capture(
+    State(state): State<Arc<ServeState>>,
+    Query(query): Query<CaptureQuery>,
+) -> impl IntoResponse {
     let target = query.target.unwrap_or_default();
-    let mut tmux = TmuxClient::local();
-    let resolved = serve_resolve_capture_target(&target, &mut tmux);
-    match tmux.capture(&resolved, None) {
+    let sessions = match state.delivery.route_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => return serve_delivery_error(StatusCode::SERVICE_UNAVAILABLE, "route-list-failed", &target, &error),
+    };
+    let resolved = serve_resolve_capture_target(&target, &sessions);
+    let resolved = match serve_resolve_pane_target(&state, &resolved) {
+        Ok(resolved) => resolved,
+        Err(error) => return serve_route_pane_error(&target, &resolved, &error),
+    };
+    match state.delivery.capture_full(&resolved) {
         Ok(content) => Json(json!({"content": content, "target": target, "resolvedTarget": resolved})).into_response(),
         Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"content": "", "target": target, "resolvedTarget": resolved, "error": error.to_string()})),
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"content": "", "target": target, "resolvedTarget": resolved, "error": error})),
         )
             .into_response(),
     }
@@ -2584,16 +2644,63 @@ fn serve_capture_tail_with_runner<R: maw_tmux::TmuxRunner>(
 
 fn serve_resolve_capture_target(
     target: &str,
-    tmux: &mut TmuxClient<maw_tmux::CommandTmuxRunner>,
+    sessions: &[RouteSession],
 ) -> String {
     if target.trim().is_empty() || target.starts_with('%') {
         return target.to_owned();
     }
-    let sessions = route_sessions_from_tmux(tmux);
-    match resolve_route_target(target, &load_hey_config().route, &sessions) {
+    match resolve_route_target(target, &load_hey_config().route, sessions) {
         RouteResult::Local { target } | RouteResult::SelfNode { target } => target,
         RouteResult::Peer { .. } | RouteResult::Error { .. } => target.to_owned(),
     }
+}
+
+fn serve_resolve_pane_target(
+    state: &ServeState,
+    resolved: &str,
+) -> Result<String, RoutePaneError> {
+    if route_window_target_without_pane(resolved).is_none() {
+        return Ok(resolved.to_owned());
+    }
+    let panes = state.delivery.route_panes().map_err(|message| RoutePaneError {
+        reason: "pane_inventory_unavailable".to_owned(),
+        detail: format!(
+            "could not enumerate panes for target '{resolved}'; refusing to guess a pane: {message}"
+        ),
+        hint: None,
+    })?;
+    resolve_window_agent_pane_target(resolved, &panes)
+}
+
+fn serve_route_pane_error(
+    target: &str,
+    resolved: &str,
+    error: &RoutePaneError,
+) -> axum::response::Response {
+    let candidates = error
+        .hint
+        .as_deref()
+        .and_then(|hint| hint.strip_prefix("candidates: "))
+        .map(|raw| raw.split(", ").map(ToOwned::to_owned).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let status = if error.reason == "pane_target_ambiguous" {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error": error.reason,
+            "target": target,
+            "resolvedTarget": resolved,
+            "detail": serve_truncate(&error.detail, SERVE_LOG_ERROR_MAX),
+            "candidates": candidates,
+            "state": "failed",
+        })),
+    )
+        .into_response()
 }
 
 fn serve_tmux_session_json(session: &TmuxSession, panes: &[TmuxPane]) -> Value {
@@ -3814,9 +3921,11 @@ mod serve_tests {
     #[derive(Default)]
     struct FakeServeDelivery {
         sessions: Mutex<Vec<Vec<RouteSession>>>,
+        panes: Mutex<Vec<TmuxPane>>,
         sends: Mutex<Vec<(String, String)>>,
         captures: Mutex<HashMap<String, String>>,
         capture_requests: Mutex<Vec<(String, u32)>>,
+        full_capture_requests: Mutex<Vec<String>>,
         capture_error: Mutex<Option<String>>,
         send_error: Mutex<Option<String>>,
         list_error: Mutex<Option<String>>,
@@ -3838,6 +3947,10 @@ mod serve_tests {
             *self.sessions.lock().expect("sessions") = sessions;
         }
 
+        fn set_panes(&self, panes: Vec<TmuxPane>) {
+            *self.panes.lock().expect("panes") = panes;
+        }
+
         fn set_capture(&self, target: &str, capture: &str) {
             self.captures
                 .lock()
@@ -3851,6 +3964,10 @@ mod serve_tests {
 
         fn capture_requests(&self) -> Vec<(String, u32)> {
             self.capture_requests.lock().expect("capture requests").clone()
+        }
+
+        fn full_capture_requests(&self) -> Vec<String> {
+            self.full_capture_requests.lock().expect("full capture requests").clone()
         }
 
         fn set_capture_error(&self, error: Option<&str>) {
@@ -3870,6 +3987,10 @@ mod serve_tests {
             Ok(sessions.first().cloned().unwrap_or_default())
         }
 
+        fn route_panes(&self) -> Result<Vec<TmuxPane>, String> {
+            Ok(self.panes.lock().expect("panes").clone())
+        }
+
         fn send_literal_enter(&self, target: &str, text: &str) -> Result<(), String> {
             if let Some(error) = self.send_error.lock().expect("send error").clone() {
                 return Err(error);
@@ -3879,6 +4000,23 @@ mod serve_tests {
                 .expect("sends")
                 .push((target.to_owned(), text.to_owned()));
             Ok(())
+        }
+
+        fn capture_full(&self, target: &str) -> Result<String, String> {
+            if let Some(error) = self.capture_error.lock().expect("capture error").clone() {
+                return Err(error);
+            }
+            self.full_capture_requests
+                .lock()
+                .expect("full capture requests")
+                .push(target.to_owned());
+            Ok(self
+                .captures
+                .lock()
+                .expect("captures")
+                .get(target)
+                .cloned()
+                .unwrap_or_else(|| "[capture] delivered\n".to_owned()))
         }
 
         fn capture_tail(&self, target: &str, lines: u32) -> Result<String, String> {
@@ -3909,6 +4047,18 @@ mod serve_tests {
                 active: true,
                 kind: None,
             }],
+        }
+    }
+
+    fn serve_test_agent_pane(id: &str, command: &str, target: &str) -> TmuxPane {
+        TmuxPane {
+            id: id.to_owned(),
+            command: command.to_owned(),
+            target: target.to_owned(),
+            title: command.to_owned(),
+            pid: None,
+            cwd: None,
+            last_activity: None,
         }
     }
 
@@ -4398,6 +4548,158 @@ mod serve_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let json = response_json(response).await;
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_refuses_ambiguous_agent_panes_before_injection() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_panes(vec![
+            serve_test_agent_pane("%1", "claude", "capture-agent:0.0"),
+            serve_test_agent_pane("%2", "codex", "capture-agent:0.1"),
+        ]);
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(signed_api_send_json_request(
+                r#"{"target":"capture-agent","text":"must not cross deliver"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+        assert_eq!(payload["error"], "pane_target_ambiguous");
+        assert_eq!(payload["resolvedTarget"], "capture-agent:0");
+        assert_eq!(payload["candidates"], json!(["capture-agent:0.0", "capture-agent:0.1"]));
+        assert!(delivery.sends().is_empty());
+        assert!(delivery.capture_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_resolves_a_single_agent_pane_before_injection() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_panes(vec![serve_test_agent_pane("%2", "codex", "capture-agent:0.1")]);
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(signed_api_send_json_request(
+                r#"{"target":"capture-agent","text":"single pane"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["target"], "capture-agent:0.1");
+        assert_eq!(delivery.sends()[0].0, "capture-agent:0.1");
+        assert_eq!(delivery.capture_requests(), vec![("capture-agent:0.1".to_owned(), 8)]);
+    }
+
+    #[tokio::test]
+    async fn serve_api_send_does_not_report_delivered_when_capture_confirmation_fails() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_capture_error(Some("capture unavailable"));
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            vec![serve_test_peer_pubkey(FROM, KEY)],
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(signed_api_send_json_request(
+                r#"{"target":"capture-agent","text":"must confirm"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
+        assert_eq!(payload["error"], "tmux-capture-failed");
+        assert_eq!(payload["state"], "failed");
+        assert_eq!(delivery.sends().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_api_capture_refuses_ambiguous_agent_panes_before_capture() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_panes(vec![
+            serve_test_agent_pane("%1", "claude", "capture-agent:0.0"),
+            serve_test_agent_pane("%2", "codex", "capture-agent:0.1"),
+        ]);
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            Vec::new(),
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/capture?target=capture-agent")
+                    .body(Body::empty())
+                    .expect("capture request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{payload}");
+        assert_eq!(payload["error"], "pane_target_ambiguous");
+        assert_eq!(payload["candidates"], json!(["capture-agent:0.0", "capture-agent:0.1"]));
+        assert!(delivery.full_capture_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_api_capture_resolves_a_single_agent_pane_before_capture() {
+        let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
+        delivery.set_panes(vec![serve_test_agent_pane("%2", "codex", "capture-agent:0.1")]);
+        delivery.set_capture("capture-agent:0.1", "single pane content\n");
+        let app = serve_test_app_with_o6_keys_and_delivery(
+            Vec::new(),
+            1_782_277_200,
+            Some(NON_LOOPBACK_TEST_PEER),
+            delivery.clone(),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/capture?target=capture-agent")
+                    .body(Body::empty())
+                    .expect("capture request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let payload = response_json(response).await;
+
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(payload["resolvedTarget"], "capture-agent:0.1");
+        assert_eq!(payload["content"], "single pane content\n");
+        assert_eq!(delivery.full_capture_requests(), vec!["capture-agent:0.1".to_owned()]);
     }
 
     #[tokio::test]
