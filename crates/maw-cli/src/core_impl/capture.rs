@@ -200,6 +200,7 @@ mod capture_tests {
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: "03-neo|||2|||main|||1|||\n".to_owned(),
+            panes: "%1|||zsh|||03-neo:2.0|||shell|||101|||/tmp|||0\n".to_owned(),
             capture: "hello\n".to_owned(),
             ..CaptureMockTmux::default()
         };
@@ -218,7 +219,7 @@ mod capture_tests {
                 ]),
             )
         );
-        assert_eq!(tmux.calls[2], ("capture-pane".to_owned(), capture_strings(&["-t", "03-neo:2", "-p", "-S", "-50"])));
+        assert_eq!(tmux.calls[2], ("capture-pane".to_owned(), capture_strings(&["-t", "03-neo:2.0", "-p", "-S", "-50"])));
     }
 
     #[test]
@@ -280,6 +281,7 @@ mod capture_tests {
         let _env = CaptureEnvGuard::new();
         let mut tmux = CaptureMockTmux {
             windows: "03-neo|||0|||main|||1|||\n03-neo|||1|||neo-oracle|||0|||\n".to_owned(),
+            panes: "%1|||zsh|||03-neo:1.0|||shell|||101|||/tmp|||0\n".to_owned(),
             fail_capture: true,
             ..CaptureMockTmux::default()
         };
@@ -287,13 +289,14 @@ mod capture_tests {
         let error = capture_with_runner(&capture_strings(&["neo-oracle"]), &mut tmux).expect_err("fail");
 
         assert_eq!(error, "capture failed: no pane");
-        assert_eq!(tmux.calls[2].1, capture_strings(&["-t", "03-neo:1", "-p", "-S", "-50"]));
+        assert_eq!(tmux.calls[2].1, capture_strings(&["-t", "03-neo:1.0", "-p", "-S", "-50"]));
     }
 
     #[derive(Debug, Default)]
     struct CaptureTargetAwareMock {
         calls: Vec<(String, Vec<String>)>,
         windows: String,
+        panes: String,
         content: std::collections::BTreeMap<String, String>,
     }
 
@@ -306,7 +309,7 @@ mod capture_tests {
             self.calls.push((subcommand.to_owned(), args.to_vec()));
             match subcommand {
                 "list-windows" => Ok(self.windows.clone()),
-                "list-panes" => Ok(String::new()),
+                "list-panes" => Ok(self.panes.clone()),
                 "capture-pane" => {
                     let target = args
                         .windows(2)
@@ -332,6 +335,11 @@ mod capture_tests {
         content.insert("dev:1".to_owned(), "target window output\n".to_owned());
         let mut tmux = CaptureTargetAwareMock {
             windows: "dev|||0|||main|||1|||\ndev|||1|||worker|||0|||\n".to_owned(),
+            panes: [
+                "%1|||zsh|||dev:0.0|||shell|||101|||/tmp|||0",
+                "%2|||zsh|||dev:1.0|||shell|||102|||/tmp|||0",
+            ]
+            .join("\n"),
             content,
             ..CaptureTargetAwareMock::default()
         };
@@ -347,8 +355,8 @@ mod capture_tests {
             "must pass -t flag"
         );
         assert!(
-            capture_call.1.contains(&"dev:1".to_owned()),
-            "must target dev:1 (the worker window), got: {:?}",
+            capture_call.1.contains(&"dev:1.0".to_owned()),
+            "must target dev:1.0 (the worker window's sole pane), got: {:?}",
             capture_call.1
         );
     }
@@ -362,6 +370,11 @@ mod capture_tests {
         content.insert("beta:2".to_owned(), "beta worker content\n".to_owned());
         let mut tmux = CaptureTargetAwareMock {
             windows: "alpha|||0|||main|||1|||\nbeta|||2|||worker|||0|||\n".to_owned(),
+            panes: [
+                "%1|||zsh|||alpha:0.0|||shell|||101|||/tmp|||0",
+                "%2|||zsh|||beta:2.0|||shell|||102|||/tmp|||0",
+            ]
+            .join("\n"),
             content,
             ..CaptureTargetAwareMock::default()
         };
@@ -373,8 +386,8 @@ mod capture_tests {
         let capture_call = &tmux.calls[2];
         assert_eq!(capture_call.0, "capture-pane");
         assert!(
-            capture_call.1.contains(&"beta:2".to_owned()),
-            "must resolve to beta:2, got: {:?}",
+            capture_call.1.contains(&"beta:2.0".to_owned()),
+            "must resolve to beta:2.0, got: {:?}",
             capture_call.1
         );
     }
@@ -395,6 +408,7 @@ mod capture_tests {
                 "arra-oracle-v3|||4|||codex-1|||0|||\n"
             )
             .to_owned(),
+            panes: "%1|||zsh|||webhook-relay-v3:2.0|||shell|||101|||/tmp|||0\n".to_owned(),
             capture: "right pane\n".to_owned(),
             ..CaptureMockTmux::default()
         };
@@ -405,7 +419,7 @@ mod capture_tests {
         assert_eq!(output.stdout, "right pane\n");
         assert_eq!(
             tmux.calls[2],
-            ("capture-pane".to_owned(), capture_strings(&["-t", "webhook-relay-v3:2", "-p", "-S", "-50"]))
+            ("capture-pane".to_owned(), capture_strings(&["-t", "webhook-relay-v3:2.0", "-p", "-S", "-50"]))
         );
     }
 

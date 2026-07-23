@@ -139,6 +139,13 @@ fn resolve_window_agent_pane_target(
     let Some(window_target) = route_window_target_without_pane(target) else {
         return Ok(target.to_owned());
     };
+    let mut window_panes = panes
+        .iter()
+        .filter(|pane| candidate_window_target(&pane.target).as_deref() == Some(window_target))
+        .map(|pane| pane.target.clone())
+        .collect::<Vec<_>>();
+    window_panes.sort();
+    window_panes.dedup();
     let mut candidates = panes
         .iter()
         .filter(|pane| {
@@ -151,7 +158,14 @@ fn resolve_window_agent_pane_target(
     candidates.dedup();
     match candidates.as_slice() {
         [candidate] => Ok(candidate.clone()),
-        [] => Ok(target.to_owned()),
+        [] if window_panes.len() == 1 => Ok(window_panes.remove(0)),
+        [] => Err(RoutePaneError {
+            reason: "pane_target_not_found".to_owned(),
+            detail: format!(
+                "target '{target}' has no recognized agent pane and no unique pane; refusing to guess a pane"
+            ),
+            hint: Some(format!("candidates: {}", window_panes.join(", "))),
+        }),
         _ => Err(RoutePaneError {
             reason: "pane_target_ambiguous".to_owned(),
             detail: format!(
@@ -325,6 +339,59 @@ mod target_resolver_tests {
                 Ok(target.to_owned())
             );
         }
+    }
+
+    #[test]
+    fn multiple_unrecognized_panes_refuse_and_list_explicit_candidates() {
+        let mut runner = FakeRunner {
+            raw: [
+                "%1|||zsh|||81-kru32:0.0|||shell|||101|||/tmp|||0",
+                "%2|||bash|||81-kru32:0.1|||shell|||102|||/tmp|||0",
+            ]
+            .join("\n"),
+            ..FakeRunner::default()
+        };
+
+        let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
+            RouteResult::Local {
+                target: "81-kru32:0".to_owned(),
+            },
+            &mut runner,
+        );
+
+        assert_eq!(
+            result,
+            RouteResult::Error {
+                reason: "pane_target_not_found".to_owned(),
+                detail: "target '81-kru32:0' has no recognized agent pane and no unique pane; refusing to guess a pane"
+                    .to_owned(),
+                hint: Some("candidates: 81-kru32:0.0, 81-kru32:0.1".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn sole_unrecognized_pane_resolves_explicitly() {
+        let mut runner = FakeRunner {
+            raw: "%1|||zsh|||81-kru32:0.0|||shell|||101|||/tmp|||0".to_owned(),
+            ..FakeRunner::default()
+        };
+
+        let result = route_result_refuse_ambiguous_agent_panes(
+            "kru32",
+            RouteResult::Local {
+                target: "81-kru32:0".to_owned(),
+            },
+            &mut runner,
+        );
+
+        assert_eq!(
+            result,
+            RouteResult::Local {
+                target: "81-kru32:0.0".to_owned(),
+            }
+        );
     }
 
     #[test]
