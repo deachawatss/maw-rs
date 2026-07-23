@@ -1370,10 +1370,7 @@ fn serve_deliver_local(
 
     let capture = match state.delivery.capture_tail(&delivery_target, 8) {
         Ok(capture) => capture,
-        Err(error) => {
-            serve_log_delivery_failed(state, context.requested, context.message, context.log_from, context.log_to, &error, "tmux-capture");
-            return serve_delivery_error(StatusCode::BAD_GATEWAY, "tmux-capture-failed", &delivery_target, &error);
-        }
+        Err(error) => return serve_delivery_unconfirmed(state, context, idempotency_key, &delivery_target, &error),
     };
     let state_name = if capture.contains("Press up to edit queued messages") {
         "queued"
@@ -1414,6 +1411,53 @@ fn serve_deliver_local(
         "source": "maw-rs",
         "state": state_name,
         "lastLine": last_line,
+    }))
+    .into_response()
+}
+
+fn serve_delivery_unconfirmed(
+    state: &ServeState,
+    context: &ServeDeliverContext<'_>,
+    idempotency_key: Option<DeliveryIdempotencyKey>,
+    delivery_target: &str,
+    error: &str,
+) -> axum::response::Response {
+    if let Some(key) = idempotency_key {
+        serve_delivery_idempotency_complete(
+            state,
+            key,
+            delivery_target,
+            "delivered",
+            serve_delivery_idempotency_now(state),
+        );
+    }
+    let warning = format!("capture confirmation unavailable: {error}");
+    serve_log_lifecycle(
+        state,
+        json!({
+            "kind": "context.message",
+            "direction": "inbound",
+            "state": "delivered",
+            "route": "local",
+            "context.from": serve_truncate(context.log_from, SERVE_LOG_TEXT_MAX),
+            "to": serve_truncate(context.log_to, SERVE_LOG_TEXT_MAX),
+            "target": delivery_target,
+            "requestedTarget": context.requested,
+            "text": serve_truncate(context.message, SERVE_LOG_TEXT_MAX),
+            "oracle": serve_oracle_from_target(context.requested),
+            "confirmation": "unavailable",
+            "warning": serve_truncate(&warning, SERVE_LOG_TEXT_MAX),
+            "source": "maw-rs-native",
+        }),
+    );
+    Json(json!({
+        "ok": true,
+        "target": delivery_target,
+        "text": context.message,
+        "source": "maw-rs",
+        "state": "delivered",
+        "lastLine": "",
+        "warning": warning,
     }))
     .into_response()
 }
@@ -4614,7 +4658,7 @@ mod serve_tests {
     }
 
     #[tokio::test]
-    async fn serve_api_send_does_not_report_delivered_when_capture_confirmation_fails() {
+    async fn serve_api_send_completes_idempotency_when_capture_confirmation_fails() {
         let delivery = Arc::new(FakeServeDelivery::with_capture_agent());
         delivery.set_capture_error(Some("capture unavailable"));
         let app = serve_test_app_with_o6_keys_and_delivery(
@@ -4624,7 +4668,8 @@ mod serve_tests {
             delivery.clone(),
         );
 
-        let response = app
+        let first = app
+            .clone()
             .oneshot(signed_api_send_json_request(
                 r#"{"target":"capture-agent","text":"must confirm"}"#,
                 KEY,
@@ -4633,12 +4678,31 @@ mod serve_tests {
             ))
             .await
             .expect("response");
-        let status = response.status();
-        let payload = response_json(response).await;
+        let first_status = first.status();
+        let first_payload = response_json(first).await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{payload}");
-        assert_eq!(payload["error"], "tmux-capture-failed");
-        assert_eq!(payload["state"], "failed");
+        assert_eq!(first_status, StatusCode::OK, "{first_payload}");
+        assert_eq!(first_payload["state"], "delivered");
+        assert_eq!(
+            first_payload["warning"],
+            "capture confirmation unavailable: capture unavailable"
+        );
+
+        let duplicate = app
+            .oneshot(signed_api_send_json_request(
+                r#"{"target":"capture-agent","text":"must confirm"}"#,
+                KEY,
+                FROM,
+                1_782_277_200,
+            ))
+            .await
+            .expect("duplicate response");
+        let duplicate_status = duplicate.status();
+        let duplicate_payload = response_json(duplicate).await;
+
+        assert_eq!(duplicate_status, StatusCode::OK, "{duplicate_payload}");
+        assert_eq!(duplicate_payload["state"], "delivered");
+        assert_eq!(duplicate_payload["deduped"], true);
         assert_eq!(delivery.sends().len(), 1);
     }
 
