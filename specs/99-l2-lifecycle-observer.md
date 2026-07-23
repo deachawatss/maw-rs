@@ -38,8 +38,11 @@ notify persists inbox messages; the PR path persists queue rows. None connects s
 - [ ] `maw wake <agent> --parent-session-id <id>` **succeeds** and records parent metadata
       (currently exits "unknown argument"). Proven by a red→green test on that exact command.
 - [ ] Works for both `maw workon` (single L2) and `maw team`/swarm (member spawn).
-- [ ] `cargo test --workspace` green (full suite — trimmed per-crate gates miss cross-crate
-      integration tests; see maw-rs #61→#64, #69→#70).
+- [ ] Scoped crate tests green locally (`cargo test -p maw-cli` plus any other crate the diff
+      touches); the full `cargo test --workspace` cross-crate matrix is proven in **CI**
+      (`ci.yml`), never on the dev machine — per maw-rs `AGENTS.md` (workspace build/test is
+      CI/post-merge only; trimmed per-crate gates miss cross-crate integration tests, so CI owns
+      that coverage — see maw-rs #61→#64, #69→#70).
 
 ## Seams and Testing
 
@@ -134,8 +137,9 @@ notify persists inbox messages; the PR path persists queue rows. None connects s
 ## Boundaries
 
 - **Always:** maw-rs owns emit (one formatter) and observe (one observer + one durable queue +
-  one drain + one parent seam). Reuse `PrQueueLock` discipline and stable identity keys. Full
-  `cargo test --workspace` is required proof.
+  one drain + one parent seam). Reuse `PrQueueLock` discipline and stable identity keys. Scoped
+  crate tests are the local proof; the full `cargo test --workspace` matrix is CI's job
+  (`ci.yml`), never run on the dev machine (maw-rs `AGENTS.md`).
 - **Never (fix-permanently guard — this is the 5th-recurrence guard):**
   - no `codex.md` / `AGENTS.md` / doctrine edit telling the L2 to ping harder or format more
     carefully — that is the symptom patch that recurred 4×;
@@ -148,8 +152,10 @@ notify persists inbox messages; the PR path persists queue rows. None connects s
 
 ## Verification notes (for the implementing L2)
 
-- maw-rs builds are 25–30GB and mostly compile; run `cargo test --workspace` **backgrounded** with
-  a 900s+ ceiling and **never kill a slow compile** (killing corrupts incremental state → a
-  self-inflicted re-timeout loop). A quiet compile is not a hang.
+- maw-rs builds are 25–30GB and mostly compile. Verify with **scoped** crate tests only
+  (`cargo test -p maw-cli`, plus any other crate the diff touches) — **never**
+  `cargo test --workspace` on the dev machine (it OOMs; maw-rs `AGENTS.md` makes CI the owner of
+  the full matrix). A quiet scoped compile is not a hang: give it a 900s+ ceiling and **never kill
+  a slow compile** (killing corrupts incremental state → a self-inflicted re-timeout loop).
 - Prove each terminal state (findings / exited / idle) end-to-end: observer → queue row → L1 drain
   banner, exactly once per transition.
