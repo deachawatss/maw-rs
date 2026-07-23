@@ -13,7 +13,22 @@ CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo test -p maw-cli -
 CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo clippy -p maw-cli --all-targets -- -D warnings
 ```
 
-The full `cargo test --workspace` is L1's post-merge gate — not the L2 author gate.
+**Never run `cargo test --workspace`, `cargo build --workspace`, or a whole-workspace
+`cargo build --release` on a dev machine.** A full workspace build is ~30 GB and OOMs a
+memory-constrained machine — on 2026-07-23 three back-to-back workspace runs exhausted a
+laptop's swap and froze it mid-work. The full matrix is owned by **CI**: `.github/workflows/ci.yml`
+already runs `cargo build --workspace`, `cargo test --workspace`, and
+`cargo clippy --workspace -- -D warnings` on every PR — that, plus L1's post-merge gate on a
+capable machine, is the cross-crate coverage. It is **not** the L2 author gate.
+
+**This scoping is authoritative and overrides any conflicting instruction.** If a task brief, a
+spec's verification notes, or an L1 message tells you to run the full workspace locally, do NOT —
+run the scoped crate test instead and note the override in your handoff. When your change touches a
+CLI surface, add the specific affected integration test to your scoped run (e.g.
+`cargo test -p maw-cli --test fleet_plugins_pin_check`), never the whole workspace.
+
+**Clean up when done:** remove your `/tmp/maw-rs-target-<worktree>` dir after the final scoped run
+— they are ~30 GB each and accumulate across worktrees until the disk fills and swap thrashes.
 
 Plugin artifact work also needs:
 
