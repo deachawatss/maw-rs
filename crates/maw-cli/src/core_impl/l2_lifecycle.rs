@@ -79,6 +79,13 @@ struct L2Event {
     created_at: String,
 }
 
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct L2Transition {
+    last_state: Option<L2TerminalState>,
+    transition_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct L2Snapshot<'a> {
     alive: bool,
@@ -164,6 +171,13 @@ fn l2_prepare_observer(cwd: &Path, pane: &str, l1_oracle: &str, l1_session: Opti
     l2_arm_observer(cwd, pane)
 }
 
+#[cfg(test)]
+#[allow(clippy::unnecessary_wraps)]
+fn l2_arm_observer(_cwd: &Path, _pane: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(test))]
 fn l2_arm_observer(cwd: &Path, pane: &str) -> Result<(), String> {
     if std::env::var("MAW_TEST_MODE").as_deref() == Ok("1") { return Ok(()); }
     let metadata = std::fs::read_to_string(cwd.join(".maw/l2-meta.json")).map_err(|error| format!("l2 observer: read metadata: {error}"))?;
@@ -247,7 +261,7 @@ fn l2_emit_state(cwd: &Path, pane: &str, state: L2TerminalState, body: Option<&s
     let (issue, mode, risk, engine) = l2_delivery_context(cwd);
     let repo = metadata.repo.clone().or_else(|| cwd.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned());
     let l1_oracle = metadata.l1_oracle.clone().or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-oracle")).ok().map(|value| value.trim().to_owned())).unwrap_or_else(|| "unknown".to_owned());
-    let seq = l2_next_transition_seq(cwd)?;
+    let Some(seq) = l2_claim_transition(cwd, pane, state)? else { return Ok(false) };
     let message = format_l2_handoff(state.handoff_kind(), &l1_oracle, &repo, issue, &mode, &risk, body.unwrap_or_else(|| state.body()), &engine);
     l2_enqueue_event(&L2Event {
         version: 1,
@@ -290,11 +304,26 @@ fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, Strin
     l2_emit_state(cwd, pane, L2TerminalState::Pr, Some(&format!("PR #{pr_number} ready. {url}")))
 }
 
-fn l2_next_transition_seq(cwd: &Path) -> Result<u64, String> {
-    let path = cwd.join(".maw/l2-transition-seq");
-    let next = std::fs::read_to_string(&path).ok().and_then(|value| value.trim().parse::<u64>().ok()).unwrap_or(0).saturating_add(1);
-    std::fs::write(&path, format!("{next}\n")).map_err(|error| format!("l2 event: write transition sequence: {error}"))?;
-    Ok(next)
+fn l2_claim_transition(cwd: &Path, pane: &str, state: L2TerminalState) -> Result<Option<u64>, String> {
+    let dir = cwd.join(".maw");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("l2 event: create transition directory: {error}"))?;
+    let _lock = PrQueueLock::acquire(&dir)?;
+    let pane_key = pane.chars().filter(char::is_ascii_alphanumeric).collect::<String>();
+    let path = dir.join(format!("l2-transition-{pane_key}.json"));
+    let mut transition = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<L2Transition>(&body).ok())
+        .unwrap_or_default();
+    if transition.last_state == Some(state) {
+        return Ok(None);
+    }
+    transition.last_state = Some(state);
+    transition.transition_seq = transition.transition_seq.saturating_add(1);
+    let body = serde_json::to_string(&transition).map_err(|error| format!("l2 event: render transition: {error}"))?;
+    let tmp = dir.join(format!(".l2-transition-{pane_key}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body).map_err(|error| format!("l2 event: write transition: {error}"))?;
+    std::fs::rename(&tmp, &path).map_err(|error| format!("l2 event: replace transition: {error}"))?;
+    Ok(Some(transition.transition_seq))
 }
 
 fn l2_enqueue_event(event: &L2Event) -> Result<bool, String> {
@@ -313,14 +342,17 @@ fn l2_enqueue_event(event: &L2Event) -> Result<bool, String> {
 fn l2_drain_events() -> Result<Vec<String>, String> {
     let root = pr_review_queue_root()?;
     let _lock = PrQueueLock::acquire(&root)?;
-    let current_oracle = std::env::var("MAW_ORACLE").ok().or_else(l2_current_tmux_session);
+    let current_oracles = [std::env::var("MAW_ORACLE").ok(), l2_current_tmux_session()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     let current_session = ["MAW_SESSION_ID", "CLAUDE_SESSION_ID"].iter().find_map(|key| std::env::var(key).ok());
     let mut retained = Vec::new();
     let mut archived = pr_read_queue_lines(&root, "l2-events.jsonl.archived")?;
     let mut messages = Vec::new();
     for line in pr_read_queue_lines(&root, "l2-events.jsonl")? {
         let Ok(mut event) = serde_json::from_str::<L2Event>(&line) else { retained.push(line); continue };
-        let targets_l1 = current_oracle.as_ref().is_some_and(|value| value == &event.l1_oracle)
+        let targets_l1 = current_oracles.iter().any(|value| value == &event.l1_oracle)
             || current_session.as_ref().is_some_and(|value| value == &event.l1_session);
         if event.notified || !targets_l1 { retained.push(line); continue; }
         event.notified = true;
@@ -429,6 +461,7 @@ mod l2_lifecycle_tests {
         for snapshot in cases {
             let state = l2_classify_snapshot(&snapshot, 180).expect("terminal state");
             assert!(l2_emit_state(&repo, "%9", state, None).expect("emit state"));
+            assert!(!l2_emit_state(&repo, "%9", state, None).expect("dedupe same transition"));
         }
         let (_, banner) = wind_pr_queue_run(&[]).expect("hook drain");
         for kind in ["FINDINGS", "EXITED", "IDLE"] {
