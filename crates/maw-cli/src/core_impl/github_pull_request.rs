@@ -97,6 +97,8 @@ enum PrGithubState {
 }
 
 const PR_RECONCILE_MAX_ATTEMPTS: u8 = 3;
+const PR_GH_CREATE_MAX_ATTEMPTS: u8 = 3;
+const PR_GH_CREATE_INITIAL_BACKOFF_MS: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrReconciliationUpdate {
@@ -166,11 +168,11 @@ impl PrProcess for PrNativeProcess {
             .arg(cwd)
             .args(["branch", "--show-current"])
             .output()
-            .map_err(|_| format!("not a git repo: {}", cwd.display()))?;
+            .map_err(|error| format!("git branch --show-current: {error}"))?;
         if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         } else {
-            Err(format!("not a git repo: {}", cwd.display()))
+            Err(pr_command_failure("git branch --show-current", &output))
         }
     }
 
@@ -182,12 +184,11 @@ impl PrProcess for PrNativeProcess {
             .arg(cwd)
             .args(["remote", "get-url", remote])
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("git remote get-url {remote}: {error}"))?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
         }
-        let code = output.status.code().unwrap_or(1);
-        Err(format!("git remote get-url {remote} failed (exit {code})"))
+        Err(pr_command_failure(&format!("git remote get-url {remote}"), &output))
     }
 
     fn pr_rerun_delivery_command(
@@ -200,27 +201,36 @@ impl PrProcess for PrNativeProcess {
 
     fn pr_gh_create(&mut self, plan: &PrPlan) -> Result<String, String> {
         pr_validate_cwd(&plan.cwd)?;
-        let output = std::process::Command::new("gh")
-            .current_dir(&plan.cwd)
-            .args([
-                "pr",
-                "create",
-                "--repo",
-                &plan.base_repo,
-                "--base",
-                &plan.base_branch,
-                "--title",
-                &plan.title,
-                "--body",
-                &plan.body,
-            ])
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let mut attempts_remaining = PR_GH_CREATE_MAX_ATTEMPTS;
+        let mut retry_index = 0;
+        loop {
+            let output = std::process::Command::new("gh")
+                .current_dir(&plan.cwd)
+                .args([
+                    "pr",
+                    "create",
+                    "--repo",
+                    &plan.base_repo,
+                    "--base",
+                    &plan.base_branch,
+                    "--title",
+                    &plan.title,
+                    "--body",
+                    &plan.body,
+                ])
+                .output()
+                .map_err(|error| format!("gh pr create: {error}"))?;
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            }
+            attempts_remaining = attempts_remaining.saturating_sub(1);
+            let error = pr_command_failure("gh pr create", &output);
+            if attempts_remaining == 0 || !pr_is_transient_gh_create_failure(&output.stderr) {
+                return Err(error);
+            }
+            std::thread::sleep(pr_gh_create_retry_delay(retry_index));
+            retry_index = retry_index.saturating_add(1);
         }
-        let code = output.status.code().unwrap_or(1);
-        Err(format!("gh pr create failed (exit {code})"))
     }
 
     fn pr_gh_view_current(&mut self, cwd: &std::path::Path) -> Result<String, String> {
@@ -229,12 +239,11 @@ impl PrProcess for PrNativeProcess {
             .current_dir(cwd)
             .args(["pr", "view", "--json", "number,title,url", "--jq", "#\\(.number) \\(.title) \\(.url)"])
             .output()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| format!("gh pr view: {error}"))?;
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
         }
-        let code = output.status.code().unwrap_or(1);
-        Err(format!("gh pr view failed (exit {code})"))
+        Err(pr_command_failure("gh pr view", &output))
     }
 
     fn pr_gh_review_state(&mut self, repo: &str, pr_number: u64) -> Result<PrGithubState, String> {
@@ -257,8 +266,7 @@ impl PrProcess for PrNativeProcess {
             .output()
             .map_err(|error| format!("pr: view queued PR #{pr_number}: {error}"))?;
         if !output.status.success() {
-            let code = output.status.code().unwrap_or(1);
-            return Err(format!("pr: view queued PR #{pr_number} failed (exit {code})"));
+            return Err(pr_command_failure(&format!("pr: view queued PR #{pr_number}"), &output));
         }
         match String::from_utf8_lossy(&output.stdout).trim() {
             "OPEN" => Ok(PrGithubState::Open),
@@ -276,6 +284,42 @@ impl PrProcess for PrNativeProcess {
         pr_enqueue_global_review(request)
     }
 
+}
+
+fn pr_command_failure(command: &str, output: &std::process::Output) -> String {
+    let exit_code = output.status.code().unwrap_or(1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if stderr.trim().is_empty() {
+        format!("{command} failed (exit {exit_code})")
+    } else {
+        format!("{command} failed (exit {exit_code}): {stderr}")
+    }
+}
+
+fn pr_is_transient_gh_create_failure(stderr: &[u8]) -> bool {
+    let message = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    let has_server_error = message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|part| part.parse::<u16>().ok())
+        .any(|status| (500..=599).contains(&status));
+
+    message.contains("tls handshake")
+        || message.contains("could not resolve host")
+        || message.contains("temporary failure in name resolution")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("network is unreachable")
+        || message.contains("context deadline exceeded")
+        || message.contains("i/o timeout")
+        || (message.contains("graphql") && (message.contains("timeout") || message.contains("5xx")))
+        || has_server_error
+}
+
+fn pr_gh_create_retry_delay(retry_index: u8) -> std::time::Duration {
+    std::time::Duration::from_millis(
+        PR_GH_CREATE_INITIAL_BACKOFF_MS.saturating_mul(1_u64 << u32::from(retry_index)),
+    )
 }
 
 fn run_pr_command(argv: &[String]) -> CliOutput {
@@ -1093,6 +1137,138 @@ mod pr_tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("temp dir");
         path
+    }
+
+    #[test]
+    fn pr_recognizes_only_transient_gh_create_failures() {
+        for stderr in [
+            "TLS handshake timeout",
+            "Post https://api.github.com/graphql: timeout",
+            "GraphQL 5xx response",
+            "HTTP 503 Service Unavailable",
+            "could not resolve host: api.github.com",
+        ] {
+            assert!(pr_is_transient_gh_create_failure(stderr.as_bytes()), "{stderr}");
+        }
+
+        for stderr in ["authentication required", "validation failed: head branch is missing"] {
+            assert!(!pr_is_transient_gh_create_failure(stderr.as_bytes()), "{stderr}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn pr_write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).expect("write executable");
+        let mut permissions = std::fs::metadata(path).expect("executable metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make executable");
+    }
+
+    #[cfg(unix)]
+    fn pr_native_test_plan(cwd: &std::path::Path) -> PrPlan {
+        PrPlan {
+            cwd: cwd.to_path_buf(),
+            branch: "agents/issue-109-pr-stderr-retry".to_owned(),
+            base_repo: "deachawatss/maw-rs".to_owned(),
+            base_branch: "main".to_owned(),
+            title: "Issue 109 Pr Retry".to_owned(),
+            body: "Closes #109".to_owned(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_native_gh_create_surfaces_stderr_on_failure() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _path = EnvVarRestore::capture("PATH");
+        let root = pr_temp_dir("native-gh-stderr");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        pr_write_executable(
+            &bin.join("gh"),
+            "#!/bin/sh\nprintf '%s\\n' 'Post https://api.github.com/graphql: authentication required' >&2\nexit 1\n",
+        );
+        std::env::set_var("PATH", &bin);
+        let mut process = PrNativeProcess;
+
+        let error = process.pr_gh_create(&pr_native_test_plan(&root)).expect_err("gh create fails");
+
+        assert!(error.contains("exit 1"), "{error}");
+        assert!(error.contains("authentication required"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_native_gh_create_retries_transient_failure_until_success() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _path = EnvVarRestore::capture("PATH");
+        let _attempts = EnvVarRestore::capture("MAW_PR_TEST_GH_ATTEMPTS");
+        let root = pr_temp_dir("native-gh-retry");
+        let bin = root.join("bin");
+        let attempts = root.join("attempts");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        pr_write_executable(
+            &bin.join("gh"),
+            "#!/bin/sh\ncount=0\nif [ -f \"$MAW_PR_TEST_GH_ATTEMPTS\" ]; then read -r count < \"$MAW_PR_TEST_GH_ATTEMPTS\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$MAW_PR_TEST_GH_ATTEMPTS\"\nif [ \"$count\" -lt 3 ]; then printf '%s\\n' 'TLS handshake timeout' >&2; exit 1; fi\nprintf '%s\\n' 'https://github.com/deachawatss/maw-rs/pull/109'\n",
+        );
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("MAW_PR_TEST_GH_ATTEMPTS", &attempts);
+        let mut process = PrNativeProcess;
+
+        let url = process.pr_gh_create(&pr_native_test_plan(&root)).expect("transient retry succeeds");
+
+        assert_eq!(url, "https://github.com/deachawatss/maw-rs/pull/109");
+        assert_eq!(std::fs::read_to_string(attempts).expect("attempt count").trim(), "3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_native_gh_create_fails_fast_for_non_transient_error() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _path = EnvVarRestore::capture("PATH");
+        let _attempts = EnvVarRestore::capture("MAW_PR_TEST_GH_ATTEMPTS");
+        let root = pr_temp_dir("native-gh-no-retry");
+        let bin = root.join("bin");
+        let attempts = root.join("attempts");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        pr_write_executable(
+            &bin.join("gh"),
+            "#!/bin/sh\ncount=0\nif [ -f \"$MAW_PR_TEST_GH_ATTEMPTS\" ]; then read -r count < \"$MAW_PR_TEST_GH_ATTEMPTS\"; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$MAW_PR_TEST_GH_ATTEMPTS\"\nprintf '%s\\n' 'authentication required' >&2\nexit 1\n",
+        );
+        std::env::set_var("PATH", &bin);
+        std::env::set_var("MAW_PR_TEST_GH_ATTEMPTS", &attempts);
+        let mut process = PrNativeProcess;
+
+        let error = process.pr_gh_create(&pr_native_test_plan(&root)).expect_err("auth must fail fast");
+
+        assert!(error.contains("authentication required"), "{error}");
+        assert_eq!(std::fs::read_to_string(attempts).expect("attempt count").trim(), "1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_native_process_surfaces_stderr_for_other_git_and_gh_failures() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _path = EnvVarRestore::capture("PATH");
+        let root = pr_temp_dir("native-command-stderr");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        pr_write_executable(&bin.join("git"), "#!/bin/sh\nprintf '%s\\n' 'git transport unavailable' >&2\nexit 128\n");
+        pr_write_executable(&bin.join("gh"), "#!/bin/sh\nprintf '%s\\n' 'GraphQL service unavailable' >&2\nexit 1\n");
+        std::env::set_var("PATH", &bin);
+        let mut process = PrNativeProcess;
+
+        let branch = process.pr_git_branch(&root).expect_err("git branch fails");
+        let remote = process.pr_git_remote_url(&root, "origin").expect_err("git remote fails");
+        let view = process.pr_gh_view_current(&root).expect_err("gh view fails");
+        let review = process.pr_gh_review_state("deachawatss/maw-rs", 109).expect_err("gh review fails");
+
+        assert!(branch.contains("git transport unavailable"), "{branch}");
+        assert!(remote.contains("git transport unavailable"), "{remote}");
+        assert!(view.contains("GraphQL service unavailable"), "{view}");
+        assert!(review.contains("GraphQL service unavailable"), "{review}");
     }
 
     fn pr_write_delivery(repo: &std::path::Path, issue: u64) -> EnvVarRestore {
