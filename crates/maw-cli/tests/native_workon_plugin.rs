@@ -59,9 +59,11 @@ case "$1" in
     esac
     ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
+  list-panes) printf '%%1 0 0\n' ;;
   has-session) exit 1 ;;
   capture-pane) printf '$\n' ;;
-  new-session|new-window|send-keys|select-window) exit 0 ;;
+  split-window) printf '%%2\n' ;;
+  new-session|new-window|send-keys|select-window|set-window-option) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
@@ -522,17 +524,14 @@ fn native_workon_create_nested_matches_committed_golden_without_ref_checkout() {
     assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(
-        tmux_log.contains("new-window -P -F #{window_id} -t 50-mawjs: -n demo-feat -c"),
+        tmux_log.contains("split-window -h -l 60% -P -F #{pane_id} -t %1 -c"),
         "{tmux_log}"
     );
     assert!(
-        tmux_log.contains("send-keys -t 50-mawjs:demo-feat -l echo launch"),
+        tmux_log.contains("send-keys -t %2 -l echo launch"),
         "{tmux_log}"
     );
-    assert!(
-        tmux_log.contains("send-keys -t 50-mawjs:demo-feat Enter"),
-        "{tmux_log}"
-    );
+    assert!(tmux_log.contains("send-keys -t %2 Enter"), "{tmux_log}");
     let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
     assert!(git_log.contains("worktree add"), "{git_log}");
 }
@@ -566,7 +565,7 @@ fn native_workon_rejects_malformed_managed_gitignore_before_launching() {
         "{stderr}"
     );
     assert!(
-        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("new-window")),
+        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("split-window")),
         "L2 session must not launch"
     );
 }
@@ -597,7 +596,7 @@ fn native_workon_rejects_read_only_gitignore_before_launching() {
         "{stderr}"
     );
     assert!(
-        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("new-window")),
+        fs::read_to_string(root.join("tmux.log")).map_or(true, |log| !log.contains("split-window")),
         "L2 session must not launch"
     );
 }
@@ -649,7 +648,7 @@ fn native_workon_omx_create_restores_worktree_state_after_git_clean() {
     );
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(
-        tmux_log.contains("send-keys -t 50-mawjs:demo-feat -l omx-launch --direct"),
+        tmux_log.contains("send-keys -t %2 -l omx-launch --direct"),
         "{tmux_log}"
     );
 }
@@ -700,7 +699,7 @@ fn native_workon_reuse_window_is_hermetic_and_does_not_spawn() {
         tmux_log.contains("select-window -t 50-mawjs:demo"),
         "{tmux_log}"
     );
-    assert!(!tmux_log.contains("new-window"), "{tmux_log}");
+    assert!(!tmux_log.contains("split-window"), "{tmux_log}");
 }
 
 #[test]
@@ -777,6 +776,7 @@ printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
   has-session) [ "$2" = "-t" ] && [ "$3" = "=01-gale" ] ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
+  list-panes) printf '%%1 0 0\n' ;;
   display-message)
     case "$*" in
       *pane_current_command*) printf 'node\n' ;;
@@ -784,7 +784,8 @@ case "$1" in
     esac
     ;;
   capture-pane) printf '$\n' ;;
-  new-window|send-keys|select-window) exit 0 ;;
+  split-window) printf '%%2\n' ;;
+  new-window|send-keys|select-window|set-window-option) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
@@ -814,7 +815,7 @@ esac
         "{tmux_log}"
     );
     assert!(
-        tmux_log.contains("new-window -P -F #{window_id} -t 01-gale: -n demo-feat -c"),
+        tmux_log.contains("split-window -h -l 60% -P -F #{pane_id} -t %1 -c"),
         "{tmux_log}"
     );
     assert!(!tmux_log.contains("new-session"), "{tmux_log}");
@@ -844,7 +845,7 @@ fn native_workon_dot_resolves_current_repo() {
     assert!(stdout.contains("workon 'demo' in 50-mawjs"), "{stdout}");
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(
-        tmux_log.contains("new-window -P -F #{window_id} -t 50-mawjs: -n demo -c"),
+        tmux_log.contains("split-window -h -l 60% -P -F #{pane_id} -t %1 -c"),
         "{tmux_log}"
     );
     let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
