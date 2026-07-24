@@ -378,6 +378,66 @@ fn native_workon_base_overrides_the_default_origin_start_point() {
 }
 
 #[test]
+fn native_workon_explicit_wt_isolates_lightweight_repo() {
+    let root = temp_dir("lightweight-explicit-wt");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("lane dir");
+    fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
+
+    let output = run_with_tmux_env(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "--wt", "feat", "--layout", "nested"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
+    assert!(git_log.contains("worktree add"), "{git_log}");
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(
+        tmux_log.contains(&format!("-c {}", repo.join("agents/feat").display())),
+        "{tmux_log}"
+    );
+}
+
+#[test]
+fn native_workon_bare_task_keeps_lightweight_repo_on_main_checkout() {
+    let root = temp_dir("lightweight-bare-task");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("lane dir");
+    fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
+
+    let output = run_with_tmux_env(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
+    assert!(!git_log.contains("worktree add"), "{git_log}");
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(
+        tmux_log.contains(&format!("-c {} -n demo-feat", repo.display())),
+        "{tmux_log}"
+    );
+}
+
+#[test]
 fn native_workon_fetch_failure_is_actionable_and_does_not_create_a_worktree() {
     let root = temp_dir("fetch-failure");
     let bin_dir = seed_hermetic_root(&root, "shell\n");

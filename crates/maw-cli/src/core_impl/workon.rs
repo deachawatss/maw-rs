@@ -349,9 +349,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
 
     let lane = crate::wind::workon::repo_lane(&repo.repo_path, &repo.repo_name);
     if let Some(request) = workon_resolve_worktree_name(options)? {
-        if lane == crate::wind::workon::RepoLane::Lightweight {
-            window_name = format!("{}-{}", repo.repo_name, request.slug);
-        } else {
+        if lane != crate::wind::workon::RepoLane::Lightweight || options.wt.is_some() {
             let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
             let branches = workon_agent_branches(&repo.repo_path)?;
             match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
@@ -370,8 +368,8 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                     target_path = wt_path;
                 }
             }
-            window_name = format!("{}-{}", repo.repo_name, request.slug);
         }
+        window_name = format!("{}-{}", repo.repo_name, request.slug);
     } else if native_repo_path_is_oracle(&repo.repo_path, &repo.repo_name) {
         taskless_oracle = true;
     }
