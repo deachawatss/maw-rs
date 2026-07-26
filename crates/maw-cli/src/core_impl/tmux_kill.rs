@@ -398,6 +398,7 @@ mod tmux_kill_tests {
         TmuxKillFakeRunner {
             sessions: "scratch\n".to_owned(),
             panes: "%42|||scratch:1.2|||scratch|||1|||2\n".to_owned(),
+            workon_layout: String::new(),
             calls: Vec::new(),
             killed_panes: Vec::new(),
         }
