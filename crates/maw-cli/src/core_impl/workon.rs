@@ -2,6 +2,10 @@ const DISPATCH_49: &[DispatcherEntry] = &[
     DispatcherEntry { command: "workon", handler: Handler::Sync(run_workon_command) },
 ];
 
+const WORKON_LAYOUT_MARKER: &str = "@maw_workon_layout";
+const WORKON_LAYOUT_PRESET: &str = "main-vertical";
+const WORKON_MAIN_WIDTH_PERCENT: u32 = 40;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorkonOptions {
     repo: String,
@@ -696,6 +700,7 @@ fn workon_new_window<R: maw_tmux::TmuxRunner>(
     target_path: &std::path::Path,
 ) -> Result<String, String> {
     let panes = workon_list_panes(runner, session)?;
+    workon_validate_l1_main_pane(runner, &panes)?;
     let plan = workon_split_plan(session, &panes);
     let pane_id = workon_tmux_run(
         runner,
@@ -716,8 +721,52 @@ fn workon_new_window<R: maw_tmux::TmuxRunner>(
     if pane_id.is_empty() {
         return Err("workon: split-window returned no pane id".to_owned());
     }
+    workon_rebalance_l2_column(runner, session, &panes)?;
     workon_label_pane(runner, session, &pane_id, window_name);
     Ok(pane_id)
+}
+
+fn workon_validate_l1_main_pane<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    panes: &[WorkonPane],
+) -> Result<(), String> {
+    let Some(l1) = panes.iter().min_by_key(|pane| pane.left) else {
+        return Ok(());
+    };
+    let index = workon_tmux_run(runner, "display-message", &["-t", &l1.id, "-p", "#{pane_index}"])?;
+    if index.trim() != "0" {
+        return Err(format!("workon: L1 pane {} is index {}; refusing to rebalance a different main pane", l1.id, index.trim()));
+    }
+    Ok(())
+}
+
+/// Restore the workon window's main-vertical layout after every split.
+///
+/// `main-vertical` makes tmux divide all non-main panes evenly, but it chooses
+/// its main-pane width from the window option. Set L1 to the delivery layout's
+/// fixed 40% width before rebalancing the right-column L2 heights.
+fn workon_rebalance_l2_column<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    session: &str,
+    panes: &[WorkonPane],
+) -> Result<(), String> {
+    let Some(l1) = panes.iter().min_by_key(|pane| pane.left) else {
+        return Ok(());
+    };
+    let width = workon_tmux_run(runner, "display-message", &["-t", &l1.id, "-p", "#{window_width}"])?;
+    let width = width.trim();
+    let width = width
+        .parse::<u16>()
+        .ok()
+        .filter(|width| *width > 0)
+        .map(u32::from)
+        .ok_or_else(|| format!("workon: invalid window width '{width}'"))?;
+    let main_width = (width * WORKON_MAIN_WIDTH_PERCENT / 100).max(1).to_string();
+    let window = format!("{session}:");
+    workon_tmux_run(runner, "set-window-option", &["-t", &window, "main-pane-width", &main_width])?;
+    workon_tmux_run(runner, "select-layout", &["-t", &window, WORKON_LAYOUT_PRESET])?;
+    workon_tmux_run(runner, "set-window-option", &["-t", &window, WORKON_LAYOUT_MARKER, WORKON_LAYOUT_PRESET])?;
+    Ok(())
 }
 
 /// A tmux pane's id and screen offset, parsed from `list-panes`.
@@ -1565,6 +1614,8 @@ mod workon_tests {
         pane_missing: bool,
         has_session: bool,
         pane_command: String,
+        pane_index: String,
+        workon_layout: String,
         capture_responses: std::collections::VecDeque<String>,
     }
 
@@ -1575,6 +1626,10 @@ mod workon_tests {
                 "display-message" if args.iter().any(|arg| arg == "#{pane_current_command}") => {
                     Ok(if self.pane_command.is_empty() { "node\n".to_owned() } else { self.pane_command.clone() })
                 }
+                "display-message" if args.iter().any(|arg| arg == "#{pane_index}") => {
+                    Ok(if self.pane_index.is_empty() { "0\n".to_owned() } else { self.pane_index.clone() })
+                }
+                "display-message" if args.iter().any(|arg| arg == "#{window_width}") => Ok("100\n".to_owned()),
                 "display-message" if args.iter().any(|arg| arg == "#{pane_current_path}") => {
                     if self.pane_missing { Err(maw_tmux::TmuxError::new("can't find pane")) } else { Ok(self.pane_path.clone()) }
                 }
@@ -1587,7 +1642,8 @@ mod workon_tests {
                 }
                 "capture-pane" => Ok(self.capture_responses.pop_front().unwrap_or_else(|| "$".to_owned())),
                 "split-window" => Ok("%42\n".to_owned()),
-                "new-window" | "new-session" | "send-keys" | "select-window" | "select-pane" | "set-window-option" => {
+                "show-window-options" => Ok(self.workon_layout.clone()),
+                "new-window" | "new-session" | "send-keys" | "select-window" | "select-pane" | "select-layout" | "set-window-option" => {
                     Ok(String::new())
                 }
                 other => Err(maw_tmux::TmuxError::new(format!("unexpected {other}"))),
@@ -1775,6 +1831,39 @@ mod workon_tests {
         assert!(multi.calls.iter().any(|(command, _)| command == "select-pane"), "new pane labeled");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_new_window_rebalances_third_and_fourth_l2s() {
+        let root = workon_temp_root("equal-l2-heights");
+        let target = root.join("agents/feat");
+        std::fs::create_dir_all(&target).expect("worktree");
+        for panes in ["%1 0 0\n%2 80 0\n%3 80 34\n", "%1 0 0\n%2 80 0\n%3 80 23\n%4 80 46\n"] {
+            let mut runner = WorkonMockTmux { panes: panes.to_owned(), ..Default::default() };
+            workon_new_window(&mut runner, "01-gale", "demo-feat", &target).expect("split and rebalance");
+            assert!(runner.calls.iter().any(|(command, args)| command == "set-window-option" && args == &workon_strings(&["-t", "01-gale:", "main-pane-width", "40"])), "L1 must keep 40% width: {:?}", runner.calls);
+            assert!(runner.calls.iter().any(|(command, args)| command == "select-layout" && args == &workon_strings(&["-t", "01-gale:", "main-vertical"])), "third and fourth L2s must use main-vertical: {:?}", runner.calls);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workon_new_window_refuses_to_rebalance_when_l1_is_not_pane_zero() {
+        let root = workon_temp_root("main-pane-guard");
+        let target = root.join("agents/feat");
+        std::fs::create_dir_all(&target).expect("worktree");
+        let mut runner = WorkonMockTmux { panes: "%1 0 0\n%2 80 0\n".to_owned(), pane_index: "1\n".to_owned(), ..Default::default() };
+        let error = workon_new_window(&mut runner, "01-gale", "demo-feat", &target).expect_err("non-L1 main pane rejected");
+        assert!(error.contains("refusing to rebalance a different main pane"));
+        assert!(!runner.calls.iter().any(|(command, _)| command == "split-window"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resize_equal_keeps_a_marked_workon_window_main_vertical() {
+        let mut runner = WorkonMockTmux { workon_layout: "main-vertical\n".to_owned(), ..Default::default() };
+        resize_with_runner(&workon_strings(&["equal"]), &mut runner).expect("resize marked workon window");
+        assert!(runner.calls.iter().any(|(command, args)| command == "select-layout" && args == &workon_strings(&["main-vertical"])));
     }
 
     #[test]

@@ -468,13 +468,27 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     }
     let details = local.done_tmux(
         "display-message",
-        &["-t".to_owned(), pane_id.to_owned(), "-p".to_owned(), "#{window_panes}\t#{pane_current_path}".to_owned()],
+        &[
+            "-t".to_owned(),
+            pane_id.to_owned(),
+            "-p".to_owned(),
+            "#{window_panes}\t#{pane_current_path}\t#{window_id}".to_owned(),
+        ],
     );
     let Ok(details) = details else {
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
         return Ok(());
     };
-    let Some((count, cwd)) = details.trim_end().split_once('\t') else {
+    let mut fields = details.trim_end().split('\t');
+    let Some(count) = fields.next() else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
+    let Some(cwd) = fields.next() else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
+    let Some(window) = fields.next() else {
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
         return Ok(());
     };
@@ -487,7 +501,41 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     }
     local.done_reap_pane(pane_id)?;
     local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.to_owned()])?;
+    if let Err(error) = done_rebalance_workon_window(local, window) {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not rebalance workon panes: {error}");
+    }
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed split pane {pane_id}");
+    Ok(())
+}
+
+fn done_rebalance_workon_window(
+    local: &mut impl DoneRuntime,
+    window: &str,
+) -> Result<(), String> {
+    done_validate_tmux_target(window)?;
+    let marker = local
+        .done_tmux(
+            "show-window-options",
+            &[
+                "-q".to_owned(),
+                "-v".to_owned(),
+                "-t".to_owned(),
+                window.to_owned(),
+                WORKON_LAYOUT_MARKER.to_owned(),
+            ],
+        )
+        .unwrap_or_default();
+    if marker.trim() != WORKON_LAYOUT_PRESET {
+        return Ok(());
+    }
+    local.done_tmux(
+        "select-layout",
+        &[
+            "-t".to_owned(),
+            window.to_owned(),
+            WORKON_LAYOUT_PRESET.to_owned(),
+        ],
+    )?;
     Ok(())
 }
 
@@ -1318,7 +1366,7 @@ mod done_tests {
 
         let mut runtime = DoneFakeRuntime::default();
         runtime.register_worktree(&main, &worktree);
-        runtime.tmux_responses.insert("display-message".to_owned(), format!("2\t{}\n", worktree.display()));
+        runtime.tmux_responses.insert("display-message".to_owned(), format!("2\t{}\t@7\n", worktree.display()));
 
         let output = done_run_with_context(&done_args(&["issue-94", "--force"]), &mut runtime, &context)
             .expect("done split pane");
@@ -1327,6 +1375,32 @@ mod done_tests {
         assert!(runtime.tmux_calls.iter().any(|(command, args)| command == "kill-pane" && args == &done_args(&["-t", "%42"])));
         assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
         assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
+    }
+
+    #[test]
+    fn done_rebalances_a_marked_workon_window_after_closing_its_pane() {
+        let root = DoneTempRoot::new("split-pane-rebalance");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-94");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        done_write_fleet(&root, "issue-94", "acme/app/agents/issue-94");
+
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.register_worktree(&main, &worktree);
+        runtime.tmux_responses.insert("display-message".to_owned(), format!("3\t{}\t@7\n", worktree.display()));
+        runtime
+            .tmux_responses
+            .insert("show-window-options".to_owned(), "main-vertical\n".to_owned());
+
+        done_run_with_context(&done_args(&["issue-94", "--force"]), &mut runtime, &context)
+            .expect("done split pane");
+
+        assert!(runtime.tmux_calls.iter().any(|(command, args)| {
+            command == "select-layout"
+                && args == &done_args(&["-t", "@7", "main-vertical"])
+        }));
     }
 
     #[test]
