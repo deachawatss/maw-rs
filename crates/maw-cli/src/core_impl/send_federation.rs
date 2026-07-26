@@ -1311,10 +1311,17 @@ fn allows_codex_handoff_prefix(command: &str, text: &str) -> bool {
         && text.starts_with("[codex]")
         && std::env::current_dir()
             .ok()
-            .and_then(|cwd| std::fs::read_to_string(cwd.join(".maw/delivery.json")).ok())
+            .and_then(|cwd| delivery_engine_from_ancestors(&cwd))
+            .is_some_and(|engine| engine == "codex" || engine.starts_with("codex-"))
+}
+
+fn delivery_engine_from_ancestors(cwd: &std::path::Path) -> Option<String> {
+    cwd.ancestors().find_map(|path| {
+        std::fs::read_to_string(path.join(".maw/delivery.json"))
+            .ok()
             .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
             .and_then(|delivery| delivery.get("engine").and_then(serde_json::Value::as_str).map(str::to_owned))
-            .is_some_and(|engine| engine == "codex" || engine.starts_with("codex-"))
+    })
 }
 
 fn resolve_hey_wire_from(
@@ -2351,13 +2358,15 @@ mod send_acl_hotpath_tests {
     }
 
     #[test]
-    fn send_message_signature_allows_codex_handoff_from_codex_delivery() {
+    fn send_message_signature_allows_codex_handoff_from_nested_codex_delivery() {
         let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (root, _restores) = send_audit_test_env("signature-codex-handoff");
         let repo = root.join("repo");
         std::fs::create_dir_all(repo.join(".maw")).unwrap();
         std::fs::write(repo.join(".maw/delivery.json"), r#"{"engine":"codex-launch"}"#).unwrap();
-        let _cwd = SendCwdRestore::enter(&repo);
+        let nested = repo.join("crates/maw-cli");
+        std::fs::create_dir_all(&nested).unwrap();
+        let _cwd = SendCwdRestore::enter(&nested);
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
 
         assert!(send_message_signature("hey", &config, "atlas", None, "[codex] ready").is_ok());
