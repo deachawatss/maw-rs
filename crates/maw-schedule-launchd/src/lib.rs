@@ -40,7 +40,7 @@ impl LaunchctlRunner for SystemLaunchctl {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = args;
-            return Err("launchd scheduling is supported only on macOS".to_owned());
+            Err("launchd scheduling is supported only on macOS".to_owned())
         }
         #[cfg(target_os = "macos")]
         {
