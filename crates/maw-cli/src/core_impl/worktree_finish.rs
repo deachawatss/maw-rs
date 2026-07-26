@@ -23,6 +23,7 @@ struct DonePaneInfo { command: String, cwd: String }
 struct DoneContext {
     repos_root: std::path::PathBuf,
     fleet_dirs: Vec<std::path::PathBuf>,
+    solo_lease_dir: std::path::PathBuf,
 }
 
 impl DoneContext {
@@ -31,6 +32,7 @@ impl DoneContext {
         Self {
             repos_root: ghq_root().join("github.com"),
             fleet_dirs: fleet_read_dirs_for_env(&env),
+            solo_lease_dir: maw_state_path(&env, &["lease"]),
         }
     }
 
@@ -40,6 +42,7 @@ impl DoneContext {
             repos_root: done_repos_root_from_cwd(cwd)
                 .unwrap_or_else(|| ghq_root().join("github.com")),
             fleet_dirs: fleet_read_dirs_for_env(&env),
+            solo_lease_dir: maw_state_path(&env, &["lease"]),
         }
     }
 }
@@ -140,7 +143,9 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     let matched = done_find_window(&sessions, &target_lower, session_filter);
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
     let pane_info = matched.as_ref().and_then(|window| done_live_pane_info(window, local));
-    let solo_worktree = matched.as_ref().and_then(|window| solo_worktree_for_holder(&done_tmux_target(window)));
+    let solo_worktree = matched
+        .as_ref()
+        .and_then(|window| solo_worktree_for_holder_in_dir(&done_tmux_target(window), &context.solo_lease_dir));
     let selected_worktree = if let Some(path) = solo_worktree {
         done_resolve_registered_worktree(local, &path, context)?
     } else {
@@ -987,7 +992,11 @@ mod done_tests {
         fn fleet_dir(&self) -> std::path::PathBuf { self.path.join("fleet") }
 
         fn context(&self) -> DoneContext {
-            DoneContext { repos_root: self.repos_root(), fleet_dirs: vec![self.fleet_dir()] }
+            DoneContext {
+                repos_root: self.repos_root(),
+                fleet_dirs: vec![self.fleet_dir()],
+                solo_lease_dir: self.path.join("state/lease"),
+            }
         }
     }
 
@@ -1158,7 +1167,11 @@ mod done_tests {
         let live_path = live.display().to_string();
         done_run_process("git", &["worktree", "add", "-b", "agents/live-task", &live_path], Some(&main));
 
-        let wrong_context = DoneContext { repos_root: root.path.join("wrong-ghq/github.com"), fleet_dirs: Vec::new() };
+        let wrong_context = DoneContext {
+            repos_root: root.path.join("wrong-ghq/github.com"),
+            fleet_dirs: Vec::new(),
+            solo_lease_dir: root.path.join("wrong-state/lease"),
+        };
         let mut runtime = DoneRealGitRuntime::default();
         let resolved = done_resolve_registered_worktree(&mut runtime, &live, &wrong_context).expect("resolve").expect("registered worktree");
 
