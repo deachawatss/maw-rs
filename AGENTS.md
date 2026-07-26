@@ -32,8 +32,15 @@ is the thing that already did not work, twice.
 
 **CI owns the entire gate.** `.github/workflows/ci.yml` runs
 `cargo build --workspace`, `cargo test --workspace`, and
-`cargo clippy --workspace -- -D warnings` on every push. Push, then read the Actions
-result. If it is red, fix from the log — do **not** reproduce locally.
+`cargo clippy --workspace -- -D warnings`. Push, then read the Actions result with
+`gh pr checks` / `gh run view --log-failed`. If it is red, fix from the log — do
+**not** reproduce locally.
+
+This only works because CI runs on `pull_request`, restored in `4840ab8`
+(2026-07-26). It had been schedule-only since 2026-07-03, which meant the workflow
+ran on `main` *after* merge and never on a PR — so for a few hours this file pointed
+at a gate that did not exist. **If you ever push and no CI run appears, stop and tell
+L1** rather than proceeding on the assumption that something checked your work.
 
 Two things this obliges you to do honestly:
 
