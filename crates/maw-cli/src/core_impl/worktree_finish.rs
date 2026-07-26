@@ -464,8 +464,15 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     let details = local.done_tmux(
         "display-message",
         &["-t".to_owned(), pane_id.to_owned(), "-p".to_owned(), "#{window_panes}\t#{pane_current_path}".to_owned()],
-    )?;
-    let (count, cwd) = details.trim_end().split_once('\t').ok_or_else(|| format!("done: could not inspect split pane {pane_id}"))?;
+    );
+    let Ok(details) = details else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
+    let Some((count, cwd)) = details.trim_end().split_once('\t') else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
     let count = count.parse::<u32>().map_err(|_| format!("done: invalid pane count for {pane_id}"))?;
     if count <= 1 {
         return Err(format!("done: refusing to kill sole pane {pane_id}; it no longer has a split-pane parent"));
@@ -1307,6 +1314,34 @@ mod done_tests {
         assert!(runtime.tmux_calls.iter().any(|(command, args)| command == "kill-pane" && args == &done_args(&["-t", "%42"])));
         assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
         assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
+    }
+
+    #[test]
+    fn done_continues_cleanup_when_the_recorded_split_pane_is_already_gone() {
+        let root = DoneTempRoot::new("dead-split-pane");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-94");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        done_write_fleet(&root, "issue-94", "acme/app/agents/issue-94");
+
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.register_worktree(&main, &worktree);
+
+        let output = done_run_with_context(
+            &done_args(&["issue-94", "--force", "--clean-branch"]),
+            &mut runtime,
+            &context,
+        )
+        .expect("dead pane must not block worktree cleanup");
+
+        assert!(output.contains("split pane %42 already gone"), "{output}");
+        assert!(
+            runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")),
+            "{:#?}",
+            runtime.git_calls
+        );
     }
 
     #[test]

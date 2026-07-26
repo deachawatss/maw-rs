@@ -78,6 +78,12 @@ if [ "$1" = "-C" ] && [ "$2" = "{worktree}" ] && [ "$3" = "worktree" ] && [ "$4"
   printf 'worktree {main}\n\nworktree {worktree}\n\n'
   exit 0
 fi
+if [ "$1" = "-C" ] && [ "$2" = "{main}" ] && [ "$3" = "worktree" ] && [ "$4" = "remove" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$2" = "{main}" ] && [ "$3" = "worktree" ] && [ "$4" = "prune" ]; then
+  exit 0
+fi
 exit 64
 "#,
             main = main.display(),
@@ -166,5 +172,36 @@ fn done_native_config_dry_run_and_guard_do_not_touch_real_fleet() {
     );
     let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(!log.contains("-Sbad"), "guarded target reached tmux: {log}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn done_native_dead_split_pane_continues_worktree_cleanup() {
+    let (root, home, config) = done_seed("dead-split-pane");
+    let worktree = root.join("ghq/github.com/org/repo/agents/task-done");
+    done_write(&worktree.join(".maw/pane-id"), "%42\n");
+
+    let output = done_command(&root, &home, &config)
+        .env("DONE_TMUX_MODE", "empty")
+        .args(["done", "task-done", "--force", "--clean-branch"])
+        .output()
+        .expect("run done");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(
+        stdout.contains("split pane %42 already gone; continuing cleanup"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("removed worktree org/repo/agents/task-done"),
+        "{stdout}"
+    );
+    let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(log.contains("display-message -t %42"), "{log}");
     let _ = std::fs::remove_dir_all(root);
 }
