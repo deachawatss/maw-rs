@@ -23,6 +23,7 @@ struct DonePaneInfo { command: String, cwd: String }
 struct DoneContext {
     repos_root: std::path::PathBuf,
     fleet_dirs: Vec<std::path::PathBuf>,
+    solo_lease_dir: std::path::PathBuf,
 }
 
 impl DoneContext {
@@ -31,6 +32,7 @@ impl DoneContext {
         Self {
             repos_root: ghq_root().join("github.com"),
             fleet_dirs: fleet_read_dirs_for_env(&env),
+            solo_lease_dir: maw_state_path(&env, &["lease"]),
         }
     }
 
@@ -40,6 +42,7 @@ impl DoneContext {
             repos_root: done_repos_root_from_cwd(cwd)
                 .unwrap_or_else(|| ghq_root().join("github.com")),
             fleet_dirs: fleet_read_dirs_for_env(&env),
+            solo_lease_dir: maw_state_path(&env, &["lease"]),
         }
     }
 }
@@ -140,7 +143,9 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     let matched = done_find_window(&sessions, &target_lower, session_filter);
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
     let pane_info = matched.as_ref().and_then(|window| done_live_pane_info(window, local));
-    let solo_worktree = matched.as_ref().and_then(|window| solo_worktree_for_holder(&done_tmux_target(window)));
+    let solo_worktree = matched
+        .as_ref()
+        .and_then(|window| solo_worktree_for_holder_in_dir(&done_tmux_target(window), &context.solo_lease_dir));
     let selected_worktree = if let Some(path) = solo_worktree {
         done_resolve_registered_worktree(local, &path, context)?
     } else {
@@ -464,8 +469,15 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     let details = local.done_tmux(
         "display-message",
         &["-t".to_owned(), pane_id.to_owned(), "-p".to_owned(), "#{window_panes}\t#{pane_current_path}".to_owned()],
-    )?;
-    let (count, cwd) = details.trim_end().split_once('\t').ok_or_else(|| format!("done: could not inspect split pane {pane_id}"))?;
+    );
+    let Ok(details) = details else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
+    let Some((count, cwd)) = details.trim_end().split_once('\t') else {
+        let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
+        return Ok(());
+    };
     let count = count.parse::<u32>().map_err(|_| format!("done: invalid pane count for {pane_id}"))?;
     if count <= 1 {
         return Err(format!("done: refusing to kill sole pane {pane_id}; it no longer has a split-pane parent"));
@@ -980,7 +992,11 @@ mod done_tests {
         fn fleet_dir(&self) -> std::path::PathBuf { self.path.join("fleet") }
 
         fn context(&self) -> DoneContext {
-            DoneContext { repos_root: self.repos_root(), fleet_dirs: vec![self.fleet_dir()] }
+            DoneContext {
+                repos_root: self.repos_root(),
+                fleet_dirs: vec![self.fleet_dir()],
+                solo_lease_dir: self.path.join("state/lease"),
+            }
         }
     }
 
@@ -1151,7 +1167,11 @@ mod done_tests {
         let live_path = live.display().to_string();
         done_run_process("git", &["worktree", "add", "-b", "agents/live-task", &live_path], Some(&main));
 
-        let wrong_context = DoneContext { repos_root: root.path.join("wrong-ghq/github.com"), fleet_dirs: Vec::new() };
+        let wrong_context = DoneContext {
+            repos_root: root.path.join("wrong-ghq/github.com"),
+            fleet_dirs: Vec::new(),
+            solo_lease_dir: root.path.join("wrong-state/lease"),
+        };
         let mut runtime = DoneRealGitRuntime::default();
         let resolved = done_resolve_registered_worktree(&mut runtime, &live, &wrong_context).expect("resolve").expect("registered worktree");
 
@@ -1307,6 +1327,34 @@ mod done_tests {
         assert!(runtime.tmux_calls.iter().any(|(command, args)| command == "kill-pane" && args == &done_args(&["-t", "%42"])));
         assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
         assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
+    }
+
+    #[test]
+    fn done_continues_cleanup_when_the_recorded_split_pane_is_already_gone() {
+        let root = DoneTempRoot::new("dead-split-pane");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-94");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        done_write_fleet(&root, "issue-94", "acme/app/agents/issue-94");
+
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.register_worktree(&main, &worktree);
+
+        let output = done_run_with_context(
+            &done_args(&["issue-94", "--force", "--clean-branch"]),
+            &mut runtime,
+            &context,
+        )
+        .expect("dead pane must not block worktree cleanup");
+
+        assert!(output.contains("split pane %42 already gone"), "{output}");
+        assert!(
+            runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")),
+            "{:#?}",
+            runtime.git_calls
+        );
     }
 
     #[test]

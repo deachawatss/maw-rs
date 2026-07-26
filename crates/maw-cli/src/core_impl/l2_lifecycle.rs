@@ -231,7 +231,9 @@ fn l2_claim_observer_owner(cwd: &Path, pane: &str) -> Result<bool, String> {
 
 fn l2_release_observer_owner(cwd: &Path, pane: &str) -> Result<(), String> {
     let dir = cwd.join(".maw");
-    std::fs::create_dir_all(&dir).map_err(|error| format!("l2 observer: create metadata directory: {error}"))?;
+    if !dir.is_dir() {
+        return Ok(());
+    }
     let _lock = PrQueueLock::acquire(&dir)?;
     l2_write_observer_owner(cwd, pane, &L2ObserverOwner { active: false, pid: None })
 }
@@ -317,9 +319,15 @@ fn l2_watch_loop(cwd: &Path, pane: &str) -> Result<(), String> {
     let mut last_state = None;
     let mut launched = false;
     loop {
+        if !l2_observer_worktree_exists(cwd) {
+            return Ok(());
+        }
         let capture = runner.run("capture-pane", &["-t".to_owned(), pane.to_owned(), "-p".to_owned(), "-S".to_owned(), "-80".to_owned()]);
         let command = runner.run("display-message", &["-t".to_owned(), pane.to_owned(), "-p".to_owned(), "#{pane_current_command}".to_owned()]);
         let alive = capture.is_ok() && command.is_ok();
+        if !alive {
+            return Ok(());
+        }
         let text = capture.as_deref().unwrap_or_default();
         if text != previous {
             previous.clear();
@@ -352,6 +360,10 @@ fn l2_watch_loop(cwd: &Path, pane: &str) -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
     }
+}
+
+fn l2_observer_worktree_exists(cwd: &Path) -> bool {
+    cwd.is_dir() && cwd.join(".git").exists()
 }
 
 fn l2_delivery_context(cwd: &Path) -> (u64, String, String, String) {
@@ -739,6 +751,38 @@ mod l2_lifecycle_tests {
         assert!(l2_prepare_observer(&root, "%10", "gale", Some("parent-1"), None).is_err());
         let owner = std::fs::read_to_string(l2_observer_owner_path(&root, "%10")).expect("released ownership record");
         assert!(owner.contains("\"active\":false"), "{owner}");
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+
+    #[test]
+    fn observer_release_does_not_recreate_a_removed_worktree() {
+        let root = std::env::temp_dir().join(format!("maw-rs-l2-observer-release-{}", std::process::id()));
+        let worktree = root.join("agents/issue-5-purge-private");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(worktree.join(".maw")).expect("observer metadata directory");
+
+        std::fs::remove_dir_all(&worktree).expect("remove finished worktree");
+        l2_release_observer_owner(&worktree, "%12").expect("release observer ownership");
+
+        assert!(
+            !worktree.exists(),
+            "releasing an observer must not recreate its removed worktree"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+
+    #[test]
+    fn observer_stops_when_its_worktree_is_removed() {
+        let root = std::env::temp_dir().join(format!("maw-rs-l2-observer-worktree-{}", std::process::id()));
+        let worktree = root.join("agents/issue-5-purge-private");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&worktree).expect("worktree directory");
+        std::fs::write(worktree.join(".git"), "gitdir: /tmp/maw-rs-test\n").expect("worktree git file");
+
+        assert!(l2_observer_worktree_exists(&worktree));
+        std::fs::remove_dir_all(&worktree).expect("remove finished worktree");
+        assert!(!l2_observer_worktree_exists(&worktree));
+
         std::fs::remove_dir_all(root).expect("cleanup root");
     }
 

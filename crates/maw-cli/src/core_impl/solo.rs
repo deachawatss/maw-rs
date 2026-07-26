@@ -194,8 +194,8 @@ fn solo_release_holder(holder: &str) {
     }
 }
 
-fn solo_worktree_for_holder(holder: &str) -> Option<std::path::PathBuf> {
-    let entries = std::fs::read_dir(maw_state_path(&current_xdg_env(), &["lease"])).ok()?;
+fn solo_worktree_for_holder_in_dir(holder: &str, lease_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(lease_dir).ok()?;
     entries.flatten().find_map(|entry| {
         solo_read_lease_record(&entry.path()).ok().and_then(|record| (record.holder == holder).then_some(record.worktree).flatten())
     })
