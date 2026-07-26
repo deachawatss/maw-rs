@@ -21,6 +21,7 @@ struct WorkonOptions {
 enum WorkonWorktreeRequest {
     Auto,
     Named(String),
+    Shared,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +129,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
                 wt = Some(WorkonWorktreeRequest::Named(value.to_owned()));
                 index += 1;
             }
+            "--no-wt" => { wt = Some(WorkonWorktreeRequest::Shared); index += 1; }
             "--fresh" | "--new" => {
                 fresh = true;
                 index += 1;
@@ -256,7 +258,7 @@ fn workon_parse_repo(
     if positional.len() > 2 { return Err(workon_usage()); }
     workon_validate_query(&repo, "repo")?;
     if let Some(task) = positional.get(1) { workon_validate_slug_input(task, "task")?; }
-    if wt.is_some() && positional.len() > 1 { return Err("workon: use either positional task or --wt, not both".to_owned()); }
+    if matches!(wt, Some(WorkonWorktreeRequest::Auto | WorkonWorktreeRequest::Named(_))) && positional.len() > 1 { return Err("workon: use either positional task or --wt, not both".to_owned()); }
     if wt.is_none() && positional.len() == 1 && (fresh || name.is_some()) {
         return Err("workon: --fresh/--name requires --wt or a task".to_owned());
     }
@@ -272,7 +274,7 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
 }
 
 fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--profile <name>] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
+    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]|--no-wt] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--profile <name>] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
@@ -347,9 +349,8 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
     solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
-    let lane = crate::wind::workon::repo_lane(&repo.repo_path, &repo.repo_name);
     if let Some(request) = workon_resolve_worktree_name(options)? {
-        if lane != crate::wind::workon::RepoLane::Lightweight || options.wt.is_some() {
+        if !matches!(options.wt.as_ref(), Some(WorkonWorktreeRequest::Shared)) {
             let worktrees = workon_find_worktrees(&repo.parent_dir, &repo.repo_name);
             let branches = workon_agent_branches(&repo.repo_path)?;
             match workon_plan_worktree(repo, &request, options.fresh, options.layout, &worktrees, &branches)? {
@@ -868,7 +869,7 @@ fn workon_raw_worktree_slug(options: &WorkonOptions) -> Option<String> {
             .clone()
             .or_else(|| options.engine.clone())
             .or_else(|| Some("codex".to_owned())),
-        None => options.task.clone(),
+        Some(WorkonWorktreeRequest::Shared) | None => options.task.clone(),
     }
 }
 
@@ -1933,6 +1934,8 @@ mod workon_tests {
         assert_eq!(parsed.wt, Some(WorkonWorktreeRequest::Auto));
         assert!(parsed.fresh);
         assert_eq!(parsed.engine.as_deref(), Some("codex"));
+        let no_wt = workon_parse_args(&workon_strings(&["repo", "task", "--no-wt"])).expect("no wt");
+        assert_eq!(no_wt.wt, Some(WorkonWorktreeRequest::Shared));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "--wt", "other"])).is_err());
         let base = workon_parse_args(&workon_strings(&["repo", "task", "--base=origin/release"])).expect("base");
         assert_eq!(base.base.as_deref(), Some("origin/release"));

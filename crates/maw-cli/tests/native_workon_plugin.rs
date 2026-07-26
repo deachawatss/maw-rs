@@ -86,6 +86,10 @@ if [ "$3" = "fetch" ] && [ "$4" = "origin" ]; then
   exit 0
 fi
 if [ "$3" = "symbolic-ref" ] && [ "$6" = "refs/remotes/origin/HEAD" ]; then
+  if [ "${MAW_FAKE_GIT_NO_REMOTE_HEAD:-0}" = "1" ]; then
+    printf 'fatal: ref refs/remotes/origin/HEAD is not a symbolic ref\n' >&2
+    exit 1
+  fi
   printf 'origin/main\n'
   exit 0
 fi
@@ -99,9 +103,9 @@ if [ "$3" = "rev-parse" ] && [ "$4" = "--show-toplevel" ]; then
   exit 0
 fi
 if [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
-  mkdir -p "$5"
+  /bin/mkdir -p "$5"
   printf 'gitdir: fake\n' > "$5/.git"
-  mkdir -p "$5/ψ/memory"
+  /bin/mkdir -p "$5/ψ/memory"
   printf 'local worktree memory\n' > "$5/ψ/memory/local.md"
   exit 0
 fi
@@ -152,7 +156,23 @@ fn run_from(
     args: &[&str],
     tmux_env: Option<&str>,
 ) -> std::process::Output {
-    run_from_with_git_clean(cwd, root, bin_dir, args, tmux_env, false)
+    run_from_with_git_clean(cwd, root, bin_dir, args, tmux_env, false, false)
+}
+
+fn run_with_missing_remote_head(
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    run_from_with_git_clean(
+        root,
+        root,
+        bin_dir,
+        args,
+        Some("/tmp/tmux-1000/default,123,0"),
+        false,
+        true,
+    )
 }
 
 fn run_from_with_git_clean(
@@ -162,6 +182,7 @@ fn run_from_with_git_clean(
     args: &[&str],
     tmux_env: Option<&str>,
     git_clean_removes_untracked_state: bool,
+    missing_remote_head: bool,
 ) -> std::process::Output {
     let mut command = Command::new(bin());
     command
@@ -185,6 +206,9 @@ fn run_from_with_git_clean(
         .env("MAW_FAKE_GIT_LOG", root.join("git.log"));
     if git_clean_removes_untracked_state {
         command.env("MAW_FAKE_GIT_CLEAN", "1");
+    }
+    if missing_remote_head {
+        command.env("MAW_FAKE_GIT_NO_REMOTE_HEAD", "1");
     }
     if let Some(value) = tmux_env {
         command.env("TMUX", value);
@@ -410,7 +434,7 @@ fn native_workon_explicit_wt_isolates_lightweight_repo() {
 }
 
 #[test]
-fn native_workon_bare_task_keeps_lightweight_repo_on_main_checkout() {
+fn native_workon_bare_task_isolates_lightweight_repo() {
     let root = temp_dir("lightweight-bare-task");
     let bin_dir = seed_hermetic_root(&root, "shell\n");
     let repo = root.join("ghq/github.com/acme/demo");
@@ -431,12 +455,97 @@ fn native_workon_bare_task_keeps_lightweight_repo_on_main_checkout() {
         String::from_utf8_lossy(&output.stderr)
     );
     let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
+    assert!(git_log.contains("worktree add"), "{git_log}");
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(
+        tmux_log.contains(&format!("-c {}", repo.join("agents/feat").display())),
+        "{tmux_log}"
+    );
+}
+
+#[test]
+fn native_workon_no_wt_keeps_lightweight_repo_on_main_checkout() {
+    let root = temp_dir("lightweight-no-wt");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("lane dir");
+    fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
+
+    let output = run_with_tmux_env(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--no-wt", "--layout", "nested"],
+        None,
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
     assert!(!git_log.contains("worktree add"), "{git_log}");
     let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
     assert!(
         tmux_log.contains(&format!("-c {} -n demo-feat", repo.display())),
         "{tmux_log}"
     );
+}
+
+#[test]
+fn native_workon_two_lightweight_tasks_get_separate_worktrees() {
+    let root = temp_dir("lightweight-two-tasks");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("lane dir");
+    fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
+
+    for task in ["first", "second"] {
+        let output = run(
+            &root,
+            &bin_dir,
+            &["workon", "demo", task, "--layout", "nested"],
+        );
+        assert!(output.status.success(), "workon {task} failed");
+    }
+
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert_eq!(git_log.matches("worktree add").count(), 2, "{git_log}");
+    for task in ["first", "second"] {
+        assert!(
+            repo.join("agents").join(task).join(".git").is_file(),
+            "{task}"
+        );
+    }
+}
+
+#[test]
+fn native_workon_lightweight_without_wt_checks_remote_default_branch() {
+    let root = temp_dir("lightweight-unborn-origin");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("lane dir");
+    fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
+
+    let output = run_with_missing_remote_head(
+        &root,
+        &bin_dir,
+        &["workon", "demo", "feat", "--layout", "nested"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "workon should reject an unborn origin"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stderr.contains("could not determine origin's default branch after fetch"),
+        "{stderr}"
+    );
+    let git_log = fs::read_to_string(root.join("git.log")).expect("git log");
+    assert!(git_log.contains("fetch origin"), "{git_log}");
+    assert!(!git_log.contains("worktree add"), "{git_log}");
 }
 
 #[test]
@@ -626,6 +735,7 @@ fn native_workon_omx_create_restores_worktree_state_after_git_clean() {
         ],
         Some("/tmp/tmux-1000/default,123,0"),
         true,
+        false,
     );
 
     assert!(
