@@ -690,7 +690,7 @@ exit 9
         let output = run(&root, &bin_dir, &["workon", "demo"]);
 
         assert_success(&output);
-        assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo -l codex exec"));
+        assert!(sent_command(&root).contains("send-keys -t %42 -l codex exec"));
     }
 
     #[test]
@@ -710,7 +710,7 @@ exit 9
         );
 
         assert_success(&output);
-        assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo-issue-42 -l omx --xhigh"));
+        assert!(sent_command(&root).contains("send-keys -t %42 -l omx --xhigh"));
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(!stdout.contains("non-Claude engine 'claude'"), "{stdout}");
         assert!(!stdout.contains("not trusted"), "{stdout}");
@@ -855,11 +855,11 @@ exit 9
             Some(r#"{"commands":{"default":"omx --direct"},"trustedRepos":["acme/demo"]}"#),
         );
         assert_success(&run(&root, &bin_dir, &["workon", "demo", "task"]));
-        assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo-task -l omx --direct"));
+        assert!(sent_command(&root).contains("send-keys -t %42 -l omx --direct"));
 
         let root = temp_dir("fallback");
         let bin_dir = seed_root(&root, None);
         assert_success(&run(&root, &bin_dir, &["workon", "demo", "plain"]));
-        assert!(sent_command(&root).contains("send-keys -t 50-mawjs:demo-plain -l claude"));
+        assert!(sent_command(&root).contains("send-keys -t %42 -l claude"));
     }
 }
