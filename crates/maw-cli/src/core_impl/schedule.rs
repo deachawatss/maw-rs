@@ -344,9 +344,15 @@ fn schedule_log334(path: &Path, message: &str) -> Result<(), String> {
         let root = std::env::temp_dir().join(format!("maw-schedule-cli-{}", std::process::id())); let repo = root.join("odin-oracle");
         let _ = std::fs::remove_dir_all(&root); std::fs::create_dir_all(repo.join(".maw")).unwrap(); std::env::set_var("MAW_HOME", root.join("home"));
         std::fs::write(repo.join(".maw/schedule.toml"), "[[schedule]]\nid='canary'\ncommand='printf ok > artifact'\ncadence='every 1h'\nexec='shell'\nexpected_output='artifact'\n").unwrap();
-        let output = schedule_fire334(&["odin-oracle".into(), "canary".into(), repo.to_string_lossy().into_owned(), "--force".into()]).unwrap();
-        assert!(output.contains("\"status\":\"succeeded\"")); assert_eq!(std::fs::read_to_string(repo.join("artifact")).unwrap(), "ok");
-        assert!(root.join("home/schedule/runs/latest.json").is_file()); let _ = std::fs::remove_dir_all(root);
+        let result = schedule_fire334(&["odin-oracle".into(), "canary".into(), repo.to_string_lossy().into_owned(), "--force".into()]);
+        if cfg!(target_os = "macos") {
+            let output = result.unwrap();
+            assert!(output.contains("\"status\":\"succeeded\"")); assert_eq!(std::fs::read_to_string(repo.join("artifact")).unwrap(), "ok");
+            assert!(root.join("home/schedule/runs/latest.json").is_file());
+        } else {
+            assert_eq!(result.unwrap_err(), "launchd scheduling is supported only on macOS");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test] fn private_exec_uses_explicit_state_root_when_tmux_environment_is_stale() {
         let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner); let _home = EnvVarRestore::capture("MAW_HOME"); let _tmux = EnvVarRestore::capture("TMUX_TMPDIR");
