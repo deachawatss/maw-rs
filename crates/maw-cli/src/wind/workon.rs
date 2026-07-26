@@ -12,14 +12,6 @@ pub(crate) struct EngineResolution {
     pub(crate) warning: Option<String>,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RepoLane {
-    Product,
-    Permissive,
-    Lightweight,
-}
-
 pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
     ".maw/delivery.json",
     ".maw/l1-review-request.json",
@@ -43,29 +35,6 @@ const LEGACY_MARKERS: &[&str] = &[
 
 const GITIGNORE_BLOCK_START: &str = "# >>> maw ephemeral markers (managed by maw-rs) >>>";
 const GITIGNORE_BLOCK_END: &str = "# <<< maw ephemeral markers <<<";
-
-#[cfg(test)]
-pub(crate) fn repo_lane(repo_path: &Path, repo_name: &str) -> RepoLane {
-    let marker = repo_path.join(".maw/lane");
-    if let Ok(value) = std::fs::read_to_string(marker) {
-        return match value.trim().to_ascii_lowercase().as_str() {
-            "lightweight" => RepoLane::Lightweight,
-            "permissive" => RepoLane::Permissive,
-            _ => RepoLane::Product,
-        };
-    }
-
-    let name = repo_name.to_ascii_lowercase();
-    if name == "wind-framework"
-        || name.starts_with("maw-")
-        || name.starts_with("arra-")
-        || name.ends_with("-oracle")
-    {
-        RepoLane::Lightweight
-    } else {
-        RepoLane::Product
-    }
-}
 
 pub(crate) fn sanitize_fresh_worktree(
     repo_path: &Path,
@@ -427,24 +396,6 @@ mod tests {
             ".maw/req-line",
         ];
         assert_eq!(EPHEMERAL_MARKERS, &expected);
-    }
-
-    #[test]
-    fn lane_marker_overrides_infrastructure_name_fallback() {
-        let repo = temp_dir("lane-marker");
-        fs::create_dir_all(repo.join(".maw")).expect("lane dir");
-        fs::write(repo.join(".maw/lane"), "product\n").expect("lane marker");
-
-        assert_eq!(repo_lane(&repo, "maw-rs"), RepoLane::Product);
-    }
-
-    #[test]
-    fn infrastructure_names_default_to_the_lightweight_lane() {
-        let repo = temp_dir("lane-fallback");
-
-        assert_eq!(repo_lane(&repo, "maw-rs"), RepoLane::Lightweight);
-        assert_eq!(repo_lane(&repo, "arra-oracle-v3"), RepoLane::Lightweight);
-        assert_eq!(repo_lane(&repo, "customer-api"), RepoLane::Product);
     }
 
     #[test]
