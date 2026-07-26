@@ -188,7 +188,7 @@ fn schedule_fire334(argv: &[String]) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = argv;
-        return Err("launchd scheduling is supported only on macOS".to_owned());
+        Err("launchd scheduling is supported only on macOS".to_owned())
     }
     #[cfg(target_os = "macos")]
     {
