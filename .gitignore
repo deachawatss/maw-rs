@@ -21,6 +21,5 @@ agents/
 .maw/pane-id
 .maw/auto-done-pinged
 .maw/phase.json
-.maw/lane
 .maw/req-line
 # <<< maw ephemeral markers <<<
