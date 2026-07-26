@@ -59,11 +59,19 @@ line restarted day-based at `v26.7.5` (= 2026-07-05, same commit as SEQ-era
 v26.7.7). The exact commit and build time are embedded in the binary
 (`maw --version`) regardless of scheme.
 
-Cut flow: PRs squash-merge into `alpha`; a release promotes `alpha` → `main`
-via a **merge-commit** PR, then tags `v<YY>.<M>.<DD>` (stable) or
-`v<YY>.<M>.<DD>-alpha.<HMM>` (pre-release) and publishes a GitHub release.
-GitHub auto-closes `Fixes #N` only on default-branch merges, so close issues
-by hand when their PR lands on `alpha`.
+Cut flow **on this fork**: `main` is the only branch `origin` has, and every PR
+targets it (merged PRs #104/#106/#108/#111/#112 are all `base=main`). A release
+tags `v<YY>.<M>.<DD>` (stable) or `v<YY>.<M>.<DD>-alpha.<HMM>` (pre-release) off
+`main` and publishes a GitHub release. `Fixes #N` auto-closes normally, since
+`main` *is* the default branch here.
+
+`alpha` is **not** a branch on this fork — it exists only as `upstream/alpha` on
+the read-only `Soul-Brews-Studio` fork-sync remote, where it genuinely is the
+trunk (upstream squash-merges into `alpha` and promotes `alpha` → `main`). This
+paragraph described that upstream flow, inherited verbatim at fork time. Pass
+`gh --repo deachawatss/maw-rs` explicitly: with an `upstream` remote and no
+default set, a bare `gh pr list` reports upstream's `base=alpha` PRs and reads
+like confirmation.
 
 macOS install note: copying a new binary over an installed one can SIGKILL on
 next run (stale code-sign cache on the reused inode) — `rm` first, then `cp`.
