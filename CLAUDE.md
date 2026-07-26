@@ -4,31 +4,64 @@ Rust port of maw-js — distributed terminal multiplexing & fleet management.
 A Cargo workspace of small, focused crates. BUSL-1.1 licensed.
 For repo-wide agent execution conventions, read `AGENTS.md` first; this file remains the Claude-specific memory and release detail.
 
-## Build Gate
+## Build Gate — DO NOT BUILD OR TEST LOCALLY (Wind ruling, 2026-07-26)
 
-```bash
-cargo clippy --workspace --all-targets -- -D warnings
-```
+**No `cargo test`. No `cargo clippy`. No `cargo build`. Not scoped, not
+`-p <crate>`, not a single `-- <test_name>`. None.**
 
-Clippy must pass before any PR.
+Make the fix, read the diff, commit, push, open the PR, hand to L1. That is
+the whole L2 loop for this repo.
 
-**Testing rule: scope tests to what you changed.**
-- Changed one crate? `cargo test -p <crate>`.
-- Changed one module/function? `cargo test -p <crate> -- <test_name>`.
-- Never run `cargo test --workspace` for a single change — full suite runs
-  in CI after push.
+Rust compilation is the single heaviest thing that runs on this machine. Two
+concurrent scoped builds took the disk from 40Gi to 25Gi in minutes on
+2026-07-26, and a later run exhausted **memory** and killed three live L2
+panes outright. The work survived only because it was in worktrees. This is
+not a tuning problem to be solved with a narrower `-p` flag — the earlier
+"scope tests to what you changed" rule was already scoped, and it still
+crashed the box.
 
-## Development Lane — Lightweight / L1 Direct
+**CI is the gate.** Push, then read the GitHub Actions result. If CI is red,
+fix from the log — do not reproduce locally to "see it fail".
 
-maw-rs is infra. **Do not use `maw workon` or L2 worktrees.** Fix directly
-on the working branch, commit, push. Worktrees duplicate the entire Cargo
-dependency tree (~100GB) and are not worth the cost for this repo.
+Consequences to be honest about, so nobody is surprised:
 
-- Edit on `main` (or `alpha` for pre-release), commit, push.
-- Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`) — not
-  inside the repo. Cleaned automatically on reboot; never accumulates.
-- Only test the crate you touched: `cargo test -p <crate> -- <test_name>`.
-- Let CI run the full workspace gate — Wind's machine is not the build farm.
+- A PR now reaches L1 with **no local verification evidence**. `/sop-verify
+  --author` for this repo means "diff reviewed, reasoning stated", not
+  "commands run". Say so plainly in the handoff — do not claim a check you
+  did not run.
+- L1 reviews the diff and the CI result, not a claimed test run.
+- **maw-rs CI has been red on `main` since 2026-07-25** (7 `maw-cli --lib`
+  tests fail on Linux, pass on macOS — issue #127). While that is true, CI
+  cannot distinguish a new break from the standing one. Compare against the
+  known-failing set in #127 before concluding a PR broke something.
+
+This rule is maw-rs only. Other repos keep their normal proportional
+verification.
+
+## Development Lane — Lightweight, but L2 worktrees ARE used
+
+maw-rs is infra, so the **merge lane** is lightweight. That governs how a
+change lands, not where it is written.
+
+**L2 deliveries here run in worktrees, like everywhere else.** An earlier
+revision of this file said "do not use `maw workon` or L2 worktrees" and
+justified it with "worktrees duplicate the entire Cargo dependency tree
+(~100GB)". Both halves are now wrong:
+
+- `.cargo/config.toml` points every build at a shared `/tmp/maw-rs-target`,
+  so worktrees do **not** each carry a dependency tree.
+- maw-rs #116 (`d713b94`, 2026-07-26) made worktree creation unconditional
+  on every lane. There is no supported way to dispatch without one short of
+  `--no-wt`.
+
+Worktrees are also what saved three in-flight deliveries when the machine
+ran out of memory on 2026-07-26 — the panes died, the work did not.
+
+- Dispatch: `maw workon maw-rs --wt issue-N-<slug> -e codex`.
+- Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`), not
+  inside the repo — but see the Build Gate above: **you are not building.**
+- L1 merges. Wind's machine is not the build farm, and now it is not the
+  test farm either.
 
 ## Branches
 

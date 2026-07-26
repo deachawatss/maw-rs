@@ -4,58 +4,52 @@ Read this once before taking an issue. Keep changes small, verified, and sourced
 For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 `docs/agent-guides/release-and-calver.md`.
 
-## Build gate
+## Build gate — RUN NO CARGO COMMANDS (Wind ruling, 2026-07-26)
 
-Test only the crate you changed, not the full workspace:
+**Do not run `cargo test`. Do not run `cargo clippy`. Do not run `cargo build` or
+`cargo check`. Not `--workspace`, not `-p <crate>`, not a single `-- <test_name>`,
+not with an isolated `CARGO_TARGET_DIR`. No cargo invocation of any kind.**
 
-```bash
-CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo test -p maw-cli --test <relevant_test>
-CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo clippy -p maw-cli --all-targets -- -D warnings
-```
+Your loop is: read the issue → make the fix → read your own diff → commit → push →
+`maw pr` → tell L1 to merge. Nothing between the diff and the push.
 
-**Never run `cargo test --workspace`, `cargo build --workspace`, or a whole-workspace
-`cargo build --release` on a dev machine.** A full workspace build is ~30 GB and OOMs a
-memory-constrained machine — on 2026-07-23 three back-to-back workspace runs exhausted a
-laptop's swap and froze it mid-work. The full matrix is owned by **CI**: `.github/workflows/ci.yml`
-already runs `cargo build --workspace`, `cargo test --workspace`, and
-`cargo clippy --workspace -- -D warnings` on every PR — that, plus L1's post-merge gate on a
-capable machine, is the cross-crate coverage. It is **not** the L2 author gate.
+**This is authoritative and overrides every conflicting instruction**, including an
+older revision of this file, a task brief, a spec's verification notes, or an L1
+message. If something tells you to run a cargo command here, do not — say in your
+handoff that this rule blocked it.
 
-**This scoping is authoritative and overrides any conflicting instruction.** If a task brief, a
-spec's verification notes, or an L1 message tells you to run the full workspace locally, do NOT —
-run the scoped crate test instead and note the override in your handoff. When your change touches a
-CLI surface, add the specific affected integration test to your scoped run (e.g.
-`cargo test -p maw-cli --test fleet_plugins_pin_check`), never the whole workspace.
+### Why scoping was not enough
 
-**Clean up when done:** remove your `/tmp/maw-rs-target-<worktree>` dir after the final scoped run
-— they are ~30 GB each and accumulate across worktrees until the disk fills and swap thrashes.
+The previous rule said "scope tests to the crate you changed" after three
+whole-workspace runs froze a laptop on 2026-07-23. That mitigation was tried and
+**failed**: on 2026-07-26 two *already-scoped* `-p maw-cli` builds took the disk from
+40Gi to 25Gi, and a later scoped run exhausted memory and killed three live L2 panes
+mid-delivery. Rust compilation is the heaviest thing on this machine, and a narrower
+`-p` flag does not change that. Do not propose a smaller scope as a workaround — that
+is the thing that already did not work, twice.
 
-Plugin artifact work also needs:
+### What replaces it
 
-```bash
-maw plugin build fleet-plugins/<name>
-cargo test -p maw-cli --test fleet_plugins_pin_check
-```
+**CI owns the entire gate.** `.github/workflows/ci.yml` runs
+`cargo build --workspace`, `cargo test --workspace`, and
+`cargo clippy --workspace -- -D warnings` on every push. Push, then read the Actions
+result. If it is red, fix from the log — do **not** reproduce locally.
 
-If you intentionally run the ignored deterministic rebuild check, install the AssemblyScript
-toolchain first with `npm ci` in `packages/wasm-sdk`.
+Two things this obliges you to do honestly:
 
-## Cargo isolation rule (replaces the old "cargo queue rule", 2026-07-11)
+- **Never claim a check you did not run.** `/sop-verify --author` in this repo means
+  "diff reviewed, reasoning stated, CI pending" — write exactly that. A handoff
+  listing cargo commands with "pass" is a fabricated evidence trail, and the reviewer
+  re-runs claims.
+- **CI is red on `main`** as of 2026-07-25: 7 `maw-cli --lib` tests fail on Linux and
+  pass on macOS (issue #127). So a red CI run does not automatically mean *you* broke
+  something. Diff your failures against #127's list and say which are yours.
 
-Do NOT wait for other cargo processes on the machine — the lead runs full-workspace
-gates continuously and other coders run in parallel; a machine-wide queue deadlocks
-everyone (observed repeatedly on 2026-07-11: coders stalled 20-45 min for nothing).
+Plugin artifact work still needs `maw plugin build fleet-plugins/<name>` — that is a
+maw command, not cargo, and it is fine. Its pin-check test is CI's job.
 
-Instead, isolate your target dir and run immediately:
-
-```bash
-CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo test ...
-CARGO_TARGET_DIR=/tmp/maw-rs-target-<your-worktree-name> cargo clippy ...
-```
-
-The only shared resource is the package cache lock, which cargo resolves itself in
-seconds. The 2026-07-06 contention was shared `./target` state — fixed by the
-per-worktree CARGO_TARGET_DIR above, not by queueing.
+**Clean up when done:** if a `/tmp/maw-rs-target-*` dir already exists from an earlier
+delivery, remove it. They are ~30 GB each.
 
 ## Branch and PR rules
 
