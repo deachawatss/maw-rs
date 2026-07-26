@@ -409,12 +409,16 @@ fn pr_write_review_request(cwd: &std::path::Path, request: &PrReviewRequest) -> 
 
 fn pr_enqueue_global_review(request: &PrReviewRequest) -> Result<(), String> {
     let root = pr_review_queue_root()?;
-    let _lock = PrQueueLock::acquire(&root)?;
+    pr_enqueue_review_at(&root, request)
+}
+
+fn pr_enqueue_review_at(root: &std::path::Path, request: &PrReviewRequest) -> Result<(), String> {
+    let _lock = PrQueueLock::acquire(root)?;
     let mut seen = std::collections::HashSet::new();
     let key = pr_review_queue_key(request);
     let mut replaced = false;
     let mut lines = Vec::new();
-    for line in pr_read_queue_lines(&root, "pr-queue.jsonl")? {
+    for line in pr_read_queue_lines(root, "pr-queue.jsonl")? {
         match serde_json::from_str::<PrReviewRequest>(&line) {
             Ok(entry) if pr_review_queue_key(&entry) == key => {
                 if !replaced {
@@ -430,12 +434,20 @@ fn pr_enqueue_global_review(request: &PrReviewRequest) -> Result<(), String> {
     if !replaced {
         lines.push(pr_render_queue_row(request)?);
     }
-    pr_write_queue_lines(&root, "pr-queue.jsonl", &lines)
+    pr_write_queue_lines(root, "pr-queue.jsonl", &lines)
 }
 
 fn pr_reconcile_reviews<P: PrProcess>(process: &mut P, quiet: bool) -> Result<String, String> {
     let root = pr_review_queue_root()?;
-    let queued = pr_load_global_reviews(&root)?;
+    pr_reconcile_reviews_at(&root, process, quiet)
+}
+
+fn pr_reconcile_reviews_at<P: PrProcess>(
+    root: &std::path::Path,
+    process: &mut P,
+    quiet: bool,
+) -> Result<String, String> {
+    let queued = pr_load_global_reviews(root)?;
     let mut updates = std::collections::BTreeMap::new();
     let mut out = String::new();
 
@@ -472,7 +484,7 @@ fn pr_reconcile_reviews<P: PrProcess>(process: &mut P, quiet: bool) -> Result<St
         }
     }
 
-    let archived_count = pr_finalize_global_reconciliation(&root, &updates)?;
+    let archived_count = pr_finalize_global_reconciliation(root, &updates)?;
     if !quiet && out.is_empty() {
         let _ = writeln!(out, "No PR handoffs to reconcile.");
     } else if !quiet && archived_count > 0 {
@@ -1616,10 +1628,7 @@ mod pr_tests {
 
     #[test]
     fn pr_global_review_queue_upserts_by_repo_and_url() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("review-queue");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let mut request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/7".to_owned(),
@@ -1636,9 +1645,9 @@ mod pr_tests {
             last_reconcile_error: None,
         };
 
-        pr_enqueue_global_review(&request).expect("enqueue pending");
+        pr_enqueue_review_at(&state, &request).expect("enqueue pending");
         request.l1_pane = Some("%7".to_owned());
-        pr_enqueue_global_review(&request).expect("upsert pending");
+        pr_enqueue_review_at(&state, &request).expect("upsert pending");
 
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
         assert_eq!(rows.lines().count(), 1);
@@ -1647,10 +1656,7 @@ mod pr_tests {
 
     #[test]
     fn pr_reconcile_open_review_retains_durable_row_and_deduplicates_queue() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-open");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/55".to_owned(),
@@ -1668,10 +1674,9 @@ mod pr_tests {
         };
         let row = pr_render_queue_row(&request).expect("row");
         std::fs::write(state.join("pr-queue.jsonl"), format!("{row}\n{row}\n")).expect("queue duplicates");
-        let mut tmux = PrMockTmux::default();
         let mut process = PrMockProcess::default();
 
-        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("reconcile open PR");
+        let output = pr_reconcile_reviews_at(&state, &mut process, false).expect("reconcile open PR");
 
         assert!(output.contains("PR #55 is still open; durable handoff retained"), "{output}");
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
@@ -1682,10 +1687,7 @@ mod pr_tests {
 
     #[test]
     fn pr_reconcile_open_review_never_requires_live_pane_delivery() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-open-busy");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/57".to_owned(),
@@ -1701,11 +1703,10 @@ mod pr_tests {
             reconcile_attempts: 0,
             last_reconcile_error: None,
         };
-        pr_enqueue_global_review(&request).expect("enqueue");
-        let mut tmux = PrMockTmux::default();
+        pr_enqueue_review_at(&state, &request).expect("enqueue");
         let mut process = PrMockProcess::default();
 
-        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("durable reconciliation");
+        let output = pr_reconcile_reviews_at(&state, &mut process, false).expect("durable reconciliation");
 
         assert!(output.contains("PR #57 is still open; durable handoff retained"), "{output}");
         let rows = std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue");
@@ -1715,10 +1716,7 @@ mod pr_tests {
 
     #[test]
     fn pr_reconcile_archives_notified_merged_review_and_deduplicates_by_repo_and_number() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-notified-merged");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/58".to_owned(),
@@ -1740,13 +1738,12 @@ mod pr_tests {
         let duplicate_row = pr_render_queue_row(&duplicate).expect("duplicate row");
         std::fs::write(state.join("pr-queue.jsonl"), format!("{row}\n{duplicate_row}\n"))
             .expect("queue stale notified duplicates");
-        let mut tmux = PrMockTmux::default();
         let mut process = PrMockProcess {
             review_state_results: [Ok(PrGithubState::Merged)].into(),
             ..PrMockProcess::default()
         };
 
-        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process)
+        let output = pr_reconcile_reviews_at(&state, &mut process, false)
             .expect("reconcile stale notified PR");
 
         assert!(output.contains("PR #58 merged; archiving queued handoff"), "{output}");
@@ -1763,10 +1760,7 @@ mod pr_tests {
 
     #[test]
     fn pr_reconcile_quiet_archives_merged_review_without_resurfacing() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-merged");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/55".to_owned(),
@@ -1782,14 +1776,13 @@ mod pr_tests {
             reconcile_attempts: 0,
             last_reconcile_error: None,
         };
-        pr_enqueue_global_review(&request).expect("enqueue");
-        let mut tmux = PrMockTmux::default();
+        pr_enqueue_review_at(&state, &request).expect("enqueue");
         let mut process = PrMockProcess {
             review_state_results: [Ok(PrGithubState::Merged)].into(),
             ..PrMockProcess::default()
         };
 
-        let output = pr_run(&pr_strings(&["--reconcile", "--quiet"]), &mut tmux, &mut process).expect("quiet reconcile merged PR");
+        let output = pr_reconcile_reviews_at(&state, &mut process, true).expect("quiet reconcile merged PR");
 
         assert!(output.is_empty(), "{output}");
         assert!(std::fs::read_to_string(state.join("pr-queue.jsonl")).expect("queue").is_empty());
@@ -1802,10 +1795,7 @@ mod pr_tests {
 
     #[test]
     fn pr_reconcile_closed_review_archives_without_resurfacing() {
-        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = EnvVarRestore::capture("MAW_STATE_DIR");
         let state = pr_temp_dir("reconcile-closed");
-        std::env::set_var("MAW_STATE_DIR", &state);
         let request = PrReviewRequest {
             version: 1,
             pr_url: "https://github.com/acme/demo/pull/56".to_owned(),
@@ -1821,14 +1811,13 @@ mod pr_tests {
             reconcile_attempts: 0,
             last_reconcile_error: None,
         };
-        pr_enqueue_global_review(&request).expect("enqueue");
-        let mut tmux = PrMockTmux::default();
+        pr_enqueue_review_at(&state, &request).expect("enqueue");
         let mut process = PrMockProcess {
             review_state_results: [Ok(PrGithubState::Closed)].into(),
             ..PrMockProcess::default()
         };
 
-        let output = pr_run(&pr_strings(&["reconcile"]), &mut tmux, &mut process).expect("reconcile closed PR");
+        let output = pr_reconcile_reviews_at(&state, &mut process, false).expect("reconcile closed PR");
 
         assert!(output.contains("PR #56 closed; archiving queued handoff"), "{output}");
         let archived = std::fs::read_to_string(state.join("pr-queue.jsonl.archived")).expect("archive");
