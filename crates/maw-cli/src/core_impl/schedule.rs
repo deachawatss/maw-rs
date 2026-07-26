@@ -186,7 +186,10 @@ fn schedule_run334(argv: &[String]) -> Result<String, String> {
 
 fn schedule_fire334(argv: &[String]) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
-    return Err("launchd scheduling is supported only on macOS".to_owned());
+    {
+        let _ = argv;
+        Err("launchd scheduling is supported only on macOS".to_owned())
+    }
     #[cfg(target_os = "macos")]
     {
         let (oracle, id, repo, forced) = schedule_fire_args334(argv)?;
@@ -267,6 +270,7 @@ fn schedule_exec334(argv: &[String]) -> Result<String, String> {
     serde_json::to_string(&finished).map(|value| format!("{value}\n")).map_err(|error| format!("encode outcome: {error}"))
 }
 
+#[cfg(target_os = "macos")]
 fn schedule_handoff334<R: maw_tmux::TmuxRunner>(runner: &mut R, run_id: &str, repo: &Path, maw: &Path, state: &Path) -> Result<(), String> {
     schedule_safe334(run_id, "run id")?;
     let maw = maw.to_str().filter(|value| value.starts_with('/') && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/_+.-".contains(&byte)))
@@ -281,6 +285,7 @@ fn schedule_id_force334(argv: &[String]) -> Result<(String, bool), String> {
     let (id, forced) = match argv { [id] => (id.clone(), false), [id, flag] if flag == "--force" => (id.clone(), true), _ => return Err(SCHEDULE_USAGE334.to_owned()) };
     schedule_safe334(&id, "job id")?; Ok((id, forced))
 }
+#[cfg(target_os = "macos")]
 fn schedule_fire_args334(argv: &[String]) -> Result<(String, String, String, bool), String> {
     let (oracle, id, repo, forced) = match argv { [oracle, id, repo] => (oracle, id, repo, false), [oracle, id, repo, flag] if flag == "--force" => (oracle, id, repo, true), _ => return Err(SCHEDULE_USAGE334.to_owned()) };
     schedule_safe334(oracle, "oracle")?; schedule_safe334(id, "job id")?; Ok((oracle.clone(), id.clone(), repo.clone(), forced))
@@ -288,6 +293,7 @@ fn schedule_fire_args334(argv: &[String]) -> Result<(String, String, String, boo
 fn schedule_safe334(value: &str, name: &str) -> Result<(), String> {
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)) { Ok(()) } else { Err(format!("invalid {name}")) }
 }
+#[cfg(target_os = "macos")]
 fn schedule_cadence_seconds334(job: &maw_schedule::Schedule) -> Result<u64, String> {
     match maw_schedule::plist::parse_cadence(job).map_err(|error| error.to_string())? {
         maw_schedule::plist::CadencePlan::Interval { seconds } => Ok(u64::from(seconds)),
@@ -299,6 +305,7 @@ fn schedule_local_time334() -> Result<(String, String), String> {
     let text = String::from_utf8_lossy(&output.stdout); let mut parts = text.split_whitespace();
     match (output.status.success(), parts.next(), parts.next(), parts.next()) { (true, Some(day), Some(hour), None) => Ok((day.to_owned(), hour.to_owned())), _ => Err("date returned invalid local time".to_owned()) }
 }
+#[cfg(target_os = "macos")]
 fn schedule_boot334() -> Result<String, String> {
     let output = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().map_err(|error| format!("boot identity: {error}"))?;
     let identity = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -312,7 +319,9 @@ fn schedule_log334(path: &Path, message: &str) -> Result<(), String> {
 
 #[cfg(test)] mod schedule_tests334 {
     use super::*;
+    #[cfg(target_os = "macos")]
     #[derive(Default)] struct Fake { calls: Vec<(String, Vec<String>)> }
+    #[cfg(target_os = "macos")]
     impl maw_tmux::TmuxRunner for Fake { fn run(&mut self, subcommand: &str, args: &[String]) -> Result<String, maw_tmux::TmuxError> { self.calls.push((subcommand.into(), args.to_vec())); Ok(String::new()) } }
     #[test] fn schedule_registers_and_rejects_bad_private_ids() {
         assert_eq!(DISPATCH_334[0].command, "schedule");
@@ -334,6 +343,7 @@ fn schedule_log334(path: &Path, message: &str) -> Result<(), String> {
         let job = maw_schedule::Schedule { id: "bad".into(), command, cadence, max_fires_per_day: cap, exec, expected_output: None, token_name: "t2".into(), created: None, at_minute: minute, at_hour: hour };
         assert!(maw_schedule::plist::parse_cadence(&job).is_err());
     }
+    #[cfg(target_os = "macos")]
     #[test] fn headless_handoff_contains_only_safe_run_identity_not_prompt() {
         let mut fake = Fake::default(); schedule_handoff334(&mut fake, "odin-daily-1", Path::new("/tmp/repo"), Path::new("/opt/bin/maw-rs"), Path::new("/tmp/custom state")).unwrap();
         assert_eq!(fake.calls[0].0, "new-session"); let joined = fake.calls[0].1.join(" ");

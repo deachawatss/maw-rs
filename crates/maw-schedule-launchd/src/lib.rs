@@ -38,7 +38,10 @@ pub struct SystemLaunchctl;
 impl LaunchctlRunner for SystemLaunchctl {
     fn run(&mut self, args: &[String]) -> Result<LaunchctlOutput, String> {
         #[cfg(not(target_os = "macos"))]
-        return Err("launchd scheduling is supported only on macOS".to_owned());
+        {
+            let _ = args;
+            Err("launchd scheduling is supported only on macOS".to_owned())
+        }
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("launchctl")
