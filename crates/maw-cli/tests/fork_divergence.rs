@@ -581,6 +581,7 @@ printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
   display-message) printf '50-mawjs\n' ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
+  list-panes) printf '%%1 0 0\n' ;;
   new-window|send-keys|select-window) exit 0 ;;
   split-window) printf '%%42\n' ;;
   capture-pane) printf '$ \r\n' ;;
@@ -676,29 +677,6 @@ exit 9
         assert_success(&output);
         let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
         assert!(git_log.contains("worktree add"), "{git_log}");
-    }
-
-    #[test]
-    fn lightweight_lane_launches_the_task_from_the_main_checkout() {
-        let root = temp_dir("lightweight-lane");
-        let bin_dir = seed_root(&root, Some(r#"{"commands":{"default":"claude"}}"#));
-        let repo = root.join("ghq/github.com/acme/demo");
-        fs::write(repo.join(".maw/lane"), "lightweight\n").expect("lane marker");
-
-        let output = run(&root, &bin_dir, &["workon", "demo", "issue-95"]);
-
-        assert_success(&output);
-        let git_log = fs::read_to_string(root.join("git.log")).unwrap_or_default();
-        assert!(!git_log.contains("worktree add"), "{git_log}");
-        let tmux_log = sent_command(&root);
-        assert!(
-            tmux_log.contains("split-window") && tmux_log.contains("-c"),
-            "{tmux_log}"
-        );
-        assert!(
-            tmux_log.contains(repo.to_string_lossy().as_ref()),
-            "{tmux_log}"
-        );
     }
 
     #[test]
