@@ -1,8 +1,16 @@
 name: CI
 
-# Per-push/PR CI disabled 2026-07-03 (Nat): gating happens locally (Rust builds on m5);
-# CI runs on a 4-hour schedule as a safety net, plus manual dispatch.
+# PR CI re-enabled 2026-07-26 (Oracle L1). It was disabled on 2026-07-03 (Nat)
+# with the reason "gating happens locally (Rust builds on m5)" — that premise no
+# longer holds. Wind's 2026-07-26 ruling (88706d8) forbids ALL local cargo
+# commands in this repo after a scoped build exhausted memory and killed three
+# live L2 panes mid-delivery. With local gating gone AND PR CI off, a maw-rs PR
+# had no verification at all: the schedule only runs on main, i.e. after merge.
+# Restoring pull_request is what makes "CI is the gate" true rather than aspirational.
+#
+# The 4-hour schedule stays as the main-branch safety net.
 on:
+  pull_request:
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
