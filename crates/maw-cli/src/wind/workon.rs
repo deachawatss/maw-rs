@@ -12,6 +12,7 @@ pub(crate) struct EngineResolution {
     pub(crate) warning: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepoLane {
     Product,
@@ -43,6 +44,7 @@ const LEGACY_MARKERS: &[&str] = &[
 const GITIGNORE_BLOCK_START: &str = "# >>> maw ephemeral markers (managed by maw-rs) >>>";
 const GITIGNORE_BLOCK_END: &str = "# <<< maw ephemeral markers <<<";
 
+#[cfg(test)]
 pub(crate) fn repo_lane(repo_path: &Path, repo_name: &str) -> RepoLane {
     let marker = repo_path.join(".maw/lane");
     if let Ok(value) = std::fs::read_to_string(marker) {
