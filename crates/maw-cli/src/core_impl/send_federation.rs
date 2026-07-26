@@ -800,7 +800,7 @@ fn send_local_message_with_audit(
     from: Option<&str>,
     audit_args: &[String],
 ) -> CliOutput {
-    let signature = match send_message_signature(config, sender_oracle, from, text) {
+    let signature = match send_message_signature(command, config, sender_oracle, from, text) {
         Ok(signature) => signature,
         Err(message) => return CliOutput { code: send_error_code(command), stdout: String::new(), stderr: format!("{command}: {message}\n") },
     };
@@ -845,7 +845,7 @@ async fn send_peer_message(
             }
         }
     };
-    let signature = match send_message_signature(config, sender_oracle, args.from.as_deref(), &args.text) {
+    let signature = match send_message_signature(command, config, sender_oracle, args.from.as_deref(), &args.text) {
         Ok(signature) => signature,
         Err(message) => return CliOutput { code: send_error_code(command), stdout: String::new(), stderr: format!("{command}: {message}\n") },
     };
@@ -1280,13 +1280,14 @@ async fn wake_peer_target(
 }
 
 fn send_message_signature(
+    command: &str,
     config: &HeyConfig,
     sender_oracle: &str,
     from: Option<&str>,
     text: &str,
 ) -> Result<Option<MessageSignature>, String> {
-    if text.starts_with('[') {
-        return Err("bracket-prefixed hey text is reserved for signed transport prefixes".to_owned());
+    if text.starts_with('[') && !allows_codex_handoff_prefix(command, text) {
+        return Err("bracket-prefixed hey text is reserved for signed transport prefixes; Codex delivery worktrees may use [codex] with maw hey".to_owned());
     }
     let node = config.node.as_deref().filter(|value| !value.is_empty()).unwrap_or("local");
     let expected = format!("{sender_oracle}:{node}");
@@ -1303,6 +1304,17 @@ fn send_message_signature(
         return Ok(None);
     }
     Ok(Some(MessageSignature))
+}
+
+fn allows_codex_handoff_prefix(command: &str, text: &str) -> bool {
+    command == "hey"
+        && text.starts_with("[codex]")
+        && std::env::current_dir()
+            .ok()
+            .and_then(|cwd| std::fs::read_to_string(cwd.join(".maw/delivery.json")).ok())
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+            .and_then(|delivery| delivery.get("engine").and_then(serde_json::Value::as_str).map(str::to_owned))
+            .is_some_and(|engine| engine == "codex" || engine.starts_with("codex-"))
 }
 
 fn resolve_hey_wire_from(
@@ -2224,7 +2236,7 @@ mod send_acl_hotpath_tests {
 
         assert_eq!(resolve_hey_sender_oracle_for_from(&config, Some("atlas:m5")), "atlas");
         assert_eq!(resolve_hey_wire_from(Some("atlas:m5"), &config, "atlas").unwrap(), "atlas:m5");
-        assert!(send_message_signature(&config, "atlas", Some("atlas:m5"), "hello").is_ok());
+        assert!(send_message_signature("hey", &config, "atlas", Some("atlas:m5"), "hello").is_ok());
 
         send_record_success("hey", &args, &config, "atlas", Some("atlas:m5"), "agent", "[atlas:m5] hello", "local", None);
 
@@ -2333,9 +2345,38 @@ mod send_acl_hotpath_tests {
         let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_root, _restores) = send_audit_test_env("signature-forge");
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
-        assert!(send_message_signature(&config, "atlas", None, "hello").unwrap().is_some());
-        assert!(send_message_signature(&config, "atlas", Some("other:m5"), "hello").unwrap_err().contains("does not match"));
-        assert!(send_message_signature(&config, "atlas", None, "[fake] hello").unwrap_err().contains("bracket-prefixed"));
+        assert!(send_message_signature("hey", &config, "atlas", None, "hello").unwrap().is_some());
+        assert!(send_message_signature("hey", &config, "atlas", Some("other:m5"), "hello").unwrap_err().contains("does not match"));
+        assert!(send_message_signature("hey", &config, "atlas", None, "[fake] hello").unwrap_err().contains("bracket-prefixed"));
+    }
+
+    #[test]
+    fn send_message_signature_allows_codex_handoff_from_codex_delivery() {
+        let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _restores) = send_audit_test_env("signature-codex-handoff");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".maw")).unwrap();
+        std::fs::write(repo.join(".maw/delivery.json"), r#"{"engine":"codex-launch"}"#).unwrap();
+        let _cwd = SendCwdRestore::enter(&repo);
+        let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
+
+        assert!(send_message_signature("hey", &config, "atlas", None, "[codex] ready").is_ok());
+        let error = send_message_signature("send", &config, "atlas", None, "[codex] ready").unwrap_err();
+        assert!(error.contains("may use [codex] with maw hey"));
+    }
+
+    #[test]
+    fn send_message_signature_rejects_codex_handoff_from_non_codex_delivery() {
+        let _lock = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, _restores) = send_audit_test_env("signature-non-codex-handoff");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".maw")).unwrap();
+        std::fs::write(repo.join(".maw/delivery.json"), r#"{"engine":"claude"}"#).unwrap();
+        let _cwd = SendCwdRestore::enter(&repo);
+        let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
+
+        let error = send_message_signature("hey", &config, "atlas", None, "[codex] ready").unwrap_err();
+        assert!(error.contains("may use [codex] with maw hey"));
     }
 
     #[test]
