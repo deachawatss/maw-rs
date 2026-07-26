@@ -64,7 +64,18 @@ fn resize_with_runner<R: maw_tmux::TmuxRunner>(argv: &[String], runner: &mut R) 
         if argv.len() != 1 {
             return Err((2, RESIZE_USAGE.to_owned()));
         }
-        tmux_run(runner, "select-layout", &["tiled".to_owned()], "resize")?;
+        let marker = runner
+            .run(
+                "show-window-options",
+                &["-q".to_owned(), "-v".to_owned(), WORKON_LAYOUT_MARKER.to_owned()],
+            )
+            .unwrap_or_default();
+        let layout = if marker.trim() == WORKON_LAYOUT_PRESET {
+            WORKON_LAYOUT_PRESET
+        } else {
+            "tiled"
+        };
+        tmux_run(runner, "select-layout", &[layout.to_owned()], "resize")?;
         return Ok("✓ resized panes equally\n".to_owned());
     }
     if argv.len() > 2 {

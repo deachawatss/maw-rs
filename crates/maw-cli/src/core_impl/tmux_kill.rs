@@ -137,7 +137,35 @@ fn tmux_kill_pane<R: maw_tmux::TmuxRunner>(
             pane.id
         ));
     }
+    tmux_kill_rebalance_workon_window(runner, &pane)?;
     Ok(format!("  \x1b[32m✓\x1b[0m killed pane {}\n", pane.id))
+}
+
+/// Reapply workon's equal-height layout after one of its L2 panes is closed.
+///
+/// The marker confines this to windows owned by `workon`; ordinary `maw tmux
+/// kill` calls must not replace a user's chosen layout.
+fn tmux_kill_rebalance_workon_window<R: maw_tmux::TmuxRunner>(
+    runner: &mut R,
+    pane: &TmuxKillPane,
+) -> Result<(), String> {
+    let window = format!("{}:{}", pane.session, pane.window_index);
+    let marker = runner
+        .run(
+            "show-window-options",
+            &tmux_kill_strings(&["-q", "-v", "-t", &window, WORKON_LAYOUT_MARKER]),
+        )
+        .unwrap_or_default();
+    if marker.trim() != WORKON_LAYOUT_PRESET {
+        return Ok(());
+    }
+    runner
+        .run(
+            "select-layout",
+            &tmux_kill_strings(&["-t", &window, WORKON_LAYOUT_PRESET]),
+        )
+        .map_err(|error| format!("tmux select-layout failed for workon window {window}: {}", error.message))?;
+    Ok(())
 }
 
 const TMUX_KILL_PANE_FORMAT: &str = maw_tmux::PANE_TARGET_FORMAT;
@@ -316,6 +344,7 @@ mod tmux_kill_tests {
     struct TmuxKillFakeRunner {
         sessions: String,
         panes: String,
+        workon_layout: String,
         calls: Vec<TmuxKillCall>,
         killed_panes: Vec<String>,
     }
@@ -351,6 +380,8 @@ mod tmux_kill_tests {
                     }
                     String::new()
                 }
+                "show-window-options" => self.workon_layout.clone(),
+                "select-layout" => String::new(),
                 // display-message: single-pane reaper resolves the pane's pid;
                 // empty output → reap is a no-op (no real process tree touched in tests).
                 "kill-session" | "display-message" => String::new(),
@@ -384,7 +415,7 @@ mod tmux_kill_tests {
         let mut runner = fake_runner();
         let output = tmux_kill_run_with(&fake_args(&["%42"]), &mut runner).expect("kill pane");
         assert_eq!(output, "  \x1b[32m✓\x1b[0m killed pane %42\n");
-        assert_eq!(runner.calls.len(), 4);
+        assert_eq!(runner.calls.len(), 5);
         assert_eq!(runner.calls[0].subcommand, "list-panes");
         // Pane reap resolves ONE pane's pid via display-message — NOT list-panes,
         // which lists the pane's whole window and would reap sibling panes' engines.
@@ -393,6 +424,7 @@ mod tmux_kill_tests {
         assert_eq!(runner.calls[2].subcommand, "kill-pane");
         assert_eq!(runner.calls[2].args, fake_args(&["-t", "%42"]));
         assert_eq!(runner.calls[3].subcommand, "list-panes");
+        assert_eq!(runner.calls[4].subcommand, "show-window-options");
     }
 
     #[test]
@@ -460,6 +492,22 @@ mod tmux_kill_tests {
             .expect("non-last pane in protected session should succeed");
         assert!(output.contains("killed pane %8"));
         assert!(runner.calls.iter().any(|call| call.subcommand == "kill-pane"));
+    }
+
+    #[test]
+    fn tmux_kill_rebalances_a_marked_workon_window_after_closing_an_l2() {
+        let mut runner = TmuxKillFakeRunner {
+            panes: "%1|||01-gale:1.0|||lead|||1|||0\n%2|||01-gale:1.1|||worker|||1|||1\n%3|||01-gale:1.2|||worker|||1|||2\n".to_owned(),
+            workon_layout: "main-vertical\n".to_owned(),
+            ..TmuxKillFakeRunner::default()
+        };
+
+        tmux_kill_run_with(&fake_args(&["%3"]), &mut runner).expect("kill and rebalance workon pane");
+
+        assert!(runner.calls.iter().any(|call| {
+            call.subcommand == "select-layout"
+                && call.args == fake_args(&["-t", "01-gale:1", "main-vertical"])
+        }));
     }
 
     #[test]
