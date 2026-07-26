@@ -1850,7 +1850,7 @@ mod workon_tests {
 
         std::fs::create_dir_all(main.join("ψ/teams")).expect("main psi");
         std::fs::write(main.join("ψ/teams/team.yaml"), "team: test\n").expect("team");
-        git(&main, &["init", "-q"]);
+        git(&main, &["init", "-q", "-b", "main"]);
         git(&main, &["config", "user.email", "test@example.com"]);
         git(&main, &["config", "user.name", "Test User"]);
         git(&main, &["add", "ψ/teams/team.yaml"]);
