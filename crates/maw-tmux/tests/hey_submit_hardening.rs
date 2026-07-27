@@ -227,7 +227,7 @@ fn gated_send_blocks_on_busy_but_ungated_succeeds() {
 fn submit_sleeps_for(config: SubmitConfig) -> Vec<Duration> {
     let mut responses = vec![Ok("$ \r"), Ok("0")];
     if config == SubmitConfig::codex() {
-        responses.push(Ok("› Use /skills to list available skills"));
+        responses.push(Ok("› Explain this codebase"));
     }
     responses.extend([Ok(""), Ok(""), Ok("$ deploy"), Ok(""), Ok("$ \r")]);
     let runner = SharedRunner::with_responses(responses);
