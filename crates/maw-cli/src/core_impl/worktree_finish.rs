@@ -574,7 +574,7 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
         "display-message",
         &[
             "-t".to_owned(),
-            pane_id.to_owned(),
+            pane_id.clone(),
             "-p".to_owned(),
             "#{window_panes}\t#{pane_current_path}\t#{window_id}".to_owned(),
         ],
@@ -604,7 +604,7 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
         return Err(format!("done: pane {pane_id} cwd does not match worktree {}; refusing cleanup", worktree.full_path.display()));
     }
     local.done_reap_pane(&pane_id)?;
-    local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.to_owned()])?;
+    local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.clone()])?;
     if let Err(error) = done_rebalance_workon_window(local, window) {
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not rebalance workon panes: {error}");
     }
