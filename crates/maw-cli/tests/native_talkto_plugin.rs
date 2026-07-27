@@ -49,7 +49,10 @@ case "$1" in
   capture-pane)
     printf '%s\n' '$ '
     ;;
-  load-buffer|paste-buffer)
+  load-buffer)
+    while IFS= read -r line; do :; done
+    ;;
+  paste-buffer)
     ;;
   send-keys)
     ;;
@@ -131,7 +134,11 @@ fn talkto_native_local_thread_notification_sends_to_guarded_pane() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("thread #1 + sent → %42"), "{stdout}");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(
+        stdout.contains("thread #1 + sent → %42"),
+        "stdout={stdout}\nstderr={stderr}"
+    );
     assert_eq!(dispatcher_status("talk-to"), DispatchKind::Native);
     assert_eq!(dispatcher_status("talkto"), DispatchKind::Native);
     let log = std::fs::read_to_string(root.join("tmux.log")).expect("tmux log");
