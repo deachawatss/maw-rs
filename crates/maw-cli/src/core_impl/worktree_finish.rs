@@ -14,6 +14,18 @@ struct DoneOptions { all: bool, force: bool, dry_run: bool, clean_branch: bool, 
 struct DoneWindow { session: String, index: i32, name: String, cwd: Option<String> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DonePane {
+    session: String,
+    window_index: i32,
+    window_name: String,
+    pane_index: i32,
+    pane_id: String,
+    active: bool,
+    command: String,
+    cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DoneWorktree { main_path: std::path::PathBuf, full_path: std::path::PathBuf, label: String }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +64,9 @@ struct DoneLocal { runner: maw_tmux::CommandTmuxRunner }
 
 trait DoneRuntime {
     fn done_list_windows(&mut self) -> Vec<DoneWindow>;
+    fn done_list_panes(&mut self) -> Vec<DonePane>;
     fn done_current_identity(&mut self) -> Option<(String, i32)>;
+    fn done_current_pane(&mut self) -> Option<String>;
     fn done_pane_info(&mut self, target: &str) -> Option<(String, String)>;
     fn done_reap_target(&mut self, target: &str) -> Result<(), String>;
     fn done_reap_pane(&mut self, pane_id: &str) -> Result<(), String>;
@@ -139,10 +153,16 @@ fn done_run_one(target: &str, options: &DoneOptions, session_filter: Option<&str
 fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter: Option<&str>, local: &mut impl DoneRuntime, context: &DoneContext) -> Result<String, String> {
     let mut stdout = String::new();
     let sessions = local.done_list_windows();
+    let panes = local.done_list_panes();
     let target_lower = target.to_lowercase();
     let matched = done_find_window(&sessions, &target_lower, session_filter);
+    let matched_pane = done_find_pane(&panes, &target_lower, session_filter)?;
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
-    let pane_info = matched.as_ref().and_then(|window| done_live_pane_info(window, local));
+    if let Some(pane) = &matched_pane { done_assert_may_target_pane(pane, local, &mut stdout)?; }
+    let pane_info = matched
+        .as_ref()
+        .and_then(|window| done_live_pane_info(window, local))
+        .or_else(|| matched_pane.as_ref().map(done_pane_info));
     let solo_worktree = matched
         .as_ref()
         .and_then(|window| solo_worktree_for_holder_in_dir(&done_tmux_target(window), &context.solo_lease_dir));
@@ -180,14 +200,15 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
         if let Some(window) = &matched { solo_release_holder(&done_tmux_target(window)); }
     }
     if !removed_worktree { stdout.push_str("  \x1b[90m○\x1b[0m no worktree to remove (may be a main window)\n"); }
+    let config_target = done_config_target(&target_lower, matched.as_ref(), selected_worktree.as_ref());
     if options.dry_run {
-        if matched.is_none() && !removed_worktree { done_fail_missing_target(target)?; }
-        let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would remove '{target_lower}' from fleet config if present\n");
+        if matched.is_none() && !removed_worktree { done_fail_missing_target(target, &panes, context)?; }
+        let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would remove '{config_target}' from fleet config if present\n");
         return Ok(stdout);
     }
-    let removed_config = done_remove_from_fleet_config(&target_lower, context, &mut stdout);
+    let removed_config = done_remove_from_fleet_config(&config_target, context, &mut stdout);
     if !removed_config { stdout.push_str("  \x1b[90m○\x1b[0m not in any fleet config\n"); }
-    if matched.is_none() && !removed_worktree && !removed_config { done_fail_missing_target(target)?; }
+    if matched.is_none() && !removed_worktree && !removed_config { done_fail_missing_target(target, &panes, context)?; }
     stdout.push('\n');
     Ok(stdout)
 }
@@ -224,9 +245,17 @@ impl DoneRuntime for DoneLocal {
         raw.lines().filter_map(done_parse_window_line).collect()
     }
 
+    fn done_list_panes(&mut self) -> Vec<DonePane> {
+        let args = ["-a".to_owned(), "-F".to_owned(), "#{session_name}|||#{window_index}|||#{window_name}|||#{pane_index}|||#{pane_id}|||#{pane_active}|||#{pane_current_command}|||#{pane_current_path}".to_owned()];
+        let Ok(raw) = maw_tmux::TmuxRunner::run(&mut self.runner, "list-panes", &args) else { return Vec::new(); };
+        raw.lines().filter_map(done_parse_pane_line).collect()
+    }
+
     fn done_current_identity(&mut self) -> Option<(String, i32)> {
         done_invoking_pane_identity(&mut self.runner)
     }
+
+    fn done_current_pane(&mut self) -> Option<String> { crate::wind::team::caller_pane() }
 
     fn done_pane_info(&mut self, target: &str) -> Option<(String, String)> {
         done_validate_tmux_target(target).ok()?;
@@ -297,9 +326,60 @@ fn done_parse_window_line(line: &str) -> Option<DoneWindow> {
     Some(DoneWindow { session, index, name, cwd })
 }
 
+fn done_parse_pane_line(line: &str) -> Option<DonePane> {
+    let mut parts = line.split("|||");
+    let session = parts.next()?.to_owned();
+    let window_index = parts.next()?.parse::<i32>().ok()?;
+    let window_name = parts.next()?.to_owned();
+    let pane_index = parts.next()?.parse::<i32>().ok()?;
+    let pane_id = parts.next()?.to_owned();
+    let active = parts.next()? == "1";
+    let command = parts.next()?.to_owned();
+    let cwd = parts.next().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
+    (!session.is_empty() && !window_name.is_empty() && pane_id.starts_with('%')).then_some(DonePane {
+        session,
+        window_index,
+        window_name,
+        pane_index,
+        pane_id,
+        active,
+        command,
+        cwd,
+    })
+}
+
 fn done_find_window(windows: &[DoneWindow], target_lower: &str, session_filter: Option<&str>) -> Option<DoneWindow> {
     windows.iter().find(|window| session_filter.is_none_or(|session| session == window.session) && window.name.eq_ignore_ascii_case(target_lower)).cloned()
 }
+
+fn done_find_pane(panes: &[DonePane], target_lower: &str, session_filter: Option<&str>) -> Result<Option<DonePane>, String> {
+    let matches = panes
+        .iter()
+        .filter(|pane| {
+            session_filter.is_none_or(|session| session == pane.session)
+                && done_pane_targets(pane).iter().any(|candidate| candidate.eq_ignore_ascii_case(target_lower))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err(format!(
+            "done: target '{target_lower}' is ambiguous; matches panes:\n{}",
+            matches.iter().map(done_pane_target).collect::<Vec<_>>().join("\n")
+        )),
+    }
+}
+
+fn done_pane_targets(pane: &DonePane) -> [String; 3] {
+    [
+        pane.pane_id.clone(),
+        done_pane_target(pane),
+        format!("{}:{}.{}", pane.session, pane.window_name, pane.pane_index),
+    ]
+}
+
+fn done_pane_target(pane: &DonePane) -> String { format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index) }
 
 fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
     let current = local.done_current_identity();
@@ -318,6 +398,20 @@ fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], loca
     let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
     stdout.push_str("  \x1b[90m  run from the lead window, or target a non-lead agent window\x1b[0m\n");
     Err(message)
+}
+
+fn done_assert_may_target_pane(pane: &DonePane, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+    if local.done_current_pane().is_some_and(|current| current == pane.pane_id) {
+        let message = format!("refusing to done invoking pane '{}'", pane.pane_id);
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        return Err(message);
+    }
+    if pane.command.eq_ignore_ascii_case("claude") {
+        let message = format!("refusing to done lead Oracle pane '{}'", pane.pane_id);
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        return Err(message);
+    }
+    Ok(())
 }
 
 fn done_lead_window(windows: &[DoneWindow], session: &str) -> Option<DoneWindow> {
@@ -377,6 +471,15 @@ fn done_live_pane_info(window: &DoneWindow, local: &mut impl DoneRuntime) -> Opt
         None if !listed_cwd.is_empty() => Some(DonePaneInfo { command: String::new(), cwd: listed_cwd.to_owned() }),
         None => None,
     }
+}
+
+fn done_pane_info(pane: &DonePane) -> DonePaneInfo {
+    DonePaneInfo { command: pane.command.clone(), cwd: pane.cwd.clone().unwrap_or_default() }
+}
+
+fn done_config_target(target: &str, matched_window: Option<&DoneWindow>, worktree: Option<&DoneWorktree>) -> String {
+    if matched_window.is_some() { return target.to_owned(); }
+    worktree.and_then(done_worktree_slug).unwrap_or(target).to_owned()
 }
 
 fn done_auto_save(window: &DoneWindow, options: &DoneOptions, local: &mut impl DoneRuntime, pane_info: Option<&DonePaneInfo>, worktree: Option<&DoneWorktree>, stdout: &mut String) {
@@ -569,7 +672,7 @@ fn done_select_worktree(target: &str, window_lower: &str, options: &DoneOptions,
     }
 
     if let Some(worktree) = done_worktree_from_config(window_lower, context) { return Ok(Some(worktree)); }
-    Ok(done_worktree_by_scan(target, &context.repos_root, stdout))
+    done_worktree_by_scan(target, &context.repos_root, stdout)
 }
 
 fn done_worktree_from_config(window_lower: &str, context: &DoneContext) -> Option<DoneWorktree> {
@@ -674,10 +777,15 @@ fn done_git_executable() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("git"))
 }
 
-fn done_worktree_by_scan(target: &str, repos_root: &std::path::Path, stdout: &mut String) -> Option<DoneWorktree> {
+fn done_worktree_by_scan(target: &str, repos_root: &std::path::Path, stdout: &mut String) -> Result<Option<DoneWorktree>, String> {
     let matches = done_find_worktree_paths(target, repos_root);
-    if matches.len() > 1 { let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m refusing to remove worktree '{}' — matches {} repos", target, matches.len()); return None; }
-    matches.first().cloned()
+    if matches.len() > 1 {
+        let candidates = matches.iter().map(|worktree| format!("  {}", worktree.label)).collect::<Vec<_>>().join("\n");
+        let message = format!("done: target '{target}' is ambiguous; matches worktrees:\n{candidates}");
+        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+        return Err(message);
+    }
+    Ok(matches.into_iter().next())
 }
 
 fn done_rescue_psi_notes(worktree: &DoneWorktree, stdout: &mut String) {
@@ -805,25 +913,47 @@ fn done_cleanup_branch(main_path: &std::path::Path, branch: &str, options: &Done
 }
 
 fn done_find_worktree_paths(target: &str, repos_root: &std::path::Path) -> Vec<DoneWorktree> {
-    let mut out = Vec::new();
     let target_lower = target.to_lowercase();
+    done_collect_worktree_paths(repos_root)
+        .into_iter()
+        .filter(|worktree| done_worktree_aliases(worktree).iter().any(|alias| alias.eq_ignore_ascii_case(&target_lower)))
+        .collect()
+}
+
+fn done_collect_worktree_paths(repos_root: &std::path::Path) -> Vec<DoneWorktree> {
+    let mut out = Vec::new();
     let Ok(orgs) = std::fs::read_dir(repos_root) else { return out; };
     for org in orgs.flatten().filter(|entry| entry.path().is_dir()) {
         let Ok(repos) = std::fs::read_dir(org.path()) else { continue; };
-        for repo in repos.flatten().filter(|entry| entry.path().is_dir()) { done_scan_repo_worktrees(&repo.path(), repos_root, &target_lower, &mut out); }
+        for repo in repos.flatten().filter(|entry| entry.path().is_dir()) { done_collect_repo_worktrees(&repo.path(), repos_root, &mut out); }
     }
     out.sort_by(|a, b| a.full_path.cmp(&b.full_path));
     out
 }
 
-fn done_scan_repo_worktrees(repo_path: &std::path::Path, repos_root: &std::path::Path, target_lower: &str, out: &mut Vec<DoneWorktree>) {
+fn done_collect_repo_worktrees(repo_path: &std::path::Path, repos_root: &std::path::Path, out: &mut Vec<DoneWorktree>) {
     let Some(name) = repo_path.file_name().and_then(std::ffi::OsStr::to_str) else { return; };
-    if name.to_lowercase().ends_with(&format!(".wt-{target_lower}")) { if let Some(worktree) = done_parse_worktree_path(repo_path, repos_root) { out.push(worktree); } }
+    if name.contains(".wt-") { if let Some(worktree) = done_parse_worktree_path(repo_path, repos_root) { out.push(worktree); } }
     let agents = repo_path.join("agents");
     let Ok(entries) = std::fs::read_dir(agents) else { return; };
     for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
-        if entry.file_name().to_string_lossy().eq_ignore_ascii_case(target_lower) { if let Some(worktree) = done_parse_worktree_path(&entry.path(), repos_root) { out.push(worktree); } }
+        if let Some(worktree) = done_parse_worktree_path(&entry.path(), repos_root) { out.push(worktree); }
     }
+}
+
+fn done_worktree_aliases(worktree: &DoneWorktree) -> Vec<String> {
+    let Some(slug) = done_worktree_slug(worktree) else { return Vec::new(); };
+    let mut aliases = vec![slug.to_owned()];
+    if let Some(repo) = worktree.main_path.file_name().and_then(std::ffi::OsStr::to_str) {
+        aliases.push(format!("{repo}-{slug}"));
+    }
+    aliases
+}
+
+fn done_worktree_slug(worktree: &DoneWorktree) -> Option<&str> {
+    let name = worktree.full_path.file_name()?.to_str()?;
+    if worktree.full_path.parent()?.file_name()?.to_str() == Some("agents") { return Some(name); }
+    name.split_once(".wt-").map(|(_, slug)| slug)
 }
 
 fn done_parse_worktree_path(full_path: &std::path::Path, repos_root: &std::path::Path) -> Option<DoneWorktree> {
@@ -873,9 +1003,41 @@ fn done_git(args: &[String]) -> Result<String, String> {
     if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).to_string()) } else { Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()) }
 }
 
-fn done_fail_missing_target(window_name: &str) -> Result<(), String> {
-    let hint = if window_name.eq_ignore_ascii_case("all") { "\n  did you mean `maw done --all`?" } else { "" };
-    Err(format!("no done target matched '{window_name}'{hint}"))
+fn done_fail_missing_target(target: &str, panes: &[DonePane], context: &DoneContext) -> Result<(), String> {
+    let mut candidates = panes.iter().flat_map(done_pane_targets).collect::<Vec<_>>();
+    candidates.extend(done_collect_worktree_paths(&context.repos_root).iter().flat_map(done_worktree_aliases));
+    candidates.sort();
+    candidates.dedup();
+    let hint = if target.eq_ignore_ascii_case("all") {
+        "\n  did you mean `maw done --all`?".to_owned()
+    } else {
+        done_nearest_target(target, &candidates).map_or_else(String::new, |candidate| format!("\n  did you mean '{candidate}'?"))
+    };
+    Err(format!(
+        "no done target matched '{target}'{hint}\n  accepted forms: <slug>, <repo>-<slug>, <pane-id> (for example %26), <session>:<window>.<pane>"
+    ))
+}
+
+fn done_nearest_target(target: &str, candidates: &[String]) -> Option<String> {
+    let (distance, candidate) = candidates
+        .iter()
+        .map(|candidate| (done_edit_distance(target, candidate), candidate))
+        .min_by_key(|(distance, candidate)| (*distance, candidate.len()))?;
+    (distance <= (target.chars().count() / 5).max(2)).then(|| candidate.clone())
+}
+
+fn done_edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let replace = previous[right_index] + usize::from(left_char != *right_char);
+            current.push((current[right_index] + 1).min(previous[right_index + 1] + 1).min(replace));
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 fn done_normalize_target(value: &str) -> String { value.trim().to_owned() }
@@ -906,7 +1068,9 @@ mod done_tests {
     #[derive(Default)]
     struct DoneFakeRuntime {
         windows: Vec<DoneWindow>,
+        panes: Vec<DonePane>,
         current: Option<(String, i32)>,
+        current_pane: Option<String>,
         pane_info: std::collections::BTreeMap<String, (String, String)>,
         top_levels: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
         registered: std::collections::BTreeMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
@@ -937,7 +1101,11 @@ mod done_tests {
     impl DoneRuntime for DoneFakeRuntime {
         fn done_list_windows(&mut self) -> Vec<DoneWindow> { self.windows.clone() }
 
+        fn done_list_panes(&mut self) -> Vec<DonePane> { self.panes.clone() }
+
         fn done_current_identity(&mut self) -> Option<(String, i32)> { self.current.clone() }
+
+        fn done_current_pane(&mut self) -> Option<String> { self.current_pane.clone() }
 
         fn done_pane_info(&mut self, target: &str) -> Option<(String, String)> { self.pane_info.get(target).cloned() }
 
@@ -1005,7 +1173,11 @@ mod done_tests {
     impl DoneRuntime for DoneRealGitRuntime {
         fn done_list_windows(&mut self) -> Vec<DoneWindow> { Vec::new() }
 
+        fn done_list_panes(&mut self) -> Vec<DonePane> { Vec::new() }
+
         fn done_current_identity(&mut self) -> Option<(String, i32)> { None }
+
+        fn done_current_pane(&mut self) -> Option<String> { None }
 
         fn done_pane_info(&mut self, _target: &str) -> Option<(String, String)> { None }
 
@@ -1062,6 +1234,19 @@ mod done_tests {
         DoneWindow { session: "s".to_owned(), index: if name == "s" { 1 } else { 2 }, name: name.to_owned(), cwd: Some(cwd.display().to_string()) }
     }
 
+    fn done_test_pane(id: &str, index: i32, command: &str, cwd: &std::path::Path) -> DonePane {
+        DonePane {
+            session: "s".to_owned(),
+            window_index: 1,
+            window_name: "s".to_owned(),
+            pane_index: index,
+            pane_id: id.to_owned(),
+            active: index == 0,
+            command: command.to_owned(),
+            cwd: Some(cwd.display().to_string()),
+        }
+    }
+
     fn done_write_fleet(root: &DoneTempRoot, window: &str, repo: &str) {
         let fleet_dir = root.fleet_dir();
         std::fs::create_dir_all(&fleet_dir).expect("fleet dir");
@@ -1079,6 +1264,81 @@ mod done_tests {
     fn done_parse_matches_js_extra_positionals() {
         let err = done_parse_args(&["all".to_owned(), "x".to_owned()]).unwrap_err();
         assert!(err.contains("did you mean `maw done --all`?"), "{err}");
+    }
+
+    #[test]
+    fn done_workon_name_and_slug_resolve_the_same_split_pane_worktree() {
+        let root = DoneTempRoot::new("workon-name");
+        let context = root.context();
+        let worktree = context.repos_root.join("acme/app/agents/issue-147");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+
+        for target in ["issue-147", "app-issue-147"] {
+            let output = done_run_with_context(&done_args(&[target, "--dry-run"]), &mut DoneFakeRuntime::default(), &context)
+                .expect("accepted worktree target");
+            assert!(output.contains("would kill split pane %42"), "{output}");
+            assert!(output.contains("would remove worktree acme/app/agents/issue-147"), "{output}");
+            assert!(output.contains("would remove 'issue-147' from fleet config"), "{output}");
+        }
+    }
+
+    #[test]
+    fn done_pane_discovery_finds_a_split_l2_behind_the_active_oracle() {
+        let root = DoneTempRoot::new("pane-discovery");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-147");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        let raw = format!(
+            "s|||1|||s|||0|||%25|||1|||claude|||{}\ns|||1|||s|||1|||%42|||0|||codex|||{}\n",
+            main.display(), worktree.display()
+        );
+        let panes = raw.lines().filter_map(done_parse_pane_line).collect::<Vec<_>>();
+        assert!(panes[0].active && panes[1].cwd.as_deref() == Some(worktree.to_str().expect("utf8 path")));
+
+        for target in ["%42", "s:1.1"] {
+            let mut runtime = DoneFakeRuntime { panes: panes.clone(), ..DoneFakeRuntime::default() };
+            runtime.register_worktree(&main, &worktree);
+            let output = done_run_with_context(&done_args(&[target, "--dry-run"]), &mut runtime, &context)
+                .expect("accepted pane target");
+            assert!(output.contains("would kill split pane %42"), "{output}");
+            assert!(output.contains("would remove worktree acme/app/agents/issue-147"), "{output}");
+        }
+    }
+
+    #[test]
+    fn done_refuses_ambiguous_or_protected_pane_targets_and_suggests_near_matches() {
+        let root = DoneTempRoot::new("done-target-guards");
+        let context = root.context();
+        for repo in ["acme/app", "org/app"] {
+            std::fs::create_dir_all(context.repos_root.join(repo).join("agents/task")).expect("worktree dir");
+        }
+        let ambiguous = done_run_with_context(&done_args(&["app-task", "--dry-run"]), &mut DoneFakeRuntime::default(), &context)
+            .expect_err("ambiguous aliases must fail");
+        assert!(ambiguous.contains("ambiguous") && ambiguous.contains("acme/app/agents/task") && ambiguous.contains("org/app/agents/task"), "{ambiguous}");
+        let missing = done_run_with_context(&done_args(&["app-taks", "--dry-run"]), &mut DoneFakeRuntime::default(), &context)
+            .expect_err("missing target");
+        assert!(missing.contains("accepted forms") && missing.contains("did you mean 'app-task'?"), "{missing}");
+
+        let worktree = context.repos_root.join("acme/app/agents/task");
+        let self_pane = done_test_pane("%42", 1, "codex", &worktree);
+        let self_error = done_run_with_context(
+            &done_args(&["%42", "--dry-run"]),
+            &mut DoneFakeRuntime { panes: vec![self_pane], current_pane: Some("%42".to_owned()), ..DoneFakeRuntime::default() },
+            &context,
+        )
+        .expect_err("own pane must fail");
+        assert!(self_error.contains("invoking pane"), "{self_error}");
+
+        let lead_error = done_run_with_context(
+            &done_args(&["s:1.0", "--dry-run"]),
+            &mut DoneFakeRuntime { panes: vec![done_test_pane("%25", 0, "claude", &context.repos_root.join("acme/app"))], ..DoneFakeRuntime::default() },
+            &context,
+        )
+        .expect_err("lead pane must fail");
+        assert!(lead_error.contains("lead Oracle pane"), "{lead_error}");
     }
 
     #[test]
