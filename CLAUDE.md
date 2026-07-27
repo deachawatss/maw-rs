@@ -4,21 +4,34 @@ Rust port of maw-js — distributed terminal multiplexing & fleet management.
 A Cargo workspace of small, focused crates. BUSL-1.1 licensed.
 For repo-wide agent execution conventions, read `AGENTS.md` first; this file remains the Claude-specific memory and release detail.
 
-## Build Gate — DO NOT BUILD OR TEST LOCALLY (Wind ruling, 2026-07-26)
+## Build Gate — L2 DOES NOT BUILD OR TEST LOCALLY (Wind ruling, 2026-07-26; scope clarified 2026-07-27)
 
-**No `cargo test`. No `cargo clippy`. No `cargo build`. Not scoped, not
-`-p <crate>`, not a single `-- <test_name>`. None.**
+**As an L2: no `cargo test`, no `cargo clippy`, no `cargo build`. Not scoped,
+not `-p <crate>`, not a single `-- <test_name>`. None.**
 
 Make the fix, read the diff, commit, push, open the PR, hand to L1. That is
 the whole L2 loop for this repo.
 
-Rust compilation is the single heaviest thing that runs on this machine. Two
-concurrent scoped builds took the disk from 40Gi to 25Gi in minutes on
-2026-07-26, and a later run exhausted **memory** and killed three live L2
-panes outright. The work survived only because it was in worktrees. This is
-not a tuning problem to be solved with a narrower `-p` flag — the earlier
-"scope tests to what you changed" rule was already scoped, and it still
-crashed the box.
+Rust compilation is the single heaviest thing that runs on this machine, and
+the failure mode is **concurrency**. Two concurrent scoped builds took the
+disk from 40Gi to 25Gi in minutes on 2026-07-26, and a later run exhausted
+**memory** and killed three live L2 panes outright. The work survived only
+because it was in worktrees. A narrower `-p` flag does not fix it — the
+earlier "scope tests to what you changed" rule was already scoped, and it
+still crashed the box, because four or five work-team members were compiling
+at the same time and their test runs collided.
+
+**L1 may build.** One serialized build is not what broke the machine. L1
+builds the box binary and gets the live evidence an L2 delivery could not —
+one at a time, and not while L2 deliveries are mid-flight. Measured
+2026-07-27: `cargo build --release --bin maw-rs` on a warm target took 2m28s
+and 2Gi of disk. L2 still may not build, because L2s run in parallel and
+cannot see what their siblings are doing.
+
+**Toolchain:** the deps need rustc >= 1.91 (`wasmtime-internal-*`, `wiggle`).
+CI does `rustup default stable`. If your local default is pinned older the
+build fails in ~18s with "requires rustc 1.91.0" — that is a toolchain
+mismatch, not the build gate. Fix with `rustup default stable`.
 
 **CI is the gate.** Push, then read the GitHub Actions result. If CI is red,
 fix from the log — do not reproduce locally to "see it fail".
@@ -30,10 +43,13 @@ Consequences to be honest about, so nobody is surprised:
   "commands run". Say so plainly in the handoff — do not claim a check you
   did not run.
 - L1 reviews the diff and the CI result, not a claimed test run.
-- **maw-rs CI has been red on `main` since 2026-07-25** (7 `maw-cli --lib`
-  tests fail on Linux, pass on macOS — issue #127). While that is true, CI
-  cannot distinguish a new break from the standing one. Compare against the
-  known-failing set in #127 before concluding a PR broke something.
+- **Verify `main`'s current CI state; do not assume it from this file.** Issue
+  #127 (7 `maw-cli --lib` tests failing on Linux) is **closed**, and the
+  `workon_hardening` fixture failures that followed it were fixed by #144.
+  Run `gh run list --branch main --workflow CI --limit 3` and diff your
+  failures against `main`'s before concluding a PR broke something. This
+  bullet has been stale twice; treat it as a pointer to the check, not as the
+  answer.
 
 This rule is maw-rs only. Other repos keep their normal proportional
 verification.
