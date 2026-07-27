@@ -231,7 +231,7 @@ fn trailing_after_codex_pasted_prompt(lines: &[String], index: usize) -> bool {
             || line
                 .chars()
                 .next()
-                .is_some_and(|character| character.is_whitespace())
+                .is_some_and(char::is_whitespace)
     })
 }
 
