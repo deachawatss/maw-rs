@@ -48,6 +48,8 @@ maw --version    # must report the commit you just merged
 Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
 `setup.sh` has no maw-rs step, so a merged fix reaches the box only when L1 performs the
 build above. Skip it and `main` moves while every operator keeps running the old binary.
+If a build fails with a toolchain error, fix the repository pin in `rust-toolchain.toml`;
+never use `rustup default` as a workaround because it silently changes every Rust project.
 
 Do not repoint the wrapper at a build directory to avoid this step. On 2026-07-27 the
 wrapper was edited to prefer `/tmp/maw-rs-target/release/maw-rs` and the repo checkout's
