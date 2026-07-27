@@ -1255,7 +1255,13 @@ mod done_tests {
     }
 
     impl Default for DoneRealGitRuntime {
-        fn default() -> Self { Self { git: done_git_executable() } }
+        fn default() -> Self {
+            Self {
+                git: done_git_executable(),
+                tmux_responses: std::collections::BTreeMap::new(),
+                tmux_calls: Vec::new(),
+            }
+        }
     }
 
     impl DoneRuntime for DoneRealGitRuntime {
