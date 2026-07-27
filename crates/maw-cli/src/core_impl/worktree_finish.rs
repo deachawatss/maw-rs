@@ -603,7 +603,7 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     if !done_same_path(std::path::Path::new(cwd), &worktree.full_path) {
         return Err(format!("done: pane {pane_id} cwd does not match worktree {}; refusing cleanup", worktree.full_path.display()));
     }
-    local.done_reap_pane(pane_id)?;
+    local.done_reap_pane(&pane_id)?;
     local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.to_owned()])?;
     if let Err(error) = done_rebalance_workon_window(local, window) {
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m could not rebalance workon panes: {error}");
