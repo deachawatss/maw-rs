@@ -715,10 +715,8 @@ fn pr_build_plan(
 ) -> Result<PrPlan, String> {
     pr_validate_branch(&branch)?;
     pr_validate_base_repo(&base_repo)?;
-    let branch_issue = pr_extract_issue_num(&branch)
-        .ok_or_else(|| "pr: branch must contain issue-<number> for one-issue/one-PR traceability".to_owned())?;
     let delivery = pr_load_delivery(&cwd)?;
-    pr_validate_delivery(&delivery, branch_issue)?;
+    pr_validate_delivery(&delivery, pr_extract_issue_num(&branch))?;
     pr_rerun_delivery_commands(&delivery, &cwd, process)?;
     let title = options.title.clone().unwrap_or_else(|| pr_branch_to_title(&branch));
     pr_validate_text_arg(&title, "title")?;
@@ -735,18 +733,22 @@ fn pr_load_delivery(cwd: &std::path::Path) -> Result<DeliveryEvidence, String> {
         .map_err(|error| format!("pr: invalid {}: {error}", path.display()))
 }
 
-fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: u64) -> Result<(), String> {
+fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: Option<u64>) -> Result<(), String> {
     // The WF pre-guard.sh hook remains the engine-neutral shape-only fallback for
     // direct `gh pr create` and older binaries. Native `maw pr` owns re-running
     // successful local verification commands after this validation succeeds.
+    // Delivery metadata is authoritative; a recognized branch issue is only a
+    // cross-check for conflicting traceability.
     if delivery.version != 1 {
         return Err(format!("pr: unsupported delivery version {} (expected 1)", delivery.version));
     }
-    if delivery.issue != branch_issue {
-        return Err(format!(
-            "pr: delivery issue {} does not match branch issue {branch_issue}",
-            delivery.issue
-        ));
+    if let Some(branch_issue) = branch_issue {
+        if delivery.issue != branch_issue {
+            return Err(format!(
+                "pr: delivery issue {} does not match branch issue {branch_issue}",
+                delivery.issue
+            ));
+        }
     }
     if !matches!(delivery.mode.as_str(), "fast" | "standard" | "swarm" | "discovery") {
         return Err(format!("pr: invalid delivery mode {}", delivery.mode));
@@ -941,9 +943,18 @@ fn pr_branch_to_title(branch: &str) -> String {
 
 fn pr_extract_issue_num(branch: &str) -> Option<u64> {
     let lower = branch.to_ascii_lowercase();
-    let tail = lower.split_once("issue-")?.1;
-    let digits = tail.chars().take_while(char::is_ascii_digit).collect::<String>();
-    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+    lower.split('/').find_map(|component| {
+        let tail = ["issue-", "bug-", "fix-"]
+            .iter()
+            .find_map(|&prefix| component.strip_prefix(prefix))
+            .or_else(|| {
+                component
+                    .split_once('-')
+                    .and_then(|(number, _)| (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(number))
+            })?;
+        let digits = tail.chars().take_while(char::is_ascii_digit).collect::<String>();
+        (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+    })
 }
 
 fn pr_github_repo_from_remote(url: &str) -> Result<String, String> {
@@ -1492,7 +1503,7 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_requires_valid_delivery_evidence_matching_branch_issue() {
+    fn pr_requires_valid_delivery_evidence_and_rejects_branch_issue_mismatches() {
         let repo = pr_temp_dir("delivery-required");
         let options = PrOptions { window: None, title: None, body: None, show_current: false, reconcile: false, quiet: false };
         let mut process = PrMockProcess::default();
@@ -1519,6 +1530,26 @@ mod pr_tests {
         assert!(mismatch.contains("delivery issue 41 does not match branch issue 42"), "{mismatch}");
 
         let _state = pr_write_delivery(&repo, 42);
+        let nonstandard_token = pr_build_plan(
+            repo.clone(),
+            "agents/bug-42-delivery-binding".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+            &mut process,
+        )
+        .expect("delivery binding accepts nonstandard branch token");
+        assert!(nonstandard_token.body.contains("Closes #42\nREQ: #42"));
+
+        let numberless_branch = pr_build_plan(
+            repo.clone(),
+            "agents/some-slug".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+            &mut process,
+        )
+        .expect("delivery binding accepts numberless branch");
+        assert!(numberless_branch.body.contains("Closes #42\nREQ: #42"));
+
         let path = repo.join(".maw/delivery.json");
         let mut delivery: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
@@ -1533,6 +1564,36 @@ mod pr_tests {
         )
         .expect_err("invalid engine blocked");
         assert!(invalid_engine.contains("invalid delivery engine claude"), "{invalid_engine}");
+    }
+
+    #[test]
+    fn pr_rejects_branch_issue_mismatch_before_creating_pr() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("branch-issue-mismatch");
+        let _state = pr_write_delivery(&repo, 42);
+        let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/bug-41-wrong-delivery".to_owned(),
+            ..Default::default()
+        };
+
+        let error = pr_run(&[], &mut tmux, &mut process).expect_err("mismatch blocked");
+
+        assert!(error.contains("delivery issue 42 does not match branch issue 41"), "{error}");
+        assert!(process.rerun_commands.is_empty());
+        assert!(process.created.is_empty());
+    }
+
+    #[test]
+    fn pr_extract_issue_num_keeps_the_issue_token_convention() {
+        assert_eq!(pr_extract_issue_num("agents/issue-119-pr-branch-token"), Some(119));
+        assert_eq!(pr_extract_issue_num("agents/ISSUE-42-demo"), Some(42));
+        assert_eq!(pr_extract_issue_num("agents/bug-42-delivery-binding"), Some(42));
+        assert_eq!(pr_extract_issue_num("agents/fix-7-delivery-binding"), Some(7));
+        assert_eq!(pr_extract_issue_num("agents/119-pr-branch-token"), Some(119));
+        assert_eq!(pr_extract_issue_num("agents/some-slug"), None);
     }
 
     #[test]
