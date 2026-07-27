@@ -158,7 +158,7 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     let matched = done_find_window(&sessions, &target_lower, session_filter);
     let matched_pane = done_find_pane(&panes, &target_lower, session_filter)?;
     if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
-    if let Some(pane) = &matched_pane { done_assert_may_target_pane(pane, local, &mut stdout)?; }
+    if let Some(pane) = &matched_pane { done_assert_not_invoking_pane(pane, local, &mut stdout)?; }
     let pane_info = matched
         .as_ref()
         .and_then(|window| done_live_pane_info(window, local))
@@ -171,6 +171,7 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     } else {
         done_select_worktree(target, &target_lower, options, pane_info.as_ref(), local, context, &mut stdout)?
     };
+    if let Some(pane) = &matched_pane { done_assert_may_target_pane(pane, selected_worktree.as_ref(), &mut stdout)?; }
     if !options.dry_run {
         if let Some(worktree) = &selected_worktree {
             done_rescue_psi_notes(worktree, &mut stdout);
@@ -400,18 +401,20 @@ fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], loca
     Err(message)
 }
 
-fn done_assert_may_target_pane(pane: &DonePane, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+fn done_assert_not_invoking_pane(pane: &DonePane, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
     if local.done_current_pane().is_some_and(|current| current == pane.pane_id) {
         let message = format!("refusing to done invoking pane '{}'", pane.pane_id);
         let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
         return Err(message);
     }
-    if pane.command.eq_ignore_ascii_case("claude") {
-        let message = format!("refusing to done lead Oracle pane '{}'", pane.pane_id);
-        let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
-        return Err(message);
-    }
     Ok(())
+}
+
+fn done_assert_may_target_pane(pane: &DonePane, worktree: Option<&DoneWorktree>, stdout: &mut String) -> Result<(), String> {
+    if worktree.and_then(done_recorded_worktree_pane_id).as_deref() == Some(pane.pane_id.as_str()) { return Ok(()); }
+    let message = format!("refusing to done pane '{}': it is not a recorded worktree L2", pane.pane_id);
+    let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
+    Err(message)
 }
 
 fn done_lead_window(windows: &[DoneWindow], session: &str) -> Option<DoneWindow> {
@@ -558,13 +561,11 @@ fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut impl
 }
 
 fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
-    let marker = worktree.full_path.join(".maw/pane-id");
-    let Ok(pane_id) = std::fs::read_to_string(&marker) else {
+    let Some(pane_id) = done_recorded_worktree_pane_id(worktree) else {
         let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{}' not running", worktree.label);
         return Ok(());
     };
-    let pane_id = pane_id.trim();
-    done_validate_tmux_target(pane_id)?;
+    done_validate_tmux_target(&pane_id)?;
     if options.dry_run {
         let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would kill split pane {pane_id}");
         return Ok(());
@@ -609,6 +610,10 @@ fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local
     }
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed split pane {pane_id}");
     Ok(())
+}
+
+fn done_recorded_worktree_pane_id(worktree: &DoneWorktree) -> Option<String> {
+    std::fs::read_to_string(worktree.full_path.join(".maw/pane-id")).ok().map(|pane_id| pane_id.trim().to_owned())
 }
 
 fn done_rebalance_workon_window(
@@ -1309,7 +1314,34 @@ mod done_tests {
     }
 
     #[test]
-    fn done_refuses_ambiguous_or_protected_pane_targets_and_suggests_near_matches() {
+    fn done_allows_a_claude_worktree_pane_and_refuses_a_claude_lead_pane() {
+        let root = DoneTempRoot::new("claude-pane-ownership");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/issue-147");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+
+        let mut runtime = DoneFakeRuntime {
+            panes: vec![
+                done_test_pane("%25", 0, "claude", &main),
+                done_test_pane("%42", 1, "claude", &worktree),
+            ],
+            ..DoneFakeRuntime::default()
+        };
+        runtime.register_worktree(&main, &worktree);
+
+        let output = done_run_with_context(&done_args(&["%42", "--dry-run"]), &mut runtime, &context)
+            .expect("recorded Claude L2 pane must be accepted");
+        assert!(output.contains("would kill split pane %42"), "{output}");
+
+        let error = done_run_with_context(&done_args(&["%25", "--dry-run"]), &mut runtime, &context)
+            .expect_err("Claude lead pane without a worktree marker must be refused");
+        assert!(error.contains("not a recorded worktree L2"), "{error}");
+    }
+
+    #[test]
+    fn done_refuses_ambiguous_or_self_pane_targets_and_suggests_near_matches() {
         let root = DoneTempRoot::new("done-target-guards");
         let context = root.context();
         for repo in ["acme/app", "org/app"] {
@@ -1331,14 +1363,6 @@ mod done_tests {
         )
         .expect_err("own pane must fail");
         assert!(self_error.contains("invoking pane"), "{self_error}");
-
-        let lead_error = done_run_with_context(
-            &done_args(&["s:1.0", "--dry-run"]),
-            &mut DoneFakeRuntime { panes: vec![done_test_pane("%25", 0, "claude", &context.repos_root.join("acme/app"))], ..DoneFakeRuntime::default() },
-            &context,
-        )
-        .expect_err("lead pane must fail");
-        assert!(lead_error.contains("lead Oracle pane"), "{lead_error}");
     }
 
     #[test]
