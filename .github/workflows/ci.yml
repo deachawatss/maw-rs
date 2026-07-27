@@ -35,8 +35,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.91.0 --profile minimal --component clippy --component rustfmt
-          rustup +1.91.0 target add wasm32-unknown-unknown
+          rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+          rustup +1.97.1 target add wasm32-unknown-unknown
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -155,8 +155,8 @@ jobs:
 
       - name: Install Rust musl target
         run: |
-          rustup toolchain install 1.91.0 --profile minimal
-          rustup +1.91.0 target add x86_64-unknown-linux-musl
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup +1.97.1 target add x86_64-unknown-linux-musl
 
       - name: Build maw-cli for musl static
         run: cargo build --release --target x86_64-unknown-linux-musl -p maw-cli
