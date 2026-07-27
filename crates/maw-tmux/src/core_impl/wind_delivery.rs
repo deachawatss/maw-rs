@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use super::{
-    pane_input_pending_from_capture, strip_tmux_ansi, SendTextReport, SendThrottle, TmuxClient,
-    TmuxError, TmuxRunner, MAX_SUBMIT_ATTEMPTS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
+    pane_has_empty_prompt_from_capture, pane_input_pending_from_capture, strip_tmux_ansi,
+    SendTextReport, SendThrottle, TmuxClient, TmuxError, TmuxRunner, MAX_SUBMIT_ATTEMPTS,
+    SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
 };
 
 pub const CODEX_SUBMIT_CONFIRM_MS: u64 = 200;
@@ -217,7 +218,7 @@ where
     let codex_was_idle = config == SubmitConfig::codex()
         && client
             .capture(target, Some(5))
-            .is_ok_and(|content| !codex_execution_active(&content));
+            .is_ok_and(|content| pane_has_empty_prompt_from_capture(&content));
     let used_buffer = text.contains('\n') || text.len() > 500;
     if used_buffer {
         client.load_buffer(text)?;
@@ -398,5 +399,13 @@ mod tests {
         assert!(report.used_buffer);
         assert_eq!(report.enter_attempts, 1);
         assert!(!report.warned_pending);
+    }
+
+    #[test]
+    fn codex_working_acceptance_requires_an_initially_empty_prompt() {
+        assert!(pane_has_empty_prompt_from_capture(
+            "› Use /skills to list available skills"
+        ));
+        assert!(!pane_has_empty_prompt_from_capture("› unrelated queued input"));
     }
 }
