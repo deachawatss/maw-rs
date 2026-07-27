@@ -603,7 +603,7 @@ fn done_kill_worktree_pane(
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
         return Ok(());
     };
-    let Some(cwd) = fields.next() else {
+    let Some(_cwd) = fields.next() else {
         let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m split pane {pane_id} already gone; continuing cleanup");
         return Ok(());
     };
@@ -615,9 +615,9 @@ fn done_kill_worktree_pane(
     if count <= 1 {
         return Err(format!("done: refusing to kill sole pane {pane_id}; it no longer has a split-pane parent"));
     }
-    if !done_same_path(std::path::Path::new(cwd), &worktree.full_path) {
-        return Err(format!("done: pane {pane_id} cwd does not match worktree {}; refusing cleanup", worktree.full_path.display()));
-    }
+    // The marker identifies the pane from the resolved worktree before removal.
+    // Pane targets were also verified by `done_assert_may_target_pane`; tmux
+    // marks the cwd as " (deleted)" after removal, so it cannot prove ownership here.
     local.done_reap_pane(&pane_id)?;
     local.done_tmux("kill-pane", &["-t".to_owned(), pane_id.clone()])?;
     if let Err(error) = done_rebalance_workon_window(local, window) {
@@ -1113,6 +1113,7 @@ mod done_tests {
         tmux_responses: std::collections::BTreeMap<String, String>,
         git_calls: Vec<Vec<String>>,
         tmux_calls: Vec<(String, Vec<String>)>,
+        actions: Vec<&'static str>,
         sent_text: Vec<(String, String)>,
     }
 
@@ -1149,6 +1150,9 @@ mod done_tests {
 
         fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
             self.tmux_calls.push((command.to_owned(), args.to_vec()));
+            if command == "kill-pane" {
+                self.actions.push("kill-pane");
+            }
             Ok(self.tmux_responses.get(command).cloned().unwrap_or_default())
         }
 
@@ -1188,6 +1192,7 @@ mod done_tests {
                 return Ok(format!("{}\n", self.branches.get(&cwd).map_or("agent/task", String::as_str)));
             }
             if args.iter().any(|arg| arg == "remove") {
+                self.actions.push("remove-worktree");
                 let worktree = Self::arg_after_separator(args).ok_or_else(|| "missing worktree path".to_owned())?;
                 if self.dirty_removals.contains(&worktree) && !args.iter().any(|arg| arg == "--force") {
                     return Err(format!("fatal: '{}' contains modified or untracked files", worktree.display()));
@@ -1775,7 +1780,7 @@ mod done_tests {
     }
 
     #[test]
-    fn done_removes_the_worktree_before_killing_its_recorded_split_pane() {
+    fn done_retires_recorded_split_pane_after_worktree_removal_marks_its_cwd_deleted() {
         let root = DoneTempRoot::new("split-pane");
         let context = root.context();
         let main = context.repos_root.join("acme/app");
@@ -1786,7 +1791,9 @@ mod done_tests {
 
         let mut runtime = DoneFakeRuntime::default();
         runtime.register_worktree(&main, &worktree);
-        runtime.tmux_responses.insert("display-message".to_owned(), format!("2\t{}\t@7\n", worktree.display()));
+        runtime
+            .tmux_responses
+            .insert("display-message".to_owned(), format!("2\t{} (deleted)\t@7\n", worktree.display()));
 
         let output = done_run_with_context(&done_args(&["issue-94", "--force"]), &mut runtime, &context)
             .expect("done split pane");
@@ -1795,6 +1802,7 @@ mod done_tests {
         assert!(runtime.tmux_calls.iter().any(|(command, args)| command == "kill-pane" && args == &done_args(&["-t", "%42"])));
         assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
         assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
+        assert_eq!(runtime.actions, vec!["remove-worktree", "kill-pane"]);
     }
 
     #[test]
