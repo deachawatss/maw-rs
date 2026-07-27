@@ -350,6 +350,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut target_path = repo.repo_path.clone();
     let mut window_name = repo.repo_name.clone();
     let mut taskless_oracle = false;
+    let mut resuming_worktree = false;
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
     solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
@@ -362,6 +363,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                     workon_cargo_disk_preflight(&repo.repo_path, &path, &mut stdout)?;
                     workon_restore_shared_worktree_state(&repo.repo_path, &path)?;
                     let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing worktree: {}", path.display());
+                    resuming_worktree = true;
                     target_path = path;
                 }
                 WorkonWorktreePlan::Create { wt_path, branch, branch_exists, .. } => {
@@ -396,6 +398,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 window_name: &window_name,
                 target_path: &target_path,
                 taskless_oracle,
+                resuming_worktree,
                 force_new_window: options.fresh,
                 engine: options.engine.as_deref(),
                 prompt: options.prompt.as_deref(),
@@ -414,6 +417,9 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                 "new-session",
                 &["-d", "-s", &session, "-c", workon_path_str(&target_path)?, "-n", &window_name],
             )?;
+            if resuming_worktree {
+                workon_warn_if_resuming_without_lead(&mut stdout, &session, &[window_name.clone()]);
+            }
             workon_send_window_command(runner, &session, &window_name, &target_path, options.engine.as_deref(), options.prompt.as_deref())?;
             if taskless_oracle {
                 if let WorkonFleetStatus::Created = workon_ensure_fleet_session_entry(&session, &window_name, &target_path)? {
@@ -431,6 +437,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
                     window_name: &window_name,
                     target_path: &target_path,
                     taskless_oracle,
+                    resuming_worktree,
                     force_new_window: options.fresh,
                     engine: options.engine.as_deref(),
                     prompt: options.prompt.as_deref(),
@@ -473,6 +480,7 @@ struct WorkonWindowLaunch<'a> {
     window_name: &'a str,
     target_path: &'a std::path::Path,
     taskless_oracle: bool,
+    resuming_worktree: bool,
     force_new_window: bool,
     engine: Option<&'a str>,
     prompt: Option<&'a str>,
@@ -504,6 +512,7 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
         window_name,
         target_path,
         taskless_oracle,
+        resuming_worktree,
         force_new_window,
         engine,
         prompt,
@@ -513,6 +522,9 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
     workon_validate_tmux_target(&format!("{session}:{window_name}"))?;
 
     let windows = workon_list_windows(runner, session)?;
+    if resuming_worktree {
+        workon_warn_if_resuming_without_lead(stdout, session, &windows);
+    }
     if !force_new_window && windows.iter().any(|name| name == window_name) {
         workon_tmux_run(runner, "select-window", &["-t", &format!("{session}:{window_name}")])?;
         let _ = writeln!(stdout, "\x1b[33m⚡\x1b[0m reusing existing window '{window_name}' in {session}");
@@ -549,6 +561,25 @@ fn workon_ensure_window<R: maw_tmux::TmuxRunner>(
 
     let _ = writeln!(stdout, "\x1b[32m✅\x1b[0m workon '{window_name}' in {session} → {}", target_path.display());
     Ok(())
+}
+
+fn workon_warn_if_resuming_without_lead(stdout: &mut String, session: &str, windows: &[String]) {
+    if windows.iter().any(|window| workon_session_stem(window) == workon_session_stem(session)) {
+        return;
+    }
+    let _ = writeln!(
+        stdout,
+        "\x1b[33m⚠\x1b[0m resumed worktree is attached to leadless session '{session}'; PR handoff and `maw done` cannot reach an L1. Re-run from the L1 session or pass `--oracle <live-l1-session>`."
+    );
+}
+
+fn workon_session_stem(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .trim_start_matches(|character: char| character.is_ascii_digit() || character == '-')
+        .trim_end_matches("-oracle")
+        .to_owned()
 }
 
 const WORKON_PROMPT_READY_POLL_MS: u64 = 250;
@@ -2254,6 +2285,37 @@ mod workon_tests {
                 branch: "agents/feat".to_owned(),
                 branch_exists: false,
             }
+        );
+    }
+
+    #[test]
+    fn workon_warns_when_resuming_into_a_leadless_session() {
+        let target_path = std::path::Path::new("/tmp/maw-rs-workon-leadless");
+        let mut runner = WorkonMockTmux {
+            windows: "maw-rs-issue-138\n".to_owned(),
+            ..Default::default()
+        };
+        let mut stdout = String::new();
+
+        workon_ensure_window(
+            &mut runner,
+            WorkonWindowLaunch {
+                session: "maw-rs",
+                window_name: "maw-rs-issue-138",
+                target_path,
+                taskless_oracle: false,
+                resuming_worktree: true,
+                force_new_window: false,
+                engine: None,
+                prompt: None,
+            },
+            &mut stdout,
+        )
+        .expect("leadless resume remains actionable");
+
+        assert_eq!(
+            stdout,
+            "\x1b[33m⚠\x1b[0m resumed worktree is attached to leadless session 'maw-rs'; PR handoff and `maw done` cannot reach an L1. Re-run from the L1 session or pass `--oracle <live-l1-session>`.\n\x1b[33m⚡\x1b[0m reusing existing window 'maw-rs-issue-138' in maw-rs\n"
         );
     }
 
