@@ -22,4 +22,9 @@ agents/
 .maw/auto-done-pinged
 .maw/phase.json
 .maw/req-line
+.maw/l2-meta*.json
+.maw/l2-observer*.json
+.maw/l2-transition*.json
+.maw/delivery-issue*.json*
+.maw/pr-*-body.md
 # <<< maw ephemeral markers <<<

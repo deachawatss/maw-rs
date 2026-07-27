@@ -184,19 +184,28 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     } else if options.dry_run {
         let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] window '{target}' not running — nothing to auto-save");
     }
-    if let Some(window) = &matched {
-        done_kill_window(window, options, local, &mut stdout);
-    } else if let Some(worktree) = &selected_worktree {
-        done_kill_worktree_pane(worktree, options, local, &mut stdout)?;
-    } else {
-        let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running");
-    }
+    let worktree_pane_id = selected_worktree
+        .as_ref()
+        .and_then(done_recorded_worktree_pane_id);
     let removed_worktree = if let Some(worktree) = &selected_worktree {
         done_remove_selected_worktree(worktree, options, local, &mut stdout)?;
         true
     } else {
         false
     };
+    if let Some(window) = &matched {
+        done_kill_window(window, options, local, &mut stdout);
+    } else if let Some(worktree) = &selected_worktree {
+        done_kill_worktree_pane(
+            worktree,
+            worktree_pane_id.as_deref(),
+            options,
+            local,
+            &mut stdout,
+        )?;
+    } else {
+        let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{target}' not running");
+    }
     if !options.dry_run {
         if let Some(window) = &matched { solo_release_holder(&done_tmux_target(window)); }
     }
@@ -560,8 +569,14 @@ fn done_kill_window(window: &DoneWindow, options: &DoneOptions, local: &mut impl
     match local.done_reap_target(&target).and_then(|()| local.done_tmux("kill-window", &["-t".to_owned(), target.clone()])) { Ok(_) => { let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m killed window {target}"); }, Err(_) => stdout.push_str("  \x1b[33m⚠\x1b[0m could not kill window (may already be closed)\n") }
 }
 
-fn done_kill_worktree_pane(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
-    let Some(pane_id) = done_recorded_worktree_pane_id(worktree) else {
+fn done_kill_worktree_pane(
+    worktree: &DoneWorktree,
+    pane_id: Option<&str>,
+    options: &DoneOptions,
+    local: &mut impl DoneRuntime,
+    stdout: &mut String,
+) -> Result<(), String> {
+    let Some(pane_id) = pane_id.map(str::to_owned) else {
         let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m window '{}' not running", worktree.label);
         return Ok(());
     };
@@ -1760,7 +1775,7 @@ mod done_tests {
     }
 
     #[test]
-    fn done_kills_only_the_recorded_split_pane_before_removing_its_worktree() {
+    fn done_removes_the_worktree_before_killing_its_recorded_split_pane() {
         let root = DoneTempRoot::new("split-pane");
         let context = root.context();
         let main = context.repos_root.join("acme/app");
@@ -1873,19 +1888,33 @@ mod done_tests {
     }
 
     #[test]
-    fn done_dirty_worktree_removal_is_refused_without_force() {
+    fn done_refuses_dirty_worktree_before_killing_its_pane() {
         let root = DoneTempRoot::new("dirty");
         let context = root.context();
         let main = context.repos_root.join("acme/app");
         let dirty = main.join("agents/dirty-task");
+        std::fs::create_dir_all(dirty.join(".maw")).expect("marker dir");
+        std::fs::write(dirty.join(".maw/pane-id"), "%42\n").expect("pane marker");
         done_write_fleet(&root, "worker", "acme/app/agents/dirty-task");
 
         let mut runtime = DoneFakeRuntime::default();
         runtime.dirty_removals.insert(dirty.clone());
+        runtime.register_worktree(&main, &dirty);
+        runtime
+            .tmux_responses
+            .insert("display-message".to_owned(), format!("2\t{}\t@7\n", dirty.display()));
 
         let err = done_run_with_context(&done_args(&["worker"]), &mut runtime, &context).expect_err("dirty");
         assert!(err.contains("contains modified or untracked files"), "{err}");
         assert!(runtime.git_calls.iter().all(|args| !args.iter().any(|arg| arg == "--force")), "{:?}", runtime.git_calls);
+        assert!(
+            runtime
+                .tmux_calls
+                .iter()
+                .all(|(command, _)| command != "kill-pane"),
+            "a failed worktree removal must leave its pane intact: {:#?}",
+            runtime.tmux_calls
+        );
     }
 
     #[test]
