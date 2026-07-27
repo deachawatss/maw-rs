@@ -43,6 +43,7 @@ struct FleetConfigSummary {
     node: String,
     peers: Vec<FleetPeerSummary>,
     agents: BTreeMap<String, String>,
+    slots: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +137,7 @@ struct FleetRenumberItem {
     old_file: String,
     new_file: String,
     path: std::path::PathBuf,
+    authority: &'static str,
     changed: bool,
     tmux: Option<String>,
     tmux_error: Option<String>,
@@ -375,7 +377,8 @@ fn fleet_load_config(env: &MawXdgEnv) -> FleetConfigSummary {
     let node = value.get("node").and_then(serde_json::Value::as_str).unwrap_or("local").to_owned();
     let peers = fleet_parse_peers(&value);
     let agents = fleet_parse_agents(&value);
-    FleetConfigSummary { node, peers, agents }
+    let slots = fleet_parse_slots(&value);
+    FleetConfigSummary { node, peers, agents, slots }
 }
 
 fn fleet_parse_peers(value: &serde_json::Value) -> Vec<FleetPeerSummary> {
@@ -405,6 +408,16 @@ fn fleet_parse_agents(value: &serde_json::Value) -> BTreeMap<String, String> {
         }
     }
     agents
+}
+
+fn fleet_parse_slots(value: &serde_json::Value) -> BTreeMap<String, u32> {
+    value
+        .get("slots")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(oracle, slot)| u32::try_from(slot.as_u64()?).ok().map(|slot| (oracle.clone(), slot)))
+        .collect()
 }
 
 fn fleet_agent_node(value: &str) -> String {
@@ -1007,7 +1020,7 @@ fn fleet_json_gc_result(result: &FleetGcResult) -> serde_json::Value {
 }
 
 fn fleet_run_renumber(state: &FleetState, options: &FleetOptions, runtime: &mut impl FleetRuntime) -> Result<(i32, String), String> {
-    let mut items = fleet_renumber_plan(&state.fleet_entries, options.include_99, options.only_99);
+    let mut items = fleet_renumber_plan(&state.fleet_entries, &state.config.slots, options.include_99, options.only_99)?;
     let live = runtime.fleet_list_all().into_iter().map(|session| session.name).collect::<Vec<_>>();
     if !options.dry_run {
         fleet_apply_renumber(&mut items, &live, runtime)?;
@@ -1018,46 +1031,88 @@ fn fleet_run_renumber(state: &FleetState, options: &FleetOptions, runtime: &mut 
     Ok((0, fleet_render_renumber(state, options, &items)))
 }
 
-fn fleet_renumber_plan(entries: &[NativeFleetEntry], include_99: bool, only_99: bool) -> Vec<FleetRenumberItem> {
+fn fleet_renumber_plan(
+    entries: &[NativeFleetEntry],
+    slots: &BTreeMap<String, u32>,
+    include_99: bool,
+    only_99: bool,
+) -> Result<Vec<FleetRenumberItem>, String> {
+    fleet_validate_slots(slots)?;
     if only_99 {
-        return fleet_renumber_only_99_plan(entries);
+        return fleet_renumber_only_99_plan(entries, slots);
     }
     let mut candidates = entries
         .iter()
-        .filter_map(|entry| fleet_renumber_candidate(entry, include_99))
+        .filter_map(|entry| {
+            let stem = fleet_session_stem(&entry.session.name);
+            fleet_renumber_candidate(entry, include_99 || slots.contains_key(stem))
+        })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-    candidates
-        .into_iter()
-        .enumerate()
-        .map(|(index, (_, stem, entry))| fleet_renumber_item(entry, &format!("{:02}-{stem}", index + 1)))
-        .collect()
+    let mut used = slots.values().copied().collect::<BTreeSet<_>>();
+    let mut items = Vec::with_capacity(candidates.len());
+    for (_, stem, entry) in candidates {
+        let (slot, authority) = if let Some(slot) = slots.get(&stem) {
+            (*slot, "config")
+        } else {
+            let slot = (1..=99)
+                .find(|slot| !used.contains(slot))
+                .ok_or_else(|| "fleet renumber: no free slot in 01-99 after configured slots".to_owned())?;
+            used.insert(slot);
+            (slot, "gap-consolidated")
+        };
+        items.push(fleet_renumber_item(entry, &format!("{slot:02}-{stem}"), authority));
+    }
+    Ok(items)
 }
 
-fn fleet_renumber_only_99_plan(entries: &[NativeFleetEntry]) -> Vec<FleetRenumberItem> {
-    let mut used = entries
+fn fleet_validate_slots(slots: &BTreeMap<String, u32>) -> Result<(), String> {
+    let mut owners = BTreeMap::new();
+    for (oracle, slot) in slots {
+        if let Some(other) = owners.insert(*slot, oracle.as_str()) {
+            return Err(format!("fleet renumber: slot {slot} is claimed by both {other} and {oracle}"));
+        }
+    }
+    Ok(())
+}
+
+fn fleet_renumber_only_99_plan(
+    entries: &[NativeFleetEntry],
+    slots: &BTreeMap<String, u32>,
+) -> Result<Vec<FleetRenumberItem>, String> {
+    let mut occupied = entries
         .iter()
         .filter_map(|entry| fleet_renumber_candidate(entry, true))
         .filter_map(|(number, _, entry)| (number != 99).then_some(entry.session.name.clone()))
         .filter_map(|name| name.split_once('-').and_then(|(prefix, _)| prefix.parse::<u32>().ok()))
         .collect::<BTreeSet<_>>();
+    let reserved = slots.values().copied().collect::<BTreeSet<_>>();
     let mut candidates = entries
         .iter()
         .filter_map(|entry| fleet_renumber_candidate(entry, true))
         .filter(|(number, stem, _)| *number == 99 && stem != "overview")
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.1.cmp(&right.1));
-    candidates
-        .into_iter()
-        .filter_map(|(_, stem, entry)| {
-            let next = (1..=99).find(|number| !used.contains(number))?;
-            used.insert(next);
-            Some(fleet_renumber_item(entry, &format!("{next:02}-{stem}")))
-        })
-        .collect()
+    let mut items = Vec::with_capacity(candidates.len());
+    for (_, stem, entry) in candidates {
+        let (slot, authority) = if let Some(slot) = slots.get(&stem) {
+            if occupied.contains(slot) {
+                return Err(format!("fleet renumber: configured slot {slot} for {stem} is occupied; run fleet renumber without --only-99"));
+            }
+            (*slot, "config")
+        } else {
+            let slot = (1..=99)
+                .find(|slot| !occupied.contains(slot) && !reserved.contains(slot))
+                .ok_or_else(|| "fleet renumber: no free slot in 01-99 after configured slots".to_owned())?;
+            (slot, "gap-consolidated")
+        };
+        occupied.insert(slot);
+        items.push(fleet_renumber_item(entry, &format!("{slot:02}-{stem}"), authority));
+    }
+    Ok(items)
 }
 
-fn fleet_renumber_item(entry: &NativeFleetEntry, new_name: &str) -> FleetRenumberItem {
+fn fleet_renumber_item(entry: &NativeFleetEntry, new_name: &str, authority: &'static str) -> FleetRenumberItem {
     let new_file = format!("{new_name}.json");
     FleetRenumberItem {
         old_name: entry.session.name.clone(),
@@ -1065,6 +1120,7 @@ fn fleet_renumber_item(entry: &NativeFleetEntry, new_name: &str) -> FleetRenumbe
         old_file: entry.file.clone(),
         new_file,
         path: entry.path.clone(),
+        authority,
         changed: entry.session.name != new_name,
         tmux: None,
         tmux_error: None,
@@ -1089,6 +1145,7 @@ fn fleet_renumber_candidate(entry: &NativeFleetEntry, include_99: bool) -> Optio
 fn fleet_apply_renumber(items: &mut [FleetRenumberItem], live: &[String], runtime: &mut impl FleetRuntime) -> Result<(), String> {
     for item in items.iter_mut().filter(|item| item.changed) {
         fleet_write_renumbered_config(item)?;
+        fleet_write_renumbered_tab_order(item)?;
         let stem = fleet_session_stem(&item.old_name);
         let running = live
             .iter()
@@ -1102,6 +1159,17 @@ fn fleet_apply_renumber(items: &mut [FleetRenumberItem], live: &[String], runtim
         }
     }
     Ok(())
+}
+
+fn fleet_write_renumbered_tab_order(item: &FleetRenumberItem) -> Result<(), String> {
+    let env = current_xdg_env();
+    let source = maw_state_path(&env, &["tab-order", &format!("{}.json", item.old_name)]);
+    if !source.exists() {
+        return Ok(());
+    }
+    let target = maw_state_path(&env, &["tab-order", &format!("{}.json", item.new_name)]);
+    std::fs::rename(&source, &target)
+        .map_err(|error| format!("fleet renumber: rename tab order {} -> {}: {error}", source.display(), target.display()))
 }
 
 fn fleet_write_renumbered_config(item: &FleetRenumberItem) -> Result<(), String> {
@@ -1131,7 +1199,8 @@ fn fleet_render_renumber(state: &FleetState, options: &FleetOptions, items: &[Fl
     for item in items {
         if item.changed {
             let verb = if options.dry_run { "would rename" } else { "renamed" };
-            let _ = write!(out, "  - {verb} {} -> {}", item.old_file, item.new_file);
+            let authority = if item.authority == "config" { "from config" } else { "gap-consolidated" };
+            let _ = write!(out, "  - {verb} {} -> {} ({authority})", item.old_file, item.new_file);
             if let Some(tmux) = &item.tmux {
                 let _ = write!(out, " (tmux: {tmux} -> {})", item.new_name);
             }
@@ -1140,7 +1209,8 @@ fn fleet_render_renumber(state: &FleetState, options: &FleetOptions, items: &[Fl
             }
             out.push('\n');
         } else {
-            let _ = writeln!(out, "  - {} (unchanged)", item.old_file);
+            let authority = if item.authority == "config" { "from config" } else { "gap-consolidated" };
+            let _ = writeln!(out, "  - {} (unchanged; {authority})", item.old_file);
         }
     }
     out
@@ -1165,6 +1235,7 @@ fn fleet_json_renumber_item(item: &FleetRenumberItem) -> serde_json::Value {
         "newName": item.new_name,
         "oldFile": item.old_file,
         "newFile": item.new_file,
+        "authority": item.authority,
         "changed": item.changed,
         "tmux": item.tmux,
         "tmuxError": item.tmux_error,
@@ -2163,6 +2234,91 @@ mod fleet_tests {
             assert_eq!(bud["mystery"], true);
             assert!(runtime.commands.iter().any(|(program, args)| program == "tmux" && args == &fleet_strings(&["rename-session", "-t", "03-alpha", "01-alpha"])));
             assert!(runtime.commands.iter().any(|(program, args)| program == "tmux" && args == &fleet_strings(&["rename-session", "-t", "99-bud", "02-bud"])));
+        });
+    }
+
+    #[test]
+    fn fleet_renumber_reconciles_later_slot_config_and_moves_live_state() {
+        fleet_with_fixture(|root| {
+            std::fs::remove_file(root.join("config/fleet/03-alpha.json")).expect("remove default fleet entry");
+            std::fs::write(
+                root.join("config/maw.config.50.json"),
+                r#"{"slots":{"gale":1,"leaf":2,"coder":3}}"#,
+            )
+            .expect("later slot config");
+            std::fs::create_dir_all(root.join("ghq/github.com/acme/leaf-oracle")).expect("leaf repo");
+            for (file, session, window) in [
+                ("01-gale.json", "01-gale", "gale-oracle"),
+                ("03-coder.json", "03-coder", "coder-oracle"),
+                ("09-moss.json", "09-moss", "moss-oracle"),
+                ("18-leaf.json", "18-leaf", "leaf-oracle"),
+            ] {
+                std::fs::write(
+                    root.join("config/fleet").join(file),
+                    format!(r#"{{"name":"{session}","windows":[{{"name":"{window}","repo":"acme/{window}"}}]}}"#),
+                )
+                .expect("fleet entry");
+            }
+            let tab_order = maw_state_path(&current_xdg_env(), &["tab-order"]);
+            std::fs::create_dir_all(&tab_order).expect("tab order");
+            std::fs::write(tab_order.join("18-leaf.json"), r#"[{"index":0,"name":"leaf-oracle"}]"#).expect("tab order entry");
+
+            let mut dry_runtime = FleetFakeRuntime {
+                sessions: vec![
+                    fleet_live_session("01-gale", &["gale-oracle"]),
+                    fleet_live_session("03-coder", &["coder-oracle"]),
+                    fleet_live_session("18-leaf", &["leaf-oracle"]),
+                ],
+                ..Default::default()
+            };
+            let (code, stdout) = fleet_run_with(&fleet_strings(&["renumber", "--dry-run", "--json"]), &mut dry_runtime).expect("dry run");
+            assert_eq!(code, 0);
+            let plan: serde_json::Value = serde_json::from_str(&stdout).expect("plan json");
+            assert_eq!(plan["configs"][0]["newName"], "01-gale");
+            assert_eq!(plan["configs"][1]["newName"], "03-coder");
+            assert_eq!(plan["configs"][3]["oldName"], "18-leaf");
+            assert_eq!(plan["configs"][3]["newName"], "02-leaf");
+            assert_eq!(plan["configs"][3]["authority"], "config");
+            assert_eq!(plan["configs"][2]["newName"], "04-moss");
+            assert_eq!(plan["configs"][2]["authority"], "gap-consolidated");
+            assert!(root.join("config/fleet/18-leaf.json").exists(), "dry run leaves fleet registry unchanged");
+            assert!(tab_order.join("18-leaf.json").exists(), "dry run leaves tab order unchanged");
+
+            let mut runtime = FleetFakeRuntime {
+                sessions: vec![
+                    fleet_live_session("01-gale", &["gale-oracle"]),
+                    fleet_live_session("03-coder", &["coder-oracle"]),
+                    fleet_live_session("18-leaf", &["leaf-oracle"]),
+                ],
+                ..Default::default()
+            };
+            let (code, _) = fleet_run_with(&fleet_strings(&["renumber"]), &mut runtime).expect("renumber");
+            assert_eq!(code, 0);
+            assert!(!root.join("config/fleet/18-leaf.json").exists());
+            let leaf: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("config/fleet/02-leaf.json")).expect("renamed fleet entry")).expect("fleet json");
+            assert_eq!(leaf["name"], "02-leaf");
+            assert!(!tab_order.join("18-leaf.json").exists());
+            assert_eq!(std::fs::read_to_string(tab_order.join("02-leaf.json")).expect("renamed tab order"), r#"[{"index":0,"name":"leaf-oracle"}]"#);
+            assert!(runtime.commands.iter().any(|(program, args)| program == "tmux" && args == &fleet_strings(&["rename-session", "-t", "18-leaf", "02-leaf"])));
+            assert!(!runtime.commands.iter().any(|(_, args)| args.first().is_some_and(|arg| arg == "kill-session")));
+
+            let located = locate_gather_info("leaf", false, &[fleet_live_session("02-leaf", &["leaf-oracle"])]).expect("locate leaf");
+            assert_eq!(located.session, "02-leaf");
+            assert_eq!(located.session_name.as_deref(), Some("02-leaf"));
+        });
+    }
+
+    #[test]
+    fn fleet_renumber_rejects_duplicate_config_slots() {
+        fleet_with_fixture(|root| {
+            std::fs::write(root.join("config/maw.config.50.json"), r#"{"slots":{"gale":7,"leaf":7}}"#).expect("slot config");
+            let mut runtime = FleetFakeRuntime::default();
+
+            let error = fleet_run_with(&fleet_strings(&["renumber", "--dry-run"]), &mut runtime).expect_err("duplicate slots must fail");
+
+            assert!(error.contains("gale"), "{error}");
+            assert!(error.contains("leaf"), "{error}");
+            assert!(error.contains("7"), "{error}");
         });
     }
 
