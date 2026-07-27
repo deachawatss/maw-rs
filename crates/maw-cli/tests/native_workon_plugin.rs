@@ -55,6 +55,8 @@ case "$1" in
   display-message)
     case "$*" in
       *pane_current_command*) printf 'node\n' ;;
+      *'#{pane_index}'*) printf '0\n' ;;
+      *'#{window_width}'*) printf '100\n' ;;
       *) printf '50-mawjs\n' ;;
     esac
     ;;
@@ -63,7 +65,7 @@ case "$1" in
   has-session) exit 1 ;;
   capture-pane) printf '$\n' ;;
   split-window) printf '%%2\n' ;;
-  new-session|new-window|send-keys|select-window|set-window-option) exit 0 ;;
+  new-session|new-window|send-keys|select-window|set-window-option|select-layout) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
@@ -890,12 +892,14 @@ case "$1" in
   display-message)
     case "$*" in
       *pane_current_command*) printf 'node\n' ;;
+      *'#{pane_index}'*) printf '0\n' ;;
+      *'#{window_width}'*) printf '100\n' ;;
       *) printf '0\n' ;;
     esac
     ;;
   capture-pane) printf '$\n' ;;
   split-window) printf '%%2\n' ;;
-  new-window|send-keys|select-window|set-window-option) exit 0 ;;
+  new-window|send-keys|select-window|set-window-option|select-layout) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,

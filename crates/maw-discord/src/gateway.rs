@@ -168,12 +168,14 @@ pub async fn observe_mock_gateway_events(events: &[String]) -> usize {
             _ => Ok(Some(Event::GatewayHeartbeat)),
         })
         .collect::<Vec<_>>();
+    let start_gate = std::sync::Arc::new(tokio::sync::Notify::new());
     let handle = spawn_gateway_with_source(
         GatewayConfig::new("mock-gateway", twilight_model::gateway::Intents::GUILDS)
             .backoff(Duration::from_millis(1), Duration::from_millis(1)),
-        MockGatewaySource::new(mocked),
+        MockGatewaySource::with_start_gate(mocked, std::sync::Arc::clone(&start_gate)),
     );
     let mut rx = handle.subscribe();
+    start_gate.notify_one();
     let mut count = 0usize;
     for _ in events {
         if timeout(Duration::from_millis(50), rx.recv()).await.is_ok() {

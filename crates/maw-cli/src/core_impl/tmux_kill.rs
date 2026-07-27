@@ -381,10 +381,9 @@ mod tmux_kill_tests {
                     String::new()
                 }
                 "show-window-options" => self.workon_layout.clone(),
-                "select-layout" => String::new(),
                 // display-message: single-pane reaper resolves the pane's pid;
                 // empty output → reap is a no-op (no real process tree touched in tests).
-                "kill-session" | "display-message" => String::new(),
+                "select-layout" | "kill-session" | "display-message" => String::new(),
                 other => panic!("unexpected tmux subcommand: {other}"),
             })
         }
