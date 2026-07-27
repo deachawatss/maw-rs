@@ -17,7 +17,7 @@ Owner: existing `maw-tmux` send/capture helpers.
 Migrated from maw-js fork patches:
 
 - pending-input detection for prompts with typed content
-- Codex `[Pasted Content ... chars]` false-positive submit detection
+- Codex collapsed, soft-wrapped `[Pasted Content ... chars]` stays eligible for submit confirmation
 - Codex idle hints are empty prompts; an idle-to-working footer transition confirms `maw hey` acceptance
 - OSC escape stripping while preserving ordinary captured text
 - existing retry-Enter path remains in `send_text_with_sleeper`
