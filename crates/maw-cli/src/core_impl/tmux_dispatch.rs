@@ -34,7 +34,17 @@ fn tmux_subcommand_entries() -> impl Iterator<Item = &'static TmuxSubcommandEntr
         .chain(TMUX_SUB_FRAGMENTS.iter().copied().flatten())
 }
 
-fn tmux_usage() -> CliOutput { CliOutput { code: 0, stdout: "usage: maw tmux <ls|peek|split|attach|break> [...]\n".to_owned(), stderr: String::new() } }
+fn tmux_usage() -> CliOutput {
+    tmux_usage_for(tmux_subcommand_entries())
+}
+
+fn tmux_usage_for<'a>(entries: impl Iterator<Item = &'a TmuxSubcommandEntry>) -> CliOutput {
+    let mut stdout = "usage: maw tmux <subcommand> [...]\nsubcommands:\n".to_owned();
+    for entry in entries {
+        let _ = writeln!(stdout, "  {}", entry.names.join(", "));
+    }
+    CliOutput { code: 0, stdout, stderr: String::new() }
+}
 
 fn run_tmux_ls(argv: &[String]) -> CliOutput {
     let json = argv.iter().any(|arg| arg == "--json");
@@ -60,4 +70,39 @@ fn run_tmux_split(argv: &[String]) -> CliOutput {
     let mut client = TmuxClient::local();
     let options = maw_tmux::TmuxSplitActionOptions { vertical, pct, command };
     match client.split_pane_action(target, &options) { Ok(()) => CliOutput { code: 0, stdout: format!("split → {target}\n"), stderr: String::new() }, Err(error) => command_target_error("tmux split", &error.message) }
+}
+
+#[cfg(test)]
+mod tmux_dispatch_tests {
+    use super::*;
+
+    const TEST_ENTRY: TmuxSubcommandEntry = TmuxSubcommandEntry {
+        names: &["test-command", "test-alias"],
+        handler: run_tmux_ls,
+    };
+
+    #[test]
+    fn tmux_usage_lists_every_registered_subcommand() {
+        let output = tmux_usage();
+
+        assert_eq!(output.code, 0);
+        for entry in tmux_subcommand_entries() {
+            assert!(
+                output.stdout.contains(&format!("  {}\n", entry.names.join(", "))),
+                "missing {:?} from {}",
+                entry.names,
+                output.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn tmux_usage_renderer_lists_added_subcommand_entries() {
+        let output = tmux_usage_for(
+            tmux_subcommand_entries().chain(std::iter::once(&TEST_ENTRY)),
+        );
+
+        assert_eq!(output.code, 0);
+        assert!(output.stdout.contains("  test-command, test-alias\n"));
+    }
 }
