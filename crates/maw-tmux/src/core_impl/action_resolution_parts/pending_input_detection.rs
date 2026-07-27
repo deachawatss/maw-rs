@@ -209,8 +209,6 @@ fn prompt_line(line: &str) -> PromptLine {
     let input = input.trim_end();
     if input.is_empty() {
         PromptLine::Empty
-    } else if marker == '›' && input == "Use /skills to list available skills" {
-        PromptLine::Empty
     } else {
         PromptLine::Pending(input.to_owned())
     }

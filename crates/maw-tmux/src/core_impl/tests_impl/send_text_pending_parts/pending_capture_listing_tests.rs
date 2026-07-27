@@ -48,29 +48,6 @@
     }
 
     #[test]
-    fn codex_idle_hint_is_an_empty_prompt_not_pending_input() {
-        let idle_hint = [
-            "─ Worked for 20m 43s ─────────────────────────",
-            "",
-            "› Use /skills to list available skills",
-            "",
-            "  gpt-5.6-terra xhigh · agents/issue-139 · Context left",
-        ]
-        .join("\n");
-
-        assert!(pane_has_empty_prompt_from_capture(&idle_hint));
-        assert_eq!(pane_pending_input_from_capture(&idle_hint), None);
-        assert_eq!(
-            pending_input_state_from_capture(&idle_hint, "[codex] deliver issue 139"),
-            PendingInputState::Cleared
-        );
-        assert_eq!(
-            pane_pending_input_from_capture("> Use /skills to list available skills"),
-            Some("Use /skills to list available skills".to_owned())
-        );
-    }
-
-    #[test]
     fn codex_pasted_content_detection_handles_the_live_wrapped_capture() {
         let sent = "x".repeat(1024);
         let pasted = [

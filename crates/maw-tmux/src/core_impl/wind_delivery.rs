@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    pane_has_empty_prompt_from_capture, pane_input_pending_from_capture, strip_tmux_ansi,
-    SendTextReport, SendThrottle, TmuxClient, TmuxError, TmuxRunner, MAX_SUBMIT_ATTEMPTS,
-    SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
+    pane_input_pending_from_capture, strip_tmux_ansi, SendTextReport, SendThrottle, TmuxClient,
+    TmuxError, TmuxRunner, MAX_SUBMIT_ATTEMPTS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
 };
 
 pub const CODEX_SUBMIT_CONFIRM_MS: u64 = 200;
@@ -215,10 +214,9 @@ where
     F: FnMut(Duration),
 {
     client.exit_mode_if_needed(target)?;
-    let codex_was_idle = config == SubmitConfig::codex()
-        && client
-            .capture(target, Some(5))
-            .is_ok_and(|content| pane_has_empty_prompt_from_capture(&content));
+    let codex_pre_send_capture = (config == SubmitConfig::codex())
+        .then(|| client.capture(target, Some(5)).ok())
+        .flatten();
     let used_buffer = text.contains('\n') || text.len() > 500;
     if used_buffer {
         client.load_buffer(text)?;
@@ -227,8 +225,13 @@ where
         client.send_keys_literal(target, text)?;
     }
     sleep(Duration::from_millis(SEND_SETTLE_MS));
-    let (enter_attempts, warned_pending) =
-        submit_with_confirm_config(client, target, &mut sleep, config, codex_was_idle)?;
+    let (enter_attempts, warned_pending) = submit_with_confirm_config(
+        client,
+        target,
+        &mut sleep,
+        config,
+        codex_pre_send_capture.as_deref(),
+    )?;
     Ok(SendTextReport {
         used_buffer,
         enter_attempts,
@@ -241,7 +244,7 @@ fn submit_with_confirm_config<R, F>(
     target: &str,
     sleep: &mut F,
     config: SubmitConfig,
-    codex_was_idle: bool,
+    codex_pre_send_capture: Option<&str>,
 ) -> Result<(u32, bool), TmuxError>
 where
     R: TmuxRunner,
@@ -253,7 +256,7 @@ where
         let submission_confirmed = match client.capture(target, Some(5)) {
             Ok(content) => {
                 !pane_input_pending_from_capture(&content)
-                    || (codex_was_idle && codex_execution_active(&content))
+                    || codex_working_transition(codex_pre_send_capture, &content)
             }
             Err(_) => true,
         };
@@ -269,6 +272,10 @@ fn codex_execution_active(content: &str) -> bool {
         let line = line.trim();
         line.contains("• Working (") && line.contains("esc to interrupt")
     })
+}
+
+fn codex_working_transition(before: Option<&str>, after: &str) -> bool {
+    before.is_some_and(|capture| !codex_execution_active(capture)) && codex_execution_active(after)
 }
 
 fn pane_prompt_ready_from_capture(content: &str) -> bool {
@@ -324,9 +331,18 @@ mod tests {
                 "capture-pane" => {
                     self.captures += 1;
                     Ok(if self.captures == 1 {
-                        "› Use /skills to list available skills".to_owned()
+                        concat!(
+                            "› Explain this codebase\n\n",
+                            "  gpt-5.6-terra xhigh · agents/issue-139 · Context left"
+                        )
+                        .to_owned()
                     } else {
-                        "• Working (0s • esc to interrupt)".to_owned()
+                        concat!(
+                            "• Working (0s • esc to interrupt)\n\n",
+                            "› Explain this codebase\n\n",
+                            "  gpt-5.6-terra xhigh · agents/issue-139 · Context left"
+                        )
+                        .to_owned()
                     })
                 }
                 "display-message" => Ok("0".to_owned()),
@@ -366,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_idle_submit_is_confirmed_by_working_transition() {
+    fn codex_rotating_idle_hint_allows_short_submit_to_confirm_from_working() {
         let mut client = TmuxClient::new(CodexConfirmRunner::default());
 
         let report = send_text_ungated_with_sleeper(
@@ -376,7 +392,7 @@ mod tests {
             SubmitConfig::codex(),
             |_| {},
         )
-        .expect("working transition confirms delivery");
+        .expect("working transition confirms delivery despite a retained rotating hint");
 
         assert_eq!(report.enter_attempts, 1);
         assert!(!report.warned_pending);
@@ -402,10 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_working_acceptance_requires_an_initially_empty_prompt() {
-        assert!(pane_has_empty_prompt_from_capture(
-            "› Use /skills to list available skills"
+    fn codex_working_transition_requires_a_new_working_footer() {
+        assert!(!codex_working_transition(
+            Some("• Working (1s • esc to interrupt)"),
+            "• Working (2s • esc to interrupt)"
         ));
-        assert!(!pane_has_empty_prompt_from_capture("› unrelated queued input"));
+        assert!(codex_working_transition(
+            Some("› Explain this codebase"),
+            "• Working (0s • esc to interrupt)"
+        ));
     }
 }
