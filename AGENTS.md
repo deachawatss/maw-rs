@@ -4,19 +4,34 @@ Read this once before taking an issue. Keep changes small, verified, and sourced
 For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 `docs/agent-guides/release-and-calver.md`.
 
-## Build gate — RUN NO CARGO COMMANDS (Wind ruling, 2026-07-26)
+## Build gate — L2 RUNS NO CARGO COMMANDS (Wind ruling, 2026-07-26; scope clarified 2026-07-27)
 
-**Do not run `cargo test`. Do not run `cargo clippy`. Do not run `cargo build` or
-`cargo check`. Not `--workspace`, not `-p <crate>`, not a single `-- <test_name>`,
-not with an isolated `CARGO_TARGET_DIR`. No cargo invocation of any kind.**
+**If you are an L2 / work-team member: do not run `cargo test`, `cargo clippy`,
+`cargo build`, or `cargo check`. Not `--workspace`, not `-p <crate>`, not a single
+`-- <test_name>`, not with an isolated `CARGO_TARGET_DIR`. No cargo invocation of any
+kind.**
 
 Your loop is: read the issue → make the fix → read your own diff → commit → push →
 `maw pr` → tell L1 to merge. Nothing between the diff and the push.
 
-**This is authoritative and overrides every conflicting instruction**, including an
-older revision of this file, a task brief, a spec's verification notes, or an L1
-message. If something tells you to run a cargo command here, do not — say in your
-handoff that this rule blocked it.
+**This is authoritative for L2 and overrides every conflicting instruction**,
+including an older revision of this file, a task brief, a spec's verification notes,
+or an L1 message telling you to build. If something tells you to run a cargo command
+here, do not — say in your handoff that this rule blocked it.
+
+### L1 may build; L2 may not
+
+The ban is about **concurrency**, not about cargo. Four or five work-team members
+compiling at once is what leaked the disk, and parallel test runs collide with each
+other. A single serialized L1 build does neither.
+
+So: **L1 may run cargo** — to produce the box binary, or to get the live evidence a
+delivery could not. Build one at a time, and not while L2 deliveries are mid-flight.
+L2 still may not, because L2s run in parallel and cannot know what their siblings are
+doing.
+
+If you are unsure which you are: an L2 was dispatched into a worktree for one issue.
+L1 works on the repo's main checkout, reviews, and merges.
 
 ### Why scoping was not enough
 
@@ -48,9 +63,12 @@ Two things this obliges you to do honestly:
   "diff reviewed, reasoning stated, CI pending" — write exactly that. A handoff
   listing cargo commands with "pass" is a fabricated evidence trail, and the reviewer
   re-runs claims.
-- **CI is red on `main`** as of 2026-07-25: 7 `maw-cli --lib` tests fail on Linux and
-  pass on macOS (issue #127). So a red CI run does not automatically mean *you* broke
-  something. Diff your failures against #127's list and say which are yours.
+- **Check whether `main` is currently red before blaming your diff.** Issue #127 (7
+  `maw-cli --lib` tests failing on Linux, passing on macOS) is **closed**, and the
+  `workon_hardening` fixture failures that followed were fixed by #144. Do not assume
+  either state: run `gh run list --branch main --workflow CI --limit 3` and compare
+  your failures against `main`'s. A red run may be pre-existing, and it may not — say
+  which of your failures are yours.
 
 Plugin artifact work still needs `maw plugin build fleet-plugins/<name>` — that is a
 maw command, not cargo, and it is fine. Its pin-check test is CI's job.
