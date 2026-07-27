@@ -2318,7 +2318,7 @@ mod fleet_tests {
 
             assert!(error.contains("gale"), "{error}");
             assert!(error.contains("leaf"), "{error}");
-            assert!(error.contains("7"), "{error}");
+            assert!(error.contains('7'), "{error}");
         });
     }
 
