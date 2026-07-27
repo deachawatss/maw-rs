@@ -48,6 +48,32 @@
     }
 
     #[test]
+    fn codex_pasted_content_detection_handles_the_live_wrapped_capture() {
+        let sent = "x".repeat(1024);
+        let pasted = [
+            "─ Worked for 12m 02s ────────────────────────────────────────",
+            "",
+            "",
+            "› [Pasted Content 1024 chars] Also REQUIRED: TOCTOU at 778",
+            "  to 783, buffered content applied with no final liveness or",
+            "  hash recheck before executeOperation deletes sources at",
+            "  690 to 695. Also REQUIRED: a process that cd s away leaves",
+            "  its older sessions unlocked past the 5 minute fallback.",
+            "  Full verdict is on the PR.",
+            "",
+            "",
+            "  gpt-5.6-terra xhigh · ~/ghq/github.com/deachawatss/Wind-Fr…",
+        ]
+        .join("\n");
+
+        assert!(codex_pasted_content_pending(&pasted));
+        assert_eq!(
+            pending_input_state_from_capture(&pasted, &sent),
+            PendingInputState::MatchesSent
+        );
+    }
+
+    #[test]
     fn pending_input_detection_matches_claude_capture_states() {
         let idle_empty = [
             "✻ Twisting… (4m 34s)",

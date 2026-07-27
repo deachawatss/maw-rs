@@ -205,6 +205,9 @@ fn sendtext_pending_input_state<R: maw_tmux::TmuxRunner>(
     if maw_tmux::pane_has_empty_prompt_from_capture(&content) {
         return SendtextPendingState::Cleared;
     }
+    if maw_tmux::codex_pasted_content_pending(&content) {
+        return SendtextPendingState::MatchesSent;
+    }
     let Some(pending) = maw_tmux::pane_pending_input_from_capture(&content) else {
         return SendtextPendingState::Unconfirmed;
     };
@@ -414,6 +417,32 @@ mod sendtext_tests {
             .collect::<Vec<_>>();
         assert_eq!(captures.len(), 2);
         assert!(captures.iter().all(|(_, args)| args.ends_with(&sendtext_strings(&["-S", "-10"]))));
+    }
+
+    #[test]
+    fn sendtext_retries_collapsed_codex_paste_instead_of_treating_it_as_different_input() {
+        let sent = "x".repeat(1024);
+        let capture = [
+            "─ Worked for 12m 02s ────────────────────────────────────────",
+            "",
+            "",
+            "› [Pasted Content 1024 chars] Also REQUIRED: TOCTOU at 778",
+            "  to 783, buffered content applied with no final liveness or",
+            "  hash recheck before executeOperation deletes sources at",
+            "  690 to 695. Also REQUIRED: a process that cd s away leaves",
+            "  its older sessions unlocked past the 5 minute fallback.",
+            "  Full verdict is on the PR.",
+            "",
+            "",
+            "  gpt-5.6-terra xhigh · ~/ghq/github.com/deachawatss/Wind-Fr…",
+        ]
+        .join("\n");
+        let mut tmux = SendtextMockTmux::sendtext_with_responses(vec![Ok(capture.as_str())]);
+
+        assert_eq!(
+            sendtext_pending_input_state(&mut tmux, "%9", &sent),
+            SendtextPendingState::MatchesSent
+        );
     }
 
     #[test]

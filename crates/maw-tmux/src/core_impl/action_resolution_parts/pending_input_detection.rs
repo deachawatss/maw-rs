@@ -55,9 +55,22 @@ pub fn pane_input_pending_from_capture(content: &str) -> bool {
     pane_pending_input_from_capture(content).is_some()
 }
 
-fn codex_pasted_content_pending(content: &str) -> bool {
-    let clean = normalize_capture_line(content.lines().next_back().unwrap_or_default());
-    clean.contains("[Pasted Content") && clean.contains("chars]")
+/// Return true when Codex displays its collapsed pasted-content marker at the current prompt.
+#[must_use]
+pub fn codex_pasted_content_pending(content: &str) -> bool {
+    let lines = content
+        .lines()
+        .map(normalize_capture_line)
+        .collect::<Vec<_>>();
+    lines.iter().enumerate().rev().any(|(index, line)| {
+        line.trim_start().starts_with('›')
+            && trailing_after_codex_pasted_prompt(&lines, index)
+            && matches!(
+                prompt_line(line),
+                PromptLine::Pending(input)
+                    if input.contains("[Pasted Content") && input.contains("chars]")
+            )
+    })
 }
 
 /// Return the current prompt input from captured pane output when it appears pending.
@@ -137,6 +150,11 @@ pub enum PendingInputState {
 /// Classify captured pending input for duplicate-safe Enter retries.
 #[must_use]
 pub fn pending_input_state_from_capture(content: &str, sent: &str) -> PendingInputState {
+    if codex_pasted_content_pending(content) {
+        // Codex collapses and soft-wraps pasted bytes, so their captured text cannot
+        // be compared to `sent`. Keep the retry path rather than misclassifying it.
+        return PendingInputState::MatchesSent;
+    }
     let Some(pending) = pane_pending_input_from_capture(content) else {
         return PendingInputState::Cleared;
     };
@@ -205,6 +223,16 @@ fn trailing_after_prompt_is_chrome(lines: &[String], index: usize) -> bool {
         .iter()
         .skip(index + 1)
         .all(|line| line_is_tui_chrome(line))
+}
+
+fn trailing_after_codex_pasted_prompt(lines: &[String], index: usize) -> bool {
+    lines.iter().skip(index + 1).all(|line| {
+        line_is_tui_chrome(line)
+            || line
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_whitespace())
+    })
 }
 
 fn line_is_tui_chrome(line: &str) -> bool {

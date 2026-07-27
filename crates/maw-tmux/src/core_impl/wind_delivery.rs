@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    strip_tmux_ansi, SendTextReport, SendThrottle, TmuxClient, TmuxError, TmuxRunner,
-    MAX_SUBMIT_ATTEMPTS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
+    pane_input_pending_from_capture, strip_tmux_ansi, SendTextReport, SendThrottle, TmuxClient,
+    TmuxError, TmuxRunner, MAX_SUBMIT_ATTEMPTS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
 };
 
 pub const CODEX_SUBMIT_CONFIRM_MS: u64 = 200;
@@ -214,6 +214,9 @@ where
     F: FnMut(Duration),
 {
     client.exit_mode_if_needed(target)?;
+    let codex_pre_send_capture = (config == SubmitConfig::codex())
+        .then(|| client.capture(target, Some(5)).ok())
+        .flatten();
     let used_buffer = text.contains('\n') || text.len() > 500;
     if used_buffer {
         client.load_buffer(text)?;
@@ -222,8 +225,13 @@ where
         client.send_keys_literal(target, text)?;
     }
     sleep(Duration::from_millis(SEND_SETTLE_MS));
-    let (enter_attempts, warned_pending) =
-        submit_with_confirm_config(client, target, &mut sleep, config)?;
+    let (enter_attempts, warned_pending) = submit_with_confirm_config(
+        client,
+        target,
+        &mut sleep,
+        config,
+        codex_pre_send_capture.as_deref(),
+    )?;
     Ok(SendTextReport {
         used_buffer,
         enter_attempts,
@@ -236,6 +244,7 @@ fn submit_with_confirm_config<R, F>(
     target: &str,
     sleep: &mut F,
     config: SubmitConfig,
+    codex_pre_send_capture: Option<&str>,
 ) -> Result<(u32, bool), TmuxError>
 where
     R: TmuxRunner,
@@ -244,11 +253,29 @@ where
     for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
         client.send_enter(target)?;
         sleep(Duration::from_millis(config.confirm_interval_ms));
-        if !client.pane_input_pending(target) {
+        let submission_confirmed = match client.capture(target, Some(5)) {
+            Ok(content) => {
+                !pane_input_pending_from_capture(&content)
+                    || codex_working_transition(codex_pre_send_capture, &content)
+            }
+            Err(_) => true,
+        };
+        if submission_confirmed {
             return Ok((attempt, false));
         }
     }
     Ok((MAX_SUBMIT_ATTEMPTS, true))
+}
+
+fn codex_execution_active(content: &str) -> bool {
+    content.lines().map(strip_tmux_ansi).any(|line| {
+        let line = line.trim();
+        line.contains("• Working (") && line.contains("esc to interrupt")
+    })
+}
+
+fn codex_working_transition(before: Option<&str>, after: &str) -> bool {
+    before.is_some_and(|capture| !codex_execution_active(capture)) && codex_execution_active(after)
 }
 
 fn pane_prompt_ready_from_capture(content: &str) -> bool {
@@ -293,6 +320,37 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct CodexConfirmRunner {
+        captures: u8,
+    }
+
+    impl TmuxRunner for CodexConfirmRunner {
+        fn run(&mut self, subcommand: &str, _args: &[String]) -> Result<String, TmuxError> {
+            match subcommand {
+                "capture-pane" => {
+                    self.captures += 1;
+                    Ok(if self.captures == 1 {
+                        concat!(
+                            "› Explain this codebase\n\n",
+                            "  gpt-5.6-terra xhigh · agents/issue-139 · Context left"
+                        )
+                        .to_owned()
+                    } else {
+                        concat!(
+                            "• Working (0s • esc to interrupt)\n\n",
+                            "› Explain this codebase\n\n",
+                            "  gpt-5.6-terra xhigh · agents/issue-139 · Context left"
+                        )
+                        .to_owned()
+                    })
+                }
+                "display-message" => Ok("0".to_owned()),
+                _ => Ok(String::new()),
+            }
+        }
+    }
+
     #[test]
     fn hey_delivery_is_ungated_before_text_is_sent() {
         let runner = UngatedRunner::default();
@@ -321,5 +379,53 @@ mod tests {
             literal_send < confirmation_capture,
             "ungated delivery must not readiness-poll before sending: {calls:?}"
         );
+    }
+
+    #[test]
+    fn codex_rotating_idle_hint_allows_short_submit_to_confirm_from_working() {
+        let mut client = TmuxClient::new(CodexConfirmRunner::default());
+
+        let report = send_text_ungated_with_sleeper(
+            &mut client,
+            "%7",
+            "[codex] deliver issue 139",
+            SubmitConfig::codex(),
+            |_| {},
+        )
+        .expect("working transition confirms delivery despite a retained rotating hint");
+
+        assert_eq!(report.enter_attempts, 1);
+        assert!(!report.warned_pending);
+    }
+
+    #[test]
+    fn codex_long_submit_is_confirmed_by_working_transition() {
+        let mut client = TmuxClient::new(CodexConfirmRunner::default());
+        let message = "x".repeat(501);
+
+        let report = send_text_ungated_with_sleeper(
+            &mut client,
+            "%7",
+            &message,
+            SubmitConfig::codex(),
+            |_| {},
+        )
+        .expect("working transition confirms buffered delivery");
+
+        assert!(report.used_buffer);
+        assert_eq!(report.enter_attempts, 1);
+        assert!(!report.warned_pending);
+    }
+
+    #[test]
+    fn codex_working_transition_requires_a_new_working_footer() {
+        assert!(!codex_working_transition(
+            Some("• Working (1s • esc to interrupt)"),
+            "• Working (2s • esc to interrupt)"
+        ));
+        assert!(codex_working_transition(
+            Some("› Explain this codebase"),
+            "• Working (0s • esc to interrupt)"
+        ));
     }
 }
