@@ -172,9 +172,9 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
         done_select_worktree(target, &target_lower, options, pane_info.as_ref(), local, context, &mut stdout)?
     };
     if let Some(pane) = &matched_pane { done_assert_may_target_pane(pane, selected_worktree.as_ref(), &mut stdout)?; }
-    if !options.dry_run {
-        if let Some(worktree) = &selected_worktree {
-            done_rescue_psi_notes(worktree, &mut stdout);
+    if let Some(worktree) = &selected_worktree {
+        if !options.dry_run || worktree.full_path.is_dir() {
+            done_rescue_psi_notes(worktree, options.dry_run, &mut stdout);
         }
     }
     if let Some(window) = &matched {
@@ -808,21 +808,35 @@ fn done_worktree_by_scan(target: &str, repos_root: &std::path::Path, stdout: &mu
     Ok(matches.into_iter().next())
 }
 
-fn done_rescue_psi_notes(worktree: &DoneWorktree, stdout: &mut String) {
+fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut String) {
     // Copy uncommitted ψ/ brain notes out of the worktree into the owning main
     // checkout BEFORE auto-save sweeps them into a branch that --clean-branch may
     // force-delete (git branch -D) before the PR merges — losing the notes to GC.
     // Never overwrites existing files; best-effort (rescue failure must not block
     // the rest of `done`).
-    match crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path) {
+    let rescue = if dry_run {
+        crate::wind::done::preview_rescue_psi(&worktree.full_path, &worktree.main_path)
+    } else {
+        crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path)
+    };
+    match rescue {
         Ok(rescued) if !rescued.is_empty() => {
-            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m rescued {} uncommitted ψ note(s) to main before removal", rescued.len());
+            let action = if dry_run { "[dry-run] would rescue" } else { "rescued" };
+            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {action} {} uncommitted ψ note(s) to main before removal", rescued.len());
+        }
+        Ok(_) if done_psi_has_entries(worktree) => {
+            let prefix = if dry_run { "[dry-run] " } else { "" };
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m {prefix}ψ rescue found no uncommitted notes although ψ/ is non-empty");
         }
         Ok(_) => {}
         Err(error) => {
             let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m ψ rescue skipped: {error}");
         }
     }
+}
+
+fn done_psi_has_entries(worktree: &DoneWorktree) -> bool {
+    std::fs::read_dir(worktree.full_path.join("ψ")).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 fn done_remove_selected_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
@@ -1525,6 +1539,113 @@ mod done_tests {
         assert!(done_same_path(&resolved.main_path, &main), "{} != {}", resolved.main_path.display(), main.display());
         assert!(done_same_path(&resolved.full_path, &live), "{} != {}", resolved.full_path.display(), live.display());
         assert_eq!(resolved.label, "acme/app/agents/live-task");
+    }
+
+    #[test]
+    fn done_dry_run_previews_an_ignored_psi_retro() {
+        let root = DoneTempRoot::new("dry-run-psi-rescue");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/dry-run-psi-rescue");
+        let relative = "ψ/memory/retrospectives/2026-07-27/dry-run.md";
+        std::fs::create_dir_all(main.join("agents")).expect("main repo dir");
+        done_run_process("git", &["init"], Some(&main));
+        std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
+        std::fs::write(main.join("README.md"), "dry-run fixture\n").expect("seed readme");
+        done_run_process("git", &["add", ".gitignore", "README.md"], Some(&main));
+        done_run_process(
+            "git",
+            &[
+                "-c",
+                "user.name=maw-test",
+                "-c",
+                "user.email=maw-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "seed dry-run rescue fixture",
+            ],
+            Some(&main),
+        );
+        let worktree_arg = worktree.display().to_string();
+        done_run_process(
+            "git",
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "agents/dry-run-psi-rescue",
+                &worktree_arg,
+            ],
+            Some(&main),
+        );
+        let note = worktree.join(relative);
+        std::fs::create_dir_all(note.parent().expect("note parent")).expect("note dir");
+        std::fs::write(&note, "preview this note\n").expect("write note");
+
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![done_test_window("lead"), done_test_window_with_cwd("worker", &worktree)],
+            ..DoneFakeRuntime::default()
+        };
+        runtime.register_worktree(&main, &worktree);
+        let out = done_run_with_context(&done_args(&["worker", "--dry-run"]), &mut runtime, &context)
+            .expect("done dry run");
+
+        assert!(out.contains("[dry-run] would rescue 1 uncommitted ψ note(s) to main before removal"), "{out}");
+        assert!(!main.join(relative).exists(), "dry run must not copy the note");
+        let rescued = crate::wind::done::rescue_psi(&worktree, &main).expect("rescue ignored retro");
+        assert_eq!(rescued, vec![main.join(relative)]);
+        assert_eq!(std::fs::read_to_string(main.join(relative)).expect("rescued note"), "preview this note\n");
+    }
+
+    #[test]
+    fn done_reports_a_nonempty_psi_without_rescue_candidates() {
+        let root = DoneTempRoot::new("empty-psi-rescue");
+        let main = root.repos_root().join("acme/app");
+        let worktree = main.join("agents/empty-psi-rescue");
+        std::fs::create_dir_all(main.join("agents")).expect("worktree parent");
+        std::fs::create_dir_all(main.join("ψ/teams")).expect("tracked ψ dir");
+        done_run_process("git", &["init"], Some(&main));
+        std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
+        std::fs::write(main.join("README.md"), "empty rescue fixture\n").expect("seed readme");
+        std::fs::write(main.join("ψ/teams/roster.yaml"), "name: gale\n").expect("tracked ψ file");
+        done_run_process("git", &["add", ".gitignore", "README.md"], Some(&main));
+        done_run_process("git", &["add", "-f", "ψ/teams/roster.yaml"], Some(&main));
+        done_run_process(
+            "git",
+            &[
+                "-c",
+                "user.name=maw-test",
+                "-c",
+                "user.email=maw-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "seed empty rescue fixture",
+            ],
+            Some(&main),
+        );
+        let worktree_arg = worktree.display().to_string();
+        done_run_process(
+            "git",
+            &["worktree", "add", "-b", "agents/empty-psi-rescue", &worktree_arg],
+            Some(&main),
+        );
+
+        let mut stdout = String::new();
+        done_rescue_psi_notes(
+            &DoneWorktree {
+                main_path: main,
+                full_path: worktree,
+                label: "acme/app/agents/empty-psi-rescue".to_owned(),
+            },
+            false,
+            &mut stdout,
+        );
+
+        assert!(stdout.contains("ψ rescue found no uncommitted notes although ψ/ is non-empty"), "{stdout}");
     }
 
     #[test]

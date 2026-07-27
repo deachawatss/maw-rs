@@ -13,6 +13,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Returns an error when Git inspection fails or when a rescue copy cannot be completed.
 pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec<PathBuf>, String> {
+    rescue_psi_with_mode(worktree_path, fallback_main_path, false)
+}
+
+/// List the `ψ/` files that a rescue would copy without modifying the main checkout.
+///
+/// # Errors
+///
+/// Returns an error when Git metadata inspection fails, a required Git command fails
+/// (including its stderr or exit status), or a source `ψ/` path cannot be inspected.
+pub fn preview_rescue_psi(
+    worktree_path: &Path,
+    fallback_main_path: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    match std::fs::symlink_metadata(worktree_path.join(".git")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "inspect ψ rescue Git metadata '{}': {error}",
+                worktree_path.display()
+            ));
+        }
+    }
+    rescue_psi_with_mode(worktree_path, fallback_main_path, true)
+}
+
+fn rescue_psi_with_mode(
+    worktree_path: &Path,
+    fallback_main_path: &Path,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>, String> {
     let status = git(&[
         "-C".to_owned(),
         worktree_path.display().to_string(),
@@ -43,7 +74,9 @@ pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec
     let mut rescued = Vec::new();
     for source in sources {
         let destination = rescue_destination(worktree_path, &main_psi, &source, timestamp)?;
-        copy_without_overwrite(&source, &destination)?;
+        if !dry_run {
+            copy_without_overwrite(&source, &destination)?;
+        }
         rescued.push(destination);
     }
     Ok(rescued)
@@ -248,6 +281,31 @@ fn git(args: &[String]) -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(git_error_detail(
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code(),
+        ))
+    }
+}
+
+fn git_error_detail(stderr: &str, code: Option<i32>) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        code.map_or_else(
+            || "git exited without a status code".to_owned(),
+            |code| format!("git exited with status {code}"),
+        )
+    } else {
+        stderr.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_errors_without_stderr_include_exit_status() {
+        assert_eq!(git_error_detail("", Some(64)), "git exited with status 64");
     }
 }
