@@ -127,7 +127,7 @@ fn done_native_matched_dry_run_is_hermetic_without_js_ref() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout"),
         format!(
-            "  \x1b[36m\u{2b21}\x1b[0m [dry-run] would skip retro (no retrospective command for this engine)\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would git add + commit + push in {}\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would kill window 13-nova:task-done\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would remove worktree org/repo/agents/task-done\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would remove 'task-done' from fleet config if present\n\n",
+            "  \x1b[36m\u{2b21}\x1b[0m [dry-run] would skip retro (no retrospective command for this engine)\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would git add + commit + push in {}\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would remove worktree org/repo/agents/task-done\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would kill window 13-nova:task-done\n  \x1b[36m\u{2b21}\x1b[0m [dry-run] would remove 'task-done' from fleet config if present\n\n",
             root.join("ghq/github.com/org/repo/agents/task-done").display()
         )
     );
