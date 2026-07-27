@@ -579,10 +579,15 @@ mod workon_hardening {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$MAW_FAKE_TMUX_LOG"
 case "$1" in
-  display-message) printf '50-mawjs\n' ;;
+  display-message)
+    case "$*" in
+      *'#{pane_index}'*) printf '0\n' ;;
+      *'#{window_width}'*) printf '100\n' ;;
+      *) printf '50-mawjs\n' ;;
+    esac ;;
   list-windows) printf '%s' "$MAW_FAKE_TMUX_WINDOWS" ;;
   list-panes) printf '%%1 0 0\n' ;;
-  new-window|send-keys|select-window) exit 0 ;;
+  new-window|send-keys|select-window|set-window-option|select-layout) exit 0 ;;
   split-window) printf '%%42\n' ;;
   capture-pane) printf '$ \r\n' ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
