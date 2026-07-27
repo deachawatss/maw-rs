@@ -33,6 +33,34 @@ doing.
 If you are unsure which you are: an L2 was dispatched into a worktree for one issue.
 L1 works on the repo's main checkout, reviews, and merges.
 
+### L1 MUST rebuild after merging — nothing else installs the binary
+
+The permission above is also an obligation. **After merging to `main`, L1 rebuilds and
+installs the binary before moving on:**
+
+```
+cargo build --release
+install -m755 target/release/maw-rs ~/.local/bin/maw-rs
+maw --version    # must report the commit you just merged
+```
+
+`~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
+Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
+`setup.sh` has no maw-rs step, so a merged fix reaches the box only when L1 performs the
+build above. Skip it and `main` moves while every operator keeps running the old binary.
+
+Do not repoint the wrapper at a build directory to avoid this step. On 2026-07-27 the
+wrapper was edited to prefer `/tmp/maw-rs-target/release/maw-rs` and the repo checkout's
+`target/release/`, which reopens the disk-exhaustion path in #121, makes the running
+binary depend on a build cache that any `cargo clean` can delete, and — in that same
+edit — dropped the guard that fails loudly when no binary is present. The Cargo target
+directory is a build cache, never a runtime dependency. If the installed binary is
+stale, run the build; do not reach into the cache.
+
+Timing is unchanged: build one at a time, and not while L2 deliveries are mid-flight.
+If sibling L2s are still running when a merge lands, finish their reviews first, then
+rebuild once for all merged work.
+
 ### Why scoping was not enough
 
 The previous rule said "scope tests to the crate you changed" after three
