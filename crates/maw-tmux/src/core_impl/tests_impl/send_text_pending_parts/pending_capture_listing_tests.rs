@@ -126,6 +126,34 @@
     }
 
     #[test]
+    fn trailing_marker_prompts_are_recognized_for_stock_linux_bash() {
+        // Default Debian/Ubuntu PS1 renders `\u@\h:\w\$ ` — marker LAST. The
+        // marker-first scan cannot see it, which is why a stock Linux box timed out
+        // waiting for a shell prompt that was sitting right there.
+        let bash = "deachawat@Wind:~/ghq/github.com/deachawatss/gale-oracle$ ";
+        assert!(!pane_has_empty_prompt_from_capture(bash));
+        assert!(pane_has_trailing_marker_prompt_from_capture(bash));
+
+        // root shells end in `#`, and blank trailing lines are pane padding.
+        assert!(pane_has_trailing_marker_prompt_from_capture(
+            "root@box:/srv#\n\n\n"
+        ));
+    }
+
+    #[test]
+    fn trailing_marker_scan_does_not_treat_typed_input_as_ready() {
+        // Anything typed after the marker ends the line in that text, so the pane is
+        // not idle and must not be reported ready.
+        assert!(!pane_has_trailing_marker_prompt_from_capture(
+            "deachawat@Wind:~$ ls -la"
+        ));
+        assert!(!pane_has_trailing_marker_prompt_from_capture(""));
+        assert!(!pane_has_trailing_marker_prompt_from_capture("\n\n"));
+        // Still agrees with the marker-first scan on the classic false friend.
+        assert!(!pane_has_trailing_marker_prompt_from_capture("$HOME"));
+    }
+
+    #[test]
     fn pending_input_matching_is_duplicate_safe() {
         assert!(pending_input_matches_sent("deploy now", "deploy now"));
         assert!(pending_input_matches_sent(

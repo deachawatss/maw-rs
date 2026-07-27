@@ -100,6 +100,32 @@ pub fn pane_has_empty_prompt_from_capture(content: &str) -> bool {
     false
 }
 
+/// Return true when the last rendered line ends at a trailing-marker shell prompt.
+///
+/// [`pane_has_empty_prompt_from_capture`] only recognizes prompts whose marker is the
+/// FIRST character of the line (`❯ `, `% `) — the shape starship and most zsh themes
+/// render. The default Debian/Ubuntu bash `PS1` puts the marker LAST
+/// (`user@host:~/path$ `), so that scan finds no prompt at all — forever — and a
+/// caller polling for readiness times out on every stock Linux box.
+///
+/// Kept deliberately narrow: this only reports that the last non-blank line ENDS in a
+/// marker. Anything typed after the marker (`user@host:~$ ls`) ends in that text
+/// instead, so pending input still reads as not-ready. Callers should pair this with a
+/// process-level check (`pane_current_command` is a shell) so readiness stays positive
+/// evidence rather than a guess about arbitrary pane text.
+#[must_use]
+pub fn pane_has_trailing_marker_prompt_from_capture(content: &str) -> bool {
+    let Some(last) = content
+        .lines()
+        .map(normalize_capture_line)
+        .rev()
+        .find(|line| !line.trim().is_empty())
+    else {
+        return false;
+    };
+    last.trim_end().chars().next_back().is_some_and(is_prompt_marker)
+}
+
 /// Classification of pane pending input against the exact text maw just sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingInputState {

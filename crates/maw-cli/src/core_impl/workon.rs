@@ -593,6 +593,19 @@ where
         if maw_tmux::pane_has_empty_prompt_from_capture(&capture) {
             return Ok(());
         }
+        // The scan above only sees marker-FIRST prompts (`❯ `), which is what starship
+        // and most zsh themes render — so this gate passed on macOS and could never pass
+        // on a stock Linux box, whose bash PS1 puts the marker LAST (`user@host:~$ `).
+        // Accept that shape too, but only while a shell is still the pane's foreground
+        // process: `workon_wait_for_launch` below already reads `pane_current_command`
+        // to prove the shell was LEFT, so this is the same signal at the opposite
+        // polarity, and readiness stays positive evidence rather than absence of it.
+        // Errors resolve to "not a shell", keeping the gate fail-closed.
+        if maw_tmux::pane_has_trailing_marker_prompt_from_capture(&capture)
+            && !workon_launch_started(runner, target).unwrap_or(true)
+        {
+            return Ok(());
+        }
         if attempt + 1 < WORKON_PROMPT_READY_ATTEMPTS {
             sleep(std::time::Duration::from_millis(WORKON_PROMPT_READY_POLL_MS));
         }
