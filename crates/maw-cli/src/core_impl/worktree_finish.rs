@@ -188,7 +188,13 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
         .as_ref()
         .and_then(done_recorded_worktree_pane_id);
     let removed_worktree = if let Some(worktree) = &selected_worktree {
-        done_remove_selected_worktree(worktree, options, local, &mut stdout)?;
+        done_remove_selected_worktree(
+            worktree,
+            worktree_pane_id.as_deref(),
+            options,
+            local,
+            &mut stdout,
+        )?;
         true
     } else {
         false
@@ -840,22 +846,45 @@ fn done_psi_has_entries(worktree: &DoneWorktree) -> bool {
     std::fs::read_dir(worktree.full_path.join("ψ")).is_ok_and(|mut entries| entries.next().is_some())
 }
 
-fn done_remove_selected_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+fn done_remove_selected_worktree(
+    worktree: &DoneWorktree,
+    recorded_pane_id: Option<&str>,
+    options: &DoneOptions,
+    local: &mut impl DoneRuntime,
+    stdout: &mut String,
+) -> Result<(), String> {
     if options.dry_run { let _ = writeln!(stdout, "  \x1b[36m⬡\x1b[0m [dry-run] would remove worktree {}", worktree.label); return Ok(()); }
-    done_remove_worktree(worktree, options, local, stdout)
+    done_remove_worktree(worktree, recorded_pane_id, options, local, stdout)
 }
 
-fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+fn done_remove_worktree(
+    worktree: &DoneWorktree,
+    recorded_pane_id: Option<&str>,
+    options: &DoneOptions,
+    local: &mut impl DoneRuntime,
+    stdout: &mut String,
+) -> Result<(), String> {
     done_validate_exec_path(&worktree.main_path)?;
     done_validate_exec_path(&worktree.full_path)?;
     let cargo_target_dir = done_managed_cargo_target_dir(&worktree.full_path);
     let branch = local.done_git(&["-C".to_owned(), worktree.full_path.display().to_string(), "rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]).unwrap_or_default().trim().to_owned();
+    let cleaned = crate::wind::workon::remove_ephemeral_markers(&worktree.full_path)
+        .map_err(|error| format!("done: clean maw markers: {error}"))?;
     let mut remove_args = vec!["-C".to_owned(), worktree.main_path.display().to_string(), "worktree".to_owned(), "remove".to_owned()];
     if options.force {
         remove_args.push("--force".to_owned());
     }
     remove_args.extend(["--".to_owned(), worktree.full_path.display().to_string()]);
-    local.done_git(&remove_args)?;
+    if let Err(error) = local.done_git(&remove_args) {
+        if cleaned.iter().any(|marker| marker == ".maw/pane-id") {
+            if let Some(pane_id) = recorded_pane_id {
+                if let Err(restore_error) = done_restore_recorded_pane_id(worktree, pane_id) {
+                    return Err(format!("{error}; additionally failed to restore pane ownership proof: {restore_error}"));
+                }
+            }
+        }
+        return Err(error);
+    }
     if let Some(target_dir) = cargo_target_dir {
         done_reclaim_cargo_target_dir(&target_dir, stdout);
     }
@@ -863,6 +892,17 @@ fn done_remove_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &
     let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m removed worktree {}", worktree.label);
     done_cleanup_branch(&worktree.main_path, &branch, options, local, stdout);
     Ok(())
+}
+
+fn done_restore_recorded_pane_id(worktree: &DoneWorktree, pane_id: &str) -> Result<(), String> {
+    let marker = worktree.full_path.join(".maw/pane-id");
+    let Some(parent) = marker.parent() else {
+        return Err(format!("done: invalid pane marker path {}", marker.display()));
+    };
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("done: restore pane marker directory {}: {error}", parent.display()))?;
+    std::fs::write(&marker, format!("{pane_id}\n"))
+        .map_err(|error| format!("done: restore pane marker {}: {error}", marker.display()))
 }
 
 fn done_managed_cargo_target_dir(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1208,10 +1248,20 @@ mod done_tests {
         }
     }
 
-    struct DoneRealGitRuntime { git: std::path::PathBuf }
+    struct DoneRealGitRuntime {
+        git: std::path::PathBuf,
+        tmux_responses: std::collections::BTreeMap<String, String>,
+        tmux_calls: Vec<(String, Vec<String>)>,
+    }
 
     impl Default for DoneRealGitRuntime {
-        fn default() -> Self { Self { git: done_git_executable() } }
+        fn default() -> Self {
+            Self {
+                git: done_git_executable(),
+                tmux_responses: std::collections::BTreeMap::new(),
+                tmux_calls: Vec::new(),
+            }
+        }
     }
 
     impl DoneRuntime for DoneRealGitRuntime {
@@ -1225,11 +1275,14 @@ mod done_tests {
 
         fn done_pane_info(&mut self, _target: &str) -> Option<(String, String)> { None }
 
-        fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
+        fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Ok(()) }
 
-        fn done_reap_pane(&mut self, _pane_id: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
+        fn done_reap_pane(&mut self, _pane_id: &str) -> Result<(), String> { Ok(()) }
 
-        fn done_tmux(&mut self, _command: &str, _args: &[String]) -> Result<String, String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
+        fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String> {
+            self.tmux_calls.push((command.to_owned(), args.to_vec()));
+            Ok(self.tmux_responses.get(command).cloned().unwrap_or_default())
+        }
 
         fn done_send_text(&mut self, _target: &str, _text: &str) -> Result<(), String> { Err("tmux unavailable in real-git test runtime".to_owned()) }
 
@@ -1298,6 +1351,34 @@ mod done_tests {
     }
 
     fn done_args(args: &[&str]) -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() }
+
+    fn done_init_unignored_worktree(root: &DoneTempRoot, label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let main = root.repos_root().join("acme/app");
+        let worktree = main.join("agents").join(label);
+        std::fs::create_dir_all(main.join("agents")).expect("worktree parent");
+        done_run_process("git", &["init"], Some(&main));
+        std::fs::write(main.join("README.md"), "fixture\n").expect("seed fixture");
+        done_run_process("git", &["add", "README.md"], Some(&main));
+        done_run_process(
+            "git",
+            &[
+                "-c",
+                "user.name=maw-test",
+                "-c",
+                "user.email=maw-test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "seed done marker fixture",
+            ],
+            Some(&main),
+        );
+        let branch = format!("agents/{label}");
+        let worktree_arg = worktree.display().to_string();
+        done_run_process("git", &["worktree", "add", "-b", &branch, &worktree_arg], Some(&main));
+        (main, worktree)
+    }
 
     #[test]
     fn done_parse_rejects_leading_dash_positionals() {
@@ -1871,6 +1952,56 @@ mod done_tests {
         assert!(!runtime.tmux_calls.iter().any(|(command, _)| command == "kill-window"));
         assert!(runtime.git_calls.iter().any(|args| args.iter().any(|arg| arg == "remove")));
         assert_eq!(runtime.actions, vec!["remove-worktree", "kill-pane"]);
+    }
+
+    #[test]
+    fn done_removes_unignored_ephemeral_markers_and_retires_recorded_pane() {
+        let root = DoneTempRoot::new("unignored-marker-cleanup");
+        let (_main, worktree) = done_init_unignored_worktree(&root, "marker-task");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        std::fs::write(worktree.join(".maw/delivery.json"), "{}\n").expect("delivery marker");
+        std::fs::write(worktree.join(".maw/phase.json"), "{}\n").expect("phase marker");
+
+        let mut runtime = DoneRealGitRuntime::default();
+        runtime
+            .tmux_responses
+            .insert("display-message".to_owned(), format!("2\t{} (deleted)\t@7\n", worktree.display()));
+        let output = done_run_with_context(
+            &done_args(&["marker-task", "--worktree", &worktree.display().to_string()]),
+            &mut runtime,
+            &root.context(),
+        )
+        .expect("unignored maw markers must not block done");
+
+        assert!(output.contains("removed worktree acme/app/agents/marker-task"), "{output}");
+        assert!(!worktree.exists(), "worktree should be removed: {}", worktree.display());
+        assert!(runtime.tmux_calls.iter().any(|(command, args)| {
+            command == "kill-pane" && args == &done_args(&["-t", "%42"])
+        }));
+    }
+
+    #[test]
+    fn done_preserves_pane_proof_when_genuine_dirt_refuses_removal() {
+        let root = DoneTempRoot::new("marker-cleanup-user-dirt");
+        let (_main, worktree) = done_init_unignored_worktree(&root, "dirty-marker-task");
+        std::fs::create_dir_all(worktree.join(".maw")).expect("marker dir");
+        std::fs::write(worktree.join(".maw/pane-id"), "%42\n").expect("pane marker");
+        std::fs::write(worktree.join(".maw/delivery.json"), "{}\n").expect("delivery marker");
+        std::fs::write(worktree.join("README.md"), "user edit\n").expect("genuine user dirt");
+
+        let mut runtime = DoneRealGitRuntime::default();
+        let error = done_run_with_context(
+            &done_args(&["dirty-marker-task", "--worktree", &worktree.display().to_string()]),
+            &mut runtime,
+            &root.context(),
+        )
+        .expect_err("genuine user dirt must still refuse removal");
+
+        assert!(error.contains("contains modified or untracked files"), "{error}");
+        assert_eq!(std::fs::read_to_string(worktree.join(".maw/pane-id")).expect("restored pane proof"), "%42\n");
+        assert!(!worktree.join(".maw/delivery.json").exists(), "non-proof markers stay cleaned");
+        assert!(runtime.tmux_calls.iter().all(|(command, _)| command != "kill-pane"));
     }
 
     #[test]
