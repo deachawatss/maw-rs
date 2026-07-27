@@ -821,7 +821,7 @@ fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut St
 }
 
 fn done_psi_has_entries(worktree: &DoneWorktree) -> bool {
-    std::fs::read_dir(worktree.full_path.join("ψ")).map_or(false, |mut entries| entries.next().is_some())
+    std::fs::read_dir(worktree.full_path.join("ψ")).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 fn done_remove_selected_worktree(worktree: &DoneWorktree, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {

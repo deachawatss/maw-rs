@@ -17,6 +17,11 @@ pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec
 }
 
 /// List the `ψ/` files that a rescue would copy without modifying the main checkout.
+///
+/// # Errors
+///
+/// Returns an error when Git metadata inspection fails, a required Git command fails
+/// (including its stderr or exit status), or a source `ψ/` path cannot be inspected.
 pub fn preview_rescue_psi(
     worktree_path: &Path,
     fallback_main_path: &Path,
