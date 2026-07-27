@@ -46,8 +46,8 @@ pub(crate) fn sanitize_fresh_worktree(
     wt_path: &Path,
 ) -> Result<Vec<String>, String> {
     run_git_clean(wt_path)?;
-    let mut cleaned = Vec::new();
-    for relative in EPHEMERAL_MARKERS.iter().chain(LEGACY_MARKERS) {
+    let mut cleaned = remove_ephemeral_markers(wt_path)?;
+    for relative in LEGACY_MARKERS {
         remove_stale_file(wt_path, relative, &mut cleaned)?;
     }
     for (label, path) in index_lock_candidates(wt_path) {
@@ -57,6 +57,14 @@ pub(crate) fn sanitize_fresh_worktree(
     }
     if ensure_claude_md(repo_path, wt_path)? {
         cleaned.push("CLAUDE.md".to_owned());
+    }
+    Ok(cleaned)
+}
+
+pub(crate) fn remove_ephemeral_markers(wt_path: &Path) -> Result<Vec<String>, String> {
+    let mut cleaned = Vec::new();
+    for relative in EPHEMERAL_MARKERS {
+        remove_stale_file(wt_path, relative, &mut cleaned)?;
     }
     Ok(cleaned)
 }
