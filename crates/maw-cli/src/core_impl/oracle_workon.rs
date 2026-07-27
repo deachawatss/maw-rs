@@ -6,6 +6,7 @@ const DISPATCH_90: &[DispatcherEntry] = &[DispatcherEntry {
 const ORACLEWORKON_USAGE: &str = "usage: maw oracle-workon <repo> [task] [--dry-run] [--work <repo>] [--task <slug>] [--engine <name>] [--prompt <text>] [--with <oracle>] [--all --force --no-attach --split --tiled]";
 
 type OracleworkonFleetLoader = fn() -> Vec<NativeFleetSession>;
+type OracleworkonWorkonRunner = fn(&[String]) -> CliOutput;
 
 const ORACLEWORKON_FLAG_DRY_RUN: u8 = 1 << 0;
 const ORACLEWORKON_FLAG_ALL: u8 = 1 << 1;
@@ -47,13 +48,22 @@ fn oracleworkon_run(argv: &[String], load_fleet: OracleworkonFleetLoader) -> Res
     let orchestrator = crate::serve_core::ServecoreCommandOrchestrator::servecore_with_root(
         oracleworkon_orchestration_root(),
     );
-    oracleworkon_run_with_orchestrator(argv, load_fleet, &orchestrator)
+    oracleworkon_run_with_orchestrator_and_workon(argv, load_fleet, &orchestrator, run_workon_command)
 }
 
 fn oracleworkon_run_with_orchestrator(
     argv: &[String],
     load_fleet: OracleworkonFleetLoader,
     orchestrator: &dyn crate::serve_core::ServecoreOrchestrator,
+) -> Result<String, String> {
+    oracleworkon_run_with_orchestrator_and_workon(argv, load_fleet, orchestrator, run_workon_command)
+}
+
+fn oracleworkon_run_with_orchestrator_and_workon(
+    argv: &[String],
+    load_fleet: OracleworkonFleetLoader,
+    orchestrator: &dyn crate::serve_core::ServecoreOrchestrator,
+    run_workon: OracleworkonWorkonRunner,
 ) -> Result<String, String> {
     let mut options = oracleworkon_parse_args(argv)?;
     if oracleworkon_has_flag(&options, ORACLEWORKON_FLAG_ALL) {
@@ -66,7 +76,7 @@ fn oracleworkon_run_with_orchestrator(
     if oracleworkon_needs_orchestration(&options) {
         return oracleworkon_spawn_with_orchestrator(&options, orchestrator);
     }
-    oracleworkon_run_single_workon(&options)
+    oracleworkon_run_single_workon_with(&options, run_workon)
 }
 
 fn oracleworkon_parse_args(argv: &[String]) -> Result<OracleworkonOptions, String> {
@@ -299,14 +309,17 @@ fn oracleworkon_orchestration_root() -> std::path::PathBuf {
     )
 }
 
-fn oracleworkon_run_single_workon(options: &OracleworkonOptions) -> Result<String, String> {
+fn oracleworkon_run_single_workon_with(
+    options: &OracleworkonOptions,
+    run_workon: OracleworkonWorkonRunner,
+) -> Result<String, String> {
     let target = options.targets.first().ok_or_else(|| ORACLEWORKON_USAGE.to_owned())?;
     let mut args = vec![target.clone()];
     if let Some(task) = &options.task {
         args.push(task.clone());
     }
     args.extend(["--layout".to_owned(), "nested".to_owned()]);
-    let output = run_workon_command(&args);
+    let output = run_workon(&args);
     if output.code == 0 {
         Ok(output.stdout)
     } else {
@@ -351,62 +364,12 @@ mod oracleworkon_tests {
         }
     }
 
-    struct OracleworkonEnvGuard {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl OracleworkonEnvGuard {
-        fn oracleworkon_new() -> Self {
-            let keys = ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "TMUX", "PATH", "GHQ_ROOT"];
-            let saved = keys.into_iter().map(|key| (key, std::env::var_os(key))).collect::<Vec<_>>();
-            let root = std::env::temp_dir().join(format!("maw-oracleworkon-test-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("bin")).expect("bin");
-            std::fs::create_dir_all(root.join("ghq/github.com/acme/demo")).expect("repo");
-            std::fs::create_dir_all(root.join("xdg-config/maw")).expect("config");
-            std::fs::write(root.join("xdg-config/maw/maw.config.json"), r#"{"commands":{"default":"echo launch"}}"#).expect("config");
-            oracleworkon_write_fake_tmux(&root);
-            std::env::set_var("HOME", root.join("home"));
-            std::env::set_var("XDG_CONFIG_HOME", root.join("xdg-config"));
-            std::env::set_var("XDG_STATE_HOME", root.join("xdg-state"));
-            std::env::set_var("XDG_DATA_HOME", root.join("xdg-data"));
-            std::env::set_var("XDG_CACHE_HOME", root.join("xdg-cache"));
-            std::env::set_var("TMUX", "/tmp/tmux,1,0");
-            std::env::set_var("PATH", root.join("bin"));
-            std::env::set_var("GHQ_ROOT", root.join("ghq"));
-            Self { saved }
-        }
-    }
-
-    impl Drop for OracleworkonEnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..) {
-                if let Some(value) = value { std::env::set_var(key, value); } else { std::env::remove_var(key); }
-            }
-        }
-    }
-
-    fn oracleworkon_write_fake_tmux(root: &std::path::Path) {
-        let tmux = root.join("bin/tmux");
-        std::fs::write(
-            &tmux,
-            r#"#!/bin/sh
-printf '%s\n' "$*" >> "$HOME/tmux.log"
-case "$1" in
-  display-message) printf '50-mawjs\n' ;;
-  list-windows) printf 'demo\n' ;;
-  select-window|new-window|send-keys) exit 0 ;;
-  *) exit 9 ;;
-esac
-"#,
-        )
-        .expect("tmux");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&tmux).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&tmux, permissions).expect("chmod");
+    fn oracleworkon_fake_workon(argv: &[String]) -> CliOutput {
+        assert_eq!(argv, &["demo".to_owned(), "--layout".to_owned(), "nested".to_owned()]);
+        CliOutput {
+            code: 0,
+            stdout: "reusing existing window 'demo'\n".to_owned(),
+            stderr: String::new(),
         }
     }
 
@@ -496,9 +459,14 @@ esac
 
     #[test]
     fn oracleworkon_single_target_delegates_to_native_workon_hermetically() {
-        let _lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = OracleworkonEnvGuard::oracleworkon_new();
-        let output = oracleworkon_run(&oracleworkon_strings(&["demo"]), oracleworkon_fleet).expect("run");
+        let orchestrator = OracleworkonFakeOrchestrator::default();
+        let output = oracleworkon_run_with_orchestrator_and_workon(
+            &oracleworkon_strings(&["demo"]),
+            oracleworkon_fleet,
+            &orchestrator,
+            oracleworkon_fake_workon,
+        )
+        .expect("run");
         assert!(output.contains("reusing existing window 'demo'"));
     }
 }
