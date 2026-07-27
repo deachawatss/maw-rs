@@ -21,6 +21,16 @@ pub fn preview_rescue_psi(
     worktree_path: &Path,
     fallback_main_path: &Path,
 ) -> Result<Vec<PathBuf>, String> {
+    match std::fs::symlink_metadata(worktree_path.join(".git")) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "inspect ψ rescue Git metadata '{}': {error}",
+                worktree_path.display()
+            ));
+        }
+    }
     rescue_psi_with_mode(worktree_path, fallback_main_path, true)
 }
 
@@ -266,7 +276,22 @@ fn git(args: &[String]) -> Result<String, String> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(git_error_detail(
+            String::from_utf8_lossy(&output.stderr).as_ref(),
+            output.status.code(),
+        ))
+    }
+}
+
+fn git_error_detail(stderr: &str, code: Option<i32>) -> String {
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        code.map_or_else(
+            || "git exited without a status code".to_owned(),
+            |code| format!("git exited with status {code}"),
+        )
+    } else {
+        stderr.to_owned()
     }
 }
 
@@ -274,82 +299,8 @@ fn git(args: &[String]) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    struct RescueTempRoot {
-        path: PathBuf,
-    }
-
-    impl RescueTempRoot {
-        fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "maw-rs-done-rescue-{}-{sequence}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("temp root");
-            Self { path }
-        }
-    }
-
-    impl Drop for RescueTempRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    fn rescue_git(repo: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "MAW rescue test")
-            .env("GIT_AUTHOR_EMAIL", "rescue@example.invalid")
-            .env("GIT_COMMITTER_NAME", "MAW rescue test")
-            .env("GIT_COMMITTER_EMAIL", "rescue@example.invalid")
-            .output()
-            .expect("run git");
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn rescue_fixture() -> (RescueTempRoot, PathBuf, PathBuf, PathBuf) {
-        let root = RescueTempRoot::new();
-        let main = root.path.join("main");
-        let worktree = root.path.join("worktree");
-        let relative = PathBuf::from("ψ/memory/retrospectives/2026-07-27/rescue.md");
-        std::fs::create_dir_all(&main).expect("main dir");
-        rescue_git(&main, &["init", "-q"]);
-        std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
-        std::fs::write(main.join("README.md"), "rescue fixture\n").expect("seed readme");
-        rescue_git(&main, &["add", ".gitignore", "README.md"]);
-        rescue_git(&main, &["commit", "-m", "seed rescue fixture"]);
-        let worktree_arg = worktree.to_str().expect("worktree UTF-8");
-        rescue_git(
-            &main,
-            &["worktree", "add", "-b", "agents/rescue-psi", worktree_arg],
-        );
-        let note = worktree.join(&relative);
-        std::fs::create_dir_all(note.parent().expect("note parent")).expect("note dir");
-        std::fs::write(&note, "durable retrospective\n").expect("write note");
-        (root, main, worktree, relative)
-    }
-
     #[test]
-    fn rescue_psi_copies_an_ignored_retro_from_a_worktree() {
-        let (_root, main, worktree, relative) = rescue_fixture();
-
-        let rescued = rescue_psi(&worktree, &main).expect("rescue ignored retro");
-
-        let destination = main.join(&relative);
-        assert_eq!(rescued, vec![destination.clone()]);
-        assert_eq!(
-            std::fs::read_to_string(destination).expect("rescued note"),
-            "durable retrospective\n"
-        );
+    fn git_errors_without_stderr_include_exit_status() {
+        assert_eq!(git_error_detail("", Some(64)), "git exited with status 64");
     }
 }

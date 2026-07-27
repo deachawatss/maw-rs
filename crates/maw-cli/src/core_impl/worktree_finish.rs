@@ -1579,6 +1579,9 @@ mod done_tests {
 
         assert!(out.contains("[dry-run] would rescue 1 uncommitted ψ note(s) to main before removal"), "{out}");
         assert!(!main.join(relative).exists(), "dry run must not copy the note");
+        let rescued = crate::wind::done::rescue_psi(&worktree, &main).expect("rescue ignored retro");
+        assert_eq!(rescued, vec![main.join(relative)]);
+        assert_eq!(std::fs::read_to_string(main.join(relative)).expect("rescued note"), "preview this note\n");
     }
 
     #[test]
