@@ -25,11 +25,17 @@ impl MockGatewaySource {
 
     /// Creates a source that waits until the caller has attached its subscriber.
     #[must_use]
-    pub fn with_start_gate(events: Vec<Result<Option<Event>, String>>, start_gate: Arc<Notify>) -> Self {
+    pub fn with_start_gate(
+        events: Vec<Result<Option<Event>, String>>,
+        start_gate: Arc<Notify>,
+    ) -> Self {
         Self::with_optional_start_gate(events, Some(start_gate))
     }
 
-    fn with_optional_start_gate(events: Vec<Result<Option<Event>, String>>, start_gate: Option<Arc<Notify>>) -> Self {
+    fn with_optional_start_gate(
+        events: Vec<Result<Option<Event>, String>>,
+        start_gate: Option<Arc<Notify>>,
+    ) -> Self {
         let mut reversed = events;
         reversed.reverse();
         Self {
