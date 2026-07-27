@@ -157,7 +157,7 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
     let target_lower = target.to_lowercase();
     let matched = done_find_window(&sessions, &target_lower, session_filter);
     let matched_pane = done_find_pane(&panes, &target_lower, session_filter)?;
-    if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, local, &mut stdout)?; }
+    if let Some(window) = &matched { done_assert_may_target_lead(window, &sessions, options.force, local, &mut stdout)?; }
     if let Some(pane) = &matched_pane { done_assert_not_invoking_pane(pane, local, &mut stdout)?; }
     let pane_info = matched
         .as_ref()
@@ -391,7 +391,7 @@ fn done_pane_targets(pane: &DonePane) -> [String; 3] {
 
 fn done_pane_target(pane: &DonePane) -> String { format!("{}:{}.{}", pane.session, pane.window_index, pane.pane_index) }
 
-fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
+fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], force: bool, local: &mut impl DoneRuntime, stdout: &mut String) -> Result<(), String> {
     let current = local.done_current_identity();
     if let Some(message) = crate::wind::done::self_invocation_message(current.as_ref(), &window.session, window.index, &window.name) {
         let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
@@ -399,7 +399,8 @@ fn done_assert_may_target_lead(window: &DoneWindow, windows: &[DoneWindow], loca
         return Err(message);
     }
     let Some(lead) = done_lead_window(windows, &window.session) else {
-        let message = format!("refusing to done window '{}' because the lead window for session '{}' could not be identified", window.name, window.session);
+        if force { return Ok(()); }
+        let message = format!("refusing to done window '{}' because the lead window for session '{}' could not be identified; retry with --force to retire the orphaned delivery", window.name, window.session);
         let _ = writeln!(stdout, "  \x1b[31m✗\x1b[0m {message}");
         return Err(message);
     };
@@ -1113,6 +1114,7 @@ mod done_tests {
         tmux_responses: std::collections::BTreeMap<String, String>,
         git_calls: Vec<Vec<String>>,
         tmux_calls: Vec<(String, Vec<String>)>,
+        reaped_targets: Vec<String>,
         actions: Vec<&'static str>,
         sent_text: Vec<(String, String)>,
     }
@@ -1144,7 +1146,10 @@ mod done_tests {
 
         fn done_pane_info(&mut self, target: &str) -> Option<(String, String)> { self.pane_info.get(target).cloned() }
 
-        fn done_reap_target(&mut self, _target: &str) -> Result<(), String> { Ok(()) }
+        fn done_reap_target(&mut self, target: &str) -> Result<(), String> {
+            self.reaped_targets.push(target.to_owned());
+            Ok(())
+        }
 
         fn done_reap_pane(&mut self, _pane_id: &str) -> Result<(), String> { Ok(()) }
 
@@ -1452,6 +1457,69 @@ mod done_tests {
         let error = done_run_with_context(&done_args(&["gale", "--dry-run"]), &mut runtime, &root.context()).expect_err("self invocation rejected");
 
         assert_eq!(error, "refusing to done current window 'gale' in session '01-gale'");
+    }
+
+    #[test]
+    fn done_leadless_session_refuses_without_force_and_names_escape_hatch() {
+        let root = DoneTempRoot::new("leadless-refusal");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![DoneWindow {
+                session: "orphan".to_owned(),
+                index: 1,
+                name: "worker".to_owned(),
+                cwd: None,
+            }],
+            ..DoneFakeRuntime::default()
+        };
+
+        let err = done_run_with_context(&done_args(&["worker", "--dry-run"]), &mut runtime, &root.context())
+            .expect_err("leadless session must require --force");
+
+        assert_eq!(
+            err,
+            "refusing to done window 'worker' because the lead window for session 'orphan' could not be identified; retry with --force to retire the orphaned delivery"
+        );
+    }
+
+    #[test]
+    fn done_force_retires_leadless_session_worktree_window_and_branch() {
+        let root = DoneTempRoot::new("leadless-force");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let worktree = main.join("agents/worker");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        done_write_fleet(&root, "worker", "acme/app/agents/worker");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![DoneWindow {
+                session: "orphan".to_owned(),
+                index: 1,
+                name: "worker".to_owned(),
+                cwd: None,
+            }],
+            ..DoneFakeRuntime::default()
+        };
+        runtime.register_worktree(&main, &worktree);
+
+        let output = done_run_with_context(
+            &done_args(&["worker", "--force", "--clean-branch"]),
+            &mut runtime,
+            &context,
+        )
+        .expect("--force must retire the leadless delivery");
+
+        assert!(output.contains("removed worktree acme/app/agents/worker"), "{output}");
+        assert!(output.contains("deleted branch agent/task"), "{output}");
+        assert_eq!(runtime.reaped_targets, vec!["orphan:worker"]);
+        assert!(runtime.git_calls.iter().any(|args| {
+            args == &vec![
+                "-C".to_owned(),
+                main.display().to_string(),
+                "branch".to_owned(),
+                "-D".to_owned(),
+                "--".to_owned(),
+                "agent/task".to_owned(),
+            ]
+        }), "{:#?}", runtime.git_calls);
     }
 
     #[test]
