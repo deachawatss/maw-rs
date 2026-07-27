@@ -56,8 +56,18 @@ pub fn pane_input_pending_from_capture(content: &str) -> bool {
 }
 
 fn codex_pasted_content_pending(content: &str) -> bool {
-    let clean = normalize_capture_line(content.lines().next_back().unwrap_or_default());
-    clean.contains("[Pasted Content") && clean.contains("chars]")
+    let lines = content
+        .lines()
+        .map(normalize_capture_line)
+        .collect::<Vec<_>>();
+    lines.iter().enumerate().rev().any(|(index, line)| {
+        trailing_after_prompt_is_chrome(&lines, index)
+            && matches!(
+                prompt_line(line),
+                PromptLine::Pending(input)
+                    if input.contains("[Pasted Content") && input.contains("chars]")
+            )
+    })
 }
 
 /// Return the current prompt input from captured pane output when it appears pending.
@@ -190,6 +200,8 @@ fn prompt_line(line: &str) -> PromptLine {
     }
     let input = input.trim_end();
     if input.is_empty() {
+        PromptLine::Empty
+    } else if marker == '›' && input == "Use /skills to list available skills" {
         PromptLine::Empty
     } else {
         PromptLine::Pending(input.to_owned())
