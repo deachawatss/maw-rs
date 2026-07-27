@@ -21,6 +21,11 @@ pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
     ".maw/auto-done-pinged",
     ".maw/phase.json",
     ".maw/req-line",
+    ".maw/l2-meta*.json",
+    ".maw/l2-observer*.json",
+    ".maw/l2-transition*.json",
+    ".maw/delivery-issue*.json*",
+    ".maw/pr-*-body.md",
 ];
 
 const LEGACY_MARKERS: &[&str] = &[
@@ -153,10 +158,55 @@ fn remove_stale_file(
     relative: &str,
     cleaned: &mut Vec<String>,
 ) -> Result<(), String> {
-    if remove_file_if_present(&wt_path.join(relative))? {
+    let path = wt_path.join(relative);
+    let Some(pattern) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return Ok(());
+    };
+    if pattern.contains('*') {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("workon: read {}: {error}", parent.display())),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("workon: read {}: {error}", parent.display()))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if marker_pattern_matches(pattern, &name) && remove_file_if_present(&entry.path())? {
+                cleaned.push(format!(".maw/{name}"));
+            }
+        }
+        return Ok(());
+    }
+    if remove_file_if_present(&path)? {
         cleaned.push(relative.to_owned());
     }
     Ok(())
+}
+
+fn marker_pattern_matches(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*').peekable();
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    let Some(mut remaining) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            return remaining.ends_with(part);
+        }
+        let Some(index) = remaining.find(part) else {
+            return false;
+        };
+        remaining = &remaining[(index + part.len())..];
+    }
+    true
 }
 
 #[rustfmt::skip]
@@ -394,6 +444,11 @@ mod tests {
             ".maw/auto-done-pinged",
             ".maw/phase.json",
             ".maw/req-line",
+            ".maw/l2-meta*.json",
+            ".maw/l2-observer*.json",
+            ".maw/l2-transition*.json",
+            ".maw/delivery-issue*.json*",
+            ".maw/pr-*-body.md",
         ];
         assert_eq!(EPHEMERAL_MARKERS, &expected);
     }
@@ -470,7 +525,20 @@ mod tests {
         fs::create_dir_all(maw.join("fleet")).expect("fleet dir");
         fs::create_dir_all(maw.join("briefs")).expect("briefs dir");
 
-        for marker in EPHEMERAL_MARKERS {
+        let mut stale_markers = EPHEMERAL_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| !marker.contains('*'))
+            .collect::<Vec<_>>();
+        stale_markers.extend([
+            ".maw/l2-meta.json",
+            ".maw/l2-meta-26.json",
+            ".maw/l2-observer-26.json",
+            ".maw/l2-transition-26.json",
+            ".maw/delivery-issue126.json.bak",
+            ".maw/pr-126-body.md",
+        ]);
+        for marker in &stale_markers {
             fs::write(dir.join(marker), "stale").expect("write marker");
         }
         fs::write(maw.join("plugins/transcriber.json"), "{}").expect("plugin");
@@ -483,7 +551,7 @@ mod tests {
             remove_stale_file(&dir, marker, &mut cleaned).unwrap();
         }
 
-        for marker in EPHEMERAL_MARKERS {
+        for marker in &stale_markers {
             assert!(
                 !dir.join(marker).exists(),
                 "ephemeral marker should be removed: {marker}"
@@ -498,10 +566,10 @@ mod tests {
         assert!(maw.join("fleet/fleet.json").exists(), "fleet preserved");
         assert!(maw.join("briefs/brief.md").exists(), "briefs preserved");
 
-        assert_eq!(cleaned.len(), EPHEMERAL_MARKERS.len());
-        for marker in EPHEMERAL_MARKERS {
+        assert_eq!(cleaned.len(), stale_markers.len());
+        for marker in stale_markers {
             assert!(
-                cleaned.contains(&(*marker).to_owned()),
+                cleaned.contains(&marker.to_owned()),
                 "cleaned list should contain {marker}"
             );
         }
@@ -569,6 +637,8 @@ mod tests {
         assert!(ensure_gitignore_ephemeral_block(&dir).expect("migrate"));
         let content = fs::read_to_string(dir.join(".gitignore")).expect("read");
         assert!(content.contains(".maw/delivery.json"));
+        assert!(content.contains(".maw/l2-meta*.json"));
+        assert!(!content.contains(".maw/lane"));
         assert!(!content.contains(".maw/strategy.json"));
         assert!(content.ends_with("notes/\n"));
         assert!(!ensure_gitignore_ephemeral_block(&dir).expect("idempotent"));
