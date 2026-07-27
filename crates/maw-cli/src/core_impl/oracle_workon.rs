@@ -51,6 +51,7 @@ fn oracleworkon_run(argv: &[String], load_fleet: OracleworkonFleetLoader) -> Res
     oracleworkon_run_with_orchestrator_and_workon(argv, load_fleet, &orchestrator, run_workon_command)
 }
 
+#[cfg(test)]
 fn oracleworkon_run_with_orchestrator(
     argv: &[String],
     load_fleet: OracleworkonFleetLoader,
