@@ -1586,7 +1586,8 @@ mod done_tests {
         let root = DoneTempRoot::new("empty-psi-rescue");
         let main = root.repos_root().join("acme/app");
         let worktree = main.join("agents/empty-psi-rescue");
-        std::fs::create_dir_all(main.join("agents").join("ψ/teams")).expect("main repo dir");
+        std::fs::create_dir_all(main.join("agents")).expect("worktree parent");
+        std::fs::create_dir_all(main.join("ψ/teams")).expect("tracked ψ dir");
         done_run_process("git", &["init"], Some(&main));
         std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
         std::fs::write(main.join("README.md"), "empty rescue fixture\n").expect("seed readme");
