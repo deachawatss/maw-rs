@@ -950,7 +950,7 @@ fn pr_extract_issue_num(branch: &str) -> Option<u64> {
             .or_else(|| {
                 component
                     .split_once('-')
-                    .and_then(|(number, _)| (!number.is_empty() && number.chars().all(char::is_ascii_digit)).then_some(number))
+                    .and_then(|(number, _)| (!number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit())).then_some(number))
             })?;
         let digits = tail.chars().take_while(char::is_ascii_digit).collect::<String>();
         (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
