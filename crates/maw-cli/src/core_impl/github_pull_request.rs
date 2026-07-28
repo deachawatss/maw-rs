@@ -182,6 +182,14 @@ trait PrProcess {
     fn pr_gh_review_state(&mut self, repo: &str, pr_number: u64) -> Result<PrGithubState, String>;
     fn pr_reconcile_review_queue(&mut self, quiet: bool) -> Result<String, String>;
     fn pr_enqueue_review(&mut self, request: &PrReviewRequest) -> Result<(), String>;
+    /// Paths under `ψ/memory/` this branch adds on top of its base.
+    ///
+    /// Empty means the delivery's retro has not been committed yet.
+    fn pr_git_retro_paths(
+        &mut self,
+        cwd: &std::path::Path,
+        base_branch: &str,
+    ) -> Result<Vec<String>, String>;
 }
 
 struct PrNativeProcess;
@@ -200,6 +208,34 @@ impl PrProcess for PrNativeProcess {
         } else {
             Err(pr_command_failure("git branch --show-current", &output))
         }
+    }
+
+    fn pr_git_retro_paths(
+        &mut self,
+        cwd: &std::path::Path,
+        base_branch: &str,
+    ) -> Result<Vec<String>, String> {
+        pr_validate_cwd(cwd)?;
+        pr_validate_branch(base_branch)?;
+        // Three-dot: what this branch adds relative to the merge base, so a base
+        // that has moved on does not make an unwritten retro look present.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["diff", "--name-only", &format!("{base_branch}...HEAD"), "--", "ψ/memory/"])
+            .output()
+            .map_err(|error| format!("git diff --name-only: {error}"))?;
+        if !output.status.success() {
+            // A missing base ref (shallow clone, fresh fork) is not evidence that
+            // the retro is absent — say nothing rather than accuse.
+            return Err(pr_command_failure("git diff --name-only", &output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     fn pr_git_remote_url(&mut self, cwd: &std::path::Path, remote: &str) -> Result<String, String> {
@@ -787,9 +823,15 @@ fn pr_build_plan(
     pr_rerun_delivery_commands(&delivery, &cwd, process)?;
     let title = options.title.clone().unwrap_or_else(|| pr_branch_to_title(&branch));
     pr_validate_text_arg(&title, "title")?;
-    let body = pr_render_delivery_body(options.body.as_deref(), &delivery);
+    let base_branch = "main".to_owned();
+    // Derived from the repository, never from the handoff text — a handoff that
+    // says "RRR done" is exactly the claim #158 exists to stop trusting. An
+    // unreadable base (shallow clone, fresh fork) yields None: unknown, which
+    // renders as neither complete nor pending rather than a false accusation.
+    let retro = process.pr_git_retro_paths(&cwd, &base_branch).ok();
+    let body = pr_render_delivery_body(options.body.as_deref(), &delivery, retro.as_deref());
     pr_validate_text_arg(&body, "body")?;
-    Ok(PrPlan { cwd, branch, base_repo, base_branch: "main".to_owned(), title, body })
+    Ok(PrPlan { cwd, branch, base_repo, base_branch, title, body })
 }
 
 fn pr_load_delivery(cwd: &std::path::Path) -> Result<DeliveryEvidence, String> {
@@ -957,7 +999,28 @@ fn pr_rerun_local_delivery_command(
     }
 }
 
-fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence) -> String {
+/// The `Retro:` line a reviewer reads to tell *ready* from *complete*.
+///
+/// #158: two PRs merged green and left their retro commit behind, and the tip
+/// check that was supposed to catch the second one passed — the commit did not
+/// exist yet when it ran. No amount of checking harder fixes that; the PR has to
+/// carry the state.
+fn pr_render_retro_line(retro_paths: Option<&[String]>) -> String {
+    match retro_paths {
+        None => "- Retro: unknown (base branch unreadable — verify before merging)".to_owned(),
+        Some([]) => "- Retro: **PENDING** — no commit touching `ψ/memory/` on this branch. \
+                     This delivery is ready for review, not complete; re-run `maw pr` after `/rrr` \
+                     lands so this line clears."
+            .to_owned(),
+        Some(paths) => format!("- Retro: committed ({} file(s) under `ψ/memory/`)", paths.len()),
+    }
+}
+
+fn pr_render_delivery_body(
+    user_body: Option<&str>,
+    delivery: &DeliveryEvidence,
+    retro_paths: Option<&[String]>,
+) -> String {
     let mut sections = Vec::new();
     if let Some(body) = user_body.filter(|body| !body.trim().is_empty()) {
         sections.push(body.trim().to_owned());
@@ -996,9 +1059,10 @@ fn pr_render_delivery_body(user_body: Option<&str>, delivery: &DeliveryEvidence)
         .collect::<Vec<_>>()
         .join("\n");
     sections.push(format!(
-        "## Delivery\n\n- Mode: {}\n- Engine: {}\n- Risk tags: {risk_tags}\n- Spec: {spec}\n\n## Verification\n\n{commands}\n- Live evidence: {}\n- Artifacts: {artifacts}\n- Open risks: {open_risks}",
+        "## Delivery\n\n- Mode: {}\n- Engine: {}\n- Risk tags: {risk_tags}\n- Spec: {spec}\n{}\n\n## Verification\n\n{commands}\n- Live evidence: {}\n- Artifacts: {artifacts}\n- Open risks: {open_risks}",
         delivery.mode,
         delivery.engine,
+        pr_render_retro_line(retro_paths),
         delivery.verification.live_evidence
     ));
     sections.join("\n\n")
@@ -1202,9 +1266,19 @@ mod pr_tests {
         review_state_results: std::collections::VecDeque<Result<PrGithubState, String>>,
         reconcile_quiet: Vec<bool>,
         enqueued: Vec<PrReviewRequest>,
+        /// `ψ/memory/` paths this branch adds; empty by default, i.e. retro pending.
+        retro_paths: Vec<String>,
     }
 
     impl PrProcess for PrMockProcess {
+        fn pr_git_retro_paths(
+            &mut self,
+            _cwd: &std::path::Path,
+            _base_branch: &str,
+        ) -> Result<Vec<String>, String> {
+            Ok(self.retro_paths.clone())
+        }
+
         fn pr_git_branch(&mut self, cwd: &std::path::Path) -> Result<String, String> {
             Ok(if self.branch.is_empty() { cwd.file_name().unwrap().to_string_lossy().into_owned() } else { self.branch.clone() })
         }
@@ -1616,6 +1690,66 @@ mod pr_tests {
 
         assert_eq!(error, "not in a tmux session — run inside tmux");
         assert!(process.created.is_empty());
+    }
+
+    /// #158 AC 5, the arra-oracle-v3 PR #80 shape: the PR is created and goes
+    /// green while the retro commit does not exist yet. The tip check that was
+    /// meant to catch this *passed* — the commit was written afterwards. So the
+    /// PR itself has to say so.
+    fn pr_plan_for_retro(repo: std::path::PathBuf, retro_paths: &[&str]) -> PrPlan {
+        let _state = pr_write_delivery(&repo, 42);
+        let options = PrOptions {
+            window: None,
+            title: None,
+            body: None,
+            show_current: false,
+            reconcile: false,
+            quiet: false,
+        };
+        let mut process = PrMockProcess {
+            retro_paths: retro_paths.iter().map(|path| (*path).to_owned()).collect(),
+            ..PrMockProcess::default()
+        };
+        pr_build_plan(
+            repo,
+            "agents/issue-42-demo".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+            &mut process,
+        )
+        .expect("plan")
+    }
+
+    #[test]
+    fn pr_marks_a_delivery_whose_retro_has_not_landed_as_pending() {
+        let plan = pr_plan_for_retro(pr_temp_dir("retro-pending"), &[]);
+
+        assert!(plan.body.contains("Retro: **PENDING**"), "body: {}", plan.body);
+        assert!(
+            plan.body.contains("ready for review, not complete"),
+            "the marker must say what it means: {}",
+            plan.body
+        );
+    }
+
+    #[test]
+    fn pr_marks_a_delivery_whose_retro_landed_as_committed() {
+        let plan = pr_plan_for_retro(
+            pr_temp_dir("retro-done"),
+            &["ψ/memory/retrospectives/2026-07/28/x.md", "ψ/memory/learnings/session-metrics.md"],
+        );
+
+        assert!(plan.body.contains("Retro: committed (2 file(s)"), "body: {}", plan.body);
+        assert!(!plan.body.contains("PENDING"), "body: {}", plan.body);
+    }
+
+    #[test]
+    fn pr_retro_line_never_accuses_when_the_base_is_unreadable() {
+        // A shallow clone or fresh fork cannot resolve `main...HEAD`. Unknown is
+        // not the same as pending, and claiming pending there would train
+        // reviewers to ignore the marker.
+        assert!(pr_render_retro_line(None).contains("unknown"));
+        assert!(!pr_render_retro_line(None).contains("PENDING"));
     }
 
     #[test]
