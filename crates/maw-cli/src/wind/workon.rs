@@ -514,9 +514,7 @@ mod tests {
     #[test]
     fn workon_records_the_dispatching_l1_pane_with_its_oracle() {
         let dir = temp_dir("l1-handoff");
-
         assert!(record_l1_oracle(&dir, "01-gale", Some("%42")).expect("record handoff"));
-
         assert_eq!(
             fs::read_to_string(dir.join(".maw/l1-oracle")).expect("oracle marker"),
             "01-gale\n"

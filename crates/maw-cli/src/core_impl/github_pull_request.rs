@@ -142,7 +142,6 @@ impl PrTmux for PrNativeTmux {
         pr_validate_tmux_target(target, "window target")?;
         pr_tmux_output(&["display-message", "-t", target, "-p", "#{pane_current_path}"])
     }
-
     fn pr_l1_pane_for_oracle(&mut self, oracle: &str) -> Result<String, String> {
         let mut runner = maw_tmux::CommandTmuxRunner::new();
         let target = resolve_local_tmux_runner_target(&mut runner, oracle, "pr L1 fallback")?;
@@ -1529,7 +1528,6 @@ mod pr_tests {
         assert!(output.contains("L1 handoff queued for the next hook drain"), "{output}");
         assert_eq!(process.enqueued[0].l1_pane.as_deref(), Some("%42"));
     }
-
     #[test]
     fn pr_fails_loudly_when_oracle_fallback_cannot_resolve_a_pane() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1545,7 +1543,6 @@ mod pr_tests {
         let mut process = PrMockProcess { branch: "agents/issue-32-pr-durable-notification".to_owned(), ..PrMockProcess::default() };
 
         let error = pr_run(&[], &mut tmux, &mut process).expect_err("missing target is loud");
-
         assert!(error.contains(".maw/l1-pane is missing"), "{error}");
         assert!(error.contains("tried L1 oracle 01-gale"), "{error}");
     }
