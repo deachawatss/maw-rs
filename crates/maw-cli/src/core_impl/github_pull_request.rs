@@ -486,7 +486,7 @@ fn pr_mark_review_notifications_at(
             continue;
         };
         if acknowledged_urls.contains(&request.pr_url) && !request.notified {
-            request.status = "notified".to_owned();
+            "notified".clone_into(&mut request.status);
             request.notified = true;
             request.notified_at = Some(cli_dispatch_now_iso());
             request.notifier = Some("maw fleet pr-queue".to_owned());
