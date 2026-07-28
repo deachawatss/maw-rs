@@ -30,8 +30,8 @@ use maw_discord::{run_discord_command, run_discord_command_with_pane_relay, Disc
 use maw_fuzzy::{distance as fuzzy_distance, fuzzy_match};
 use maw_identity::{canonical_node_identity, canonical_session_name, CanonicalSessionNameInput};
 use maw_matcher::{
-    normalize_target, resolve_by_name, resolve_session_target, resolve_worktree_target,
-    ResolveOptions, ResolveResult,
+    normalize_target, resolve_by_name, resolve_numeric_fleet_stem_exact, resolve_session_target,
+    resolve_worktree_target, ResolveOptions, ResolveResult,
 };
 use maw_peer::{
     classify_probe_error, format_probe_error, is_valid_maw_handshake, pick_probe_hint,
