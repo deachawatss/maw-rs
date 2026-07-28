@@ -74,6 +74,8 @@ struct L2Event {
     state: L2TerminalState,
     transition_seq: u64,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_url: Option<String>,
     notified: bool,
     notified_at: Option<String>,
     created_at: String,
@@ -381,6 +383,16 @@ fn l2_delivery_context(cwd: &Path) -> (u64, String, String, String) {
 }
 
 fn l2_emit_state(cwd: &Path, pane: &str, state: L2TerminalState, body: Option<&str>) -> Result<bool, String> {
+    l2_emit_state_with_pr_url(cwd, pane, state, body, None)
+}
+
+fn l2_emit_state_with_pr_url(
+    cwd: &Path,
+    pane: &str,
+    state: L2TerminalState,
+    body: Option<&str>,
+    pr_url: Option<&str>,
+) -> Result<bool, String> {
     let metadata_path = l2_pane_metadata_path(cwd, pane);
     let metadata = std::fs::read_to_string(if metadata_path.exists() { metadata_path } else { cwd.join(".maw/l2-meta.json") })
         .map_err(|error| format!("l2 event: read metadata: {error}"))
@@ -401,6 +413,7 @@ fn l2_emit_state(cwd: &Path, pane: &str, state: L2TerminalState, body: Option<&s
         state,
         transition_seq: 0,
         message,
+        pr_url: pr_url.map(str::to_owned),
         notified: false,
         notified_at: None,
         created_at: cli_dispatch_now_iso(),
@@ -414,10 +427,6 @@ fn l2_emit_state(cwd: &Path, pane: &str, state: L2TerminalState, body: Option<&s
 
 fn l2_pane_metadata_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
     cwd.join(".maw").join(format!("l2-meta-{}.json", l2_pane_key(pane)))
-}
-
-fn l2_pr_handoff_message(pr_number: u64, url: &str) -> String {
-    format!("PR #{pr_number} ready. {url}")
 }
 
 fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, String> {
@@ -441,8 +450,8 @@ fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, Strin
     let metadata = std::fs::read_to_string(metadata_path).map_err(|error| format!("l2 event: read PR metadata: {error}"))?;
     let metadata = serde_json::from_str::<L2ParentMetadata>(&metadata).map_err(|error| format!("l2 event: parse PR metadata: {error}"))?;
     let metadata_pane = metadata.l2_pane.as_deref().unwrap_or(&pane);
-    let message = l2_pr_handoff_message(pr_number, url);
-    l2_emit_state(cwd, metadata_pane, L2TerminalState::Pr, Some(&message))
+    let message = format!("PR #{pr_number} ready. {url}");
+    l2_emit_state_with_pr_url(cwd, metadata_pane, L2TerminalState::Pr, Some(&message), Some(url))
 }
 
 fn l2_transition_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
@@ -567,7 +576,7 @@ fn l2_acknowledge_events(events: &[L2Event]) -> Result<(), String> {
         }
         event.notified = true;
         event.notified_at = Some(cli_dispatch_now_iso());
-        if let Some(url) = l2_pr_handoff_url(&event) {
+        if let Some(url) = event.pr_url.as_deref() {
             acknowledged_pr_urls.insert(url.to_owned());
         }
         archived.push(serde_json::to_string(&event).map_err(|error| format!("l2 event: archive render: {error}"))?);
@@ -575,18 +584,6 @@ fn l2_acknowledge_events(events: &[L2Event]) -> Result<(), String> {
     pr_mark_review_notifications_at(&root, &acknowledged_pr_urls)?;
     pr_write_queue_lines(&root, "l2-events.jsonl", &retained)?;
     pr_write_queue_lines(&root, "l2-events.jsonl.archived", &archived)
-}
-
-fn l2_pr_handoff_url(event: &L2Event) -> Option<&str> {
-    if event.state != L2TerminalState::Pr {
-        return None;
-    }
-    event
-        .message
-        .strip_prefix("PR #")?
-        .split_once(" ready. ")
-        .map(|(_, url)| url)
-        .filter(|url| url.starts_with("https://github.com/"))
 }
 
 fn l2_current_tmux_session() -> Option<String> {
@@ -642,6 +639,7 @@ mod l2_lifecycle_tests {
             state: L2TerminalState::Findings,
             transition_seq: 1,
             message: "one durable handoff".to_owned(),
+            pr_url: None,
             notified: false,
             notified_at: None,
             created_at: "2026-07-23T00:00:00.000Z".to_owned(),
@@ -660,15 +658,48 @@ mod l2_lifecycle_tests {
     }
 
     #[test]
-    fn pr_event_acknowledgement_marks_the_matching_review_request_notified() {
+    fn legacy_events_without_a_pr_url_are_drained_and_archived() {
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _state = EnvVarRestore::capture("MAW_STATE_DIR");
         let _oracle = EnvVarRestore::capture("MAW_ORACLE");
-        let root = std::env::temp_dir().join(format!("maw-rs-pr-event-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("maw-rs-legacy-l2-event-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("state root");
         std::env::set_var("MAW_STATE_DIR", &root);
         std::env::set_var("MAW_ORACLE", "gale");
+        std::fs::write(
+            root.join("l2-events.jsonl"),
+            "{\"version\":1,\"l2Pane\":\"%9\",\"l2Session\":\"child-1\",\"l1Oracle\":\"gale\",\"l1Session\":\"parent-1\",\"repo\":\"maw-rs\",\"issue\":169,\"state\":\"pr\",\"transitionSeq\":1,\"message\":\"legacy PR event\",\"notified\":false,\"notifiedAt\":null,\"createdAt\":\"2026-07-28T00:00:00.000Z\"}\n",
+        )
+        .expect("write legacy event");
+
+        let events = l2_drain_events().expect("drain legacy event");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pr_url, None);
+        l2_acknowledge_events(&events).expect("archive legacy event");
+
+        assert!(std::fs::read_to_string(root.join("l2-events.jsonl")).expect("active queue").is_empty());
+        let archived = std::fs::read_to_string(root.join("l2-events.jsonl.archived")).expect("archived queue");
+        let archived = serde_json::from_str::<L2Event>(archived.trim()).expect("archived legacy event");
+        assert!(archived.notified);
+        assert_eq!(archived.pr_url, None);
+        std::fs::remove_dir_all(root).expect("cleanup state");
+    }
+
+    #[test]
+    fn pr_event_acknowledgement_marks_the_matching_review_request_notified() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _oracle = EnvVarRestore::capture("MAW_ORACLE");
+        let _pane = EnvVarRestore::capture("MAW_L2_PANE_ID");
+        let root = std::env::temp_dir().join(format!("maw-rs-pr-event-{}", std::process::id()));
+        let repo = root.join("maw-rs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("state root");
+        std::fs::create_dir_all(repo.join(".maw")).expect("repo metadata");
+        std::env::set_var("MAW_STATE_DIR", &root);
+        std::env::set_var("MAW_ORACLE", "gale");
+        std::env::set_var("MAW_L2_PANE_ID", "%9");
         let pr_url = "https://github.com/acme/demo/pull/169".to_owned();
         let request = PrReviewRequest {
             version: 1,
@@ -688,24 +719,23 @@ mod l2_lifecycle_tests {
         let request = pr_render_queue_row(&request).expect("render request");
         std::fs::write(root.join("pr-queue.jsonl"), format!("{request}\n"))
             .expect("write review request");
-        let event = L2Event {
-            version: 1,
-            l2_pane: "%9".to_owned(),
-            l2_session: "child-1".to_owned(),
-            l1_oracle: "gale".to_owned(),
-            l1_session: "parent-1".to_owned(),
-            repo: "maw-rs".to_owned(),
-            issue: 169,
-            state: L2TerminalState::Pr,
-            transition_seq: 1,
-            message: l2_pr_handoff_message(169, &pr_url),
-            notified: false,
-            notified_at: None,
-            created_at: "2026-07-28T00:00:00.000Z".to_owned(),
-        };
-        assert!(l2_enqueue_event(&event).expect("enqueue"));
+        std::fs::write(repo.join(".maw/delivery.json"), r#"{"issue":169,"mode":"standard","riskTags":[],"engine":"codex"}"#)
+            .expect("delivery");
+        l2_record_pane_metadata(&repo, "%9", &L2ParentMetadata {
+            session_id: Some("child-1".to_owned()),
+            l1_oracle: Some("gale".to_owned()),
+            l1_session: Some("parent-1".to_owned()),
+            l2_pane: Some("%9".to_owned()),
+            repo: Some("maw-rs".to_owned()),
+            ..L2ParentMetadata::default()
+        })
+        .expect("pane metadata");
+        assert!(l2_emit_pr_event(&repo, 169, &pr_url).expect("emit PR event"));
 
         let events = l2_drain_events().expect("L1 receives event");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message, "[gale:maw-rs] READY issue #169 (standard/none): PR #169 ready. https://github.com/acme/demo/pull/169 — Oracle-authored (codex L2)");
+        assert_eq!(events[0].pr_url.as_deref(), Some(pr_url.as_str()));
         l2_acknowledge_events(&events).expect("acknowledge L1 receipt");
 
         let stored = std::fs::read_to_string(root.join("pr-queue.jsonl")).expect("review queue");
@@ -877,7 +907,7 @@ mod l2_lifecycle_tests {
         std::env::set_var("MAW_STATE_DIR", &root);
         std::env::set_var("MAW_ORACLE", "gale");
         let event = L2Event {
-            version: 1, l2_pane: "%9".to_owned(), l2_session: "child-1".to_owned(), l1_oracle: "gale".to_owned(), l1_session: "parent-1".to_owned(), repo: "maw-rs".to_owned(), issue: 99, state: L2TerminalState::Findings, transition_seq: 1, message: "replay after failed hook".to_owned(), notified: false, notified_at: None, created_at: "2026-07-23T00:00:00.000Z".to_owned(),
+            version: 1, l2_pane: "%9".to_owned(), l2_session: "child-1".to_owned(), l1_oracle: "gale".to_owned(), l1_session: "parent-1".to_owned(), repo: "maw-rs".to_owned(), issue: 99, state: L2TerminalState::Findings, transition_seq: 1, message: "replay after failed hook".to_owned(), pr_url: None, notified: false, notified_at: None, created_at: "2026-07-23T00:00:00.000Z".to_owned(),
         };
         assert!(l2_enqueue_event(&event).expect("enqueue"));
         let interrupted = l2_drain_events().expect("hook selects event before later failure");
