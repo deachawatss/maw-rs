@@ -833,15 +833,28 @@ fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut St
     // force-delete (git branch -D) before the PR merges — losing the notes to GC.
     // Never overwrites existing files; best-effort (rescue failure must not block
     // the rest of `done`).
-    let rescue = if dry_run {
-        crate::wind::done::preview_rescue_psi(&worktree.full_path, &worktree.main_path)
-    } else {
-        crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path)
+    //
+    // The destination is the *dispatching oracle's* vault when `.maw/l1-oracle`
+    // names one that resolves — that vault is what Oracle v3 indexes, so it is the
+    // only destination that leaves a retro findable. Copying into whichever repo
+    // the worktree happened to sit in was how notes went missing: they landed in a
+    // product repo nobody searches, or in a ψ/ that repo gitignores.
+    let vault = done_psi_l1_vault(worktree);
+    let rescue = match vault.as_ref() {
+        Some((_, root)) => crate::wind::done::rescue_psi_into(&worktree.full_path, root, dry_run),
+        None if dry_run => {
+            crate::wind::done::preview_rescue_psi(&worktree.full_path, &worktree.main_path)
+        }
+        None => crate::wind::done::rescue_psi(&worktree.full_path, &worktree.main_path),
     };
     match rescue {
         Ok(rescued) if !rescued.is_empty() => {
             let action = if dry_run { "[dry-run] would rescue" } else { "rescued" };
-            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {action} {} uncommitted ψ note(s) to main before removal", rescued.len());
+            let where_to = vault.as_ref().map_or_else(
+                || "main".to_owned(),
+                |(oracle, root)| format!("{oracle}'s vault ({})", root.display()),
+            );
+            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {action} {} uncommitted ψ note(s) to {where_to} before removal", rescued.len());
         }
         Ok(_) if done_psi_skipped_symlink(worktree) => {
             let prefix = if dry_run { "[dry-run] " } else { "" };
@@ -849,9 +862,34 @@ fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut St
         }
         Ok(_) => {}
         Err(error) => {
-            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m ψ rescue skipped: {error}");
+            // Best-effort: never block retirement. But name the destination that
+            // failed — "ψ rescue skipped" alone leaves nowhere to look.
+            let where_to = vault.as_ref().map_or_else(
+                || worktree.main_path.join("ψ").display().to_string(),
+                |(_, root)| root.join("ψ").display().to_string(),
+            );
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m ψ rescue skipped (destination {where_to}): {error}");
         }
     }
+}
+
+/// The dispatching oracle's vault root, from the `.maw/l1-oracle` marker `workon`
+/// writes at spawn.
+///
+/// Returns `None` — and the caller falls back to the worktree's own main checkout
+/// — when the marker is absent, unreadable, names something that does not resolve
+/// to a real checkout, or resolves to the worktree itself (which would make the
+/// rescue a no-op copy onto its own source).
+fn done_psi_l1_vault(worktree: &DoneWorktree) -> Option<(String, std::path::PathBuf)> {
+    let raw = std::fs::read_to_string(worktree.full_path.join(".maw/l1-oracle")).ok()?;
+    let oracle = raw.trim();
+    if oracle.is_empty() {
+        return None;
+    }
+    let fleet = load_native_fleet();
+    let github_root = ghq_root().join("github.com");
+    let path = soulsync_resolve_oracle_path(oracle, &fleet, &github_root)?;
+    (path.is_dir() && path != worktree.full_path).then(|| (oracle.to_owned(), path))
 }
 
 /// Did the rescue scan silently skip something it could not carry out?
