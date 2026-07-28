@@ -113,7 +113,7 @@ fn team_remove_archive_before_done(team: &str, member: &str, charter_path: &str)
 
 fn team_remove_done(session: &str, target: &str, keep_branch: bool) -> Result<(), String> {
     if team_remove_fake_mode() { return team_remove_record_fake("done", &format!("{session}:{target}:keep_branch={keep_branch}")); }
-    let options = DoneOptions { target: Some(target.to_owned()), ..Default::default() };
+    let options = DoneOptions { target: Some(target.to_owned()), keep_branch, ..Default::default() };
     let mut local = DoneLocal::default();
     done_run_one(target, &options, Some(session), &mut local).map(|_| ())
 }
