@@ -1966,6 +1966,8 @@ mod workon_tests {
     #[cfg(unix)]
     #[test]
     fn link_shared_psi_keeps_tracked_worktree_psi_real() {
+        // Shells out to real git — serialize with tests that replace PATH.
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
         let root = workon_temp_root("tracked-psi");
         let main = root.join("main");
         let wt = main.join("agents/feat");
@@ -2021,6 +2023,8 @@ mod workon_tests {
     #[cfg(unix)]
     #[test]
     fn link_shared_psi_preserves_existing_worktree_psi() {
+        // Shells out to real git — serialize with tests that replace PATH.
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
         let root = workon_temp_root("shared-psi");
         let main = root.join("main");
         let wt = root.join("main/agents/feat");
