@@ -1,6 +1,6 @@
 const DISPATCH_76: &[DispatcherEntry] = &[DispatcherEntry { command: "panes", handler: Handler::Sync(run_panes_command) }];
 
-const PANES_USAGE: &str = "usage: maw panes [target] [--pid] [--all|-a]  (see: maw pane swap, maw tile)";
+const PANES_USAGE: &str = "usage: maw panes [target] [--pid] [--all|-a]  (see: maw pane swap, maw resize equal)";
 const PANES_BASE_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}|||#{pane_width}x#{pane_height}|||#{pane_current_command}|||#{pane_title}";
 const PANES_PID_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}|||#{pane_width}x#{pane_height}|||#{pane_current_command}|||#{pane_title}|||#{pane_pid}";
 

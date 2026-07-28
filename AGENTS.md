@@ -242,7 +242,7 @@ exists. Use the maw verb instead:
 | instead of raw tmux | use maw verb |
 |---------------------|-------------|
 | `tmux send-keys` | `maw run` / `maw hey` / `maw send-text` / `maw send-enter` |
-| `tmux split-window` | `maw split` / `maw tile` / `maw new --split` |
+| `tmux split-window` | `maw split` / `maw new --split` |
 | `tmux kill-window` | `maw kill` / `maw done` |
 | `tmux new-window` | `maw new --window` |
 | `tmux select-layout` | `maw layout` (#264) |
