@@ -205,12 +205,25 @@ fn kill_run(
     peer_key: fn() -> Result<String, String>,
     now: fn() -> i64,
 ) -> Result<String, String> {
-    let options = kill_parse_args(argv)?;
+    let mut options = kill_parse_args(argv)?;
     if options.peer.is_some() {
         return kill_peer_forward(&options, peer, config, peer_key, now);
     }
     kill_validate_user_target(&options.target)?;
-    let (raw_session, raw_window) = kill_split_target(&options.target);
+    let (raw_session, raw_window, target_pane) = kill_split_target(&options.target);
+    if let Some(pane) = target_pane {
+        match options.pane {
+            Some(explicit) if explicit != pane => {
+                return Err(format!(
+                    "target '{}' names pane {pane} but --pane {explicit} was also given; \
+                     drop one of them",
+                    options.target
+                ));
+            }
+            _ => options.pane = Some(pane),
+        }
+    }
+    let options = options;
     kill_validate_user_target(&raw_session)?;
     let sessions = tmux.kill_list_sessions()?;
     kill_resolve_and_apply(tmux, &sessions, &raw_session, &raw_window, &options)
@@ -531,11 +544,31 @@ fn kill_parse_non_negative(value: &str, flag: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag} must be a non-negative integer (got {value})"))
 }
 
-fn kill_split_target(target: &str) -> (String, String) {
-    target.split_once(':').map_or_else(
+/// Split `session[:window[.pane]]`.
+///
+/// The trailing `.pane` used to be left inside the window component, where
+/// `kill_matching_window_indexes` compared it against window *names* — so
+/// `maw kill 01-gale:1.1` reported `window '1.1' not found in session 01-gale
+/// (valid: 1:gale)` while `maw capture 01-gale:1.1` addressed the same pane
+/// fine. `maw ls` prints that form, so the listing named targets the killer
+/// refused. Same digit-suffix rule the shared route resolver uses
+/// (`route_split_pane_suffix`), kept deliberately identical so the two agree.
+fn kill_split_target(target: &str) -> (String, String, Option<u32>) {
+    let (session, window) = target.split_once(':').map_or_else(
         || (target.to_owned(), String::new()),
         |(session, window)| (session.to_owned(), window.to_owned()),
-    )
+    );
+    if let Some((window_part, pane_part)) = window.rsplit_once('.') {
+        if !window_part.is_empty()
+            && !pane_part.is_empty()
+            && pane_part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if let Ok(pane) = pane_part.parse::<u32>() {
+                return (session, window_part.to_owned(), Some(pane));
+            }
+        }
+    }
+    (session, window, None)
 }
 
 fn kill_resolve_and_apply(
@@ -1115,6 +1148,104 @@ mod kill_tests {
     fn kill_dispatch_registers_native_kill() {
         assert_eq!(DISPATCH_78.len(), 1);
         assert_eq!(DISPATCH_78[0].command, "kill");
+    }
+
+    /// Fixture reproducing the reported case: session `01-gale`, one window at
+    /// index 1 named `gale`, panes 0 and 1. `maw ls` prints `gale.1` for the
+    /// second pane and `maw capture 01-gale:1.1` addresses it — `maw kill` did
+    /// not, because `1.1` was compared against window names.
+    fn kill_fake_gale() -> KillFakeTmux {
+        KillFakeTmux {
+            sessions_raw: "01-gale|||1|||gale|||1|||/tmp\n".to_owned(),
+            pane_indexes_raw: "0\n1\n".to_owned(),
+            ..KillFakeTmux::default()
+        }
+    }
+
+    fn kill_killed_pane_targets(tmux: &KillFakeTmux) -> Vec<String> {
+        tmux.calls
+            .iter()
+            .filter(|(verb, _)| verb == "kill-pane")
+            .filter_map(|(_, args)| args.last().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn kill_accepts_the_session_window_pane_form_maw_ls_prints() {
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["01-gale:1.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m killed pane 01-gale:1.1\n");
+        assert_eq!(kill_killed_pane_targets(&tmux), vec!["01-gale:1.1".to_owned()]);
+    }
+
+    #[test]
+    fn kill_resolves_a_pane_suffix_on_a_named_window() {
+        // `01-gale:gale.1` — window by name, pane by index. The suffix must split
+        // before the name lookup, or `gale.1` is searched for as a window name.
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["01-gale:gale.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert_eq!(kill_killed_pane_targets(&tmux), vec!["01-gale:1.1".to_owned()]);
+    }
+
+    #[test]
+    fn kill_pane_target_never_escalates_to_the_window_or_session() {
+        // maw-js regressed exactly this way on 2026-06-12: a session:window target
+        // fell through and got kill-pane'd. Guard the inverse direction too — a
+        // pane target must destroy only the pane.
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["01-gale:1.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert!(
+            !tmux.calls.iter().any(|(verb, _)| verb == "kill-window" || verb == "kill-session"),
+            "pane target must not kill the window or session; calls: {:?}",
+            tmux.calls
+        );
+    }
+
+    #[test]
+    fn kill_rejects_a_pane_suffix_that_contradicts_an_explicit_pane_flag() {
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["01-gale:1.1", "--pane", "0"]), &mut tmux);
+
+        assert_eq!(output.code, 1);
+        assert!(output.stderr.contains("names pane 1 but --pane 0"), "stderr: {}", output.stderr);
+        assert!(
+            kill_killed_pane_targets(&tmux).is_empty(),
+            "must not kill anything on a contradictory target; calls: {:?}",
+            tmux.calls
+        );
+    }
+
+    #[test]
+    fn kill_split_target_only_treats_a_numeric_suffix_as_a_pane() {
+        // Same rule as the shared route resolver's `route_split_pane_suffix`, so
+        // the two agree on what a pane suffix is.
+        assert_eq!(
+            kill_split_target("01-gale:1.1"),
+            ("01-gale".to_owned(), "1".to_owned(), Some(1))
+        );
+        assert_eq!(
+            kill_split_target("01-gale:gale.12"),
+            ("01-gale".to_owned(), "gale".to_owned(), Some(12))
+        );
+        // A dot that is not a numeric pane suffix stays part of the window name.
+        assert_eq!(
+            kill_split_target("01-gale:v1.2-rc"),
+            ("01-gale".to_owned(), "v1.2-rc".to_owned(), None)
+        );
+        assert_eq!(
+            kill_split_target("01-gale:1"),
+            ("01-gale".to_owned(), "1".to_owned(), None)
+        );
+        assert_eq!(
+            kill_split_target("01-gale"),
+            ("01-gale".to_owned(), String::new(), None)
+        );
     }
 
     #[test]
