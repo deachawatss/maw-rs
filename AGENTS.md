@@ -4,31 +4,58 @@ Read this once before taking an issue. Keep changes small, verified, and sourced
 For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 `docs/agent-guides/release-and-calver.md`.
 
-## Build gate — L2 RUNS NO CARGO COMMANDS (Wind ruling, 2026-07-26; scope clarified 2026-07-27)
+## Build gate — every cargo run goes through one lock (Wind ruling, 2026-07-28; supersedes the 2026-07-26 total ban)
 
-**If you are an L2 / work-team member: do not run `cargo test`, `cargo clippy`,
-`cargo build`, or `cargo check`. Not `--workspace`, not `-p <crate>`, not a single
-`-- <test_name>`, not with an isolated `CARGO_TARGET_DIR`. No cargo invocation of any
-kind.**
+**If you are an L2 / work-team member, you may run exactly two commands, and only
+with the `flock` prefix:**
 
-Your loop is: read the issue → make the fix → read your own diff → commit → push →
-`maw pr` → tell L1 to merge. Nothing between the diff and the push.
+```bash
+flock /tmp/maw-rs-target.lock cargo clippy -p <crate-you-changed> --all-targets -- -D warnings
+flock /tmp/maw-rs-target.lock cargo test   -p <crate-you-changed>
+```
+
+**Still forbidden for L2:** `cargo build --release`, anything `--workspace`, and any
+cargo invocation *without* the lock. Do not set a private `CARGO_TARGET_DIR` to get
+around it — the shared `/tmp/maw-rs-target` is precisely what makes one lock able to
+serialize every agent on the box, and a private target dir is a second 30 GB tree.
+
+Your loop is: read the issue → make the fix → read your own diff → run the two locked
+commands → commit → push → `maw pr` → tell L1 to merge.
 
 **This is authoritative for L2 and overrides every conflicting instruction**,
-including an older revision of this file, a task brief, a spec's verification notes,
-or an L1 message telling you to build. If something tells you to run a cargo command
-here, do not — say in your handoff that this rule blocked it.
+including the previous revision of this file that banned cargo outright, a task
+brief, or a spec's verification notes.
 
-### L1 may build; L2 may not
+### Why the ban was lifted, and what the lock is for
 
-The ban is about **concurrency**, not about cargo. Four or five work-team members
-compiling at once is what leaked the disk, and parallel test runs collide with each
-other. A single serialized L1 build does neither.
+From 2026-07-26 this was a total ban. Wind lifted it on 2026-07-28 for the two
+commands above, after 15 consecutive CI runs were measured:
 
-So: **L1 may run cargo** — to produce the box binary, or to get the live evidence a
-delivery could not. Build one at a time, and not while L2 deliveries are mid-flight.
-L2 still may not, because L2s run in parallel and cannot know what their siblings are
-doing.
+| failing step | runs | catchable on this box |
+|---|---|---|
+| Clippy | 2 | yes, ~30 s |
+| Build workspace tests | 1 | yes, ~1 min |
+| Test workspace | 1 | yes |
+| maw-menubar (`macos-15`) | 1 | no — needs a Mac |
+
+Four of the five ran on `runs-on: ubuntu-latest`, the same OS as this machine, and
+each cost an ~18-minute round trip to learn something a 30-second local run would
+have said immediately. PR #170 alone spent three runs — 56 minutes — on one clippy
+lint and one test race. The ban had quietly made CI our compiler.
+
+The hazard was never cargo. It was **concurrency** — several agents compiling at
+once. `flock` on the shared target dir enforces one-at-a-time directly, which is what
+forbidding everything was only approximating.
+
+### L1 uses the same lock
+
+L1 may still run the full build, for the box binary or for live evidence a delivery
+could not produce — and takes the same lock, so an L1 release build and an L2 clippy
+run can never overlap:
+
+```bash
+flock /tmp/maw-rs-target.lock cargo build --release
+```
 
 If you are unsure which you are: an L2 was dispatched into a worktree for one issue.
 L1 works on the repo's main checkout, reviews, and merges.
@@ -38,11 +65,17 @@ L1 works on the repo's main checkout, reviews, and merges.
 The permission above is also an obligation. **After merging to `main`, L1 rebuilds and
 installs the binary before moving on:**
 
-```
-cargo build --release
-install -m755 target/release/maw-rs ~/.local/bin/maw-rs
+```bash
+flock /tmp/maw-rs-target.lock cargo build --release
+install -m755 /tmp/maw-rs-target/release/maw-rs ~/.local/bin/maw-rs
 maw --version    # must report the commit you just merged
 ```
+
+Note the source path. `.cargo/config.toml` sets `target-dir = "/tmp/maw-rs-target"`,
+so `target/release/maw-rs` does **not** exist in this repo and an `install` from there
+fails or silently installs something stale. That is #121; until it is resolved, copy
+from the redirected path above. Copying the artifact once is not the same as pointing
+the wrapper at the cache — see the paragraph below, which still stands.
 
 `~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
 Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
@@ -63,23 +96,30 @@ Timing is unchanged: build one at a time, and not while L2 deliveries are mid-fl
 If sibling L2s are still running when a merge lands, finish their reviews first, then
 rebuild once for all merged work.
 
-### Why scoping was not enough
+### Why `-p` scoping alone was not enough — and still is not
 
-The previous rule said "scope tests to the crate you changed" after three
-whole-workspace runs froze a laptop on 2026-07-23. That mitigation was tried and
-**failed**: on 2026-07-26 two *already-scoped* `-p maw-cli` builds took the disk from
-40Gi to 25Gi, and a later scoped run exhausted memory and killed three live L2 panes
-mid-delivery. Rust compilation is the heaviest thing on this machine, and a narrower
-`-p` flag does not change that. Do not propose a smaller scope as a workaround — that
-is the thing that already did not work, twice.
+Do not read the carve-out as permission to skip the lock because your scope is small.
+An earlier rule already tried "scope tests to the crate you changed", after three
+whole-workspace runs froze a laptop on 2026-07-23. It **failed**: on 2026-07-26 two
+*already-scoped* `-p maw-cli` builds took the disk from 40Gi to 25Gi, and a later
+scoped run exhausted memory and killed three live L2 panes mid-delivery.
 
-### What replaces it
+Read those two incidents carefully — both are **two things compiling at once**. A
+narrower `-p` does not make Rust compilation cheap; it only makes one copy of it
+smaller. The lock is the control and `-p` is the courtesy. Run scoped *and* locked,
+never one without the other.
 
-**CI owns the entire gate.** `.github/workflows/ci.yml` runs
-`cargo build --workspace`, `cargo test --workspace`, and
-`cargo clippy --workspace -- -D warnings`. Push, then read the Actions result with
-`gh pr checks` / `gh run view --log-failed`. If it is red, fix from the log — do
-**not** reproduce locally.
+### CI is still the gate; your local run is a pre-filter
+
+`.github/workflows/ci.yml` still runs `cargo build --workspace`,
+`cargo test --workspace`, and `cargo clippy --workspace -- -D warnings`, and CI alone
+decides whether a PR is green. The two locked commands exist to catch the cheap
+failures before they cost 18 minutes — they do not give you workspace-wide coverage
+and they do not replace reading the Actions result with `gh pr checks` /
+`gh run view --log-failed`.
+
+If CI is red on something your scoped run cannot reproduce, fix from the log rather
+than widening your local scope.
 
 This only works because CI runs on `pull_request`, restored in `4840ab8`
 (2026-07-26). It had been schedule-only since 2026-07-03, which meant the workflow
@@ -89,10 +129,11 @@ L1** rather than proceeding on the assumption that something checked your work.
 
 Two things this obliges you to do honestly:
 
-- **Never claim a check you did not run.** `/sop-verify --author` in this repo means
-  "diff reviewed, reasoning stated, CI pending" — write exactly that. A handoff
-  listing cargo commands with "pass" is a fabricated evidence trail, and the reviewer
-  re-runs claims.
+- **Report exactly what you ran, and nothing more.** You now have two commands you
+  may legitimately list — the locked scoped `clippy` and `test`. List those with their
+  real results, and mark everything workspace-wide as CI-pending. Listing
+  `cargo test --workspace` as "pass" is still a fabricated evidence trail, and the
+  reviewer re-runs claims.
 - **Check whether `main` is currently red before blaming your diff.** Issue #127 (7
   `maw-cli --lib` tests failing on Linux, passing on macOS) is **closed**, and the
   `workon_hardening` fixture failures that followed were fixed by #144. Do not assume
