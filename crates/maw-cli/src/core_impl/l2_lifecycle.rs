@@ -416,6 +416,10 @@ fn l2_pane_metadata_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
     cwd.join(".maw").join(format!("l2-meta-{}.json", l2_pane_key(pane)))
 }
 
+fn l2_pr_handoff_message(pr_number: u64, url: &str) -> String {
+    format!("PR #{pr_number} ready. {url}")
+}
+
 fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, String> {
     let pane = std::env::var("MAW_L2_PANE_ID")
         .ok()
@@ -437,7 +441,8 @@ fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, Strin
     let metadata = std::fs::read_to_string(metadata_path).map_err(|error| format!("l2 event: read PR metadata: {error}"))?;
     let metadata = serde_json::from_str::<L2ParentMetadata>(&metadata).map_err(|error| format!("l2 event: parse PR metadata: {error}"))?;
     let metadata_pane = metadata.l2_pane.as_deref().unwrap_or(&pane);
-    l2_emit_state(cwd, metadata_pane, L2TerminalState::Pr, Some(&format!("PR #{pr_number} ready. {url}")))
+    let message = l2_pr_handoff_message(pr_number, url);
+    l2_emit_state(cwd, metadata_pane, L2TerminalState::Pr, Some(&message))
 }
 
 fn l2_transition_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
@@ -664,9 +669,10 @@ mod l2_lifecycle_tests {
         std::fs::create_dir_all(&root).expect("state root");
         std::env::set_var("MAW_STATE_DIR", &root);
         std::env::set_var("MAW_ORACLE", "gale");
+        let pr_url = "https://github.com/acme/demo/pull/169".to_owned();
         let request = PrReviewRequest {
             version: 1,
-            pr_url: "https://github.com/acme/demo/pull/169".to_owned(),
+            pr_url: pr_url.clone(),
             pr_number: 169,
             repo: "acme/demo".to_owned(),
             branch: "agents/issue-169-pr-notify".to_owned(),
@@ -692,7 +698,7 @@ mod l2_lifecycle_tests {
             issue: 169,
             state: L2TerminalState::Pr,
             transition_seq: 1,
-            message: "PR #169 ready. https://github.com/acme/demo/pull/169".to_owned(),
+            message: l2_pr_handoff_message(169, &pr_url),
             notified: false,
             notified_at: None,
             created_at: "2026-07-28T00:00:00.000Z".to_owned(),

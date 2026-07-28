@@ -365,6 +365,7 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     let base_repo = pr_github_repo_from_remote(&origin_url)?;
     let plan = pr_build_plan(cwd, branch, base_repo, &options, process)?;
     let mut out = pr_render_start(&plan);
+    let l1_pane = pr_l1_pane(&plan.cwd, tmux)?;
     let url = process.pr_gh_create(&plan)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m {url}");
     let pr_number = pr_extract_pr_number(&url)
@@ -380,7 +381,7 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
         notified_at: None,
         notifier: None,
         l1_oracle: pr_l1_oracle(&plan.cwd),
-        l1_pane: Some(pr_l1_pane(&plan.cwd, tmux)?),
+        l1_pane: Some(l1_pane),
         reconcile_attempts: 0,
         last_reconcile_error: None,
     };
@@ -1545,6 +1546,10 @@ mod pr_tests {
         let error = pr_run(&[], &mut tmux, &mut process).expect_err("missing target is loud");
         assert!(error.contains(".maw/l1-pane is missing"), "{error}");
         assert!(error.contains("tried L1 oracle 01-gale"), "{error}");
+        assert!(process.created.is_empty(), "pane resolution must precede GitHub PR creation");
+        assert!(process.enqueued.is_empty(), "failed pane resolution must not create a queue row");
+        assert!(!repo.join(".maw/l1-review-request.json").exists());
+        assert!(!repo.join(".maw-test-state/pr-queue.jsonl").exists());
     }
 
     #[test]
