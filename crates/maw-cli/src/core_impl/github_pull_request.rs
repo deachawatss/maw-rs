@@ -1388,6 +1388,19 @@ mod pr_tests {
         assert!(review.contains("GraphQL service unavailable"), "{review}");
     }
 
+    /// Write `.maw/delivery.json` and point `MAW_STATE_DIR` at a per-test dir.
+    ///
+    /// **Every caller must already hold `env_test_lock`.** `MAW_STATE_DIR` is
+    /// process-global and at least ten test modules set it; the returned
+    /// `EnvVarRestore` puts the old value back afterwards, but restoring is not
+    /// mutual exclusion. Two callers lacked the lock, so a concurrent test could
+    /// repoint `MAW_STATE_DIR` mid-run — the l2-event queue was then written into
+    /// another test's directory and the later read failed with `NotFound`, at a
+    /// line that looks like it is about PR output.
+    ///
+    /// The lock is taken by the caller rather than here on purpose: ten callers
+    /// already hold it, and `std::sync::Mutex` is not reentrant, so locking here
+    /// too would deadlock every one of them.
     fn pr_write_delivery(repo: &std::path::Path, issue: u64) -> EnvVarRestore {
         std::fs::create_dir_all(repo.join(".maw")).expect("maw dir");
         let restore = EnvVarRestore::capture("MAW_STATE_DIR");
@@ -1607,6 +1620,10 @@ mod pr_tests {
 
     #[test]
     fn pr_overrides_title_body_and_rejects_detached_head() {
+        // `pr_write_delivery` sets the process-global MAW_STATE_DIR; without this
+        // lock a concurrent test repoints it mid-run. See the note on
+        // `pr_write_delivery`.
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = pr_temp_dir("override");
         let _state = pr_write_delivery(&repo, 42);
         let options = PrOptions {
@@ -1627,6 +1644,9 @@ mod pr_tests {
 
     #[test]
     fn pr_requires_valid_delivery_evidence_and_rejects_branch_issue_mismatches() {
+        // Two `pr_write_delivery` calls below, each setting the process-global
+        // MAW_STATE_DIR. See the note on `pr_write_delivery`.
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let repo = pr_temp_dir("delivery-required");
         let options = PrOptions { window: None, title: None, body: None, show_current: false, reconcile: false, quiet: false };
         let mut process = PrMockProcess::default();
