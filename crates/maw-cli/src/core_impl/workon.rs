@@ -318,11 +318,12 @@ fn workon_prepare_delivery(
     target_path: &Path,
     engine: Option<&str>,
     parent_oracle: Option<&str>,
+    parent_pane: Option<&str>,
 ) {
     // Preserve the parent Oracle name so PR handoff can use the same
     // federation-aware routing as `maw hey`.
     if let Some(oracle) = parent_oracle {
-        if let Err(error) = crate::wind::workon::record_l1_oracle(target_path, oracle) {
+        if let Err(error) = crate::wind::workon::record_l1_oracle(target_path, oracle, parent_pane) {
             let _ = writeln!(stdout, "\x1b[33m⚠\x1b[0m workon: L1 handoff target not recorded: {error}");
         }
     }
@@ -352,6 +353,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
     let mut taskless_oracle = false;
     let mut resuming_worktree = false;
     let parent_oracle = workon_parent_oracle(runner, options.oracle.as_deref())?;
+    let parent_pane = std::env::var("TMUX_PANE").ok();
     solo_require_workon_session(&repo.repo_name, parent_oracle.as_deref(), runner)?;
 
     if let Some(request) = workon_resolve_worktree_name(options)? {
@@ -387,6 +389,7 @@ fn workon_cmd_with_runner<R: maw_tmux::TmuxRunner>(
         &target_path,
         options.engine.as_deref(),
         parent_oracle.as_deref(),
+        parent_pane.as_deref(),
     );
 
     if let Some(session) = parent_oracle {
@@ -1963,6 +1966,8 @@ mod workon_tests {
     #[cfg(unix)]
     #[test]
     fn link_shared_psi_keeps_tracked_worktree_psi_real() {
+        // Shells out to real git — serialize with tests that replace PATH.
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
         let root = workon_temp_root("tracked-psi");
         let main = root.join("main");
         let wt = main.join("agents/feat");
@@ -2018,6 +2023,8 @@ mod workon_tests {
     #[cfg(unix)]
     #[test]
     fn link_shared_psi_preserves_existing_worktree_psi() {
+        // Shells out to real git — serialize with tests that replace PATH.
+        let _guard = env_test_lock().lock().unwrap_or_else(|error| error.into_inner());
         let root = workon_temp_root("shared-psi");
         let main = root.join("main");
         let wt = root.join("main/agents/feat");

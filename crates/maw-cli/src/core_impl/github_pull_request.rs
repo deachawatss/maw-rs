@@ -111,6 +111,7 @@ trait PrTmux {
     fn pr_current_path(&mut self) -> Result<String, String>;
     fn pr_current_session(&mut self) -> Result<String, String>;
     fn pr_window_path(&mut self, target: &str) -> Result<String, String>;
+    fn pr_l1_pane_for_oracle(&mut self, oracle: &str) -> Result<String, String>;
 }
 
 struct PrNativeTmux;
@@ -140,6 +141,26 @@ impl PrTmux for PrNativeTmux {
     fn pr_window_path(&mut self, target: &str) -> Result<String, String> {
         pr_validate_tmux_target(target, "window target")?;
         pr_tmux_output(&["display-message", "-t", target, "-p", "#{pane_current_path}"])
+    }
+    fn pr_l1_pane_for_oracle(&mut self, oracle: &str) -> Result<String, String> {
+        let mut runner = maw_tmux::CommandTmuxRunner::new();
+        let target = resolve_local_tmux_runner_target(&mut runner, oracle, "pr L1 fallback")?;
+        let target = resolve_window_agent_pane_target_with_runner(&target, &mut runner).map_err(|error| {
+            let detail = error.detail;
+            error.hint.map_or_else(|| detail.clone(), |hint| format!("{detail}; {hint}"))
+        })?;
+        let pane = maw_tmux::TmuxRunner::run(
+            &mut runner,
+            "display-message",
+            &["-t".to_owned(), target, "-p".to_owned(), "#{pane_id}".to_owned()],
+        )
+        .map_err(|error| format!("pr L1 fallback pane lookup failed: {}", error.message))?;
+        let pane = pane.trim().to_owned();
+        if pr_valid_pane_id(&pane) {
+            Ok(pane)
+        } else {
+            Err(format!("pr L1 fallback returned invalid pane {pane:?}"))
+        }
     }
 }
 
@@ -344,6 +365,7 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
     let base_repo = pr_github_repo_from_remote(&origin_url)?;
     let plan = pr_build_plan(cwd, branch, base_repo, &options, process)?;
     let mut out = pr_render_start(&plan);
+    let l1_pane = pr_l1_pane(&plan.cwd, tmux)?;
     let url = process.pr_gh_create(&plan)?;
     let _ = writeln!(out, "\x1b[32m✅\x1b[0m {url}");
     let pr_number = pr_extract_pr_number(&url)
@@ -359,7 +381,7 @@ fn pr_run<T: PrTmux, P: PrProcess>(argv: &[String], tmux: &mut T, process: &mut 
         notified_at: None,
         notifier: None,
         l1_oracle: pr_l1_oracle(&plan.cwd),
-        l1_pane: pr_l1_pane(&plan.cwd),
+        l1_pane: Some(l1_pane),
         reconcile_attempts: 0,
         last_reconcile_error: None,
     };
@@ -380,12 +402,26 @@ fn pr_l1_oracle(cwd: &std::path::Path) -> Option<String> {
         .filter(|value| pr_valid_oracle_name(value))
 }
 
-fn pr_l1_pane(cwd: &std::path::Path) -> Option<String> {
-    std::env::var("MAW_L1_PANE")
+fn pr_l1_pane(
+    cwd: &std::path::Path,
+    tmux: &mut impl PrTmux,
+) -> Result<String, String> {
+    if let Some(pane) = std::env::var("MAW_L1_PANE")
         .ok()
         .or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-pane")).ok())
         .map(|value| value.trim().to_owned())
         .filter(|value| pr_valid_pane_id(value))
+    {
+        return Ok(pane);
+    }
+    let oracle = pr_l1_oracle(cwd).ok_or_else(|| {
+        "pr: cannot resolve L1 pane: .maw/l1-pane is missing and .maw/l1-oracle is missing".to_owned()
+    })?;
+    tmux.pr_l1_pane_for_oracle(&oracle).map_err(|error| {
+        format!(
+            "pr: cannot resolve L1 pane: .maw/l1-pane is missing; tried L1 oracle {oracle}: {error}"
+        )
+    })
 }
 
 fn pr_valid_oracle_name(value: &str) -> bool {
@@ -433,6 +469,32 @@ fn pr_enqueue_review_at(root: &std::path::Path, request: &PrReviewRequest) -> Re
     }
     if !replaced {
         lines.push(pr_render_queue_row(request)?);
+    }
+    pr_write_queue_lines(root, "pr-queue.jsonl", &lines)
+}
+
+fn pr_mark_review_notifications_at(
+    root: &std::path::Path,
+    acknowledged_urls: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if acknowledged_urls.is_empty() {
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    for line in pr_read_queue_lines(root, "pr-queue.jsonl")? {
+        let Ok(mut request) = serde_json::from_str::<PrReviewRequest>(&line) else {
+            lines.push(line);
+            continue;
+        };
+        if acknowledged_urls.contains(&request.pr_url) && !request.notified {
+            "notified".clone_into(&mut request.status);
+            request.notified = true;
+            request.notified_at = Some(cli_dispatch_now_iso());
+            request.notifier = Some("maw fleet pr-queue".to_owned());
+            lines.push(pr_render_queue_row(&request)?);
+        } else {
+            lines.push(line);
+        }
     }
     pr_write_queue_lines(root, "pr-queue.jsonl", &lines)
 }
@@ -1076,7 +1138,12 @@ mod pr_tests {
     use super::*;
 
     #[derive(Default)]
-    struct PrMockTmux { current_path: String, session: String, window_path: String }
+    struct PrMockTmux {
+        current_path: String,
+        session: String,
+        window_path: String,
+        resolved_l1_pane: Option<Result<String, String>>,
+    }
 
     impl PrTmux for PrMockTmux {
         fn pr_current_path(&mut self) -> Result<String, String> { Ok(self.current_path.clone()) }
@@ -1084,6 +1151,10 @@ mod pr_tests {
         fn pr_window_path(&mut self, target: &str) -> Result<String, String> {
             assert!(!target.starts_with('-'));
             Ok(self.window_path.clone())
+        }
+        fn pr_l1_pane_for_oracle(&mut self, oracle: &str) -> Result<String, String> {
+            assert_eq!(oracle, "01-gale");
+            self.resolved_l1_pane.take().unwrap_or_else(|| Ok("%42".to_owned()))
         }
     }
 
@@ -1409,8 +1480,8 @@ mod pr_tests {
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let repo = pr_temp_dir("durable-l1-target");
         let _state = pr_write_delivery(&repo, 55);
-        std::fs::write(repo.join(".maw/l1-oracle"), "01-gale\n").expect("oracle target");
-        std::fs::write(repo.join(".maw/l1-pane"), "%55\n").expect("pane target");
+        crate::wind::workon::record_l1_oracle(&repo, "01-gale", Some("%55"))
+            .expect("dispatch metadata");
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
         let mut process = PrMockProcess { branch: "agents/issue-55-l1-notify-ack".to_owned(), ..Default::default() };
 
@@ -1427,29 +1498,58 @@ mod pr_tests {
     }
 
     #[test]
-    fn pr_reads_oracle_metadata_separately_from_legacy_pane() {
+    fn pr_reads_l1_metadata_recorded_by_workon() {
         let repo = pr_temp_dir("l1-metadata");
-        let metadata = repo.join(".maw");
-        std::fs::create_dir_all(&metadata).expect("metadata dir");
-        std::fs::write(metadata.join("l1-oracle"), "50-mawjs\n").expect("oracle");
-        std::fs::write(metadata.join("l1-pane"), "%42\n").expect("pane");
+        crate::wind::workon::record_l1_oracle(&repo, "50-mawjs", Some("%42"))
+            .expect("workon metadata");
         assert_eq!(pr_l1_oracle(&repo).as_deref(), Some("50-mawjs"));
-        assert_eq!(pr_l1_pane(&repo).as_deref(), Some("%42"));
+        let mut tmux = PrMockTmux::default();
+        assert_eq!(pr_l1_pane(&repo, &mut tmux).as_deref(), Ok("%42"));
     }
 
     #[test]
-    fn pr_without_pane_metadata_still_queues_durable_handoff() {
+    fn pr_resolves_oracle_fallback_when_dispatch_metadata_has_no_pane() {
         let repo = pr_temp_dir("l1-pane-fallback");
         let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = EnvVarRestore::capture("TMUX");
         std::env::set_var("TMUX", "/tmp/tmux,1,0");
         let _state = pr_write_delivery(&repo, 32);
+        std::fs::remove_file(repo.join(".maw/l1-oracle")).expect("replace fixture marker");
+        crate::wind::workon::record_l1_oracle(&repo, "01-gale", None)
+            .expect("dispatch metadata");
+        assert!(!repo.join(".maw/l1-pane").exists());
         let mut tmux = PrMockTmux { current_path: repo.display().to_string(), ..Default::default() };
-        let mut process = PrMockProcess { branch: "agents/issue-32-pr-durable-notification".to_owned(), ..PrMockProcess::default() };
+        let mut process = PrMockProcess {
+            branch: "agents/issue-32-pr-durable-notification".to_owned(),
+            ..PrMockProcess::default()
+        };
 
         let output = pr_run(&[], &mut tmux, &mut process).expect("run");
 
         assert!(output.contains("L1 handoff queued for the next hook drain"), "{output}");
+        assert_eq!(process.enqueued[0].l1_pane.as_deref(), Some("%42"));
+    }
+    #[test]
+    fn pr_fails_loudly_when_oracle_fallback_cannot_resolve_a_pane() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = EnvVarRestore::capture("TMUX");
+        std::env::set_var("TMUX", "/tmp/tmux,1,0");
+        let repo = pr_temp_dir("l1-pane-unresolvable");
+        let _state = pr_write_delivery(&repo, 32);
+        let mut tmux = PrMockTmux {
+            current_path: repo.display().to_string(),
+            resolved_l1_pane: Some(Err("target has no recognized agent pane".to_owned())),
+            ..Default::default()
+        };
+        let mut process = PrMockProcess { branch: "agents/issue-32-pr-durable-notification".to_owned(), ..PrMockProcess::default() };
+
+        let error = pr_run(&[], &mut tmux, &mut process).expect_err("missing target is loud");
+        assert!(error.contains(".maw/l1-pane is missing"), "{error}");
+        assert!(error.contains("tried L1 oracle 01-gale"), "{error}");
+        assert!(process.created.is_empty(), "pane resolution must precede GitHub PR creation");
+        assert!(process.enqueued.is_empty(), "failed pane resolution must not create a queue row");
+        assert!(!repo.join(".maw/l1-review-request.json").exists());
+        assert!(!repo.join(".maw-test-state/pr-queue.jsonl").exists());
     }
 
     #[test]

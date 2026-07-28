@@ -416,6 +416,10 @@ fn l2_pane_metadata_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
     cwd.join(".maw").join(format!("l2-meta-{}.json", l2_pane_key(pane)))
 }
 
+fn l2_pr_handoff_message(pr_number: u64, url: &str) -> String {
+    format!("PR #{pr_number} ready. {url}")
+}
+
 fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, String> {
     let pane = std::env::var("MAW_L2_PANE_ID")
         .ok()
@@ -437,7 +441,8 @@ fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, Strin
     let metadata = std::fs::read_to_string(metadata_path).map_err(|error| format!("l2 event: read PR metadata: {error}"))?;
     let metadata = serde_json::from_str::<L2ParentMetadata>(&metadata).map_err(|error| format!("l2 event: parse PR metadata: {error}"))?;
     let metadata_pane = metadata.l2_pane.as_deref().unwrap_or(&pane);
-    l2_emit_state(cwd, metadata_pane, L2TerminalState::Pr, Some(&format!("PR #{pr_number} ready. {url}")))
+    let message = l2_pr_handoff_message(pr_number, url);
+    l2_emit_state(cwd, metadata_pane, L2TerminalState::Pr, Some(&message))
 }
 
 fn l2_transition_path(cwd: &Path, pane: &str) -> std::path::PathBuf {
@@ -553,6 +558,7 @@ fn l2_acknowledge_events(events: &[L2Event]) -> Result<(), String> {
     let keys = events.iter().map(l2_event_key).collect::<std::collections::HashSet<_>>();
     let mut retained = Vec::new();
     let mut archived = pr_read_queue_lines(&root, "l2-events.jsonl.archived")?;
+    let mut acknowledged_pr_urls = std::collections::HashSet::new();
     for line in pr_read_queue_lines(&root, "l2-events.jsonl")? {
         let Ok(mut event) = serde_json::from_str::<L2Event>(&line) else { retained.push(line); continue };
         if event.notified || !keys.contains(&l2_event_key(&event)) {
@@ -561,10 +567,26 @@ fn l2_acknowledge_events(events: &[L2Event]) -> Result<(), String> {
         }
         event.notified = true;
         event.notified_at = Some(cli_dispatch_now_iso());
+        if let Some(url) = l2_pr_handoff_url(&event) {
+            acknowledged_pr_urls.insert(url.to_owned());
+        }
         archived.push(serde_json::to_string(&event).map_err(|error| format!("l2 event: archive render: {error}"))?);
     }
+    pr_mark_review_notifications_at(&root, &acknowledged_pr_urls)?;
     pr_write_queue_lines(&root, "l2-events.jsonl", &retained)?;
     pr_write_queue_lines(&root, "l2-events.jsonl.archived", &archived)
+}
+
+fn l2_pr_handoff_url(event: &L2Event) -> Option<&str> {
+    if event.state != L2TerminalState::Pr {
+        return None;
+    }
+    event
+        .message
+        .strip_prefix("PR #")?
+        .split_once(" ready. ")
+        .map(|(_, url)| url)
+        .filter(|url| url.starts_with("https://github.com/"))
 }
 
 fn l2_current_tmux_session() -> Option<String> {
@@ -634,6 +656,64 @@ mod l2_lifecycle_tests {
         let archived = std::fs::read_to_string(root.join("l2-events.jsonl.archived")).expect("archive");
         assert_eq!(archived.lines().count(), 1);
         assert!(archived.contains("\"notified\":true"));
+        std::fs::remove_dir_all(root).expect("cleanup state");
+    }
+
+    #[test]
+    fn pr_event_acknowledgement_marks_the_matching_review_request_notified() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _oracle = EnvVarRestore::capture("MAW_ORACLE");
+        let root = std::env::temp_dir().join(format!("maw-rs-pr-event-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("state root");
+        std::env::set_var("MAW_STATE_DIR", &root);
+        std::env::set_var("MAW_ORACLE", "gale");
+        let pr_url = "https://github.com/acme/demo/pull/169".to_owned();
+        let request = PrReviewRequest {
+            version: 1,
+            pr_url: pr_url.clone(),
+            pr_number: 169,
+            repo: "acme/demo".to_owned(),
+            branch: "agents/issue-169-pr-notify".to_owned(),
+            status: "pending".to_owned(),
+            notified: false,
+            notified_at: None,
+            notifier: None,
+            l1_oracle: Some("gale".to_owned()),
+            l1_pane: Some("%42".to_owned()),
+            reconcile_attempts: 0,
+            last_reconcile_error: None,
+        };
+        let request = pr_render_queue_row(&request).expect("render request");
+        std::fs::write(root.join("pr-queue.jsonl"), format!("{request}\n"))
+            .expect("write review request");
+        let event = L2Event {
+            version: 1,
+            l2_pane: "%9".to_owned(),
+            l2_session: "child-1".to_owned(),
+            l1_oracle: "gale".to_owned(),
+            l1_session: "parent-1".to_owned(),
+            repo: "maw-rs".to_owned(),
+            issue: 169,
+            state: L2TerminalState::Pr,
+            transition_seq: 1,
+            message: l2_pr_handoff_message(169, &pr_url),
+            notified: false,
+            notified_at: None,
+            created_at: "2026-07-28T00:00:00.000Z".to_owned(),
+        };
+        assert!(l2_enqueue_event(&event).expect("enqueue"));
+
+        let events = l2_drain_events().expect("L1 receives event");
+        l2_acknowledge_events(&events).expect("acknowledge L1 receipt");
+
+        let stored = std::fs::read_to_string(root.join("pr-queue.jsonl")).expect("review queue");
+        let stored = serde_json::from_str::<PrReviewRequest>(stored.trim()).expect("review request");
+        assert!(stored.notified);
+        assert_eq!(stored.status, "notified");
+        assert_eq!(stored.notifier.as_deref(), Some("maw fleet pr-queue"));
+        assert!(stored.notified_at.is_some());
         std::fs::remove_dir_all(root).expect("cleanup state");
     }
 
