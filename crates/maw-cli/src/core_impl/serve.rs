@@ -3067,7 +3067,17 @@ async fn api_transport_send(
 }
 
 async fn api_health() -> impl IntoResponse {
-    Json(json!({"ok": true, "source": "maw-rs", "server": "local", "port": DEFAULT_SERVE_PORT}))
+    // buildVersion lets a caller tell a freshly-installed binary from the one this
+    // daemon actually started with. Without it the only signal is process start time
+    // vs binary mtime, which nobody checks: on 2026-07-28 maw-serve served a
+    // 21-hour-old build across eight merges and reported healthy the whole time (#121).
+    Json(json!({
+        "ok": true,
+        "source": "maw-rs",
+        "server": "local",
+        "port": DEFAULT_SERVE_PORT,
+        "buildVersion": MAW_RS_BUILD_VERSION,
+    }))
 }
 
 async fn api_message_ledger(

@@ -247,8 +247,61 @@ fn doctor_check_xdg(options: &DoctorOptions) -> DoctorCheckNative {
     doctor_info("xdg", &format!("enabled={enabled}; config={}; data={}; state={}", config.display(), data.display(), state.display()))
 }
 
-fn doctor_check_version(_options: &DoctorOptions) -> DoctorCheckNative {
-    doctor_info("version:source", &format!("maw-rs {} (no running maw probe in native doctor)", env!("CARGO_PKG_VERSION")))
+/// Compare the build the daemon is running against the build that is installed.
+///
+/// This check used to be a stub that reported the source version and admitted
+/// "no running maw probe in native doctor". That gap is what remains of #121: installing a
+/// binary does not update the process already running one, and nothing reported the
+/// difference. On 2026-07-28 `maw-serve` had been up 21 hours across eight merges
+/// while `~/.local/bin/maw-rs` was rebuilt minutes earlier — every CLI caller had the
+/// fixes, every HTTP caller did not, and `maw doctor` said the daemon was fine.
+fn doctor_check_version(options: &DoctorOptions) -> DoctorCheckNative {
+    let installed = MAW_RS_BUILD_VERSION;
+    let port = options.port.unwrap_or_else(doctor_default_port);
+    if !doctor_tcp_reachable(port) {
+        return doctor_info("version", &format!("installed {installed}; no daemon on :{port} to compare"));
+    }
+    match doctor_probe_daemon_build(port) {
+        Some(running) if running == installed => {
+            doctor_ok("version", &format!("daemon and installed binary both {installed}"))
+        }
+        Some(running) => doctor_warn(
+            "version",
+            &format!(
+                "daemon on :{port} is running {running} but the installed binary is {installed} — it has not been restarted since the rebuild"
+            ),
+            &["pm2 restart maw-serve"],
+        ),
+        // An older daemon predates the buildVersion field, which is itself the
+        // symptom: it is running a binary from before this check existed.
+        None => doctor_warn(
+            "version",
+            &format!(
+                "daemon on :{port} reports no buildVersion — it predates this field, so it is running a binary older than {installed}"
+            ),
+            &["pm2 restart maw-serve"],
+        ),
+    }
+}
+
+/// Read `buildVersion` from the daemon's `/api/health`.
+///
+/// Uses `curl` rather than an HTTP client dependency, matching how the kill peer
+/// transport already talks to a remote maw. Any failure returns `None` — the caller
+/// treats "cannot tell" as a warning, never as a pass, because a silent stale daemon
+/// is the exact failure this check exists to surface.
+fn doctor_probe_daemon_build(port: u16) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/api/health");
+    let output = std::process::Command::new("curl")
+        .args(["-fsS", "--max-time", "5", &url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let version = body.get("buildVersion")?.as_str()?.trim().to_owned();
+    (!version.is_empty()).then_some(version)
 }
 
 fn doctor_check_plugins() -> DoctorCheckNative {
