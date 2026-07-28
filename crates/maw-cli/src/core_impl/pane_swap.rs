@@ -1,6 +1,6 @@
 const DISPATCH_73: &[DispatcherEntry] = &[DispatcherEntry { command: "pane", handler: Handler::Sync(run_pane_command) }];
 
-const PANE_USAGE: &str = "usage: maw pane swap <pane-a> <pane-b>  (see: maw panes to list, maw tile for grids)";
+const PANE_USAGE: &str = "usage: maw pane swap <pane-a> <pane-b>  (see: maw panes to list, maw resize equal for grids)";
 const PANE_LIST_FORMAT: &str = "#{pane_index}|||#{pane_id}|||#{pane_title}|||#{pane_top}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,7 @@ fn pane_parse_swap_args(argv: &[String]) -> Result<PaneOptions, (i32, String)> {
 
 fn pane_help_text() -> String {
     concat!(
-        "usage: maw pane swap <pane-a> <pane-b>  (see: maw panes to list, maw tile for grids)\n",
+        "usage: maw pane swap <pane-a> <pane-b>  (see: maw panes to list, maw resize equal for grids)\n",
         "  pane targets: index (1), pane id (%1), title prefix (tile-1), top, bottom\n"
     ).to_owned()
 }

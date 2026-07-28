@@ -150,7 +150,7 @@ fn panes_native_guard_rejects_leading_dash_before_tmux_listing() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stderr).expect("stderr"),
-        "\"-target\" looks like a flag, not a target.\n  usage: maw panes [target] [--pid] [--all|-a]  (see: maw pane swap, maw tile)\n"
+        "\"-target\" looks like a flag, not a target.\n  usage: maw panes [target] [--pid] [--all|-a]  (see: maw pane swap, maw resize equal)\n"
     );
     let log = std::fs::read_to_string(root.join("tmux.log")).unwrap_or_default();
     assert!(

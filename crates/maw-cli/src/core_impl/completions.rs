@@ -270,6 +270,12 @@ fn completions_usage_sources() -> Vec<(&'static str, String)> {
         ("notify", NOTIFY_USAGE.to_owned()),
         ("oracle", ORACLE_USAGE.to_owned()),
         ("oracle-workon", ORACLEWORKON_USAGE.to_owned()),
+        // `pane`/`panes` were absent here, so their help text was invisible to
+        // `commands --describe` *and* to the dangling-reference guard below —
+        // which is how both of them pointed at the nonexistent `maw tile`
+        // through #179 and #180 without anything noticing (#180 AC 3).
+        ("pane", PANE_USAGE.to_owned()),
+        ("panes", PANES_USAGE.to_owned()),
         ("plugin", PLUGIN_USAGE.to_owned()),
         ("plugin-artifact", PLUGINARTIFACT_USAGE.to_owned()),
         ("plugin-policy", POLICY_USAGE.to_owned()),
@@ -548,6 +554,59 @@ mod completions_tests {
         assert!(zsh.stdout.contains("'oracle shorthand'"));
         assert!(zsh.stdout.contains("'maw commands'"));
         assert!(zsh.stdout.contains("_maw_squads"));
+    }
+
+    /// Every verb named in a usage string must be a verb the CLI actually accepts.
+    ///
+    /// #180 AC 3. `maw panes` and `maw pane swap` both pointed at `maw tile`,
+    /// which has never existed as a command — an operator who followed the
+    /// printed guidance landed on `unknown command 'tile'` and fell back to raw
+    /// tmux, which is what produced the 10-column panes in the first place.
+    /// This has now cost time twice (#179 and #180), so it is a test rather than
+    /// another one-off string fix.
+    #[test]
+    fn every_verb_named_in_help_text_resolves_to_a_real_command() {
+        let known = completions_commands();
+        let mut dangling = Vec::new();
+        for (command, usage) in completions_usage_sources() {
+            for referenced in help_referenced_verbs(&usage) {
+                if !known.contains(&referenced.as_str()) {
+                    dangling.push(format!("`maw {command}` help points at `maw {referenced}`"));
+                }
+            }
+        }
+        assert!(
+            dangling.is_empty(),
+            "help text names commands that do not exist:\n  {}",
+            dangling.join("\n  ")
+        );
+    }
+
+    /// Verbs mentioned as `maw <verb>` in a usage string.
+    ///
+    /// Only the first token after `maw` is a command — `maw pane swap` and
+    /// `maw peers list` are verb plus subcommand, and `swap`/`list` are not
+    /// top-level verbs. Placeholders (`<target>`, `{target}`) are not verbs.
+    fn help_referenced_verbs(usage: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        for tail in usage.split("maw ").skip(1) {
+            let verb: String = tail
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                .collect();
+            if !verb.is_empty() {
+                found.push(verb);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn help_referenced_verbs_takes_only_the_leading_token() {
+        assert_eq!(help_referenced_verbs("see: maw pane swap, maw resize equal"), ["pane", "resize"]);
+        assert_eq!(help_referenced_verbs("maw split {target} --vertical"), ["split"]);
+        assert!(help_referenced_verbs("usage: split <target>").is_empty());
+        assert!(help_referenced_verbs("maw <target>").is_empty(), "a placeholder is not a verb");
     }
 
     #[test]
