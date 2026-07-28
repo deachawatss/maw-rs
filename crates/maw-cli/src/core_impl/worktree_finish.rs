@@ -3,12 +3,12 @@ const DISPATCH_57: &[DispatcherEntry] = &[
     DispatcherEntry { command: "finish", handler: Handler::Sync(run_done_command) },
 ];
 
-const DONE_USAGE: &str = "usage: maw done <window-name> [--force] [--dry-run] [--clean-branch] [--worktree <path>] or maw done --all [<oracle>] [--force] [--dry-run] [--clean-branch]  (see: maw sleep/kill for non-worktree shutdown)";
-const DONE_ALL_USAGE: &str = "usage: maw done --all [<oracle>] [--force] [--dry-run] [--clean-branch]";
+const DONE_USAGE: &str = "usage: maw done <window-name> [--force] [--dry-run] [--keep-branch] [--clean-branch] [--worktree <path>] or maw done --all [<oracle>] [--force] [--dry-run] [--keep-branch] [--clean-branch]  (see: maw sleep/kill for non-worktree shutdown)";
+const DONE_ALL_USAGE: &str = "usage: maw done --all [<oracle>] [--force] [--dry-run] [--keep-branch] [--clean-branch]";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
-struct DoneOptions { all: bool, force: bool, dry_run: bool, clean_branch: bool, target: Option<String>, worktree: Option<std::path::PathBuf> }
+struct DoneOptions { all: bool, force: bool, dry_run: bool, clean_branch: bool, keep_branch: bool, target: Option<String>, worktree: Option<std::path::PathBuf> }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DoneWindow { session: String, index: i32, name: String, cwd: Option<String> }
@@ -73,6 +73,7 @@ trait DoneRuntime {
     fn done_tmux(&mut self, command: &str, args: &[String]) -> Result<String, String>;
     fn done_send_text(&mut self, target: &str, text: &str) -> Result<(), String>;
     fn done_git(&mut self, args: &[String]) -> Result<String, String>;
+    fn done_pr_state(&mut self, main_path: &std::path::Path, branch: &str) -> Result<PrGithubState, String>;
 }
 
 fn run_done_command(argv: &[String]) -> CliOutput {
@@ -111,6 +112,7 @@ fn done_parse_args(argv: &[String]) -> Result<DoneOptions, String> {
             "--force" => options.force = true,
             "--dry-run" => options.dry_run = true,
             "--clean-branch" => options.clean_branch = true,
+            "--keep-branch" => options.keep_branch = true,
             "--worktree" => {
                 let value = argv.get(index + 1).ok_or_else(|| "done: missing --worktree value".to_owned())?;
                 done_set_worktree_option(&mut options, value)?;
@@ -125,6 +127,9 @@ fn done_parse_args(argv: &[String]) -> Result<DoneOptions, String> {
             value => positionals.push(value.to_owned()),
         }
         index += 1;
+    }
+    if options.clean_branch && options.keep_branch {
+        return Err("done: --keep-branch cannot be used with --clean-branch".to_owned());
     }
     if options.all && positionals.len() > 1 {
         return Err(format!("unexpected extra positional arg(s) for maw done --all: {}\n  {DONE_ALL_USAGE}", positionals[1..].join(" ")));
@@ -195,6 +200,9 @@ fn done_run_one_with_context(target: &str, options: &DoneOptions, session_filter
             local,
             &mut stdout,
         )?;
+        if !options.dry_run {
+            done_sweep_repo_after_removal(&worktree.main_path, &panes, options, local, &mut stdout);
+        }
         true
     } else {
         false
@@ -312,6 +320,10 @@ impl DoneRuntime for DoneLocal {
     }
 
     fn done_git(&mut self, args: &[String]) -> Result<String, String> { done_git(args) }
+
+    fn done_pr_state(&mut self, main_path: &std::path::Path, branch: &str) -> Result<PrGithubState, String> {
+        done_pr_state_for_branch(main_path, branch)
+    }
 }
 
 /// Resolve the session and window of the pane that invoked `maw done`.
@@ -984,7 +996,42 @@ fn done_format_reclaimed_bytes(bytes: u64) -> String {
 
 fn done_cleanup_branch(main_path: &std::path::Path, branch: &str, options: &DoneOptions, local: &mut impl DoneRuntime, stdout: &mut String) {
     if branch.is_empty() || branch == "main" || branch == "HEAD" { return; }
-    if options.clean_branch { let _ = local.done_git(&["-C".to_owned(), main_path.display().to_string(), "branch".to_owned(), "-D".to_owned(), "--".to_owned(), branch.to_owned()]); let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch}"); } else { let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m branch {branch} retained (use --clean-branch to delete)"); }
+    if options.keep_branch {
+        let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m branch {branch} retained (--keep-branch)");
+        return;
+    }
+    if options.clean_branch {
+        done_delete_branch(main_path, branch, local, stdout, "requested by --clean-branch");
+        return;
+    }
+    match local.done_pr_state(main_path, branch) {
+        Ok(PrGithubState::Merged) => {
+            done_delete_branch(main_path, branch, local, stdout, "merged PR");
+        }
+        Ok(PrGithubState::Open) => {
+            let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m branch {branch} retained (PR open)");
+        }
+        Ok(PrGithubState::Closed) => {
+            let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m branch {branch} retained (PR closed without merge)");
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m branch {branch} retained (PR state unavailable: {error})");
+        }
+    }
+}
+
+fn done_delete_branch(main_path: &std::path::Path, branch: &str, local: &mut impl DoneRuntime, stdout: &mut String, reason: &str) -> bool {
+    let args = ["-C".to_owned(), main_path.display().to_string(), "branch".to_owned(), "-D".to_owned(), "--".to_owned(), branch.to_owned()];
+    match local.done_git(&args) {
+        Ok(_) => {
+            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch} ({reason})");
+            true
+        }
+        Err(error) => {
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m branch {branch} retained (delete failed after {reason}: {error})");
+            false
+        }
+    }
 }
 
 fn done_find_worktree_paths(target: &str, repos_root: &std::path::Path) -> Vec<DoneWorktree> {
@@ -1150,6 +1197,8 @@ mod done_tests {
         top_levels: std::collections::BTreeMap<std::path::PathBuf, std::path::PathBuf>,
         registered: std::collections::BTreeMap<std::path::PathBuf, Vec<std::path::PathBuf>>,
         branches: std::collections::BTreeMap<std::path::PathBuf, String>,
+        local_branches: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
+        pr_states: std::collections::BTreeMap<(std::path::PathBuf, String), Result<PrGithubState, String>>,
         dirty_removals: std::collections::BTreeSet<std::path::PathBuf>,
         tmux_responses: std::collections::BTreeMap<String, String>,
         git_calls: Vec<Vec<String>>,
@@ -1161,9 +1210,18 @@ mod done_tests {
 
     impl DoneFakeRuntime {
         fn register_worktree(&mut self, main: &std::path::Path, worktree: &std::path::Path) {
+            self.register_worktree_branch(main, worktree, "agent/task");
+        }
+
+        fn register_worktree_branch(&mut self, main: &std::path::Path, worktree: &std::path::Path, branch: &str) {
             self.top_levels.insert(worktree.to_path_buf(), worktree.to_path_buf());
             self.registered.entry(main.to_path_buf()).or_default().push(worktree.to_path_buf());
-            self.branches.insert(worktree.to_path_buf(), "agent/task".to_owned());
+            self.branches.insert(worktree.to_path_buf(), branch.to_owned());
+            self.local_branches.entry(main.to_path_buf()).or_default().insert(branch.to_owned());
+        }
+
+        fn set_pr_state(&mut self, main: &std::path::Path, branch: &str, state: PrGithubState) {
+            self.pr_states.insert((main.to_path_buf(), branch.to_owned()), Ok(state));
         }
 
         fn git_cwd(args: &[String]) -> Option<std::path::PathBuf> {
@@ -1221,17 +1279,22 @@ mod done_tests {
                     *main == &cwd || worktrees.iter().any(|worktree| worktree == &cwd)
                 });
                 let out = if let Some((main, worktrees)) = registered {
-                    let mut out = format!("worktree {}\n\n", main.display());
+                    let mut out = format!("worktree {}\nbranch refs/heads/main\n\n", main.display());
                     for worktree in worktrees {
                         if worktree != main {
-                            let _ = write!(out, "worktree {}\n\n", worktree.display());
+                            let branch = self.branches.get(worktree).map_or("agent/task", String::as_str);
+                            let _ = write!(out, "worktree {}\nbranch refs/heads/{branch}\n\n", worktree.display());
                         }
                     }
                     out
                 } else {
-                    format!("worktree {}\n\n", cwd.display())
+                    format!("worktree {}\nbranch refs/heads/main\n\n", cwd.display())
                 };
                 return Ok(out);
+            }
+            if args.iter().any(|arg| arg == "branch") && args.iter().any(|arg| arg == "--format=%(refname:short)") {
+                let branches = self.local_branches.get(&cwd).into_iter().flatten().filter(|branch| branch.starts_with("agents/")).cloned().collect::<Vec<_>>();
+                return Ok(if branches.is_empty() { String::new() } else { format!("{}\n", branches.join("\n")) });
             }
             if args.ends_with(&["rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()]) {
                 return Ok(format!("{}\n", self.branches.get(&cwd).map_or("agent/task", String::as_str)));
@@ -1242,9 +1305,29 @@ mod done_tests {
                 if self.dirty_removals.contains(&worktree) && !args.iter().any(|arg| arg == "--force") {
                     return Err(format!("fatal: '{}' contains modified or untracked files", worktree.display()));
                 }
+                for worktrees in self.registered.values_mut() {
+                    worktrees.retain(|registered| registered != &worktree);
+                }
+                self.branches.remove(&worktree);
+                self.top_levels.remove(&worktree);
+                return Ok(String::new());
+            }
+            if args.iter().any(|arg| arg == "branch") && args.iter().any(|arg| arg == "-D") {
+                if let Some(branch) = Self::arg_after_separator(args) {
+                    if let Some(branches) = self.local_branches.get_mut(&cwd) {
+                        branches.remove(&branch.display().to_string());
+                    }
+                }
                 return Ok(String::new());
             }
             Ok(String::new())
+        }
+
+        fn done_pr_state(&mut self, main_path: &std::path::Path, branch: &str) -> Result<PrGithubState, String> {
+            self.pr_states
+                .get(&(main_path.to_path_buf(), branch.to_owned()))
+                .cloned()
+                .unwrap_or_else(|| Err("gh unavailable".to_owned()))
         }
     }
 
@@ -1289,6 +1372,10 @@ mod done_tests {
         fn done_git(&mut self, args: &[String]) -> Result<String, String> {
             let output = std::process::Command::new(&self.git).args(args).output().map_err(|error| format!("git failed: {error}"))?;
             if output.status.success() { Ok(String::from_utf8_lossy(&output.stdout).to_string()) } else { Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()) }
+        }
+
+        fn done_pr_state(&mut self, main_path: &std::path::Path, branch: &str) -> Result<PrGithubState, String> {
+            done_pr_state_for_branch(main_path, branch)
         }
     }
 
@@ -1878,6 +1965,75 @@ mod done_tests {
         assert!(remove < branch_delete, "{:#?}", runtime.git_calls);
         assert_eq!(runtime.git_calls[remove][1], main.display().to_string());
         assert_eq!(runtime.git_calls[branch_delete][1], main.display().to_string());
+    }
+
+    #[test]
+    fn done_sweep_removes_merged_deliveries_and_retains_an_open_delivery() {
+        let root = DoneTempRoot::new("merged-sweep");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let target = main.join("agents/done-target");
+        let merged = main.join("agents/merged");
+        let open = main.join("agents/open");
+        let mut runtime = DoneFakeRuntime { windows: vec![done_test_window("lead"), done_test_window("worker")], ..DoneFakeRuntime::default() };
+        runtime.pane_info.insert("s:worker".to_owned(), ("codex".to_owned(), target.display().to_string()));
+        for (path, branch, state) in [
+            (&target, "agents/done-target", PrGithubState::Merged),
+            (&merged, "agents/merged", PrGithubState::Merged),
+            (&open, "agents/open", PrGithubState::Open),
+        ] {
+            runtime.register_worktree_branch(&main, path, branch);
+            runtime.set_pr_state(&main, branch, state);
+        }
+        runtime.local_branches.entry(main.clone()).or_default().insert("agents/merged-without-worktree".to_owned());
+        runtime.set_pr_state(&main, "agents/merged-without-worktree", PrGithubState::Merged);
+
+        let out = done_run_with_context(&done_args(&["worker", "--force"]), &mut runtime, &context).expect("done");
+
+        assert!(out.contains("sweep removed stale worktree"), "{out}");
+        assert!(out.contains("sweep retained") && out.contains("PR open"), "{out}");
+        assert_eq!(runtime.local_branches.get(&main).cloned().unwrap_or_default(), ["agents/open".to_owned()].into());
+    }
+
+    #[test]
+    fn done_sweep_never_removes_a_live_merged_delivery() {
+        let root = DoneTempRoot::new("live-sweep");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let target = main.join("agents/done-target");
+        let live = main.join("agents/live");
+        let mut runtime = DoneFakeRuntime {
+            windows: vec![done_test_window("lead"), done_test_window("worker")],
+            panes: vec![done_test_pane("%88", 1, "codex", &live)],
+            ..DoneFakeRuntime::default()
+        };
+        runtime.pane_info.insert("s:worker".to_owned(), ("codex".to_owned(), target.display().to_string()));
+        for (path, branch) in [(&target, "agents/done-target"), (&live, "agents/live")] {
+            runtime.register_worktree_branch(&main, path, branch);
+            runtime.set_pr_state(&main, branch, PrGithubState::Merged);
+        }
+
+        let out = done_run_with_context(&done_args(&["worker", "--force"]), &mut runtime, &context).expect("done");
+
+        assert!(out.contains("sweep retained") && out.contains("live pane"), "{out}");
+        assert!(runtime.registered[&main].contains(&live));
+    }
+
+    #[test]
+    fn done_keep_branch_overrides_merged_pr_default() {
+        let root = DoneTempRoot::new("keep-merged");
+        let context = root.context();
+        let main = context.repos_root.join("acme/app");
+        let target = main.join("agents/done-target");
+        let mut runtime = DoneFakeRuntime { windows: vec![done_test_window("lead"), done_test_window("worker")], ..DoneFakeRuntime::default() };
+        runtime.pane_info.insert("s:worker".to_owned(), ("codex".to_owned(), target.display().to_string()));
+        runtime.register_worktree_branch(&main, &target, "agents/done-target");
+        runtime.set_pr_state(&main, "agents/done-target", PrGithubState::Merged);
+
+        let out = done_run_with_context(&done_args(&["worker", "--force", "--keep-branch"]), &mut runtime, &context).expect("done");
+
+        assert!(out.contains("retained (--keep-branch)"), "{out}");
+        assert!(runtime.local_branches[&main].contains("agents/done-target"));
     }
 
     #[test]

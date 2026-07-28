@@ -48,6 +48,8 @@ Migrated from maw-js fork patches:
 - auto-save push is now guarded; it skips push when branch is `main`, `HEAD`, empty, has no live remote branch, or its PR is `MERGED`/`CLOSED`
 - branch/PR-state guard has pure unit coverage so upstream sync cannot silently remove the behavior
 - existing lead-window self-guard, retrospective command selection, worktree removal, and fleet config cleanup remain on the existing command surface
+- `maw done` now deletes a delivery branch by default only after the shared PR reconciliation path confirms it is `MERGED`; `--keep-branch` preserves it
+- after a successful worktree removal, `maw done` sweeps only that repo's non-live `agents/` worktrees with no open PR and its merged `agents/*` branches
 
 Proof tests:
 
