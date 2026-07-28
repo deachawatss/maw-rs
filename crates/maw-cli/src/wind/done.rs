@@ -42,7 +42,7 @@ where
     }
 }
 
-pub use super::done_rescue::{preview_rescue_psi, rescue_psi};
+pub use super::done_rescue::{preview_rescue_psi, rescue_psi, rescue_psi_into};
 
 fn wait_interval() -> Duration {
     std::env::var("MAW_DONE_RRR_WAIT_INTERVAL_MS")

@@ -13,7 +13,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// Returns an error when Git inspection fails or when a rescue copy cannot be completed.
 pub fn rescue_psi(worktree_path: &Path, fallback_main_path: &Path) -> Result<Vec<PathBuf>, String> {
-    rescue_psi_with_mode(worktree_path, fallback_main_path, false)
+    rescue_psi_with_mode(worktree_path, fallback_main_path, None, false)
+}
+
+/// Rescue into an explicit vault root instead of the worktree's own main checkout.
+///
+/// A delivery's notes belong to the oracle that dispatched it, not to whichever
+/// repo the worktree happens to sit in — that vault is what Oracle v3 indexes, so
+/// it is the only destination that makes a retro findable again. The caller
+/// resolves the root (it needs fleet config, which this module deliberately does
+/// not depend on) and is responsible for reporting which root it chose.
+///
+/// # Errors
+///
+/// Returns an error when Git inspection fails or when a rescue copy cannot be completed.
+pub fn rescue_psi_into(
+    worktree_path: &Path,
+    destination_root: &Path,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>, String> {
+    if dry_run {
+        match std::fs::symlink_metadata(worktree_path.join(".git")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "inspect ψ rescue Git metadata '{}': {error}",
+                    worktree_path.display()
+                ));
+            }
+        }
+    }
+    rescue_psi_with_mode(
+        worktree_path,
+        destination_root,
+        Some(destination_root),
+        dry_run,
+    )
 }
 
 /// List the `ψ/` files that a rescue would copy without modifying the main checkout.
@@ -36,12 +72,13 @@ pub fn preview_rescue_psi(
             ));
         }
     }
-    rescue_psi_with_mode(worktree_path, fallback_main_path, true)
+    rescue_psi_with_mode(worktree_path, fallback_main_path, None, true)
 }
 
 fn rescue_psi_with_mode(
     worktree_path: &Path,
     fallback_main_path: &Path,
+    destination_root: Option<&Path>,
     dry_run: bool,
 ) -> Result<Vec<PathBuf>, String> {
     let status = git(&[
@@ -69,7 +106,12 @@ fn rescue_psi_with_mode(
     if sources.is_empty() {
         return Ok(Vec::new());
     }
-    let main_psi = main_path_from_git(worktree_path, fallback_main_path).join("ψ");
+    let main_psi = destination_root
+        .map_or_else(
+            || main_path_from_git(worktree_path, fallback_main_path),
+            Path::to_path_buf,
+        )
+        .join("ψ");
     let timestamp = unix_timestamp();
     let mut rescued = Vec::new();
     for source in sources {
@@ -303,9 +345,107 @@ fn git_error_detail(stderr: &str, code: Option<i32>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn git_errors_without_stderr_include_exit_status() {
         assert_eq!(git_error_detail("", Some(64)), "git exited with status 64");
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("maw-rs-rescue-{label}-{stamp}"));
+        std::fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn write(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(path, body).expect("write fixture file");
+    }
+
+    /// A worktree whose `.gitignore` swallows `ψ/`, holding one untracked retro.
+    fn gitignored_psi_worktree(label: &str) -> PathBuf {
+        let worktree = temp_dir(label);
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "gale@example.invalid"],
+            vec!["config", "user.name", "Gale"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args(&args)
+                .output()
+                .expect("run git");
+            assert!(status.status.success(), "git {args:?} failed");
+        }
+        write(&worktree.join(".gitignore"), "ψ/\n");
+        write(
+            &worktree.join("ψ/memory/retrospectives/2026-07/28/x.md"),
+            "# retro that must survive retirement\n",
+        );
+        worktree
+    }
+
+    #[test]
+    fn rescue_carries_out_a_gitignored_note_into_the_named_vault() {
+        // The reported case in #175: `ψ/` is gitignored in the worktree, so the
+        // note is invisible to `git status` — it must still be rescued, and it
+        // must land in the vault the caller names rather than the worktree's own
+        // main checkout.
+        let worktree = gitignored_psi_worktree("ignored");
+        let vault = temp_dir("vault");
+
+        let rescued = rescue_psi_into(&worktree, &vault, false).expect("rescue");
+
+        assert_eq!(rescued.len(), 1, "rescued: {rescued:?}");
+        let landed = vault.join("ψ/memory/retrospectives/2026-07/28/x.md");
+        assert!(landed.is_file(), "not rescued into the vault: {rescued:?}");
+        assert_eq!(
+            std::fs::read_to_string(&landed).expect("read rescued"),
+            "# retro that must survive retirement\n"
+        );
+    }
+
+    #[test]
+    fn rescue_into_a_vault_never_overwrites_an_existing_note() {
+        // AC 3: the collision rule must cover the new destination too, or a
+        // second delivery silently clobbers the first one's retro.
+        let worktree = gitignored_psi_worktree("collide");
+        let vault = temp_dir("vault-collide");
+        let occupied = vault.join("ψ/memory/retrospectives/2026-07/28/x.md");
+        write(&occupied, "# the note already there\n");
+
+        let rescued = rescue_psi_into(&worktree, &vault, false).expect("rescue");
+
+        assert_eq!(rescued.len(), 1, "rescued: {rescued:?}");
+        assert_eq!(
+            std::fs::read_to_string(&occupied).expect("read incumbent"),
+            "# the note already there\n",
+            "the incumbent note was overwritten"
+        );
+        assert_ne!(rescued[0], occupied, "collision reused the occupied path");
+        assert!(rescued[0].is_file(), "collision copy was not written");
+    }
+
+    #[test]
+    fn rescue_dry_run_into_a_vault_writes_nothing() {
+        let worktree = gitignored_psi_worktree("dry");
+        let vault = temp_dir("vault-dry");
+
+        let previewed = rescue_psi_into(&worktree, &vault, true).expect("preview");
+
+        assert_eq!(previewed.len(), 1, "previewed: {previewed:?}");
+        assert!(
+            !vault.join("ψ").exists(),
+            "dry run created {}",
+            vault.join("ψ").display()
+        );
     }
 }
