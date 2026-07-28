@@ -58,11 +58,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Measured on run 30326663734 (2026-07-28): the step ran all 7 reclaim
+      # options (only tool-cache/large-packages were pinned; the rest default
+      # true) and took 2m59s for 31GiB. Per-option cost/yield from that run's
+      # log (`=> <name>: Saved <size>`, timestamped):
+      #   android          71.5s /  11GiB  (11GiB is the biggest single win,
+      #                                     but also the single slowest step —
+      #                                     not "seconds" as first assumed)
+      #   large-packages   54.1s / 4.5GiB  (apt purge; worst s/GiB of all: ~12)
+      #   tool-cache       28.3s / 5.3GiB  (best throughput of the big ones)
+      #   docker-images    13.1s / 1.9GiB  (irrelevant — job never uses docker)
+      #   dotnet            9.8s / 5.1GiB
+      #   haskell           2.4s / 3.6GiB
+      #   swap-storage      0.0s /    0B   (no swapfile on this image)
+      # Runner starts this step with 88GB free (145GB image, `df -h /` before
+      # cleanup). The full 7-option cleanup used to push that to 119GB before
+      # build+test+clippy ran (and always finished green from there — no
+      # ENOSPC on record). Disabling android/large-packages/docker-images and
+      # keeping tool-cache+dotnet+haskell+swap-storage cuts the step to ~40s
+      # (~2m20s saved) while still reclaiming ~14GiB, leaving ~103GB free
+      # before the build starts: 16GB less than the old 119GB starting point,
+      # but still 15GB above the 88GB the runner has before any cleanup at
+      # all. See issue #181 for the full breakdown; do not re-enable
+      # large-packages without new data showing the workspace needs the room.
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: true
-          large-packages: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: true
 
       - name: Install Rust toolchain
         run: |
