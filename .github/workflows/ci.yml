@@ -19,8 +19,39 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect CI-relevant changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      non_docs: ${{ steps.filter.outputs.non_docs }}
+    steps:
+      - name: Checkout
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@v4
+
+      - name: Detect non-documentation changes
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            non_docs:
+              - '**'
+              - '!**/*.md'
+              - '!docs/**'
+              - '!AGENTS.md'
+              - '!LICENSE'
+              - '!.github/ISSUE_TEMPLATE/**'
+          predicate-quantifier: every
+
   rust:
     name: Rust workspace
+    needs: changes
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.changes.outputs.non_docs == 'true'
     # Self-hosted runner deferred until TK's Linux test server is ready.
     runs-on: ubuntu-latest
     steps:
