@@ -173,6 +173,10 @@ jobs:
 
   musl-static:
     name: MUSL static Extism linkability
+    needs: changes
+    if: >-
+      github.event_name != 'pull_request' ||
+      needs.changes.outputs.non_docs == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
