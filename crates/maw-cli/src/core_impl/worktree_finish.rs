@@ -843,9 +843,9 @@ fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut St
             let action = if dry_run { "[dry-run] would rescue" } else { "rescued" };
             let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m {action} {} uncommitted ψ note(s) to main before removal", rescued.len());
         }
-        Ok(_) if done_psi_has_entries(worktree) => {
+        Ok(_) if done_psi_skipped_symlink(worktree) => {
             let prefix = if dry_run { "[dry-run] " } else { "" };
-            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m {prefix}ψ rescue found no uncommitted notes although ψ/ is non-empty");
+            let _ = writeln!(stdout, "  \x1b[33m⚠\x1b[0m {prefix}ψ rescue carried nothing out and ψ/ contains a symlink; symlinks are never followed. Move any real note off the link before retiring.");
         }
         Ok(_) => {}
         Err(error) => {
@@ -854,8 +854,48 @@ fn done_rescue_psi_notes(worktree: &DoneWorktree, dry_run: bool, stdout: &mut St
     }
 }
 
-fn done_psi_has_entries(worktree: &DoneWorktree) -> bool {
-    std::fs::read_dir(worktree.full_path.join("ψ")).is_ok_and(|mut entries| entries.next().is_some())
+/// Did the rescue scan silently skip something it could not carry out?
+///
+/// `collect_psi_source` never follows a symlink — deliberately, because a planted
+/// `ψ/leak -> ~/.ssh/id_rsa` would otherwise be copied into the main checkout. That
+/// guard is correct and stays, but it is also the one way a real note can sit in
+/// `ψ/` and be silently left behind, so it is worth a warning.
+///
+/// This replaces a bare "is `ψ/` non-empty?" check. Every worktree carries tracked,
+/// unmodified `ψ/teams/*.yaml`, so that check was true on essentially every
+/// retirement and the warning fired even when there was correctly nothing to rescue —
+/// observed 7 times in one session on 2026-07-28. A warning that fires on the healthy
+/// path teaches operators to ignore it, which is worse than not having it.
+fn done_psi_skipped_symlink(worktree: &DoneWorktree) -> bool {
+    let psi = worktree.full_path.join("ψ");
+    if std::fs::symlink_metadata(&psi).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return true;
+    }
+    done_psi_dir_has_symlink(&psi, 0)
+}
+
+fn done_psi_dir_has_symlink(dir: &std::path::Path, depth: u32) -> bool {
+    // Bounded: ψ/ is a notes vault, not a source tree. Symlinks are not followed, so
+    // this cannot cycle; the depth cap only stops a pathological tree costing time
+    // during retirement.
+    if depth > 8 {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            return true;
+        }
+        if file_type.is_dir() && done_psi_dir_has_symlink(&entry.path(), depth + 1) {
+            return true;
+        }
+    }
+    false
 }
 
 fn done_remove_selected_worktree(
@@ -1902,7 +1942,135 @@ mod done_tests {
             &mut stdout,
         );
 
-        assert!(stdout.contains("ψ rescue found no uncommitted notes although ψ/ is non-empty"), "{stdout}");
+        // This fixture is the ordinary case, not an anomaly: ψ/ is gitignored, the
+        // only thing in it is a tracked, unmodified ψ/teams/*.yaml, and there is
+        // genuinely nothing to rescue. It used to print
+        //   ⚠ ψ rescue found no uncommitted notes although ψ/ is non-empty
+        // on every single retirement — 7 times in one session on 2026-07-28 —
+        // because the condition was a bare "is ψ/ non-empty?" and every worktree
+        // carries ψ/teams/. Retirement must be quiet when nothing was lost.
+        assert!(
+            !stdout.contains("ψ rescue"),
+            "a clean retirement must not warn about ψ: {stdout}"
+        );
+    }
+
+    #[test]
+    fn done_rescues_a_gitignored_untracked_note() {
+        // Guards the claim the warning made people doubt: a note under a gitignored
+        // ψ/ IS found. collect_psi_source walks the filesystem and takes anything not
+        // in `git ls-files`, so `git status --porcelain` not listing ignored paths is
+        // irrelevant to it. Verified here rather than argued.
+        let root = DoneTempRoot::new("ignored-psi-rescue");
+        let main = root.repos_root().join("acme/app");
+        let worktree = main.join("agents/ignored-psi-rescue");
+        std::fs::create_dir_all(main.join("agents")).expect("worktree parent");
+        std::fs::create_dir_all(main.join("ψ/teams")).expect("tracked ψ dir");
+        done_run_process("git", &["init"], Some(&main));
+        std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
+        std::fs::write(main.join("README.md"), "ignored rescue fixture\n").expect("seed readme");
+        std::fs::write(main.join("ψ/teams/roster.yaml"), "name: gale\n").expect("tracked ψ file");
+        done_run_process("git", &["add", ".gitignore", "README.md"], Some(&main));
+        done_run_process("git", &["add", "-f", "ψ/teams/roster.yaml"], Some(&main));
+        done_run_process(
+            "git",
+            &[
+                "-c", "user.name=maw-test",
+                "-c", "user.email=maw-test@example.invalid",
+                "-c", "commit.gpgsign=false",
+                "commit", "-m", "seed ignored rescue fixture",
+            ],
+            Some(&main),
+        );
+        let worktree_arg = worktree.display().to_string();
+        done_run_process(
+            "git",
+            &["worktree", "add", "-b", "agents/ignored-psi-rescue", &worktree_arg],
+            Some(&main),
+        );
+        std::fs::create_dir_all(worktree.join("ψ/notes")).expect("note dir");
+        std::fs::write(worktree.join("ψ/notes/scratch.md"), "keep me\n").expect("untracked note");
+        // Prove the premise: git itself will not list it.
+        let status = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &worktree.display().to_string(), "status", "--porcelain", "--", "ψ/"])
+                .output()
+                .expect("git status")
+                .stdout,
+        )
+        .into_owned();
+        assert!(status.trim().is_empty(), "fixture must be gitignored: {status}");
+
+        let mut stdout = String::new();
+        done_rescue_psi_notes(
+            &DoneWorktree {
+                main_path: main.clone(),
+                full_path: worktree,
+                label: "acme/app/agents/ignored-psi-rescue".to_owned(),
+            },
+            false,
+            &mut stdout,
+        );
+
+        assert!(stdout.contains("rescued 1 uncommitted ψ note(s)"), "{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(main.join("ψ/notes/scratch.md")).expect("rescued note"),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn done_warns_when_a_psi_symlink_was_skipped_and_nothing_was_carried_out() {
+        // The one way a real note is silently left behind: collect_psi_source never
+        // follows a symlink (a planted ψ/leak -> ~/.ssh/id_rsa would otherwise be
+        // copied into main). That guard stays; the operator gets told.
+        let root = DoneTempRoot::new("symlink-psi-rescue");
+        let main = root.repos_root().join("acme/app");
+        let worktree = main.join("agents/symlink-psi-rescue");
+        std::fs::create_dir_all(main.join("agents")).expect("worktree parent");
+        std::fs::create_dir_all(main.join("ψ/teams")).expect("tracked ψ dir");
+        done_run_process("git", &["init"], Some(&main));
+        std::fs::write(main.join(".gitignore"), "ψ/\n").expect("ignore ψ");
+        std::fs::write(main.join("README.md"), "symlink rescue fixture\n").expect("seed readme");
+        std::fs::write(main.join("ψ/teams/roster.yaml"), "name: gale\n").expect("tracked ψ file");
+        done_run_process("git", &["add", ".gitignore", "README.md"], Some(&main));
+        done_run_process("git", &["add", "-f", "ψ/teams/roster.yaml"], Some(&main));
+        done_run_process(
+            "git",
+            &[
+                "-c", "user.name=maw-test",
+                "-c", "user.email=maw-test@example.invalid",
+                "-c", "commit.gpgsign=false",
+                "commit", "-m", "seed symlink rescue fixture",
+            ],
+            Some(&main),
+        );
+        let worktree_arg = worktree.display().to_string();
+        done_run_process(
+            "git",
+            &["worktree", "add", "-b", "agents/symlink-psi-rescue", &worktree_arg],
+            Some(&main),
+        );
+        let elsewhere = root.path.join("outside-note.md");
+        std::fs::write(&elsewhere, "linked\n").expect("link target");
+        std::os::unix::fs::symlink(&elsewhere, worktree.join("ψ/linked.md")).expect("symlink");
+
+        let mut stdout = String::new();
+        done_rescue_psi_notes(
+            &DoneWorktree {
+                main_path: main.clone(),
+                full_path: worktree,
+                label: "acme/app/agents/symlink-psi-rescue".to_owned(),
+            },
+            false,
+            &mut stdout,
+        );
+
+        assert!(stdout.contains("contains a symlink"), "{stdout}");
+        assert!(
+            !main.join("ψ/linked.md").exists(),
+            "the symlink target must never be copied into main"
+        );
     }
 
     #[test]
