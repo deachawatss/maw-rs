@@ -263,7 +263,23 @@ fn doctor_check_version(options: &DoctorOptions) -> DoctorCheckNative {
     }
     match doctor_probe_daemon_build(port) {
         Some(running) if running == installed => {
-            doctor_ok("version", &format!("daemon and installed binary both {installed}"))
+            // Daemon and binary agreeing is only two of the three states. Both can
+            // be equally stale against merged `main`, which reads as a clean pass
+            // while the exact condition #121 exists to catch is present — observed
+            // on 2026-07-28 reporting `both 090c24d` with main at 1ccef0d.
+            match doctor_binary_behind_main(installed).as_deref() {
+                Some(tip) => doctor_warn(
+                    "version",
+                    &format!(
+                        "daemon and installed binary both {installed}, but the maw-rs checkout's main is at {tip} — the binary has not been rebuilt since that merge"
+                    ),
+                    &["cargo build --release && install -m755 target/release/maw-rs ~/.local/bin/maw-rs", "pm2 restart maw-serve"],
+                ),
+                // No readable checkout (fresh clone, no repo) — unknown is not
+                // stale, and an advisory that fires on a missing checkout gets
+                // ignored. Report what was actually verified.
+                _ => doctor_ok("version", &format!("daemon and installed binary both {installed}")),
+            }
         }
         Some(running) => doctor_warn(
             "version",
@@ -282,6 +298,50 @@ fn doctor_check_version(options: &DoctorOptions) -> DoctorCheckNative {
             &["pm2 restart maw-serve"],
         ),
     }
+}
+
+/// `main`'s short commit, when the installed binary is strictly **behind** it.
+///
+/// `None` in every other case, and the distinction matters more than the check:
+///
+/// - binary equals `main`      → nothing to report;
+/// - binary is *ahead* of `main` or on a side branch → **not stale**. That is the
+///   normal state while developing, and warning there would fire on every
+///   feature branch until the check was ignored — the exact fate #198 describes;
+/// - no checkout, dirty build stamp, or unknown commit → unknown is not stale.
+///
+/// Ancestry, not string inequality, is what separates behind from ahead. Local
+/// refs only — no fetch. `origin/main` after a fetch answers a different question
+/// (what exists upstream) than the one asked here (what has been merged locally).
+fn doctor_binary_behind_main(installed: &str) -> Option<String> {
+    let repo = option_env!("CARGO_MANIFEST_DIR")?;
+    let commit = installed.trim().trim_start_matches('v');
+    // A `-dirty` stamp is an uncommitted local build; there is no commit to compare.
+    if commit.is_empty() || commit.contains("dirty") {
+        return None;
+    }
+    let git = |args: &[&str]| {
+        std::process::Command::new("git").arg("-C").arg(repo).args(args).output().ok()
+    };
+    let tip = git(&["rev-parse", "--short", "main"])?;
+    if !tip.status.success() {
+        return None;
+    }
+    let tip = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+    if tip.is_empty() {
+        return None;
+    }
+    // Strictly behind: an ancestor of main, and not main itself. Compare resolved
+    // full SHAs rather than the abbreviations, which are produced independently.
+    if !git(&["merge-base", "--is-ancestor", commit, "main"])?.status.success() {
+        return None;
+    }
+    let built = git(&["rev-parse", &format!("{commit}^{{commit}}")])?;
+    let head = git(&["rev-parse", "main^{commit}"])?;
+    if !built.status.success() || !head.status.success() || built.stdout == head.stdout {
+        return None;
+    }
+    Some(tip)
 }
 
 /// Read `buildVersion` from the daemon's `/api/health`.
@@ -726,8 +786,32 @@ fn doctor_plural(count: usize) -> &'static str { if count == 1 { "" } else { "s"
 
 #[cfg(test)]
 mod doctor_tests {
-    use super::{doctor_parse_args, run_doctor_command, CliOutput, DISPATCH_65};
+    use super::{doctor_binary_behind_main, doctor_parse_args, run_doctor_command, CliOutput, DISPATCH_65};
     use std::fs;
+
+    /// #198 AC 5: a dirty or unreadable build stamp is *unknown*, never stale.
+    ///
+    /// The ancestry half needs a real repository and `doctor_binary_behind_main`
+    /// resolves its checkout from `CARGO_MANIFEST_DIR` at compile time, so it
+    /// cannot be pointed at a fixture. What is asserted here is the guard that
+    /// decides whether ancestry is even consulted — which is where a false
+    /// positive would come from, and a check that cries wolf gets ignored.
+    #[test]
+    fn doctor_binary_behind_main_treats_unknown_stamps_as_not_stale() {
+        assert!(doctor_binary_behind_main("").is_none(), "empty stamp is unknown, not stale");
+        assert!(
+            doctor_binary_behind_main("1ccef0d-dirty").is_none(),
+            "a dirty local build has no commit to compare"
+        );
+        assert!(
+            doctor_binary_behind_main("v1ccef0d-dirty").is_none(),
+            "the v prefix must not defeat the dirty guard"
+        );
+        assert!(
+            doctor_binary_behind_main("deadbeef").is_none(),
+            "a commit this repo does not contain is unknown, not stale"
+        );
+    }
 
     struct DoctorEnvRestore { key: &'static str, value: Option<std::ffi::OsString> }
 
