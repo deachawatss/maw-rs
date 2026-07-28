@@ -1753,7 +1753,6 @@ mod pr_tests {
     }
 
     #[test]
-    #[test]
     fn pr_overrides_title_body_and_rejects_detached_head() {
         // `pr_write_delivery` sets the process-global MAW_STATE_DIR; without this
         // lock a concurrent test repoints it mid-run. See the note on
