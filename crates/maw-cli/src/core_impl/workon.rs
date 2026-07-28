@@ -285,8 +285,161 @@ fn workon_help_value_flags() -> &'static [&'static str] {
     &["--layout", "--name", "--base", "-e", "--engine", "--profile", "--oracle", "--session", "--prompt"]
 }
 
+/// Risk tags that require a committed spec before dispatch.
+const WORKON_SPEC_RISK_TAGS: &[&str] = &["api", "db", "security"];
+
+/// Seconds `gh` may take before the advisory gives up silently.
+const WORKON_SPEC_LOOKUP_TIMEOUT: &str = "6";
+
+/// Risk tags declared in an issue body.
+///
+/// Product repos carry these as prose, not labels — both `Risk tags: security`
+/// and the `DISPATCH:` block's `Risk: security, api` are in use. A `none` or
+/// negated token (`no api`, `not security`) drops only that token, never the
+/// whole declaration, so `Risk tags: security, no db` still reports `security`.
+fn workon_risk_tags_from_body(body: &str) -> std::collections::BTreeSet<String> {
+    let mut tags = std::collections::BTreeSet::new();
+    for line in body.lines() {
+        let lower = line.trim().to_ascii_lowercase();
+        let Some(rest) = lower
+            .strip_prefix("- risk tags:")
+            .or_else(|| lower.strip_prefix("risk tags:"))
+            .or_else(|| lower.strip_prefix("- risk:"))
+            .or_else(|| lower.strip_prefix("risk:"))
+        else {
+            continue;
+        };
+        for raw in rest.split(&[',', ';'][..]) {
+            let token = raw.trim().trim_matches(&['`', '*', '"', '\''][..]).trim();
+            if token.is_empty() || token == "none" {
+                continue;
+            }
+            // "no api" / "not security" negate that one tag only.
+            if token.starts_with("no ") || token.starts_with("not ") {
+                continue;
+            }
+            if WORKON_SPEC_RISK_TAGS.contains(&token) || token == "ui" || token == "performance" || token == "release" {
+                tags.insert(token.to_owned());
+            }
+        }
+    }
+    tags
+}
+
+fn workon_spec_is_required(tags: &std::collections::BTreeSet<String>) -> bool {
+    tags.iter().any(|tag| WORKON_SPEC_RISK_TAGS.contains(&tag.as_str()))
+}
+
+/// Does `specs/<issue>-*.md` exist on `base_ref`?
+fn workon_spec_committed(repo_path: &std::path::Path, base_ref: &str, issue: u64) -> Option<bool> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["ls-tree", "--name-only", base_ref, "specs/"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = format!("specs/{issue}-");
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|path| path.trim().starts_with(&prefix)),
+    )
+}
+
+/// Issue body text, or `None` when `gh` is missing, unauthenticated, or offline.
+fn workon_issue_body(repo_slug: &str, issue: u64) -> Option<String> {
+    let output = std::process::Command::new("timeout")
+        .args([
+            WORKON_SPEC_LOOKUP_TIMEOUT,
+            "gh",
+            "issue",
+            "view",
+            &issue.to_string(),
+            "--repo",
+            repo_slug,
+            "--json",
+            "body",
+            "--jq",
+            ".body",
+        ])
+        .output()
+        .ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Advise — never block — when a spec-requiring issue has no committed spec.
+///
+/// #117: this lived as a `PreToolUse` shell hook that regex-parsed the command
+/// line, and three review rounds each found another valid invocation it
+/// mis-parsed (`-e codex <repo>` read the engine as the repo; an `issue-N` inside
+/// `--prompt` won over the real slug). maw already has the arguments parsed and
+/// validated, so the check is exact here. The issue number comes from the task
+/// slug only — never from `--prompt`.
+fn workon_warn_missing_spec(options: &WorkonOptions, repo: &WorkonRepo) {
+    let Some(task) = options.task.as_deref() else { return };
+    let Some(issue) = pr_extract_issue_num(task) else { return };
+    // Lightweight lane is exempt: spec policy is product/permissive only.
+    if !matches!(native_repo_marker_kind(&repo.repo_path), Some(NativeRepoKind::Project) | None) {
+        return;
+    }
+    let Some(slug) = workon_repo_slug(&repo.repo_path) else { return };
+    let Some(body) = workon_issue_body(&slug, issue) else { return };
+    let tags = workon_risk_tags_from_body(&body);
+    if !workon_spec_is_required(&tags) {
+        return;
+    }
+    let base_ref = options.base.as_deref().unwrap_or("main");
+    if workon_spec_committed(&repo.repo_path, base_ref, issue) != Some(false) {
+        return;
+    }
+    let named = tags
+        .iter()
+        .filter(|tag| WORKON_SPEC_RISK_TAGS.contains(&tag.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!(
+        "  \x1b[33m⚠\x1b[0m issue #{issue} is tagged {named} but no specs/{issue}-*.md is committed on {base_ref}.\n  \
+           \x1b[90m  a correct L2 will block without it — land the spec first (/sop-design), or confirm none is required.\x1b[0m\n  \
+           \x1b[90m  dispatching anyway.\x1b[0m"
+    );
+}
+
+/// `owner/repo` for `gh --repo`, from the checkout's origin remote.
+fn workon_repo_slug(repo_path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    workon_ssh_or_https_slug(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// `owner/repo` from either remote URL shape, or `None` when it is neither.
+fn workon_ssh_or_https_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    if !url.contains('/') {
+        return None;
+    }
+    // `git@host:owner/repo.git` — strip the host before the colon.
+    let tail = url.rsplit_once(':').map_or(url, |(_, tail)| tail);
+    let tail = tail.trim_end_matches(".git");
+    let mut parts = tail.rsplit('/');
+    let repo = parts.next()?;
+    let owner = parts.next()?;
+    (!owner.is_empty() && !repo.is_empty() && !owner.contains(':')).then(|| format!("{owner}/{repo}"))
+}
+
 fn workon_cmd(options: &WorkonOptions) -> Result<String, String> {
     let repo = workon_resolve_repo(&options.repo)?;
+    workon_warn_missing_spec(options, &repo);
     if options.profile.is_some() && options.engine.as_deref().is_some_and(|engine| engine == "claude") {
         eprintln!("workon: --profile is ignored for claude");
     }
@@ -1699,6 +1852,67 @@ mod workon_tests {
     }
 
     fn workon_strings(values: &[&str]) -> Vec<String> { values.iter().map(|value| (*value).to_owned()).collect() }
+
+    /// #117 AC 2: the three invocations the Wind-Framework shell hook mis-parsed.
+    ///
+    /// Each one is a valid `maw workon` line that a regex over the command line
+    /// read wrongly — `-e codex <repo>` gave `repo=codex`, `--layout nested <repo>`
+    /// gave `repo=nested`, and an `issue-N` inside `--prompt` beat the real slug.
+    /// maw's own parser gets all three right, which is the whole argument for
+    /// moving the check in here.
+    #[test]
+    fn workon_resolves_the_real_repo_and_issue_under_flag_reordering() {
+        let flag_first = workon_parse_args(&workon_strings(&["-e", "codex", "maw-rs", "issue-131-x"]))
+            .expect("engine flag before repo");
+        assert_eq!(flag_first.repo, "maw-rs", "hook read repo=codex here");
+        assert_eq!(pr_extract_issue_num(flag_first.task.as_deref().unwrap()), Some(131));
+
+        let layout_first = workon_parse_args(&workon_strings(&["--layout", "nested", "maw-rs", "issue-131-x"]))
+            .expect("layout flag before repo");
+        assert_eq!(layout_first.repo, "maw-rs", "hook read repo=nested here");
+
+        // The decoy: `issue-999` lives only in --prompt, and the issue number must
+        // come from the task slug. This is where the hook warned about #999.
+        let decoy = workon_parse_args(&workon_strings(&[
+            "maw-rs",
+            "issue-140-real",
+            "--prompt",
+            "deliver issue-999-decoy",
+        ]))
+        .expect("prompt with a decoy issue token");
+        assert_eq!(pr_extract_issue_num(decoy.task.as_deref().unwrap()), Some(140));
+        assert!(decoy.prompt.as_deref().unwrap().contains("issue-999-decoy"));
+    }
+
+    #[test]
+    fn workon_risk_tags_read_both_prose_forms_and_drop_only_negated_tokens() {
+        // Product repos carry risk tags as prose; GitHub labels for these do not
+        // exist there, so the body is the only source.
+        let dispatch_block = workon_risk_tags_from_body("## DISPATCH\n- Risk tags: security, api\n");
+        assert!(workon_spec_is_required(&dispatch_block));
+        assert!(dispatch_block.contains("security") && dispatch_block.contains("api"));
+
+        let short_form = workon_risk_tags_from_body("Risk: db\n");
+        assert!(workon_spec_is_required(&short_form));
+
+        // A negated token drops itself, not the whole declaration.
+        let mixed = workon_risk_tags_from_body("- Risk tags: security, no db\n");
+        assert!(mixed.contains("security"), "{mixed:?}");
+        assert!(!mixed.contains("db"), "a negated tag must not be reported: {mixed:?}");
+
+        // `none` and non-spec tags must not trigger the advisory.
+        assert!(!workon_spec_is_required(&workon_risk_tags_from_body("- Risk tags: none\n")));
+        assert!(!workon_spec_is_required(&workon_risk_tags_from_body("- Risk tags: ui, performance\n")));
+        assert!(!workon_spec_is_required(&workon_risk_tags_from_body("no risk line at all\n")));
+    }
+
+    #[test]
+    fn workon_repo_slug_parses_both_remote_url_shapes() {
+        assert_eq!(workon_ssh_or_https_slug("git@github.com:deachawatss/maw-rs.git"), Some("deachawatss/maw-rs".to_owned()));
+        assert_eq!(workon_ssh_or_https_slug("https://github.com/deachawatss/maw-rs.git"), Some("deachawatss/maw-rs".to_owned()));
+        assert_eq!(workon_ssh_or_https_slug("https://github.com/deachawatss/maw-rs"), Some("deachawatss/maw-rs".to_owned()));
+        assert_eq!(workon_ssh_or_https_slug("not-a-url"), None);
+    }
 
     #[test]
     fn workon_prefix_zai_pool_exports_group_only_when_safe() {
