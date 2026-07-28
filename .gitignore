@@ -2,9 +2,17 @@ target/
 node_modules/
 packages/*/node_modules/
 examples/**/dist/
+# Vault. Delivery scratch stays out of the repo, but memory is durable and
+# must be committed — `ψ/memory/` held 18 learnings with 0 tracked, so every
+# lesson lived on one machine's disk and nowhere else.
+#
+# `ψ/` (a bare directory exclude) previously sat below these and made the
+# `!` lines inert: git does not descend into an excluded directory, so a
+# child can never be re-included. `ψ/teams/` only survived because those
+# files predate the rule and gitignore does not affect tracked files.
 ψ/*
 !ψ/teams/
-ψ/
+!ψ/memory/
 
 # codex coder runtime homes (worktree-local CODEX_HOME)
 .codex/
