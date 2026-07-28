@@ -17,6 +17,7 @@ pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
     ".maw/l1-review-request.json",
     ".maw/delivery-notified",
     ".maw/l1-oracle",
+    ".maw/l1-pane",
     ".maw/pane-id",
     ".maw/auto-done-pinged",
     ".maw/phase.json",
@@ -29,7 +30,6 @@ pub(crate) const EPHEMERAL_MARKERS: &[&str] = &[
 ];
 
 const LEGACY_MARKERS: &[&str] = &[
-    ".maw/l1-pane",
     ".maw/strategy.json",
     ".maw/solo-justified",
     ".maw/spec-waived",
@@ -95,7 +95,11 @@ pub(crate) fn prepare_engine(
     Ok(resolution)
 }
 
-pub(crate) fn record_l1_oracle(cwd: &Path, oracle: &str) -> Result<bool, String> {
+pub(crate) fn record_l1_oracle(
+    cwd: &Path,
+    oracle: &str,
+    pane: Option<&str>,
+) -> Result<bool, String> {
     let oracle = oracle.trim();
     if !valid_oracle_name(oracle) {
         return Ok(false);
@@ -103,13 +107,25 @@ pub(crate) fn record_l1_oracle(cwd: &Path, oracle: &str) -> Result<bool, String>
     let dir = cwd.join(".maw");
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("workon: create {}: {error}", dir.display()))?;
-    let path = dir.join("l1-oracle");
-    let tmp = dir.join(format!(".l1-oracle.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{oracle}\n"))
+    if let Some(pane) = pane.map(str::trim) {
+        if !crate::wind::team::is_valid_pane_id(pane) {
+            return Err(format!("workon: invalid L1 pane {pane:?}"));
+        }
+    }
+    record_l1_marker(&dir, "l1-oracle", oracle)?;
+    if let Some(pane) = pane.map(str::trim) {
+        record_l1_marker(&dir, "l1-pane", pane)?;
+    }
+    Ok(true)
+}
+
+fn record_l1_marker(dir: &Path, name: &str, value: &str) -> Result<(), String> {
+    let path = dir.join(name);
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{value}\n"))
         .map_err(|error| format!("workon: write {}: {error}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
-        .map_err(|error| format!("workon: replace {}: {error}", path.display()))?;
-    Ok(true)
+        .map_err(|error| format!("workon: replace {}: {error}", path.display()))
 }
 
 fn valid_oracle_name(value: &str) -> bool {
@@ -448,6 +464,7 @@ mod tests {
             ".maw/l1-review-request.json",
             ".maw/delivery-notified",
             ".maw/l1-oracle",
+            ".maw/l1-pane",
             ".maw/pane-id",
             ".maw/auto-done-pinged",
             ".maw/phase.json",
@@ -492,6 +509,22 @@ mod tests {
         assert!(!valid_oracle_name(" 50-mawjs"));
         assert!(!valid_oracle_name("-oracle"));
         assert!(!valid_oracle_name("oracle\nnext"));
+    }
+
+    #[test]
+    fn workon_records_the_dispatching_l1_pane_with_its_oracle() {
+        let dir = temp_dir("l1-handoff");
+
+        assert!(record_l1_oracle(&dir, "01-gale", Some("%42")).expect("record handoff"));
+
+        assert_eq!(
+            fs::read_to_string(dir.join(".maw/l1-oracle")).expect("oracle marker"),
+            "01-gale\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(".maw/l1-pane")).expect("pane marker"),
+            "%42\n"
+        );
     }
 
     #[test]
