@@ -544,7 +544,7 @@ fn kill_parse_non_negative(value: &str, flag: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag} must be a non-negative integer (got {value})"))
 }
 
-/// Split `session[:window[.pane]]`.
+/// Split `session[:window][.pane]`.
 ///
 /// The trailing `.pane` used to be left inside the window component, where
 /// `kill_matching_window_indexes` compared it against window *names* — so
@@ -553,22 +553,38 @@ fn kill_parse_non_negative(value: &str, flag: &str) -> Result<u32, String> {
 /// fine. `maw ls` prints that form, so the listing named targets the killer
 /// refused. Same digit-suffix rule the shared route resolver uses
 /// (`route_split_pane_suffix`), kept deliberately identical so the two agree.
+///
+/// The suffix is stripped whether or not a `:window` is present. `maw ls`
+/// also prints the bare alias form `gale.1`, and the shared route resolver
+/// splits that one too (`route_agent_name_from_query` takes the whole query
+/// as the name when there is no colon, then strips the digit suffix) — so
+/// `maw capture gale.1` resolved a pane while `maw kill gale.1` looked for a
+/// *session* literally named `gale.1` and reported it missing. Consistency
+/// with that resolver is the contract in #179 AC 1/AC 2; it also means a
+/// session whose name really ends in `.<digits>` is addressed as
+/// `session:window` here exactly as it already must be for capture/hey.
 fn kill_split_target(target: &str) -> (String, String, Option<u32>) {
-    let (session, window) = target.split_once(':').map_or_else(
-        || (target.to_owned(), String::new()),
-        |(session, window)| (session.to_owned(), window.to_owned()),
-    );
-    if let Some((window_part, pane_part)) = window.rsplit_once('.') {
-        if !window_part.is_empty()
+    let Some((session, window)) = target.split_once(':') else {
+        let (session, pane) = kill_split_pane_suffix(target);
+        return (session.to_owned(), String::new(), pane);
+    };
+    let (window, pane) = kill_split_pane_suffix(window);
+    (session.to_owned(), window.to_owned(), pane)
+}
+
+/// Trailing `.<digits>` names a pane; anything else stays part of the name.
+fn kill_split_pane_suffix(value: &str) -> (&str, Option<u32>) {
+    if let Some((head, pane_part)) = value.rsplit_once('.') {
+        if !head.is_empty()
             && !pane_part.is_empty()
             && pane_part.bytes().all(|byte| byte.is_ascii_digit())
         {
             if let Ok(pane) = pane_part.parse::<u32>() {
-                return (session, window_part.to_owned(), Some(pane));
+                return (head, Some(pane));
             }
         }
     }
-    (session, window, None)
+    (value, None)
 }
 
 fn kill_resolve_and_apply(
@@ -587,7 +603,31 @@ fn kill_resolve_and_apply(
             let session = kill_find_session(sessions, &matched)?;
             kill_apply_resolved(tmux, session, raw_window, options)
         }
+        // `Fuzzy` collapses two very different things, and a destructive verb
+        // must not treat them alike:
+        //
+        //   `gale`  → `01-gale`    fleet alias — the address `maw ls` prints,
+        //                          exact once the fleet number is stripped
+        //   `ftkzz` → `ftkzz-solo` prefix guess — a different session that
+        //                          merely starts with what was typed
+        //
+        // Accepting the first is #179 AC 1 (the listing is the address book).
+        // Accepting the second would kill a session the operator never named,
+        // which `kill_session_is_exact_only_for_destructive_targets` exists to
+        // prevent. `resolve_numeric_fleet_stem_exact` draws exactly that line —
+        // it returns `Exact` only when the candidate is `<digits>-<typed>` —
+        // so the alias is admitted without loosening prefix matching at all.
+        //
+        // The `--force` gate on whole-session kills is untouched; an alias is
+        // only ever allowed to be *non-silent*, hence the resolution note.
         ResolveResult::Fuzzy { matched } => {
+            if let ResolveResult::Exact { matched: alias } =
+                resolve_numeric_fleet_stem_exact(raw_session, &names)
+            {
+                let session = kill_find_session(sessions, &alias)?;
+                let applied = kill_apply_resolved(tmux, session, raw_window, options)?;
+                return Ok(kill_note_alias(raw_session, &session.name, applied));
+            }
             let hints = kill_sessions_for_names(sessions, &[matched]);
             Err(kill_missing_session(raw_session, Some(&hints)))
         }
@@ -606,6 +646,17 @@ fn kill_resolve_and_apply(
             )
         }
     }
+}
+
+/// Append the alias → session resolution to a destructive command's output.
+///
+/// The operator typed `gale`; something named `01-gale` was destroyed. Saying
+/// so is the price of accepting the alias at all.
+fn kill_note_alias(raw_session: &str, resolved: &str, applied: String) -> String {
+    if raw_session.eq_ignore_ascii_case(resolved) {
+        return applied;
+    }
+    format!("{applied}    \x1b[90m{raw_session} → {resolved}\x1b[0m\n")
 }
 
 fn kill_find_session<'a>(
@@ -1245,6 +1296,87 @@ mod kill_tests {
         assert_eq!(
             kill_split_target("01-gale"),
             ("01-gale".to_owned(), String::new(), None)
+        );
+        // Bare alias form, no `:window`. The route resolver splits this one too,
+        // so the killer must as well — see #179 AC 1/AC 2.
+        assert_eq!(
+            kill_split_target("gale.1"),
+            ("gale".to_owned(), String::new(), Some(1))
+        );
+        assert_eq!(
+            kill_split_target("01-gale.12"),
+            ("01-gale".to_owned(), String::new(), Some(12))
+        );
+        // A non-numeric suffix on a bare name is still part of the name.
+        assert_eq!(
+            kill_split_target("v1.2-rc"),
+            ("v1.2-rc".to_owned(), String::new(), None)
+        );
+    }
+
+    #[test]
+    fn kill_accepts_the_bare_alias_pane_form_maw_ls_prints() {
+        // `maw ls -v` prints `gale.1`; `maw kill gale.1` answered
+        // "session 'gale.1' not found" because the suffix was only split after a
+        // `:`. The alias must resolve to 01-gale and the pane to its first window.
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["gale.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert_eq!(kill_killed_pane_targets(&tmux), vec!["01-gale:1.1".to_owned()]);
+        assert!(
+            output.stdout.contains("gale → 01-gale"),
+            "an alias kill must name what it resolved to; stdout: {}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn kill_admits_the_fleet_alias_without_admitting_a_prefix_guess() {
+        // The whole point of routing Fuzzy through `resolve_numeric_fleet_stem_exact`:
+        // `gale` is `01-gale` with the fleet number stripped, so it is an address.
+        // `ftkzz` is not `<digits>-ftkzz-solo`, so it stays a guess and stays refused.
+        let mut fleet = kill_fake_gale();
+        let alias = kill_run_fake(&kill_strings(&["gale.1"]), &mut fleet);
+        assert_eq!(alias.code, 0, "fleet alias must resolve; stderr: {}", alias.stderr);
+
+        let mut plain = kill_fake("ftkzz-solo|||0|||main|||1|||/tmp\n");
+        let guess = kill_run_fake(&kill_strings(&["ftkzz", "--force"]), &mut plain);
+        assert_eq!(guess.code, 1, "prefix guess must stay refused even with --force");
+        assert!(
+            !plain.calls.iter().any(|call| call.0.starts_with("kill-")),
+            "a refused guess must destroy nothing; calls: {:?}",
+            plain.calls
+        );
+    }
+
+    #[test]
+    fn kill_does_not_annotate_an_exactly_named_session() {
+        // The alias note is for aliases only — an exact target must stay quiet.
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["01-gale:1.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert_eq!(output.stdout, "  \x1b[32m✓\x1b[0m killed pane 01-gale:1.1\n");
+    }
+
+    #[test]
+    fn kill_bare_alias_pane_needs_no_force_and_spares_the_session() {
+        // The whole point of #179: killing a pane must not require the
+        // session-destroying --force, and must not escalate to it either.
+        let mut tmux = kill_fake_gale();
+        let output = kill_run_fake(&kill_strings(&["gale.1"]), &mut tmux);
+
+        assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+        assert!(
+            !output.stderr.contains("--force"),
+            "a pane kill must not demand --force; stderr: {}",
+            output.stderr
+        );
+        assert!(
+            !tmux.calls.iter().any(|(verb, _)| verb == "kill-window" || verb == "kill-session"),
+            "bare alias pane target must not kill the window or session; calls: {:?}",
+            tmux.calls
         );
     }
 
