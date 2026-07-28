@@ -49,6 +49,7 @@ Migrated from maw-js fork patches:
 - branch/PR-state guard has pure unit coverage so upstream sync cannot silently remove the behavior
 - existing lead-window self-guard, retrospective command selection, worktree removal, and fleet config cleanup remain on the existing command surface
 - `maw done` now deletes a delivery branch by default only after the shared PR reconciliation path confirms it is `MERGED`; `--keep-branch` preserves it
+- after a successful merged local-branch deletion, `maw done` also best-effort deletes the matching `origin` branch; remote failures are reported without blocking retirement
 - after a successful worktree removal, `maw done` sweeps only that repo's non-live `agents/` worktrees with no open PR and its merged `agents/*` branches
 
 Proof tests:

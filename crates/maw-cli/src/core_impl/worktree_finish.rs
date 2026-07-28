@@ -1001,12 +1001,12 @@ fn done_cleanup_branch(main_path: &std::path::Path, branch: &str, options: &Done
         return;
     }
     if options.clean_branch {
-        done_delete_branch(main_path, branch, local, stdout, "requested by --clean-branch");
+        done_delete_branch(main_path, branch, local, stdout, "requested by --clean-branch", false);
         return;
     }
     match local.done_pr_state(main_path, branch) {
         Ok(PrGithubState::Merged) => {
-            done_delete_branch(main_path, branch, local, stdout, "merged PR");
+            done_delete_branch(main_path, branch, local, stdout, "merged PR", true);
         }
         Ok(PrGithubState::Open) => {
             let _ = writeln!(stdout, "  \x1b[90m○\x1b[0m branch {branch} retained (PR open)");
@@ -1020,11 +1020,23 @@ fn done_cleanup_branch(main_path: &std::path::Path, branch: &str, options: &Done
     }
 }
 
-fn done_delete_branch(main_path: &std::path::Path, branch: &str, local: &mut impl DoneRuntime, stdout: &mut String, reason: &str) -> bool {
+fn done_delete_branch(main_path: &std::path::Path, branch: &str, local: &mut impl DoneRuntime, stdout: &mut String, reason: &str, delete_remote: bool) -> bool {
     let args = ["-C".to_owned(), main_path.display().to_string(), "branch".to_owned(), "-D".to_owned(), "--".to_owned(), branch.to_owned()];
     match local.done_git(&args) {
         Ok(_) => {
-            let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch} ({reason})");
+            if delete_remote && done_branch_name_allows_push(branch) {
+                let args = ["-C".to_owned(), main_path.display().to_string(), "push".to_owned(), "origin".to_owned(), "--delete".to_owned(), branch.to_owned()];
+                match local.done_git(&args) {
+                    Ok(_) => {
+                        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch} local+remote ({reason})");
+                    }
+                    Err(error) => {
+                        let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch} local ({reason}); remote retained: {error}");
+                    }
+                }
+            } else {
+                let _ = writeln!(stdout, "  \x1b[32m✓\x1b[0m deleted branch {branch} local ({reason})");
+            }
             true
         }
         Err(error) => {
@@ -1200,6 +1212,7 @@ mod done_tests {
         local_branches: std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
         pr_states: std::collections::BTreeMap<(std::path::PathBuf, String), Result<PrGithubState, String>>,
         dirty_removals: std::collections::BTreeSet<std::path::PathBuf>,
+        git_errors: std::collections::BTreeMap<Vec<String>, String>,
         tmux_responses: std::collections::BTreeMap<String, String>,
         git_calls: Vec<Vec<String>>,
         tmux_calls: Vec<(String, Vec<String>)>,
@@ -1266,6 +1279,9 @@ mod done_tests {
 
         fn done_git(&mut self, args: &[String]) -> Result<String, String> {
             self.git_calls.push(args.to_vec());
+            if let Some(error) = self.git_errors.get(args) {
+                return Err(error.clone());
+            }
             let cwd = Self::git_cwd(args).ok_or_else(|| "missing -C".to_owned())?;
             if args.ends_with(&["rev-parse".to_owned(), "--show-toplevel".to_owned()]) {
                 return self
@@ -1968,6 +1984,65 @@ mod done_tests {
     }
 
     #[test]
+    fn done_merged_branch_cleanup_deletes_remote_but_other_pr_states_do_not() {
+        let main = std::path::PathBuf::from("/tmp/acme/app");
+        let branch = "agents/merged-task";
+        let remote_delete = vec![
+            "-C".to_owned(),
+            main.display().to_string(),
+            "push".to_owned(),
+            "origin".to_owned(),
+            "--delete".to_owned(),
+            branch.to_owned(),
+        ];
+        let mut merged = DoneFakeRuntime::default();
+        merged.set_pr_state(&main, branch, PrGithubState::Merged);
+        let mut merged_out = String::new();
+
+        done_cleanup_branch(&main, branch, &DoneOptions::default(), &mut merged, &mut merged_out);
+
+        assert!(merged.git_calls.iter().any(|args| args == &remote_delete), "{:#?}", merged.git_calls);
+        assert!(merged_out.contains("deleted branch agents/merged-task local+remote (merged PR)"), "{merged_out}");
+
+        for (label, state) in [
+            ("open", Ok(PrGithubState::Open)),
+            ("closed", Ok(PrGithubState::Closed)),
+            ("unavailable", Err("gh unavailable".to_owned())),
+        ] {
+            let mut runtime = DoneFakeRuntime::default();
+            runtime.pr_states.insert((main.clone(), branch.to_owned()), state);
+            let mut stdout = String::new();
+
+            done_cleanup_branch(&main, branch, &DoneOptions::default(), &mut runtime, &mut stdout);
+
+            assert!(runtime.git_calls.iter().all(|args| args != &remote_delete), "{label}: {:#?}", runtime.git_calls);
+            assert!(runtime.git_calls.iter().all(|args| !args.iter().any(|arg| arg == "-D")), "{label}: {:#?}", runtime.git_calls);
+        }
+    }
+
+    #[test]
+    fn done_remote_branch_cleanup_reports_remote_delete_errors_without_blocking() {
+        let main = std::path::PathBuf::from("/tmp/acme/app");
+        let branch = "agents/merged-task";
+        let remote_delete = vec![
+            "-C".to_owned(),
+            main.display().to_string(),
+            "push".to_owned(),
+            "origin".to_owned(),
+            "--delete".to_owned(),
+            branch.to_owned(),
+        ];
+        let mut runtime = DoneFakeRuntime::default();
+        runtime.set_pr_state(&main, branch, PrGithubState::Merged);
+        runtime.git_errors.insert(remote_delete, "network unavailable".to_owned());
+        let mut stdout = String::new();
+
+        done_cleanup_branch(&main, branch, &DoneOptions::default(), &mut runtime, &mut stdout);
+
+        assert!(stdout.contains("deleted branch agents/merged-task local (merged PR); remote retained: network unavailable"), "{stdout}");
+    }
+
+    #[test]
     fn done_sweep_removes_merged_deliveries_and_retains_an_open_delivery() {
         let root = DoneTempRoot::new("merged-sweep");
         let context = root.context();
@@ -1993,6 +2068,11 @@ mod done_tests {
         assert!(out.contains("sweep removed stale worktree"), "{out}");
         assert!(out.contains("sweep retained") && out.contains("PR open"), "{out}");
         assert_eq!(runtime.local_branches.get(&main).cloned().unwrap_or_default(), ["agents/open".to_owned()].into());
+        let remote_deletes = runtime.git_calls.iter()
+            .filter(|args| args.get(2).is_some_and(|arg| arg == "push") && args.get(3).is_some_and(|arg| arg == "origin") && args.get(4).is_some_and(|arg| arg == "--delete"))
+            .filter_map(|args| args.get(5).cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(remote_deletes, ["agents/done-target".to_owned(), "agents/merged".to_owned(), "agents/merged-without-worktree".to_owned()].into());
     }
 
     #[test]
