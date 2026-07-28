@@ -159,7 +159,7 @@ fn done_sweep_merged_agent_branches(
             continue;
         }
         if matches!(local.done_pr_state(main_path, branch), Ok(PrGithubState::Merged))
-            && done_delete_branch(main_path, branch, local, stdout, "merged PR sweep")
+            && done_delete_branch(main_path, branch, local, stdout, "merged PR sweep", true)
         {
             removed += 1;
         }
