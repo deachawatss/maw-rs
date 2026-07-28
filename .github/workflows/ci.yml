@@ -54,6 +54,22 @@ jobs:
       needs.changes.outputs.non_docs == 'true'
     # Self-hosted runner deferred until TK's Linux test server is ready.
     runs-on: ubuntu-latest
+    # `.cargo/config.toml` commits `[build] target-dir = "/tmp/maw-rs-target"` so
+    # that many worktrees on the shared dev box do not each grow a 30GB target/
+    # (#121). On a runner that is pure cost: `Swatinem/rust-cache` resolves
+    # `cache-targets` against the workspace root, finds no `./target`, and caches
+    # only ~/.cargo/registry. Measured before this line: whole-repo Actions cache
+    # 166MB across 21 entries, restore 8s, `Post Cache Cargo` "cache up to date"
+    # in 3s after a full cold build — i.e. every run recompiled the workspace,
+    # which is `Build workspace tests` 6m11s + `Test workspace` 5m47s, two thirds
+    # of the job. See #184.
+    #
+    # CARGO_TARGET_DIR (env) takes precedence over build.target-dir (config), so
+    # this restores the default location for CI only. Do NOT "fix" this by editing
+    # .cargo/config.toml — the dev box has hit disk exhaustion twice and #121
+    # depends on that redirect.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
