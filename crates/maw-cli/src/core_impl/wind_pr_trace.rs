@@ -24,7 +24,7 @@ mod wind_pr_trace_tests {
         };
 
         assert!(
-            pr_render_delivery_body(None, &delivery).contains("Closes #42\nREQ: #42"),
+            pr_render_delivery_body(None, &delivery, None).contains("Closes #42\nREQ: #42"),
             "bound intake issue must replace the historical REQ: none default"
         );
     }
