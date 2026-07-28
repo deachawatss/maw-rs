@@ -97,6 +97,31 @@ fails or silently installs something stale. That is #121; until it is resolved, 
 from the redirected path above. Copying the artifact once is not the same as pointing
 the wrapper at the cache — see the paragraph below, which still stands.
 
+### Rebuilding is not enough — restart `maw-serve` too
+
+Installing the binary updates what a *new* `maw` invocation runs. It does nothing for
+the long-running server, which holds the old executable in memory:
+
+```bash
+pm2 restart maw-serve
+curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost:3456/api/mirror?target=<a live pane>'
+```
+
+`maw-serve` runs `~/.local/bin/maw serve --port 3456` under pm2 and exposes `/api/kill`,
+the PR-queue endpoints and the war-room mirror — all of which are the same code paths
+deliveries keep changing. On 2026-07-28 it was found still running a binary from
+`Jul 27 14:47`, twenty-one hours and **eight merges** old, while `~/.local/bin/maw-rs`
+had been rebuilt minutes earlier. Every CLI call saw the fix; every HTTP caller did not.
+
+This is the 2026-06-12 maw-js incident repeating in the Rust rewrite: a merge landed,
+the processes that were restarted picked it up, and the one that was forgotten served
+pre-merge behaviour until someone noticed. The lesson was recorded then and never
+carried into this file, which is why it happened again.
+
+`hermes-gateway` does not reference the binary and needs no restart. Interactive
+`maw work` / `maw wake` processes belong to other oracles' sessions — leave them; they
+serve no requests and will pick the new binary up on their next invocation.
+
 `~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
 Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
 `setup.sh` has no maw-rs step, so a merged fix reaches the box only when L1 performs the
