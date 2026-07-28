@@ -7,17 +7,25 @@ For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 ## Build gate — every cargo run goes through one lock (Wind ruling, 2026-07-28; supersedes the 2026-07-26 total ban)
 
 **If you are an L2 / work-team member, you may run exactly two commands, and only
-with the `flock` prefix:**
+with the `flock` prefix and the `-j` cap:**
 
 ```bash
-flock /tmp/maw-rs-target.lock cargo clippy -p <crate-you-changed> --all-targets -- -D warnings
-flock /tmp/maw-rs-target.lock cargo test   -p <crate-you-changed>
+flock /tmp/maw-rs-target.lock cargo clippy -j 4 -p <crate-you-changed> --all-targets -- -D warnings
+flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> -- --test-threads=4
 ```
 
 **Still forbidden for L2:** `cargo build --release`, anything `--workspace`, and any
 cargo invocation *without* the lock. Do not set a private `CARGO_TARGET_DIR` to get
 around it — the shared `/tmp/maw-rs-target` is precisely what makes one lock able to
 serialize every agent on the box, and a private target dir is a second 30 GB tree.
+
+**Do not drop `-j 4` or `--test-threads=4`.** The box has 14 cores and they are not
+yours: it also runs SQL Server, Docker, several Codex panes, two Claude panes, and an
+embedding server. Uncapped `cargo test` takes all 14 for compilation *and* runs the
+harness 14-wide on top, which on 2026-07-28 drove load average to **44** and spawned
+**~160 processes/second** — the whole machine stuttered for Wind while one L2 ran one
+scoped test. The lock stops two agents compiling at once; it does nothing about one
+agent taking the entire box, and that is what these flags are for.
 
 Your loop is: read the issue → make the fix → read your own diff → run the two locked
 commands → commit → push → `maw pr` → tell L1 to merge.
@@ -47,6 +55,18 @@ The hazard was never cargo. It was **concurrency** — several agents compiling 
 once. `flock` on the shared target dir enforces one-at-a-time directly, which is what
 forbidding everything was only approximating.
 
+The carve-out shipped that morning with the lock but no `-j` cap, and the same day it
+produced a second, different failure: not two agents at once, but **one agent taking
+every core**. That is why the commands above carry both. Two controls, two distinct
+hazards — the lock bounds *how many*, `-j` bounds *how big*.
+
+It also cost disk. `cargo test` builds the **debug** profile, which had never existed
+on this box while the ban was in force — L1 only ever built `--release` (1.6 GB).
+Measured the same day: `/tmp/maw-rs-target/debug` reached **51 GB**, of which
+`find -newermt` attributed **52.4 GB written that day**, 48 GB of it in `debug/deps`.
+That is the standing price of local testing, not a leak. Budget for it, and see the
+cleanup note at the end of this section.
+
 ### L1 uses the same lock
 
 L1 may still run the full build, for the box binary or for live evidence a delivery
@@ -54,7 +74,7 @@ could not produce — and takes the same lock, so an L1 release build and an L2 
 run can never overlap:
 
 ```bash
-flock /tmp/maw-rs-target.lock cargo build --release
+flock /tmp/maw-rs-target.lock cargo build --release -j 4
 ```
 
 If you are unsure which you are: an L2 was dispatched into a worktree for one issue.
@@ -66,7 +86,7 @@ The permission above is also an obligation. **After merging to `main`, L1 rebuil
 installs the binary before moving on:**
 
 ```bash
-flock /tmp/maw-rs-target.lock cargo build --release
+flock /tmp/maw-rs-target.lock cargo build --release -j 4
 install -m755 /tmp/maw-rs-target/release/maw-rs ~/.local/bin/maw-rs
 maw --version    # must report the commit you just merged
 ```
@@ -106,8 +126,12 @@ scoped run exhausted memory and killed three live L2 panes mid-delivery.
 
 Read those two incidents carefully — both are **two things compiling at once**. A
 narrower `-p` does not make Rust compilation cheap; it only makes one copy of it
-smaller. The lock is the control and `-p` is the courtesy. Run scoped *and* locked,
-never one without the other.
+smaller. The lock is the control and `-p` is the courtesy.
+
+`-j 4` is the third leg, added 2026-07-28 after a *single* locked, scoped run
+saturated the box. Each flag answers a different question — `-p` how much code, the
+lock how many agents, `-j` how many cores — and dropping any one of them has now
+caused a real incident. Run scoped *and* locked *and* capped, never two out of three.
 
 ### CI is still the gate; your local run is a pre-filter
 
@@ -146,6 +170,11 @@ maw command, not cargo, and it is fine. Its pin-check test is CI's job.
 
 **Clean up when done:** if a `/tmp/maw-rs-target-*` dir already exists from an earlier
 delivery, remove it. They are ~30 GB each.
+
+The shared `/tmp/maw-rs-target` itself is **not** yours to delete — sibling L2s and L1
+build against it, and removing it mid-flight forces everyone into a cold rebuild. It
+is L1's to reclaim, once no delivery is running. Report the size if it concerns you;
+do not run `cargo clean`.
 
 ## Branch and PR rules
 
