@@ -203,7 +203,6 @@ fn doctor_collect_checks(options: &DoctorOptions) -> Vec<DoctorCheckNative> {
     if doctor_should_run(only, &["federation"]) { checks.push(doctor_ok("federation", "federation reachability skipped without configured peers")); }
     if doctor_should_run(only, &["disk"]) { checks.push(doctor_check_disk()); }
     if doctor_should_run(only, &["manifest", "all"]) { checks.push(doctor_check_manifest(options)); }
-    if doctor_should_run(only, &["maw-js", "all"]) { checks.push(doctor_check_maw_js()); }
     if doctor_should_run(only, &["worktrees", "all"]) { checks.push(doctor_check_worktrees()); }
     checks
 }
@@ -369,6 +368,17 @@ fn doctor_check_plugins() -> DoctorCheckNative {
     let entries = std::fs::read_dir(&dir).map(|iter| iter.flatten().collect::<Vec<_>>());
     match entries {
         Ok(values) => doctor_info("plugins", &format!("{} loaded (broken symlink scan native)", values.len())),
+        // The directory is created when the first plugin is installed. Having none
+        // is a supported configuration — `maw plugins` says "no plugins installed"
+        // without complaint — so an absent directory is information, not a fault.
+        // Warning here left `maw doctor` permanently non-zero on a healthy box,
+        // which drains the meaning from every other warning in the list (#200).
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            doctor_info("plugins", &format!("none installed ({} absent)", dir.display()))
+        }
+        // Anything else — a permissions problem, a file where the directory should
+        // be — is genuinely broken and still warns. Absent is not the same as
+        // unreadable.
         Err(error) => doctor_warn("plugins", &format!("{} ({error})", dir.display()), &["maw plugin install"]),
     }
 }
@@ -523,12 +533,6 @@ fn doctor_check_manifest(options: &DoctorOptions) -> DoctorCheckNative {
     }
 }
 
-fn doctor_check_maw_js() -> DoctorCheckNative {
-    let ghq = doctor_ghq_root();
-    let path = ghq.join("github.com").join("Soul-Brews-Studio").join("maw-js");
-    if path.join("package.json").exists() { doctor_info("maw-js", &format!("checkout present at {}", path.display())) } else { doctor_warn("maw-js", "maw-js checkout not found under GHQ_ROOT", &[]) }
-}
-
 fn doctor_check_worktrees() -> DoctorCheckNative {
     let ghq = doctor_ghq_root();
     let count = doctor_count_worktree_dirs(&ghq);
@@ -554,7 +558,7 @@ fn doctor_fix_stale(options: &DoctorOptions) -> Result<(i32, String), String> {
 
 fn doctor_fix_sessions(options: &DoctorOptions) -> Result<(i32, String), String> {
     let dry = options.dry_run || options.plan;
-    let check = if dry { doctor_info("sessions:fix-doubled", "dry-run: no doubled github.com/github.com dirs scanned by native doctor") } else { doctor_warn("sessions:fix-doubled", "native doctor refuses automatic session rewrites; rerun maw-js doctor if needed", &[]) };
+    let check = if dry { doctor_info("sessions:fix-doubled", "dry-run: no doubled github.com/github.com dirs scanned by native doctor") } else { doctor_warn("sessions:fix-doubled", "native doctor refuses automatic session rewrites; fix the doubled path by hand", &[]) };
     let ok = check.ok;
     let checks = vec![check];
     let stdout = if options.json { doctor_render_json(&checks, ok, &[])? } else { doctor_render_text(&checks, ok, &[]) };
@@ -786,7 +790,37 @@ fn doctor_plural(count: usize) -> &'static str { if count == 1 { "" } else { "s"
 
 #[cfg(test)]
 mod doctor_tests {
-    use super::{doctor_binary_behind_main, doctor_parse_args, run_doctor_command, CliOutput, DISPATCH_65};
+    use super::{
+        doctor_binary_behind_main, doctor_check_plugins, doctor_parse_args, run_doctor_command,
+        CliOutput, DISPATCH_65,
+    };
+
+    /// #200 AC 4: absent is information, unreadable is a warning.
+    ///
+    /// The plugins directory is created when the first plugin is installed, so
+    /// having none is a supported configuration — `maw plugins` reports it without
+    /// complaint. Warning there left `maw doctor` permanently non-zero on a healthy
+    /// box, which drains the meaning from every real warning beside it.
+    #[test]
+    fn doctor_plugins_absent_is_info_and_unreadable_is_warn() {
+        let (_lock, _temp, _restores) = doctor_seed_env("plugins-scope");
+        let dir = super::maw_data_path(&super::doctor_xdg_env(), &["plugins"]);
+
+        // `doctor_seed_env` creates the directory; removing it is the state of a
+        // box that has never installed a plugin.
+        fs::remove_dir_all(&dir).expect("remove seeded plugins dir");
+        let absent = doctor_check_plugins();
+        assert!(absent.ok, "an absent plugins dir must not fail the run: {}", absent.message);
+        assert_eq!(absent.severity, "info");
+        assert!(absent.message.contains("none installed"), "{}", absent.message);
+
+        // A regular file where the directory belongs is genuinely broken and must
+        // still warn — absent is not the same as unreadable.
+        fs::write(&dir, "not a directory").expect("blocking file");
+        let unreadable = doctor_check_plugins();
+        assert!(!unreadable.ok, "a file where the dir belongs must still warn");
+        assert_eq!(unreadable.severity, "warn");
+    }
     use std::fs;
 
     /// #198 AC 5: a dirty or unreadable build stamp is *unknown*, never stale.
