@@ -96,6 +96,11 @@ enum PrGithubState {
     Closed,
 }
 
+/// Engines recognised in `.maw/delivery.json`. This is a provenance vocabulary, not an
+/// allow-list of who may open a PR — see `pr_validate_delivery`. Add an engine here when
+/// the fleet starts using it; do not add gate logic alongside it.
+const PR_KNOWN_ENGINES: &[&str] = &["omx", "codex", "claude"];
+
 const PR_RECONCILE_MAX_ATTEMPTS: u8 = 3;
 const PR_GH_CREATE_MAX_ATTEMPTS: u8 = 3;
 const PR_GH_CREATE_INITIAL_BACKOFF_MS: u64 = 100;
@@ -815,8 +820,26 @@ fn pr_validate_delivery(delivery: &DeliveryEvidence, branch_issue: Option<u64>) 
     if !matches!(delivery.mode.as_str(), "fast" | "standard" | "swarm" | "discovery") {
         return Err(format!("pr: invalid delivery mode {}", delivery.mode));
     }
-    if !matches!(delivery.engine.as_str(), "omx" | "codex") {
-        return Err(format!("pr: invalid delivery engine {}", delivery.engine));
+    // `engine` is PROVENANCE — who wrote this diff, carried into the handoff and the
+    // trailer — not AUTHORISATION. Conflating the two meant adding a worker engine
+    // required editing this gate, and on 2026-07-28 that blocked a real delivery: Wind
+    // moved implementation to Claude agents, one finished its work, pushed its branch,
+    // and could not open its own PR. It reported the block rather than writing
+    // `"engine": "codex"` to get past a field nobody verifies — the right call, and the
+    // reason this list must never become something an agent learns to lie to.
+    //
+    // What actually gates a PR is unchanged and lives below: issue/REQ binding, mode,
+    // non-empty verification commands with parseable results, and live evidence. The
+    // actor set widens; the evidence bar does not move.
+    //
+    // An unknown value is still rejected, and the error names what is accepted so the
+    // refusal is actionable instead of a dead end. See #183.
+    if !PR_KNOWN_ENGINES.contains(&delivery.engine.as_str()) {
+        return Err(format!(
+            "pr: unknown delivery engine {} (known: {})",
+            delivery.engine,
+            PR_KNOWN_ENGINES.join(", ")
+        ));
     }
     if delivery.verification.commands.is_empty() {
         return Err("pr: delivery verification.commands must contain at least one command".to_owned());
@@ -1653,17 +1676,48 @@ mod pr_tests {
         let path = repo.join(".maw/delivery.json");
         let mut delivery: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("delivery body")).expect("delivery json");
+        // `claude` is a first-class delivery engine as of 2026-07-28 (#183). This
+        // assertion used to be its inverse — it pinned codex-or-omx-only, and the day
+        // Wind moved implementation to Claude agents it blocked a finished delivery
+        // from opening its own PR. Inverted deliberately rather than deleted, so the
+        // rule stays pinned somewhere.
         delivery["engine"] = "claude".into();
         std::fs::write(&path, serde_json::to_string_pretty(&delivery).expect("render delivery")).expect("delivery");
-        let invalid_engine = pr_build_plan(
+        let claude_engine = pr_build_plan(
+            repo.clone(),
+            "agents/issue-42-demo".to_owned(),
+            "deachawatss/maw-rs".to_owned(),
+            &options,
+            &mut process,
+        )
+        .expect("claude is a known delivery engine");
+        assert!(
+            claude_engine.body.contains("Closes #42"),
+            "a claude-authored delivery must build the same plan: {}",
+            claude_engine.body
+        );
+
+        // An unknown engine is still refused, and the refusal names what is accepted
+        // so the operator is not left guessing — the failure that sent a worker looking
+        // for a missing capability instead of a wrong field value.
+        delivery["engine"] = "definitely-not-an-engine".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&delivery).expect("render delivery")).expect("delivery");
+        let unknown_engine = pr_build_plan(
             repo,
             "agents/issue-42-demo".to_owned(),
             "deachawatss/maw-rs".to_owned(),
             &options,
             &mut process,
         )
-        .expect_err("invalid engine blocked");
-        assert!(invalid_engine.contains("invalid delivery engine claude"), "{invalid_engine}");
+        .expect_err("unknown engine blocked");
+        assert!(
+            unknown_engine.contains("unknown delivery engine definitely-not-an-engine"),
+            "{unknown_engine}"
+        );
+        assert!(
+            unknown_engine.contains("known: omx, codex, claude"),
+            "the refusal must name the accepted set: {unknown_engine}"
+        );
     }
 
     #[test]
