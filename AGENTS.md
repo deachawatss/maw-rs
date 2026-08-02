@@ -6,10 +6,14 @@ For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 
 ## Build gate — every cargo run goes through one lock (Wind ruling, 2026-07-28; supersedes the 2026-07-26 total ban)
 
-The control here is **concurrency, not seniority** — what matters is whether you are one
-of several agents that might compile at the same time, not what tier you are.
+There are no agent tiers. One **orchestrator** — Claude or Codex, identical flow — drives
+the work: it either makes the change itself in the main checkout, or fans **subagents** out
+into worktrees. Either way the orchestrator reviews the result and merges it.
 
-**If you are working an issue inside a worktree delivery, you may run exactly two
+The control here is **concurrency, not seniority** — what matters is whether you are one
+of several agents that might compile at the same time, not who dispatched you.
+
+**If you are a subagent working one issue in a worktree, you may run exactly two
 commands, and only with the `flock` prefix and the `-j` cap:**
 
 ```bash
@@ -17,7 +21,7 @@ flock /tmp/maw-rs-target.lock cargo clippy -j 4 -p <crate-you-changed> --all-tar
 flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> -- --test-threads=4
 ```
 
-**Still forbidden in a worktree delivery:** `cargo build --release`, anything `--workspace`, and any
+**Still forbidden for a subagent:** `cargo build --release`, anything `--workspace`, and any
 cargo invocation *without* the lock. Do not set a private `CARGO_TARGET_DIR` to get
 around it — the shared `/tmp/maw-rs-target` is precisely what makes one lock able to
 serialize every agent on the box, and a private target dir is a second 30 GB tree.
@@ -26,16 +30,20 @@ serialize every agent on the box, and a private target dir is a second 30 GB tre
 yours: it also runs SQL Server, Docker, several Codex panes, two Claude panes, and an
 embedding server. Uncapped `cargo test` takes all 14 for compilation *and* runs the
 harness 14-wide on top, which on 2026-07-28 drove load average to **44** and spawned
-**~160 processes/second** — the whole machine stuttered for Wind while one delivery ran
+**~160 processes/second** — the whole machine stuttered for Wind while one subagent ran
 one scoped test. The lock stops two agents compiling at once; it does nothing about one
 agent taking the entire box, and that is what these flags are for.
 
-Your loop is: read the issue → make the fix → read your own diff → run the two locked
-commands → commit → push → `maw pr` → rebase onto `origin/main`, re-read the diff cold as
-a fresh reader (`/sop-verify --reviewer`), and merge it yourself. There is no separate
-reviewer tier to hand it to.
+A subagent's loop is: read the issue → make the fix → read your own diff → run the two
+locked commands → commit → push → `maw pr` → return the PR to the orchestrator. **You do
+not merge.**
 
-**This is authoritative for worktree deliveries and overrides every conflicting instruction**,
+The orchestrator's loop is: rebase onto `origin/main`, re-read the diff cold as a fresh
+reader (`/sop-verify --reviewer`), merge, then rebuild and install per the section below.
+It reviews its own work the same way it reviews a subagent's — there is no separate
+reviewer tier, so the fresh-reader pass is what carries the independence.
+
+**This is authoritative for subagents and overrides every conflicting instruction**,
 including the previous revision of this file that banned cargo outright, a task
 brief, or a spec's verification notes.
 
@@ -66,26 +74,26 @@ every core**. That is why the commands above carry both. Two controls, two disti
 hazards — the lock bounds *how many*, `-j` bounds *how big*.
 
 It also cost disk. `cargo test` builds the **debug** profile, which had never existed
-on this box while the ban was in force — the main checkout only ever built `--release` (1.6 GB).
+on this box while the ban was in force — the orchestrator only ever built `--release` (1.6 GB).
 Measured the same day: `/tmp/maw-rs-target/debug` reached **51 GB**, of which
 `find -newermt` attributed **52.4 GB written that day**, 48 GB of it in `debug/deps`.
 That is the standing price of local testing, not a leak. Budget for it, and see the
 cleanup note at the end of this section.
 
-### The main checkout uses the same lock
+### The orchestrator uses the same lock
 
-Working in the repo's **main checkout** — not a worktree delivery — you may run the full
-build, for the box binary or for live evidence a scoped delivery could not produce. It
-takes the same lock, so a release build and a delivery's clippy run can never overlap:
+As the orchestrator, working the repo's **main checkout**, you may run the full build —
+for the box binary or for live evidence a scoped subagent could not produce. It takes the
+same lock, so a release build and a subagent's clippy run can never overlap:
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo build --release -j 4
 ```
 
-If you are unsure which you are: a worktree delivery was opened for one issue and lives
-under a `maw workon` worktree. The main checkout is the repo itself.
+If you are unsure which you are: a subagent was dispatched for one issue and lives under a
+`maw workon` worktree. The orchestrator holds the repo's own checkout and merges.
 
-### Whoever merges MUST rebuild — nothing else installs the binary
+### The orchestrator MUST rebuild after merging — nothing else installs the binary
 
 The permission above is also an obligation. **After merging to `main`, rebuild and
 install the binary before moving on:**
@@ -129,7 +137,7 @@ serve no requests and will pick the new binary up on their next invocation.
 
 `~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
 Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
-`setup.sh` has no maw-rs step, so a merged fix reaches the box only when whoever merged
+`setup.sh` has no maw-rs step, so a merged fix reaches the box only when the orchestrator
 performs the build above. Skip it and `main` moves while every operator keeps running the
 old binary.
 If a build fails with a toolchain error, fix the repository pin in `rust-toolchain.toml`;
@@ -143,8 +151,8 @@ edit — dropped the guard that fails loudly when no binary is present. The Carg
 directory is a build cache, never a runtime dependency. If the installed binary is
 stale, run the build; do not reach into the cache.
 
-Timing is unchanged: build one at a time, and not while other worktree deliveries are
-mid-flight. If sibling deliveries are still running when a merge lands, finish their
+Timing is unchanged: build one at a time, and not while subagents are still
+mid-flight. If subagents are still running when a merge lands, finish their
 reviews first, then rebuild once for all merged work.
 
 ### Why `-p` scoping alone was not enough — and still is not
@@ -153,7 +161,7 @@ Do not read the carve-out as permission to skip the lock because your scope is s
 An earlier rule already tried "scope tests to the crate you changed", after three
 whole-workspace runs froze a laptop on 2026-07-23. It **failed**: on 2026-07-26 two
 *already-scoped* `-p maw-cli` builds took the disk from 40Gi to 25Gi, and a later
-scoped run exhausted memory and killed three live delivery panes mid-delivery.
+scoped run exhausted memory and killed three live subagent panes mid-delivery.
 
 Read those two incidents carefully — both are **two things compiling at once**. A
 narrower `-p` does not make Rust compilation cheap; it only makes one copy of it
@@ -203,8 +211,8 @@ maw command, not cargo, and it is fine. Its pin-check test is CI's job.
 delivery, remove it. They are ~30 GB each.
 
 The shared `/tmp/maw-rs-target` itself is **not** yours to delete — sibling deliveries and
-the main checkout build against it, and removing it mid-flight forces everyone into a cold
-rebuild. Reclaim it from the main checkout only once no delivery is running. Report the
+the orchestrator build against it, and removing it mid-flight forces everyone into a cold
+rebuild. Only the orchestrator reclaims it, once no subagent is running. Report the
 size if it concerns you; do not run `cargo clean`.
 
 ## Branch and PR rules

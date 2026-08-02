@@ -63,8 +63,9 @@ ran out of memory on 2026-07-26 — the panes died, the work did not.
 - Dispatch: `maw workon maw-rs --wt issue-N-<slug> -e codex`.
 - Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`), not
   inside the repo — and see the Build Gate above for what you may run.
-- You merge your own delivery after re-reading the rebased diff cold. Wind's
-  machine is not the build farm, and it is not the test farm either.
+- The orchestrator merges, after re-reading the rebased diff cold; subagents
+  return the PR and stop. Wind's machine is not the build farm, and it is not
+  the test farm either.
 
 ## Branches
 
