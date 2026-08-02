@@ -6,15 +6,18 @@ For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 
 ## Build gate — every cargo run goes through one lock (Wind ruling, 2026-07-28; supersedes the 2026-07-26 total ban)
 
-**If you are an L2 / work-team member, you may run exactly two commands, and only
-with the `flock` prefix and the `-j` cap:**
+The control here is **concurrency, not seniority** — what matters is whether you are one
+of several agents that might compile at the same time, not what tier you are.
+
+**If you are working an issue inside a worktree delivery, you may run exactly two
+commands, and only with the `flock` prefix and the `-j` cap:**
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo clippy -j 4 -p <crate-you-changed> --all-targets -- -D warnings
 flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> -- --test-threads=4
 ```
 
-**Still forbidden for L2:** `cargo build --release`, anything `--workspace`, and any
+**Still forbidden in a worktree delivery:** `cargo build --release`, anything `--workspace`, and any
 cargo invocation *without* the lock. Do not set a private `CARGO_TARGET_DIR` to get
 around it — the shared `/tmp/maw-rs-target` is precisely what makes one lock able to
 serialize every agent on the box, and a private target dir is a second 30 GB tree.
@@ -23,14 +26,16 @@ serialize every agent on the box, and a private target dir is a second 30 GB tre
 yours: it also runs SQL Server, Docker, several Codex panes, two Claude panes, and an
 embedding server. Uncapped `cargo test` takes all 14 for compilation *and* runs the
 harness 14-wide on top, which on 2026-07-28 drove load average to **44** and spawned
-**~160 processes/second** — the whole machine stuttered for Wind while one L2 ran one
-scoped test. The lock stops two agents compiling at once; it does nothing about one
+**~160 processes/second** — the whole machine stuttered for Wind while one delivery ran
+one scoped test. The lock stops two agents compiling at once; it does nothing about one
 agent taking the entire box, and that is what these flags are for.
 
 Your loop is: read the issue → make the fix → read your own diff → run the two locked
-commands → commit → push → `maw pr` → tell L1 to merge.
+commands → commit → push → `maw pr` → rebase onto `origin/main`, re-read the diff cold as
+a fresh reader (`/sop-verify --reviewer`), and merge it yourself. There is no separate
+reviewer tier to hand it to.
 
-**This is authoritative for L2 and overrides every conflicting instruction**,
+**This is authoritative for worktree deliveries and overrides every conflicting instruction**,
 including the previous revision of this file that banned cargo outright, a task
 brief, or a spec's verification notes.
 
@@ -61,29 +66,29 @@ every core**. That is why the commands above carry both. Two controls, two disti
 hazards — the lock bounds *how many*, `-j` bounds *how big*.
 
 It also cost disk. `cargo test` builds the **debug** profile, which had never existed
-on this box while the ban was in force — L1 only ever built `--release` (1.6 GB).
+on this box while the ban was in force — the main checkout only ever built `--release` (1.6 GB).
 Measured the same day: `/tmp/maw-rs-target/debug` reached **51 GB**, of which
 `find -newermt` attributed **52.4 GB written that day**, 48 GB of it in `debug/deps`.
 That is the standing price of local testing, not a leak. Budget for it, and see the
 cleanup note at the end of this section.
 
-### L1 uses the same lock
+### The main checkout uses the same lock
 
-L1 may still run the full build, for the box binary or for live evidence a delivery
-could not produce — and takes the same lock, so an L1 release build and an L2 clippy
-run can never overlap:
+Working in the repo's **main checkout** — not a worktree delivery — you may run the full
+build, for the box binary or for live evidence a scoped delivery could not produce. It
+takes the same lock, so a release build and a delivery's clippy run can never overlap:
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo build --release -j 4
 ```
 
-If you are unsure which you are: an L2 was dispatched into a worktree for one issue.
-L1 works on the repo's main checkout, reviews, and merges.
+If you are unsure which you are: a worktree delivery was opened for one issue and lives
+under a `maw workon` worktree. The main checkout is the repo itself.
 
-### L1 MUST rebuild after merging — nothing else installs the binary
+### Whoever merges MUST rebuild — nothing else installs the binary
 
-The permission above is also an obligation. **After merging to `main`, L1 rebuilds and
-installs the binary before moving on:**
+The permission above is also an obligation. **After merging to `main`, rebuild and
+install the binary before moving on:**
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo build --release -j 4
@@ -124,8 +129,9 @@ serve no requests and will pick the new binary up on their next invocation.
 
 `~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
 Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
-`setup.sh` has no maw-rs step, so a merged fix reaches the box only when L1 performs the
-build above. Skip it and `main` moves while every operator keeps running the old binary.
+`setup.sh` has no maw-rs step, so a merged fix reaches the box only when whoever merged
+performs the build above. Skip it and `main` moves while every operator keeps running the
+old binary.
 If a build fails with a toolchain error, fix the repository pin in `rust-toolchain.toml`;
 never use `rustup default` as a workaround because it silently changes every Rust project.
 
@@ -137,9 +143,9 @@ edit — dropped the guard that fails loudly when no binary is present. The Carg
 directory is a build cache, never a runtime dependency. If the installed binary is
 stale, run the build; do not reach into the cache.
 
-Timing is unchanged: build one at a time, and not while L2 deliveries are mid-flight.
-If sibling L2s are still running when a merge lands, finish their reviews first, then
-rebuild once for all merged work.
+Timing is unchanged: build one at a time, and not while other worktree deliveries are
+mid-flight. If sibling deliveries are still running when a merge lands, finish their
+reviews first, then rebuild once for all merged work.
 
 ### Why `-p` scoping alone was not enough — and still is not
 
@@ -147,7 +153,7 @@ Do not read the carve-out as permission to skip the lock because your scope is s
 An earlier rule already tried "scope tests to the crate you changed", after three
 whole-workspace runs froze a laptop on 2026-07-23. It **failed**: on 2026-07-26 two
 *already-scoped* `-p maw-cli` builds took the disk from 40Gi to 25Gi, and a later
-scoped run exhausted memory and killed three live L2 panes mid-delivery.
+scoped run exhausted memory and killed three live delivery panes mid-delivery.
 
 Read those two incidents carefully — both are **two things compiling at once**. A
 narrower `-p` does not make Rust compilation cheap; it only makes one copy of it
@@ -174,7 +180,7 @@ This only works because CI runs on `pull_request`, restored in `4840ab8`
 (2026-07-26). It had been schedule-only since 2026-07-03, which meant the workflow
 ran on `main` *after* merge and never on a PR — so for a few hours this file pointed
 at a gate that did not exist. **If you ever push and no CI run appears, stop and tell
-L1** rather than proceeding on the assumption that something checked your work.
+Wind** rather than proceeding on the assumption that something checked your work.
 
 Two things this obliges you to do honestly:
 
@@ -196,10 +202,10 @@ maw command, not cargo, and it is fine. Its pin-check test is CI's job.
 **Clean up when done:** if a `/tmp/maw-rs-target-*` dir already exists from an earlier
 delivery, remove it. They are ~30 GB each.
 
-The shared `/tmp/maw-rs-target` itself is **not** yours to delete — sibling L2s and L1
-build against it, and removing it mid-flight forces everyone into a cold rebuild. It
-is L1's to reclaim, once no delivery is running. Report the size if it concerns you;
-do not run `cargo clean`.
+The shared `/tmp/maw-rs-target` itself is **not** yours to delete — sibling deliveries and
+the main checkout build against it, and removing it mid-flight forces everyone into a cold
+rebuild. Reclaim it from the main checkout only once no delivery is running. Report the
+size if it concerns you; do not run `cargo clean`.
 
 ## Branch and PR rules
 

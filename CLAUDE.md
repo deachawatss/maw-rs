@@ -4,29 +4,17 @@ Rust port of maw-js — distributed terminal multiplexing & fleet management.
 A Cargo workspace of small, focused crates. BUSL-1.1 licensed.
 For repo-wide agent execution conventions, read `AGENTS.md` first; this file remains the Claude-specific memory and release detail.
 
-## Build Gate — L2 DOES NOT BUILD OR TEST LOCALLY (Wind ruling, 2026-07-26; scope clarified 2026-07-27)
+## Build Gate — `AGENTS.md` is the single source
 
-**As an L2: no `cargo test`, no `cargo clippy`, no `cargo build`. Not scoped,
-not `-p <crate>`, not a single `-- <test_name>`. None.**
+**The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** As of the
+2026-07-28 Wind ruling a worktree delivery MAY run exactly two cargo commands, each
+`flock`-ed on the shared target dir and capped at `-j 4`; the total ban that this
+section used to restate was superseded that day. Do not reconstruct the rule from
+memory or from an older revision of this file.
 
-Make the fix, read the diff, commit, push, open the PR, hand to L1. That is
-the whole L2 loop for this repo.
-
-Rust compilation is the single heaviest thing that runs on this machine, and
-the failure mode is **concurrency**. Two concurrent scoped builds took the
-disk from 40Gi to 25Gi in minutes on 2026-07-26, and a later run exhausted
-**memory** and killed three live L2 panes outright. The work survived only
-because it was in worktrees. A narrower `-p` flag does not fix it — the
-earlier "scope tests to what you changed" rule was already scoped, and it
-still crashed the box, because four or five work-team members were compiling
-at the same time and their test runs collided.
-
-**L1 may build.** One serialized build is not what broke the machine. L1
-builds the box binary and gets the live evidence an L2 delivery could not —
-one at a time, and not while L2 deliveries are mid-flight. Measured
-2026-07-27: `cargo build --release --bin maw-rs` on a warm target took 2m28s
-and 2Gi of disk. L2 still may not build, because L2s run in parallel and
-cannot see what their siblings are doing.
+Rust compilation is the single heaviest thing that runs on this machine and the failure
+mode is **concurrency** — that is why the control is a lock plus a core cap rather than
+a role. `AGENTS.md` carries the measurements and the incident history.
 
 **Toolchain:** the deps need rustc >= 1.91 (`wasmtime-internal-*`, `wiggle`).
 CI does `rustup default stable`. If your local default is pinned older the
@@ -38,11 +26,10 @@ fix from the log — do not reproduce locally to "see it fail".
 
 Consequences to be honest about, so nobody is surprised:
 
-- A PR now reaches L1 with **no local verification evidence**. `/sop-verify
-  --author` for this repo means "diff reviewed, reasoning stated", not
-  "commands run". Say so plainly in the handoff — do not claim a check you
-  did not run.
-- L1 reviews the diff and the CI result, not a claimed test run.
+- Report exactly what you ran. `/sop-verify --author` for this repo covers the
+  two locked commands in `AGENTS.md` and nothing wider — everything
+  workspace-scale is CI-pending. Do not claim a check you did not run.
+- The review reads the diff and the CI result, not a claimed test run.
 - **Verify `main`'s current CI state; do not assume it from this file.** Issue
   #127 (7 `maw-cli --lib` tests failing on Linux) is **closed**, and the
   `workon_hardening` fixture failures that followed it were fixed by #144.
@@ -54,13 +41,13 @@ Consequences to be honest about, so nobody is surprised:
 This rule is maw-rs only. Other repos keep their normal proportional
 verification.
 
-## Development Lane — Lightweight, but L2 worktrees ARE used
+## Development Lane — Lightweight, but worktrees ARE used
 
 maw-rs is infra, so the **merge lane** is lightweight. That governs how a
 change lands, not where it is written.
 
-**L2 deliveries here run in worktrees, like everywhere else.** An earlier
-revision of this file said "do not use `maw workon` or L2 worktrees" and
+**Deliveries here run in worktrees, like everywhere else.** An earlier
+revision of this file said "do not use `maw workon` or worktrees" and
 justified it with "worktrees duplicate the entire Cargo dependency tree
 (~100GB)". Both halves are now wrong:
 
@@ -75,9 +62,9 @@ ran out of memory on 2026-07-26 — the panes died, the work did not.
 
 - Dispatch: `maw workon maw-rs --wt issue-N-<slug> -e codex`.
 - Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`), not
-  inside the repo — but see the Build Gate above: **you are not building.**
-- L1 merges. Wind's machine is not the build farm, and now it is not the
-  test farm either.
+  inside the repo — and see the Build Gate above for what you may run.
+- You merge your own delivery after re-reading the rebased diff cold. Wind's
+  machine is not the build farm, and it is not the test farm either.
 
 ## Branches
 
