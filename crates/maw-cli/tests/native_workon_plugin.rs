@@ -55,6 +55,9 @@ case "$1" in
   display-message)
     case "$*" in
       *pane_current_command*) printf 'node\n' ;;
+      *pane_current_path*)
+        if [ -n "${MAW_FAKE_TMUX_PANE_PATH:-}" ]; then echo "$MAW_FAKE_TMUX_PANE_PATH"; else echo 50-mawjs; fi
+        ;;
       *'#{pane_index}'*) printf '0\n' ;;
       *'#{window_width}'*) printf '100\n' ;;
       *) printf '50-mawjs\n' ;;
@@ -65,7 +68,7 @@ case "$1" in
   has-session) exit 1 ;;
   capture-pane) printf '$\n' ;;
   split-window) printf '%%2\n' ;;
-  new-session|new-window|send-keys|select-window|set-window-option|select-layout) exit 0 ;;
+  new-session|new-window|send-keys|select-window|select-pane|set-window-option|select-layout) exit 0 ;;
   *) printf 'unexpected tmux %s\n' "$1" >&2; exit 9 ;;
 esac
 "#,
@@ -158,7 +161,25 @@ fn run_from(
     args: &[&str],
     tmux_env: Option<&str>,
 ) -> std::process::Output {
-    run_from_with_git_clean(cwd, root, bin_dir, args, tmux_env, false, false)
+    run_from_with_git_clean(cwd, root, bin_dir, args, tmux_env, false, false, None)
+}
+
+fn run_with_reusable_pane(
+    root: &Path,
+    bin_dir: &Path,
+    args: &[&str],
+    pane_path: &Path,
+) -> std::process::Output {
+    run_from_with_git_clean(
+        root,
+        root,
+        bin_dir,
+        args,
+        Some("/tmp/tmux-1000/default,123,0"),
+        false,
+        false,
+        Some(pane_path),
+    )
 }
 
 fn run_with_missing_remote_head(
@@ -174,6 +195,7 @@ fn run_with_missing_remote_head(
         Some("/tmp/tmux-1000/default,123,0"),
         false,
         true,
+        None,
     )
 }
 
@@ -185,6 +207,7 @@ fn run_from_with_git_clean(
     tmux_env: Option<&str>,
     git_clean_removes_untracked_state: bool,
     missing_remote_head: bool,
+    reusable_pane_path: Option<&Path>,
 ) -> std::process::Output {
     let mut command = Command::new(bin());
     command
@@ -211,6 +234,9 @@ fn run_from_with_git_clean(
     }
     if missing_remote_head {
         command.env("MAW_FAKE_GIT_NO_REMOTE_HEAD", "1");
+    }
+    if let Some(pane_path) = reusable_pane_path {
+        command.env("MAW_FAKE_TMUX_PANE_PATH", pane_path);
     }
     if let Some(value) = tmux_env {
         command.env("TMUX", value);
@@ -738,6 +764,7 @@ fn native_workon_omx_create_restores_worktree_state_after_git_clean() {
         Some("/tmp/tmux-1000/default,123,0"),
         true,
         false,
+        None,
     );
 
     assert!(
@@ -979,4 +1006,76 @@ fn native_workon_registers_dispatcher_and_guards_layout() {
     assert!(String::from_utf8(output.stderr)
         .expect("stderr")
         .contains("workon: --layout must be nested or legacy"));
+}
+
+/// Marker files the retired L2 subsystem left behind: `l2-meta.json`,
+/// `l2-meta-<pane>.json`, `l2-observer-<pane>.json` and `l2-transition-<pane>.json`.
+fn l2_marker_entries(metadata: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(metadata) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("l2-"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn native_workon_new_window_does_not_arm_an_l2_observer() {
+    let root = temp_dir("no-l2-new-window");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+
+    let output = run(&root, &bin_dir, &["workon", "demo"]);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata = root.join("ghq/github.com/acme/demo/.maw");
+    assert_eq!(
+        fs::read_to_string(metadata.join("pane-id")).expect("pane id"),
+        "%2\n"
+    );
+    assert_eq!(
+        l2_marker_entries(&metadata),
+        Vec::<String>::new(),
+        "a new-window workon must leave no L2 state in {}",
+        metadata.display()
+    );
+}
+
+#[test]
+fn native_workon_pane_reuse_does_not_arm_an_l2_observer() {
+    let root = temp_dir("no-l2-pane-reuse");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+    let repo = root.join("ghq/github.com/acme/demo");
+    fs::create_dir_all(repo.join(".maw")).expect("marker dir");
+    fs::write(repo.join(".maw/pane-id"), "%7\n").expect("recorded pane");
+
+    let output = run_with_reusable_pane(&root, &bin_dir, &["workon", "demo"], &repo);
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert!(stdout.contains("reusing existing pane %7"), "{stdout}");
+    let metadata = repo.join(".maw");
+    assert_eq!(
+        fs::read_to_string(metadata.join("pane-id")).expect("pane id"),
+        "%7\n"
+    );
+    assert_eq!(
+        l2_marker_entries(&metadata),
+        Vec::<String>::new(),
+        "a pane-reuse workon must leave no L2 state in {}",
+        metadata.display()
+    );
 }

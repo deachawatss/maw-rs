@@ -160,6 +160,8 @@ fn l2_is_approval_prompt(lower: &str) -> bool {
         || lower.contains("permission required")
 }
 
+// Unreachable in production since #207 stopped workon, swarm and wake arming observers.
+#[allow(dead_code)]
 fn l2_record_parent_metadata(cwd: &Path, metadata: &L2ParentMetadata) -> Result<(), String> {
     let dir = cwd.join(".maw");
     std::fs::create_dir_all(&dir).map_err(|error| format!("l2 metadata: create {}: {error}", dir.display()))?;
@@ -179,6 +181,8 @@ fn l2_record_pane_metadata(cwd: &Path, pane: &str, metadata: &L2ParentMetadata) 
     std::fs::rename(&tmp, &path).map_err(|error| format!("l2 metadata: replace {}: {error}", path.display()))
 }
 
+// Unreachable in production since #207 stopped workon, swarm and wake arming observers.
+#[allow(dead_code)]
 fn l2_prepare_observer(
     cwd: &Path,
     pane: &str,
@@ -215,6 +219,8 @@ fn l2_write_observer_owner(cwd: &Path, pane: &str, owner: &L2ObserverOwner) -> R
     std::fs::rename(&tmp, path).map_err(|error| format!("l2 observer: replace ownership: {error}"))
 }
 
+// Unreachable in production since #207 stopped workon, swarm and wake arming observers.
+#[allow(dead_code)]
 fn l2_claim_observer_owner(cwd: &Path, pane: &str) -> Result<bool, String> {
     let dir = cwd.join(".maw");
     std::fs::create_dir_all(&dir).map_err(|error| format!("l2 observer: create metadata directory: {error}"))?;
@@ -269,6 +275,8 @@ fn l2_arm_observer(cwd: &Path, pane: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Unreachable in production since #207 stopped workon, swarm and wake arming observers.
+#[allow(dead_code)]
 #[cfg(not(test))]
 fn l2_arm_observer(cwd: &Path, pane: &str) -> Result<(), String> {
     if std::env::var("MAW_TEST_MODE").as_deref() == Ok("1") { return Ok(()); }
