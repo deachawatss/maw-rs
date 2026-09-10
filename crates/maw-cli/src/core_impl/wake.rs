@@ -1514,7 +1514,7 @@ mod wake_tests {
     }
 
     #[test]
-    fn wake_records_parent_session_metadata_for_l2_observer() {
+    fn wake_does_not_arm_an_l2_observer_for_a_parent_session() {
         wake_with_fixture(|root| {
             let repo = root.join("ghq/github.com/acme/coder");
             std::fs::create_dir_all(&repo).expect("coder repo");
@@ -1527,11 +1527,22 @@ mod wake_tests {
             .expect("maw wake coder --parent-session-id parent-1");
 
             assert_eq!(code, 0);
-            let metadata = std::fs::read_to_string(repo.join(".maw/l2-meta.json"))
-                .expect("observer parent metadata");
-            let metadata = serde_json::from_str::<serde_json::Value>(&metadata).expect("metadata json");
-            assert_eq!(metadata["parentSessionId"], "parent-1");
-            assert!(metadata["l2Pane"].as_str().is_some_and(|pane| pane.ends_with(":coder")));
+            let markers = std::fs::read_dir(repo.join(".maw"))
+                .map(|entries| {
+                    let mut names: Vec<String> = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name.starts_with("l2-"))
+                        .collect();
+                    names.sort();
+                    names
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                markers,
+                Vec::<String>::new(),
+                "wake must not write L2 state, even when a parent session is named"
+            );
         });
     }
 
