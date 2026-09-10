@@ -6,6 +6,11 @@ set -euo pipefail
 BRANCH="${BRANCH:-feat/discord-backfill-rs}"
 REPO_URL="${REPO_URL:-https://github.com/MEYD-605/maw-rs.git}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+# cargo install writes to <root>/bin, so the install dir has to end in /bin.
+case "$INSTALL_DIR" in
+  */bin) ;;
+  *) echo "INSTALL_DIR must end in /bin: $INSTALL_DIR" >&2; exit 1 ;;
+esac
 WORK="${WORK:-$HOME/Code/github.com/MEYD-605/maw-rs}"
 
 echo "== discord-backfill sila deploy =="
@@ -21,9 +26,13 @@ else
 fi
 
 cd "$WORK"
-cargo build -p maw-discord-backfill --release
+# Build and install in one step. cargo places the binary itself, so no target/
+# path is written down here. A literal target/release/ path was wrong on this
+# repo from 2026-07-17, when .cargo/config.toml moved the target directory to
+# /tmp/maw-rs-target; a machine-wide [build] target-dir moves it again. The
+# Cargo target directory is a build cache and is not a deploy source.
 mkdir -p "$INSTALL_DIR"
-install -m755 target/release/discord-backfill "$INSTALL_DIR/discord-backfill"
+cargo install --path crates/maw-discord-backfill --force --root "${INSTALL_DIR%/bin}"
 
 echo "== smoke =="
 "$INSTALL_DIR/discord-backfill" whoami
