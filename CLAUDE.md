@@ -14,8 +14,10 @@ was superseded that day. Do not reconstruct the rule from memory or from an olde
 revision of this file.
 
 **`cargo test --workspace` is banned outright** (Wind, 2026-09-11, after it froze the
-machine). `claude/hooks/cargo-build-gate.sh` refuses it, so this is enforced rather than
-remembered.
+machine). Enforced in three layers, not remembered: `jobs = 4` in this repo's
+`.cargo/config.toml`, a `cargo` shim at `~/.local/bin/cargo`
+(Wind-Framework `scripts/cargo-gate.sh`) that refuses it on argv however it was invoked,
+and a PreToolUse hook that explains it when an agent types it.
 
 Rust compilation is the single heaviest thing that runs on this machine and the failure
 mode is **concurrency** — that is why the control is a lock plus a core cap rather than

@@ -36,13 +36,24 @@ is no cheap or careful form of it. Wind's ruling that day: *"you must never run 
 --workspace anymore"*. A green full-suite run is CI's job, and this repository's CI is
 where a workspace-scale check belongs.
 
-**This rule is now enforced, not just written.** `claude/hooks/cargo-build-gate.sh` in
-Wind-Framework refuses an unlocked, uncapped or `--workspace` cargo command whose
-working directory sits inside a maw-rs checkout or worktree. It exists because this
-paragraph was already correct on 2026-09-11 and still did not prevent the freeze: the
-agent never opened this file. Calibration for the hook is
-`claude/hooks/tests/calibrate-cargo-build-gate.sh`, and it asserts the allow half too —
-the two permitted commands, `cargo fmt`, and the same command in another repo all pass.
+**This rule is now enforced, not just written**, in three layers. It exists because
+this paragraph was already correct on 2026-09-11 and still did not prevent the freeze:
+the agent never opened this file.
+
+1. **`.cargo/config.toml` sets `jobs = 4`.** Cargo honours it however it was invoked, so
+   the default can no longer be 14 cores. A command-line `-j` still overrides it.
+2. **`scripts/cargo-gate.sh` in Wind-Framework is a `cargo` shim** on `~/.local/bin`,
+   ahead of `~/.cargo/bin`. It refuses `--workspace`, an unlocked run, and `-j` above 4.
+   Because it *is* cargo, it sees the argv cargo receives — a script, `make`, `xargs`,
+   `bash -c` and aliases all arrive there. This is the layer that makes recurrence
+   impossible. Wind's deliberate override is `MAW_BUILD_GATE_OVERRIDE=yes`.
+3. **`claude/hooks/cargo-build-gate.sh` refuses the same commands at the moment an agent
+   types them**, which is more useful than a failure two seconds later. It matches
+   command *text*, so it has an unbounded tail of bypasses — five review rounds found
+   fourteen — and it is the teaching layer, never the load-bearing one.
+
+Both have calibration scripts that assert the allow half as well as the block half, and
+both were falsified in each direction before being trusted.
 
 **Do not drop `-j 4` or `--test-threads=4`.** The box has 14 cores and they are not
 yours: it also runs SQL Server, Docker, several Codex panes, two Claude panes, and an
