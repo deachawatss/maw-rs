@@ -99,26 +99,35 @@ The permission above is also an obligation. **After merging to `main`, rebuild a
 install the binary before moving on:**
 
 ```bash
-flock /tmp/maw-rs-target.lock cargo build --release -j 4
-install -m755 /tmp/maw-rs-target/release/maw-rs ~/.local/bin/maw-rs
-maw --version    # must report the commit you just merged
+maw update    # build, install, restart, verify — in that order
 ```
 
-Note the source path. `.cargo/config.toml` sets `target-dir = "/tmp/maw-rs-target"`,
-so `target/release/maw-rs` does **not** exist in this repo and an `install` from there
-fails or silently installs something stale. That is #121; until it is resolved, copy
-from the redirected path above. Copying the artifact once is not the same as pointing
-the wrapper at the cache — see the paragraph below, which still stands.
+`maw update` is the whole procedure (#210). It builds the release binary, installs it to
+`~/.local/bin/maw-rs` keeping a timestamped backup, restarts `maw-serve` when pm2 has it,
+and finishes by printing `doctor`'s verdict on whether the daemon and the installed binary
+agree. It exits non-zero when they still disagree, so a script can tell success from
+partial success. `maw upgrade` is the same command.
 
-### Rebuilding is not enough — restart `maw-serve` too
+It keeps all three legs of the rule below: `--bin maw-rs` is the scope, `flock` on the
+target directory's lock file is the lock, and `-j 4` is the cap. **Cargo's own lock is not
+a substitute.** Measured 2026-09-11 on this box: two `--release` builds on the shared
+`target-dir` do serialise — the second prints `Blocking waiting for file lock on build
+directory` — but a `--release` build and a dev-profile `cargo test` ran side by side with
+no blocking at all. Cross-profile contention is exactly what the three incidents below
+describe, so the external lock is the one that matters.
+
+It asks Cargo where the artifact is rather than assembling a path. `.cargo/config.toml`
+sets `target-dir = "/tmp/maw-rs-target"`, so `target/release/maw-rs` does **not** exist in
+this repo and an `install` from there fails or silently installs something stale — that is
+#121, and #205 fixed the same assumption in the deploy script. Copying the artifact once is
+not the same as pointing the wrapper at the cache — see the paragraph below, which still
+stands.
+
+### Why the restart is part of that command, not a step after it
 
 Installing the binary updates what a *new* `maw` invocation runs. It does nothing for
-the long-running server, which holds the old executable in memory:
-
-```bash
-pm2 restart maw-serve
-curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost:3456/api/mirror?target=<a live pane>'
-```
+the long-running server, which holds the old executable in memory. That is why `maw update`
+restarts it rather than telling you to:
 
 `maw-serve` runs `~/.local/bin/maw serve --port 3456` under pm2 and exposes `/api/kill`,
 the PR-queue endpoints and the war-room mirror — all of which are the same code paths
@@ -136,10 +145,10 @@ carried into this file, which is why it happened again.
 serve no requests and will pick the new binary up on their next invocation.
 
 `~/.local/bin/maw-rs` is the canonical runtime path — `scripts/maw-wrapper.sh` in
-Wind-Framework resolves exactly that and nothing else. No installer runs on merge, and
-`setup.sh` has no maw-rs step, so a merged fix reaches the box only when the orchestrator
-performs the build above. Skip it and `main` moves while every operator keeps running the
-old binary.
+Wind-Framework resolves exactly that and nothing else, and `maw update` installs there and
+nowhere else. No installer runs on merge, and `setup.sh` has no maw-rs step, so a merged fix
+reaches the box only when the orchestrator runs `maw update`. Skip it and `main` moves while
+every operator keeps running the old binary.
 If a build fails with a toolchain error, fix the repository pin in `rust-toolchain.toml`;
 never use `rustup default` as a workaround because it silently changes every Rust project.
 
