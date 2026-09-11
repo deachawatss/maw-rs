@@ -8,7 +8,6 @@ const DISPATCH_93: &[DispatcherEntry] = &[
     DispatcherEntry { command: "snapshots", handler: Handler::Sync(snapshots_run_command) },
 ];
 
-const WORK_USAGE: &str = "usage: maw work <repo|.|path|url> [task] [--wt [slug]] [--fresh] [--name <stable>] [-e <engine>] [--layout nested|legacy]";
 const AWAKE_USAGE: &str = "usage: maw awake <name> [wake flags...]";
 const SCAFFOLD_USAGE: &str = "usage: maw scaffold <name> [--rust|--as] [--dest <path>] [--dry-run]";
 const NEW_USAGE: &str = "usage: maw new [session-name] [--path|-p <dir>] [--window <name>] [--cmd|-c <cmd>|--claude] [--shell] [--split [--right|--horizontal|--bottom|--vertical]] [--print|--json] [--attach|-a] [--no-attach] [--dry-run] [--no-fleet]";
@@ -366,13 +365,13 @@ struct SnapshotsOptionsNative {
 
 fn work_run_command(argv: &[String]) -> CliOutput {
     if wants_help(argv, workon_help_value_flags()) {
-        return help_output(WORK_USAGE);
+        return help_output(workon_usage("work"));
     }
     if argv.iter().any(|arg| arg == "--") {
         return work_error("work: -- separator is not allowed");
     }
     if argv.is_empty() {
-        return work_error(WORK_USAGE);
+        return work_error(&workon_usage("work"));
     }
     run_workon_command(argv)
 }
