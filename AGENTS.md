@@ -68,7 +68,7 @@ locked commands → commit → push → `maw pr` → return the PR to the orches
 not merge.**
 
 The orchestrator's loop is: rebase onto `origin/main`, re-read the diff cold as a fresh
-reader (`/sop-verify --reviewer`), merge, then rebuild and install per the section below.
+reader (`/mattpocock-skills:code-review`, then `/prove-live`), merge, then rebuild and install per the section below.
 It reviews its own work the same way it reviews a subagent's — there is no separate
 reviewer tier, so the fresh-reader pass is what carries the independence.
 
