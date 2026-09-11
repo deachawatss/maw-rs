@@ -4,7 +4,7 @@ use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Duration};
 
 use maw_tmux::{
     SendTextReport, SendThrottle, SubmitConfig, TmuxClient, TmuxError, TmuxRunner,
-    CODEX_SUBMIT_CONFIRM_MS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
+    CODEX_SUBMIT_CONFIRM_MS, MAX_SUBMIT_ATTEMPTS, SEND_SETTLE_MS, SUBMIT_CONFIRM_MS,
 };
 
 #[derive(Clone, Default)]
@@ -249,4 +249,142 @@ fn submit_sleeps_for(config: SubmitConfig) -> Vec<Duration> {
         }
     );
     sleeps
+}
+
+/// Key names from `send-keys` calls that carry a key rather than literal text.
+///
+/// A literal send is `-t <target> -l <text>` (four args); a key send is
+/// `-t <target> <Key>` (three), so the length separates them.
+fn submit_key_tokens(calls: &[(String, Vec<String>)]) -> Vec<String> {
+    calls
+        .iter()
+        .filter(|(subcommand, args)| subcommand == "send-keys" && args.len() == 3)
+        .map(|(_, args)| args[2].clone())
+        .collect()
+}
+
+fn every_arg_sent(calls: &[(String, Vec<String>)]) -> Vec<String> {
+    calls
+        .iter()
+        .flat_map(|(_subcommand, args)| args.iter().cloned())
+        .collect()
+}
+
+#[test]
+fn pending_pane_escalates_to_tab_on_the_second_attempt() {
+    let runner = SharedRunner::with_responses(vec![
+        Ok("node"),     // display-message: pane_current_command
+        Ok("0"),        // display-message: pane_in_mode
+        Ok(""),         // send-keys: literal text
+        Ok(""),         // send-keys: submit attempt 1
+        Ok("$ deploy"), // capture-pane: text still sitting in the composer
+        Ok(""),         // send-keys: submit attempt 2
+        Ok("$ \r"),     // capture-pane: composer cleared
+    ]);
+    let state = Rc::clone(&runner.state);
+    let mut client = TmuxClient::new(runner);
+
+    let report = client
+        .send_text_ungated_with_sleeper("%busy", "deploy", |_| {})
+        .expect("ungated send succeeds");
+
+    assert_eq!(report.enter_attempts, 2);
+    assert!(!report.warned_pending);
+    assert_eq!(
+        submit_key_tokens(&state.borrow().calls),
+        vec!["Enter".to_owned(), "Tab".to_owned()],
+        "a pane holding the text must be escalated with Tab, not a second Enter"
+    );
+}
+
+#[test]
+fn pane_that_clears_on_the_first_enter_never_receives_tab() {
+    let runner = SharedRunner::with_responses(vec![
+        Ok("node"), // display-message: pane_current_command
+        Ok("0"),    // display-message: pane_in_mode
+        Ok(""),     // send-keys: literal text
+        Ok(""),     // send-keys: submit attempt 1
+        Ok("$ \r"), // capture-pane: composer cleared
+    ]);
+    let state = Rc::clone(&runner.state);
+    let mut client = TmuxClient::new(runner);
+
+    let report = client
+        .send_text_ungated_with_sleeper("%idle", "deploy", |_| {})
+        .expect("ungated send succeeds");
+
+    assert_eq!(report.enter_attempts, 1);
+    assert!(!report.warned_pending);
+    assert_eq!(
+        submit_key_tokens(&state.borrow().calls),
+        vec!["Enter".to_owned()],
+        "an idle pane must cost exactly one Enter and no extra keystroke"
+    );
+}
+
+#[test]
+fn submit_never_sends_escape_even_when_every_attempt_leaves_text_pending() {
+    let mut responses = vec![
+        Ok("node"), // display-message: pane_current_command
+        Ok("0"),    // display-message: pane_in_mode
+        Ok(""),     // send-keys: literal text
+    ];
+    for _ in 0..MAX_SUBMIT_ATTEMPTS {
+        responses.push(Ok("")); // send-keys: submit attempt
+        responses.push(Ok("$ deploy")); // capture-pane: still pending
+    }
+    let runner = SharedRunner::with_responses(responses);
+    let state = Rc::clone(&runner.state);
+    let mut client = TmuxClient::new(runner);
+
+    let report = client
+        .send_text_ungated_with_sleeper("%stuck", "deploy", |_| {})
+        .expect("ungated send succeeds");
+
+    assert_eq!(report.enter_attempts, MAX_SUBMIT_ATTEMPTS);
+    assert!(report.warned_pending);
+    assert_eq!(
+        submit_key_tokens(&state.borrow().calls),
+        vec![
+            "Enter".to_owned(),
+            "Tab".to_owned(),
+            "Tab".to_owned(),
+            "Tab".to_owned()
+        ]
+    );
+    let sent = every_arg_sent(&state.borrow().calls);
+    assert!(
+        !sent.iter().any(|arg| arg == "Escape" || arg == "Esc"),
+        "Codex binds Escape to interrupt; it must never reach the submit path: {sent:?}"
+    );
+}
+
+#[test]
+fn codex_working_transition_counts_as_submitted_without_escalating() {
+    let runner = SharedRunner::with_responses(vec![
+        Ok("codex"),                   // display-message: pane_current_command
+        Ok("0"),                       // display-message: pane_in_mode
+        Ok("› Explain this codebase"), // capture-pane: codex pre-send baseline
+        Ok(""),                        // send-keys: literal text
+        Ok(""),                        // send-keys: submit attempt 1
+        // capture-pane: the prompt line is still visible, but the turn started
+        Ok("• Working (0s • esc to interrupt)\n\n› Explain this codebase"),
+    ]);
+    let state = Rc::clone(&runner.state);
+    let mut client = TmuxClient::new(runner);
+
+    let report = client
+        .send_text_ungated_with_sleeper("%codex", "deploy", |_| {})
+        .expect("ungated send succeeds");
+
+    assert_eq!(report.enter_attempts, 1);
+    assert!(
+        !report.warned_pending,
+        "a started Codex turn is a confirmed submit, not a pending payload"
+    );
+    assert_eq!(
+        submit_key_tokens(&state.borrow().calls),
+        vec!["Enter".to_owned()],
+        "the working transition must not trigger the Tab escalation"
+    );
 }

@@ -805,23 +805,79 @@ fn send_local_message_with_audit(
         Err(message) => return CliOutput { code: send_error_code(command), stdout: String::new(), stderr: format!("{command}: {message}\n") },
     };
     let outbound = format_local_hey_message(text, config, sender_oracle, from);
-    if let Err(error) = tmux.send_text_ungated(target, &outbound) {
-        return CliOutput {
-            code: 1,
-            stdout: String::new(),
-            stderr: format!("{command}: tmux send-text failed: {error}\n"),
-        };
-    }
-    send_record_success(command, audit_args, config, sender_oracle, from, query, &outbound, "local", signature.as_ref());
+    let report = match tmux.send_text_ungated(target, &outbound) {
+        Ok(report) => report,
+        Err(error) => {
+            return CliOutput {
+                code: 1,
+                stdout: String::new(),
+                stderr: format!("{command}: tmux send-text failed: {error}\n"),
+            }
+        }
+    };
+    let delivery = SendDelivery::from_report(&report);
+    send_record_success(command, audit_args, config, sender_oracle, from, query, &outbound, "local", signature.as_ref(), delivery);
     CliOutput {
-        code: 0,
-        stdout: send_success_output(command, target, &outbound),
+        code: delivery.code(),
+        stdout: send_success_output(command, target, &outbound, delivery),
         stderr: String::new(),
     }
 }
 
-fn send_success_output(command: &str, target: &str, outbound: &str) -> String {
-    if command == "hey" { format!("delivered → {target}: {outbound}\n") } else { format!("delivered {target}\n") }
+/// Exit code for a payload left sitting in a busy pane's composer.
+///
+/// Not `0`, because the message has not been read yet. Not the usage-error code
+/// either, because it is not a failure: a fan-out script has to tell "the peer will
+/// read this shortly" from "this did not arrive".
+const SEND_QUEUED_CODE: i32 = 3;
+
+/// How a local pane injection ended.
+///
+/// The third outcome, a hard failure, is the error return and never reaches here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendDelivery {
+    Delivered,
+    Queued,
+}
+
+impl SendDelivery {
+    /// Read the outcome off the send report.
+    ///
+    /// This is the link the bug was missing: `warned_pending` existed and was
+    /// correct, but nothing carried it as far as the printer.
+    const fn from_report(report: &maw_tmux::SendTextReport) -> Self {
+        if report.warned_pending { Self::Queued } else { Self::Delivered }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Queued => "queued",
+        }
+    }
+
+    const fn code(self) -> i32 {
+        match self {
+            Self::Delivered => 0,
+            Self::Queued => SEND_QUEUED_CODE,
+        }
+    }
+
+    const fn ledger_state(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Queued => "queued",
+        }
+    }
+}
+
+fn send_success_output(command: &str, target: &str, outbound: &str, delivery: SendDelivery) -> String {
+    let label = delivery.label();
+    let head = if command == "hey" { format!("{label} → {target}: {outbound}\n") } else { format!("{label} {target}\n") };
+    match delivery {
+        SendDelivery::Delivered => head,
+        SendDelivery::Queued => format!("{head}{command}: the text is still in the pane composer and was queued behind the running turn\n"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,7 +948,7 @@ async fn send_peer_message(
     match client.send_peer(&request).await {
         Ok(response) => {
             let outbound = format_local_hey_message(&args.text, config, sender_oracle, args.from.as_deref());
-            send_record_success(command, audit_args, config, sender_oracle, args.from.as_deref(), &args.target, &outbound, &format!("peer:{node}"), signature.as_ref());
+            send_record_success(command, audit_args, config, sender_oracle, args.from.as_deref(), &args.target, &outbound, &format!("peer:{node}"), signature.as_ref(), SendDelivery::Delivered);
             CliOutput {
                 code: 0,
                 stdout: format!(
@@ -923,6 +979,7 @@ fn send_record_success(
     msg: &str,
     route: &str,
     signature: Option<&MessageSignature>,
+    delivery: SendDelivery,
 ) {
     if audit_args.is_empty() {
         return;
@@ -937,6 +994,7 @@ fn send_record_success(
         msg,
         route,
         signature,
+        state: delivery.ledger_state(),
     };
     for sink in message_sink_registry() {
         sink.record(&record);
@@ -970,6 +1028,8 @@ struct MessageSinkRecord<'a> {
     msg: &'a str,
     route: &'a str,
     signature: Option<&'a MessageSignature>,
+    /// Ledger state for this send: `delivered` or `queued`.
+    state: &'a str,
 }
 
 #[derive(Debug)]
@@ -1098,10 +1158,11 @@ fn send_write_message_ledger_record(record: &MessageSinkRecord<'_>, from: &str) 
     let ts = cli_dispatch_now_iso();
     let id = format!("{}:{}:{}:{}", ts, from, record.to, record.route);
     let sql = format!(
-        "{} INSERT OR REPLACE INTO messages (id, ts, direction, state, channel, route, from_id, to_id, target, peer_url, text, error, last_line, signed) VALUES ({}, {}, 'outbound', 'delivered', 'hey', {}, {}, {}, {}, NULL, {}, NULL, NULL, {});",
+        "{} INSERT OR REPLACE INTO messages (id, ts, direction, state, channel, route, from_id, to_id, target, peer_url, text, error, last_line, signed) VALUES ({}, {}, 'outbound', {}, 'hey', {}, {}, {}, {}, NULL, {}, NULL, NULL, {});",
         send_message_ledger_schema_sql(),
         send_sqlite_quote(&id),
         send_sqlite_quote(&ts),
+        send_sqlite_quote(record.state),
         send_sqlite_quote(record.route),
         send_sqlite_quote(from),
         send_sqlite_quote(record.to),
@@ -1833,6 +1894,50 @@ fn format_reply_list(body: &str) -> String {
 mod send_acl_hotpath_tests {
     use super::*;
 
+    #[test]
+    fn queued_output_never_claims_delivered() {
+        let queued = send_success_output("hey", "01-gale:gale.0", "[wind] ship it", SendDelivery::Queued);
+        assert!(
+            !queued.contains("delivered"),
+            "a payload still in the composer must not be reported as delivered: {queued}"
+        );
+        assert!(queued.contains("queued"), "{queued}");
+        assert!(queued.contains("01-gale:gale.0"), "{queued}");
+
+        let delivered = send_success_output("hey", "01-gale:gale.0", "[wind] ship it", SendDelivery::Delivered);
+        assert_eq!(delivered, "delivered → 01-gale:gale.0: [wind] ship it\n");
+    }
+
+    #[test]
+    fn send_and_hey_agree_that_a_queued_payload_is_not_delivered() {
+        for command in ["hey", "send"] {
+            let queued = send_success_output(command, "01-leaf:leaf.0", "ping", SendDelivery::Queued);
+            assert!(!queued.contains("delivered"), "{command}: {queued}");
+            assert!(queued.starts_with("queued"), "{command}: {queued}");
+        }
+    }
+
+    #[test]
+    fn a_queued_payload_exits_non_zero_and_is_not_logged_as_delivered() {
+        assert_eq!(SendDelivery::Delivered.code(), 0);
+        assert_ne!(SendDelivery::Queued.code(), 0);
+        assert_eq!(SendDelivery::Delivered.ledger_state(), "delivered");
+        assert_eq!(SendDelivery::Queued.ledger_state(), "queued");
+    }
+
+    #[test]
+    fn the_send_report_decides_the_printed_outcome() {
+        let pending = maw_tmux::SendTextReport { used_buffer: false, enter_attempts: 4, warned_pending: true };
+        let clean = maw_tmux::SendTextReport { used_buffer: false, enter_attempts: 1, warned_pending: false };
+
+        assert_eq!(SendDelivery::from_report(&pending), SendDelivery::Queued);
+        assert_eq!(SendDelivery::from_report(&clean), SendDelivery::Delivered);
+
+        let reported = send_success_output("hey", "01-gale:gale.0", "ping", SendDelivery::from_report(&pending));
+        assert!(!reported.contains("delivered"), "{reported}");
+        assert!(reported.contains("queued"), "{reported}");
+    }
+
     #[derive(Debug, Default)]
     struct SendFakeTmuxRunner {
         current_session: Option<Result<String, String>>,
@@ -2217,7 +2322,7 @@ mod send_acl_hotpath_tests {
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
         let args = send_audit_args("hey", &send_acl_vec(&["agent", "hello"]));
 
-        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None);
+        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None, SendDelivery::Delivered);
 
         let audit: serde_json::Value = serde_json::from_str(std::fs::read_to_string(root.join("maw/audit.jsonl")).unwrap().trim()).unwrap();
         assert_eq!(audit["cmd"], "hey");
@@ -2245,7 +2350,7 @@ mod send_acl_hotpath_tests {
         assert_eq!(resolve_hey_wire_from(Some("atlas:m5"), &config, "atlas").unwrap(), "atlas:m5");
         assert!(send_message_signature("hey", &config, "atlas", Some("atlas:m5"), "hello").is_ok());
 
-        send_record_success("hey", &args, &config, "atlas", Some("atlas:m5"), "agent", "[atlas:m5] hello", "local", None);
+        send_record_success("hey", &args, &config, "atlas", Some("atlas:m5"), "agent", "[atlas:m5] hello", "local", None, SendDelivery::Delivered);
 
         assert_message_sink_from(&root, "m5:atlas");
     }
@@ -2268,7 +2373,7 @@ mod send_acl_hotpath_tests {
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("configured".to_owned()), route: RouteConfig::default() };
         let sender = resolve_hey_sender_oracle(&config);
 
-        send_record_success("hey", &send_audit_args("hey", &send_acl_vec(&["agent", "hello"])), &config, &sender, None, "agent", "hello", "local", None);
+        send_record_success("hey", &send_audit_args("hey", &send_acl_vec(&["agent", "hello"])), &config, &sender, None, "agent", "hello", "local", None, SendDelivery::Delivered);
 
         assert_eq!(sender, "arra-oracle-v3");
         assert_message_sink_from(&root, "m5:arra-oracle-v3");
@@ -2288,7 +2393,7 @@ mod send_acl_hotpath_tests {
         let _cwd = SendCwdRestore::enter(&repo);
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: None, route: RouteConfig::default() };
 
-        send_record_success("hey", &send_audit_args("hey", &send_acl_vec(&["agent", "hello"])), &config, "pane/window-arranger", None, "agent", "hello", "local", None);
+        send_record_success("hey", &send_audit_args("hey", &send_acl_vec(&["agent", "hello"])), &config, "pane/window-arranger", None, "agent", "hello", "local", None, SendDelivery::Delivered);
 
         assert_message_sink_from(&root, "m5:pane/window-arranger");
     }
@@ -2301,7 +2406,7 @@ mod send_acl_hotpath_tests {
 
         let (actual_root, _actual_restores) = send_audit_test_env("sink-actual");
         std::env::set_var("MAW_MESSAGE_LEDGER_DISABLE", "1");
-        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None);
+        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None, SendDelivery::Delivered);
         let actual_audit = std::fs::read(actual_root.join("maw/audit.jsonl")).unwrap();
         let actual_log = std::fs::read(actual_root.join("maw/maw-log.jsonl")).unwrap();
 
@@ -2320,7 +2425,7 @@ mod send_acl_hotpath_tests {
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
         let args = send_audit_args("hey", &send_acl_vec(&["agent", "hello"]));
 
-        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None);
+        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", None, SendDelivery::Delivered);
 
         let output = std::process::Command::new("sqlite3")
             .arg(root.join("maw/message-ledger.sqlite"))
@@ -2338,7 +2443,7 @@ mod send_acl_hotpath_tests {
         let (root, _restores) = send_audit_test_env("ledger-signed");
         let config = HeyConfig { node: Some("m5".to_owned()), oracle: Some("atlas".to_owned()), route: RouteConfig::default() };
         let args = send_audit_args("hey", &send_acl_vec(&["agent", "hello"]));
-        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", Some(&MessageSignature));
+        send_record_success("hey", &args, &config, "atlas", None, "agent", "[m5:atlas] hello", "local", Some(&MessageSignature), SendDelivery::Delivered);
         let output = std::process::Command::new("sqlite3")
             .arg(root.join("maw/message-ledger.sqlite"))
             .arg("select signed from messages;")
@@ -2402,7 +2507,7 @@ mod send_acl_hotpath_tests {
                 scope.spawn(move || {
                     let raw_args = vec!["agent".to_owned(), format!("canary-{index}")];
                     let args = send_audit_args("hey", &raw_args);
-                    send_record_success("hey", &args, &config, "atlas", None, "agent", &format!("[m5:atlas] canary-{index}"), "local", None);
+                    send_record_success("hey", &args, &config, "atlas", None, "agent", &format!("[m5:atlas] canary-{index}"), "local", None, SendDelivery::Delivered);
                 });
             }
         });
@@ -2613,7 +2718,7 @@ mod send_acl_hotpath_tests {
         let success = &fixture["localSuccess"];
         assert_output(success, CliOutput {
             code: 0,
-            stdout: send_success_output("hey", success["target"].as_str().unwrap(), success["outbound"].as_str().unwrap()),
+            stdout: send_success_output("hey", success["target"].as_str().unwrap(), success["outbound"].as_str().unwrap(), SendDelivery::Delivered),
             stderr: String::new(),
         });
     }
