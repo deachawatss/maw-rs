@@ -1,2 +1,10 @@
 [build]
 target-dir = "/tmp/maw-rs-target"
+# The `-j 4` cap from AGENTS.md, applied by default instead of by memory.
+#
+# A command-line `-j` still overrides this, so it is a default and not a ceiling.
+# That is the case worth covering: `cargo test --workspace` froze the machine on
+# 2026-09-11 carrying no `-j` at all, so it took all 14 cores. Cargo reads this
+# file however it was invoked — through a script, `make`, `xargs` or `bash -c` —
+# which is the one thing a hook that reads command text cannot do.
+jobs = 4
