@@ -7,10 +7,15 @@ For repo-wide agent execution conventions, read `AGENTS.md` first; this file rem
 ## Build Gate — `AGENTS.md` is the single source
 
 **The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** As of the
-2026-07-28 Wind ruling a worktree delivery MAY run exactly two cargo commands, each
-`flock`-ed on the shared target dir and capped at `-j 4`; the total ban that this
-section used to restate was superseded that day. Do not reconstruct the rule from
-memory or from an older revision of this file.
+2026-07-28 Wind ruling ANY agent — orchestrator in the main checkout as much as a
+subagent in a worktree — MAY run exactly two cargo commands, each `flock`-ed on the
+shared target dir and capped at `-j 4`; the total ban that this section used to restate
+was superseded that day. Do not reconstruct the rule from memory or from an older
+revision of this file.
+
+**`cargo test --workspace` is banned outright** (Wind, 2026-09-11, after it froze the
+machine). `claude/hooks/cargo-build-gate.sh` refuses it, so this is enforced rather than
+remembered.
 
 Rust compilation is the single heaviest thing that runs on this machine and the failure
 mode is **concurrency** — that is why the control is a lock plus a core cap rather than

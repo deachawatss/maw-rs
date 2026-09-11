@@ -13,18 +13,36 @@ into worktrees. Either way the orchestrator reviews the result and merges it.
 The control here is **concurrency, not seniority** — what matters is whether you are one
 of several agents that might compile at the same time, not who dispatched you.
 
-**If you are a subagent working one issue in a worktree, you may run exactly two
-commands, and only with the `flock` prefix and the `-j` cap:**
+**Whoever you are — orchestrator in the main checkout or subagent in a worktree — you
+may run exactly two commands, and only with the `flock` prefix and the `-j` cap:**
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo clippy -j 4 -p <crate-you-changed> --all-targets -- -D warnings
 flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> -- --test-threads=4
 ```
 
-**Still forbidden for a subagent:** `cargo build --release`, anything `--workspace`, and any
-cargo invocation *without* the lock. Do not set a private `CARGO_TARGET_DIR` to get
-around it — the shared `/tmp/maw-rs-target` is precisely what makes one lock able to
-serialize every agent on the box, and a private target dir is a second 30 GB tree.
+Scope `cargo test` further when you can — `--test <file>` or `--lib <module>` runs in
+seconds where the crate takes minutes.
+
+**Forbidden for every agent, in every role:** `cargo build --release`, anything
+`--workspace` or `--all`, and any cargo invocation *without* the lock or *without* the
+`-j` cap. Do not set a private `CARGO_TARGET_DIR` to get around it — the shared
+`/tmp/maw-rs-target` is precisely what makes one lock able to serialize every agent on
+the box, and a private target dir is a second 30 GB tree.
+
+**`cargo test --workspace` is the specific command that froze Wind's machine on
+2026-09-11** — disk at 100%, WSL2 unresponsive, the shared target dir destroyed. There
+is no cheap or careful form of it. Wind's ruling that day: *"you must never run test
+--workspace anymore"*. A green full-suite run is CI's job, and this repository's CI is
+where a workspace-scale check belongs.
+
+**This rule is now enforced, not just written.** `claude/hooks/cargo-build-gate.sh` in
+Wind-Framework refuses an unlocked, uncapped or `--workspace` cargo command whose
+working directory sits inside a maw-rs checkout or worktree. It exists because this
+paragraph was already correct on 2026-09-11 and still did not prevent the freeze: the
+agent never opened this file. Calibration for the hook is
+`claude/hooks/tests/calibrate-cargo-build-gate.sh`, and it asserts the allow half too —
+the two permitted commands, `cargo fmt`, and the same command in another repo all pass.
 
 **Do not drop `-j 4` or `--test-threads=4`.** The box has 14 cores and they are not
 yours: it also runs SQL Server, Docker, several Codex panes, two Claude panes, and an
@@ -43,9 +61,10 @@ reader (`/sop-verify --reviewer`), merge, then rebuild and install per the secti
 It reviews its own work the same way it reviews a subagent's — there is no separate
 reviewer tier, so the fresh-reader pass is what carries the independence.
 
-**This is authoritative for subagents and overrides every conflicting instruction**,
+**This is authoritative for every agent and overrides every conflicting instruction**,
 including the previous revision of this file that banned cargo outright, a task
-brief, or a spec's verification notes.
+brief, a spec's verification notes, or a skill step that says to run the full suite
+once at the end. In this repository that step is scoped to the crates you changed.
 
 ### Why the ban was lifted, and what the lock is for
 
