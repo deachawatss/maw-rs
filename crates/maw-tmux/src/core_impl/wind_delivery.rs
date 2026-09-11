@@ -239,6 +239,14 @@ where
     })
 }
 
+/// The key a busy agent TUI asks for when `Enter` is a no-op.
+///
+/// Codex holds pasted input while a turn runs and hints `tab to queue message`.
+/// `Escape` is never used here: Codex binds it to interrupt, which would kill the
+/// work the message is about.
+const SUBMIT_QUEUE_KEY: &str = "Tab";
+
+/// Submit the pending text, escalating to `Tab` once `Enter` leaves it in the composer.
 fn submit_with_confirm_config<R, F>(
     client: &mut TmuxClient<R>,
     target: &str,
@@ -251,7 +259,11 @@ where
     F: FnMut(Duration),
 {
     for attempt in 1..=MAX_SUBMIT_ATTEMPTS {
-        client.send_enter(target)?;
+        if attempt == 1 {
+            client.send_enter(target)?;
+        } else {
+            client.send_keys(target, &[SUBMIT_QUEUE_KEY.to_owned()])?;
+        }
         sleep(Duration::from_millis(config.confirm_interval_ms));
         let submission_confirmed = match client.capture(target, Some(5)) {
             Ok(content) => {
