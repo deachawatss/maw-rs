@@ -1079,3 +1079,121 @@ fn native_workon_pane_reuse_does_not_arm_an_l2_observer() {
         metadata.display()
     );
 }
+
+/// Run the compiled binary with nothing inherited from the developer's shell.
+fn run_bare(args: &[&str], home: &Path) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(home)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env("CARGO_TERM_COLOR", "never")
+        .output()
+        .expect("run maw-rs")
+}
+
+/// Flag tokens named anywhere in a usage string.
+///
+/// Splitting on non-flag characters keeps `-e` distinct from `--engine`, which a
+/// plain substring check would conflate. Sets, not whole strings, so re-wording or
+/// re-ordering the usage carries no meaning and cannot false-fail.
+fn usage_flag_tokens(usage: &str) -> std::collections::BTreeSet<String> {
+    usage
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+        .filter(|token| token.starts_with('-') && token.len() > 1)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8(output.stdout.clone()).expect("stdout")
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8(output.stderr.clone()).expect("stderr")
+}
+
+#[test]
+fn native_work_help_advertises_every_flag_that_workon_does() {
+    let root = temp_dir("work-help");
+
+    let work = run_bare(&["work", "--help"], &root);
+    let workon = run_bare(&["workon", "--help"], &root);
+
+    assert_eq!(work.status.code(), Some(0), "{}", stderr_of(&work));
+    assert_eq!(workon.status.code(), Some(0), "{}", stderr_of(&workon));
+
+    let work_text = stdout_of(&work);
+    let workon_text = stdout_of(&workon);
+    assert_eq!(
+        usage_flag_tokens(&work_text),
+        usage_flag_tokens(&workon_text),
+        "work and workon share one parser, so they must advertise one flag set\nwork:   {work_text}\nworkon: {workon_text}"
+    );
+
+    assert!(work_text.contains("usage: maw work <repo"), "{work_text}");
+    assert!(workon_text.contains("usage: maw workon <repo"), "{workon_text}");
+    assert!(
+        work_text.contains("--base overrides that start point"),
+        "the explanatory line travels with the flag: {work_text}"
+    );
+}
+
+#[test]
+fn native_work_empty_arguments_teach_the_same_surface_as_help() {
+    let root = temp_dir("work-empty");
+
+    let help = run_bare(&["work", "--help"], &root);
+    let empty = run_bare(&["work"], &root);
+
+    assert_ne!(empty.status.code(), Some(0));
+    assert_eq!(stdout_of(&empty), "", "the error path must not write to stdout");
+    assert_eq!(
+        stderr_of(&empty).trim_end(),
+        stdout_of(&help).trim_end(),
+        "an oracle who typed `maw work` should be taught the full surface"
+    );
+}
+
+#[test]
+fn native_work_still_rejects_the_separator_that_workon_accepts() {
+    let root = temp_dir("work-separator");
+
+    let work = run_bare(&["work", "--"], &root);
+    let workon = run_bare(&["workon", "--"], &root);
+
+    assert!(
+        stderr_of(&work).contains("-- separator is not allowed"),
+        "{}",
+        stderr_of(&work)
+    );
+    assert!(
+        !stderr_of(&workon).contains("separator"),
+        "the guard is deliberately work-only: {}",
+        stderr_of(&workon)
+    );
+}
+
+#[test]
+fn native_work_accepts_prompt_which_the_old_usage_string_omitted() {
+    let root = temp_dir("work-prompt");
+    let bin_dir = seed_hermetic_root(&root, "shell\n");
+
+    let output = run(
+        &root,
+        &bin_dir,
+        &[
+            "work", "demo", "feat", "--layout", "nested", "--prompt", "read CONTEXT.md first",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        stdout_of(&output),
+        stderr_of(&output)
+    );
+    let tmux_log = fs::read_to_string(root.join("tmux.log")).expect("tmux log");
+    assert!(tmux_log.contains("read CONTEXT.md first"), "{tmux_log}");
+}

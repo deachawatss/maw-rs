@@ -78,7 +78,7 @@ impl maw_matcher::Named for WorkonWorktree {
 
 fn run_workon_command(argv: &[String]) -> CliOutput {
     if wants_help(argv, workon_help_value_flags()) {
-        return help_output(workon_usage());
+        return help_output(workon_usage("workon"));
     }
     match workon_parse_args(argv).and_then(|options| workon_cmd(&options)) {
         Ok(stdout) => CliOutput { code: 0, stdout, stderr: String::new() },
@@ -107,7 +107,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
         if workon_parse_base_flag(argv, &mut base, &mut index)? { continue; }
         if workon_parse_profile_flag(argv, &mut profile, &mut index)? { continue; }
         match argv[index].as_str() {
-            "--help" | "-h" => return Err(workon_usage()),
+            "--help" | "-h" => return Err(workon_usage("workon")),
             "--layout" => {
                 let Some(value) = argv.get(index + 1) else { return Err("workon: --layout must be nested or legacy".to_owned()); };
                 layout = workon_parse_layout(value)?;
@@ -172,7 +172,7 @@ fn workon_parse_args(argv: &[String]) -> Result<WorkonOptions, String> {
                 prompt = Some(text);
                 break;
             }
-            value if value.starts_with('-') => return Err(workon_usage()),
+            value if value.starts_with('-') => return Err(workon_usage("workon")),
             value => {
                 positional.push(value.to_owned());
                 index += 1;
@@ -258,8 +258,8 @@ fn workon_parse_repo(
     fresh: bool,
     name: Option<&String>,
 ) -> Result<String, String> {
-    let Some(repo) = positional.first().cloned() else { return Err(workon_usage()); };
-    if positional.len() > 2 { return Err(workon_usage()); }
+    let Some(repo) = positional.first().cloned() else { return Err(workon_usage("workon")); };
+    if positional.len() > 2 { return Err(workon_usage("workon")); }
     workon_validate_query(&repo, "repo")?;
     if let Some(task) = positional.get(1) { workon_validate_slug_input(task, "task")?; }
     if matches!(wt, Some(WorkonWorktreeRequest::Auto | WorkonWorktreeRequest::Named(_))) && positional.len() > 1 { return Err("workon: use either positional task or --wt, not both".to_owned()); }
@@ -277,8 +277,13 @@ fn workon_parse_layout(raw: &str) -> Result<WorkonLayout, String> {
     }
 }
 
-fn workon_usage() -> String {
-    "usage: maw workon <repo|.|path|url> [task] [--wt [slug]|--no-wt] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--codex|--claude] [--profile <name>] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point".to_owned()
+/// Usage text for `workon` and its `work` alias.
+///
+/// One owner for the flag list. The two verbs share `workon_parse_args`, so a
+/// second hand-written string went stale the moment a flag was added to one of
+/// them — `maw work --help` under-reported six working flags for 27 days.
+fn workon_usage(verb: &str) -> String {
+    format!("usage: maw {verb} <repo|.|path|url> [task] [--wt [slug]|--no-wt] [--fresh] [--name <stable>] [--base <ref>] [-e <engine>|--engine <engine>|--codex|--claude] [--profile <name>] [--oracle <session>|--session <session>] [--layout nested|legacy] [--prompt <text>]\nnew worktrees fetch origin and branch from origin/<default-branch>; --base overrides that start point")
 }
 
 fn workon_help_value_flags() -> &'static [&'static str] {
@@ -1799,6 +1804,46 @@ fn workon_path_str(path: &std::path::Path) -> Result<&str, String> {
 mod workon_tests {
     use super::*;
 
+    /// Flag tokens named anywhere in a usage string.
+    ///
+    /// Splitting on non-flag characters keeps `-e` distinct from `--engine`, which
+    /// a plain `contains` would conflate.
+    fn workon_usage_flag_tokens(usage: &str) -> std::collections::BTreeSet<String> {
+        usage
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+            .filter(|token| token.starts_with('-') && token.len() > 1)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_value_taking_flag_is_advertised_in_the_usage_text() {
+        let advertised = workon_usage_flag_tokens(&workon_usage("workon"));
+        for flag in workon_help_value_flags() {
+            assert!(
+                advertised.contains(*flag),
+                "{flag} takes a value and is accepted, but the usage text never names it: {advertised:?}"
+            );
+        }
+    }
+
+    /// Flag-set parity between the two verbs is proven at the compiled-binary seam,
+    /// in `tests/native_workon_plugin.rs`. Asserting it here would only prove that
+    /// one format string equals itself.
+    #[test]
+    fn workon_usage_substitutes_the_verb_exactly() {
+        let work = workon_usage("work");
+        let workon = workon_usage("workon");
+
+        assert!(work.starts_with("usage: maw work <repo"), "{work}");
+        assert!(workon.starts_with("usage: maw workon <repo"), "{workon}");
+        assert_eq!(
+            work.replace("maw work ", "maw workon "),
+            workon,
+            "the verb is the only difference, and substituting it must be exact"
+        );
+    }
+
     #[derive(Default)]
     struct WorkonMockTmux {
         calls: Vec<(String, Vec<String>)>,
@@ -2290,8 +2335,8 @@ mod workon_tests {
         let base = workon_parse_args(&workon_strings(&["repo", "task", "--base=origin/release"])).expect("base");
         assert_eq!(base.base.as_deref(), Some("origin/release"));
         assert!(workon_parse_args(&workon_strings(&["repo", "task", "--base", "bad ref"])).is_err());
-        assert!(workon_usage().contains("fetch origin"));
-        assert!(workon_usage().contains("--base <ref>"));
+        assert!(workon_usage("workon").contains("fetch origin"));
+        assert!(workon_usage("workon").contains("--base <ref>"));
     }
 
     #[test]
@@ -2379,8 +2424,8 @@ mod workon_tests {
         let eq = workon_parse_args(&workon_strings(&["repo", "--wt", "--engine=claude"])).expect("eq");
         assert_eq!(eq.engine.as_deref(), Some("claude"));
         // Usage advertises the shorthands.
-        assert!(workon_usage().contains("--codex"));
-        assert!(workon_usage().contains("--claude"));
+        assert!(workon_usage("workon").contains("--codex"));
+        assert!(workon_usage("workon").contains("--claude"));
     }
 
     #[test]
