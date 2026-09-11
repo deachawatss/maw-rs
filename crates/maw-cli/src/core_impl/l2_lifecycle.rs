@@ -390,6 +390,23 @@ fn l2_delivery_context(cwd: &Path) -> (u64, String, String, String) {
     (issue, mode, risk, engine)
 }
 
+/// The oracle that owns this worktree *now*.
+///
+/// `.maw/l1-oracle` is written by `workon` and stays current. `.maw/l2-meta-<pane>.json` has
+/// had no writer since #207 removed the observer, so a repository carrying residue from an
+/// older run hands a stale name to every PR handoff that reuses the pane id, permanently.
+/// The name is not cosmetic: `l2_drain_events` only delivers an event whose `l1_oracle`
+/// matches `MAW_ORACLE`, so a stale name drops the handoff rather than mislabelling it (#209).
+///
+/// The live marker therefore wins. The recorded name stays as the fallback for a repository
+/// that has no marker, and an empty marker is no marker.
+fn l2_live_l1_oracle(cwd: &Path) -> Option<String> {
+    std::fs::read_to_string(cwd.join(".maw/l1-oracle"))
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 fn l2_emit_state(cwd: &Path, pane: &str, state: L2TerminalState, body: Option<&str>) -> Result<bool, String> {
     l2_emit_state_with_pr_url(cwd, pane, state, body, None)
 }
@@ -407,7 +424,7 @@ fn l2_emit_state_with_pr_url(
         .and_then(|raw| serde_json::from_str::<L2ParentMetadata>(&raw).map_err(|error| format!("l2 event: parse metadata: {error}")))?;
     let (issue, mode, risk, engine) = l2_delivery_context(cwd);
     let repo = metadata.repo.clone().or_else(|| cwd.file_name().and_then(std::ffi::OsStr::to_str).map(str::to_owned)).unwrap_or_else(|| "unknown".to_owned());
-    let l1_oracle = metadata.l1_oracle.clone().or_else(|| std::fs::read_to_string(cwd.join(".maw/l1-oracle")).ok().map(|value| value.trim().to_owned())).unwrap_or_else(|| "unknown".to_owned());
+    let l1_oracle = l2_live_l1_oracle(cwd).or_else(|| metadata.l1_oracle.clone()).unwrap_or_else(|| "unknown".to_owned());
     let mut delivered = l2_flush_pending_transition(cwd, pane)?;
     let message = format_l2_handoff(state.handoff_kind(), &l1_oracle, &repo, issue, &mode, &risk, body.unwrap_or_else(|| state.body()), &engine);
     let event = L2Event {
@@ -445,7 +462,7 @@ fn l2_emit_pr_event(cwd: &Path, pr_number: u64, url: &str) -> Result<bool, Strin
         .unwrap_or_else(|| "unknown".to_owned());
     let metadata_path = l2_pane_metadata_path(cwd, &pane);
     if !metadata_path.exists() {
-        let l1_oracle = std::fs::read_to_string(cwd.join(".maw/l1-oracle")).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty());
+        let l1_oracle = l2_live_l1_oracle(cwd);
         l2_record_pane_metadata(cwd, &pane, &L2ParentMetadata {
             session_id: Some(pane.clone()),
             l1_session: l1_oracle.clone(),
@@ -852,6 +869,66 @@ mod l2_lifecycle_tests {
         let events = l2_drain_events().expect("two PR handoffs");
         assert_eq!(events.iter().map(|event| event.l2_session.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["member-one", "member-two"]));
         assert_eq!(events.iter().map(|event| event.l2_pane.as_str()).collect::<std::collections::BTreeSet<_>>(), std::collections::BTreeSet::from(["%11", "%12"]));
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+
+    #[test]
+    fn pr_handoff_takes_the_oracle_name_from_the_live_marker_not_stale_pane_metadata() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _pane = EnvVarRestore::capture("MAW_L2_PANE_ID");
+        let _oracle = EnvVarRestore::capture("MAW_ORACLE");
+        let root = std::env::temp_dir().join(format!("maw-rs-l2-stale-oracle-{}", std::process::id()));
+        let repo = root.join("maw-rs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(repo.join(".maw")).expect("repo metadata");
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("MAW_ORACLE", "gale");
+        std::env::set_var("MAW_L2_PANE_ID", "%7");
+        std::fs::write(repo.join(".maw/delivery.json"), r#"{"issue":209,"mode":"standard","riskTags":[],"engine":"codex"}"#).expect("delivery");
+        // Residue from a run that predates #207: nothing rewrites this file any more.
+        l2_record_pane_metadata(&repo, "%7", &L2ParentMetadata {
+            session_id: Some("child-7".to_owned()), l1_oracle: Some("leaf".to_owned()), l1_session: Some("parent-1".to_owned()), l2_pane: Some("%7".to_owned()), repo: Some("maw-rs".to_owned()), ..L2ParentMetadata::default()
+        })
+        .expect("residue pane metadata");
+        // The marker workon still maintains names the oracle that owns the worktree now.
+        std::fs::write(repo.join(".maw/l1-oracle"), "gale\n").expect("live l1-oracle marker");
+
+        assert!(l2_emit_pr_event(&repo, 209, "https://github.com/acme/maw-rs/pull/209").expect("emit PR event"));
+
+        let events = l2_drain_events().expect("one PR handoff");
+        assert_eq!(events.len(), 1, "a stale l1_oracle does not mislabel the handoff, it drops it — l2_drain_events only delivers events matching MAW_ORACLE");
+        assert_eq!(events[0].l1_oracle, "gale");
+        assert!(events[0].message.starts_with("[gale:maw-rs]"), "{}", events[0].message);
+        assert_eq!(events[0].l2_session, "child-7", "the pane-scoped session identity stays with the metadata");
+        std::fs::remove_dir_all(root).expect("cleanup root");
+    }
+
+    #[test]
+    fn pr_handoff_ignores_an_empty_live_marker_and_keeps_the_recorded_oracle() {
+        let _guard = env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _state = EnvVarRestore::capture("MAW_STATE_DIR");
+        let _pane = EnvVarRestore::capture("MAW_L2_PANE_ID");
+        let _oracle = EnvVarRestore::capture("MAW_ORACLE");
+        let root = std::env::temp_dir().join(format!("maw-rs-l2-empty-marker-{}", std::process::id()));
+        let repo = root.join("maw-rs");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(repo.join(".maw")).expect("repo metadata");
+        std::env::set_var("MAW_STATE_DIR", root.join("state"));
+        std::env::set_var("MAW_ORACLE", "gale");
+        std::env::set_var("MAW_L2_PANE_ID", "%8");
+        std::fs::write(repo.join(".maw/delivery.json"), r#"{"issue":209,"mode":"standard","riskTags":[],"engine":"codex"}"#).expect("delivery");
+        l2_record_pane_metadata(&repo, "%8", &L2ParentMetadata {
+            session_id: Some("child-8".to_owned()), l1_oracle: Some("gale".to_owned()), l1_session: Some("parent-1".to_owned()), l2_pane: Some("%8".to_owned()), repo: Some("maw-rs".to_owned()), ..L2ParentMetadata::default()
+        })
+        .expect("pane metadata");
+        std::fs::write(repo.join(".maw/l1-oracle"), "  \n").expect("blank l1-oracle marker");
+
+        assert!(l2_emit_pr_event(&repo, 210, "https://github.com/acme/maw-rs/pull/210").expect("emit PR event"));
+
+        let events = l2_drain_events().expect("one PR handoff");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].l1_oracle, "gale");
         std::fs::remove_dir_all(root).expect("cleanup root");
     }
 
