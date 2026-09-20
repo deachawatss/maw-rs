@@ -319,18 +319,28 @@ fn pair_system_accept_live(plan: &PairAcceptPlan, config: &PairConfig) -> Result
 }
 
 fn pair_http_json(method: &str, url: &str, body: Option<String>) -> Result<maw_transport::HttpResponse, String> {
-    let io = ReqwestHttpTransportIo::new(5_000)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("pair http runtime failed: {error}"))?;
-    runtime.block_on(io.request(&TransportHttpRequest {
-        method: method.to_owned(),
-        url: url.to_owned(),
-        headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
-        body,
-        timeout_ms: Some(5_000),
-        follow_redirects: false,
-        pinned_addr: None,
-        max_response_bytes: None,
-    }))
+    // The runtime is built on a dedicated thread, not the caller's. `maw pair` is dispatched
+    // from inside an async runtime, so building one here panicked with "Cannot start a runtime
+    // from within a runtime" and took every pair subcommand with it. This mirrors
+    // `peers_fetch_info`, the sibling that does the same HTTP from the same sync call chain
+    // and works for exactly this reason.
+    let method = method.to_owned();
+    let url = url.to_owned();
+    let handle = std::thread::spawn(move || -> Result<maw_transport::HttpResponse, String> {
+        let io = ReqwestHttpTransportIo::new(5_000)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| format!("pair http runtime failed: {error}"))?;
+        runtime.block_on(io.request(&TransportHttpRequest {
+            method,
+            url,
+            headers: BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            body,
+            timeout_ms: Some(5_000),
+            follow_redirects: false,
+            pinned_addr: None,
+            max_response_bytes: None,
+        }))
+    });
+    handle.join().map_err(|_| "pair http runtime panicked".to_owned())?
 }
 
 fn pair_parse_json(raw: &str, label: &str) -> Result<serde_json::Value, String> {
