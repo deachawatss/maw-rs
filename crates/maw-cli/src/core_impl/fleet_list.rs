@@ -292,7 +292,12 @@ fn ls_node_json(node: &LsFetchedNode151) -> String {
 
 fn ls_fetch_peer_sessions(peer_url: &str) -> Result<Vec<serde_json::Value>, String> {
     ls_validate_peer_url(peer_url)?;
-    let url = format!("{}/api/ls", peer_url.trim_end_matches('/'));
+    // The server route is /api/sessions (serve.rs -> .route("/api/sessions", ...)); there is
+    // no /api/ls, so every federated peer answered 404 and `maw ls --federation` could never
+    // show a peer — including a peer pointing at our own loopback, which is what proved this
+    // was a path mismatch and not a network or auth fault. The payload is a bare session
+    // array, which ls_sessions_from_payload already handles. (2026-09-20)
+    let url = format!("{}/api/sessions", peer_url.trim_end_matches('/'));
     let output = std::process::Command::new("curl")
         .args(["-fsS", "--max-time", "2", "--"])
         .arg(&url)
