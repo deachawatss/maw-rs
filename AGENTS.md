@@ -64,7 +64,7 @@ one scoped test. The lock stops two agents compiling at once; it does nothing ab
 agent taking the entire box, and that is what these flags are for.
 
 A subagent's loop is: read the issue → make the fix → read your own diff → run the two
-locked commands → commit → push → `maw pr` → return the PR to the orchestrator. **You do
+locked commands → commit → push → `gh pr create` → return the PR to the orchestrator. **You do
 not merge.**
 
 The orchestrator's loop is: rebase onto `origin/main`, re-read the diff cold as a fresh
