@@ -4,7 +4,7 @@ Read this once before taking an issue. Keep changes small, verified, and sourced
 For how-to detail, see `docs/agent-guides/adding-a-plugin-artifact.md` and
 `docs/agent-guides/release-and-calver.md`.
 
-## Build gate — every cargo run goes through one lock (Wind ruling, 2026-07-28; supersedes the 2026-07-26 total ban)
+## Build gate — every cargo run goes through one lock
 
 There are no agent tiers. One **orchestrator** — Claude or Codex, identical flow — drives
 the work: it either makes the change itself in the main checkout, or fans **subagents** out
