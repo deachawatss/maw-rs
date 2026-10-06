@@ -6,12 +6,9 @@ For repo-wide agent execution conventions, read `AGENTS.md` first; this file rem
 
 ## Build Gate — `AGENTS.md` is the single source
 
-**The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** As of the
-2026-07-28 Wind ruling ANY agent — orchestrator in the main checkout as much as a
-subagent in a worktree — MAY run exactly two cargo commands, each `flock`-ed on the
-shared target dir and capped at `-j 4`; the total ban that this section used to restate
-was superseded that day. Do not reconstruct the rule from memory or from an older
-revision of this file.
+**The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** Any agent —
+orchestrator in the main checkout as much as a subagent in a worktree — may run exactly
+two cargo commands, each `flock`-ed on the shared target dir and capped at `-j 4`.
 
 **`cargo test --workspace` is banned outright** (Wind, 2026-09-11, after it froze the
 machine). Enforced in three layers, not remembered: `jobs = 4` in this repo's
@@ -96,12 +93,7 @@ beta:    v<YY>.<M>.<DD>-beta.<HMM>      independent channel
 collisions. If `HMM` ≤ the highest existing suffix for the same base+channel,
 the crate advances to the next calendar day (`next_calendar_base`).
 
-Transition note: before 2026-07-05 the last number was a per-month release
-*sequence* (SEQ-era `v26.7.2`–`v26.7.7`). Those tags were retired on
-2026-07-05 (notes archived in the vault, commits untouched) and the current
-line restarted day-based at `v26.7.5` (= 2026-07-05, same commit as SEQ-era
-v26.7.7). The exact commit and build time are embedded in the binary
-(`maw --version`) regardless of scheme.
+The exact commit and build time are embedded in the binary (`maw --version`).
 
 Cut flow **on this fork**: `main` is the only branch `origin` has, and every PR
 targets it (merged PRs #104/#106/#108/#111/#112 are all `base=main`). A release
