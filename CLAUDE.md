@@ -33,7 +33,7 @@ fix from the log — do not reproduce locally to "see it fail".
 
 Consequences to be honest about, so nobody is surprised:
 
-- Report exactly what you ran. `/prove-live` for this repo covers the
+- Report exactly what you ran. The local checks for this repo are the
   two locked commands in `AGENTS.md` and nothing wider — everything
   workspace-scale is CI-pending. Do not claim a check you did not run.
 - The review reads the diff and the CI result, not a claimed test run.
