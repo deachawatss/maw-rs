@@ -4,7 +4,7 @@ This branch keeps `maw-rs` on top of upstream core and migrates Wind/deachawat f
 
 ## Naming convention
 
-- Patch existing upstream surfaces when they already exist: `done`, `team`, `workon`, `overview`, `cleanup`, `pr`, `tmux`/`send-text`.
+- Patch existing upstream surfaces when they already exist: `done`, `team`, `workon`, `cleanup`, `pr`, `tmux`/`send-text`.
 - Add internal helpers only when there is no existing owner: submit/pane-delivery helpers live under `maw-tmux`, not as a new user-facing `maw-*` command.
 - Keep Wind-only workflow policy out of generic names unless it is explicitly config-gated.
 
@@ -67,7 +67,6 @@ The fork-patch audit found upstream maw-rs already has native command surfaces f
 - `done` / `finish`
 - `team`
 - `workon`
-- `overview`-adjacent tmux/fleet helpers
 - `send-text`, `send-enter`, `run`, and tmux helpers
 - `shellenv`
 - cleanup/fleet/team delete paths
@@ -80,10 +79,9 @@ These should be implemented as small hardening PRs on existing surfaces, not new
 
 1. `team`: anchored spawn/kickoff and orphan pane sweep proofs are covered by the native `team` owner plus `crates/maw-cli/src/wind/team.rs`.
 2. `workon`: fresh-worktree command sanitization, engine-resolution policy, shared `ψ/`, and Rust shared target-dir behavior are covered by the native `workon` owner plus `crates/maw-cli/src/wind/workon.rs`.
-3. `overview`: roster selection and non-zero pane/window index proofs are covered by `overview` tests and the live `TmuxSession` parser path.
-4. `cleanup`: leaked internal session/team cleanup stays on the native `cleanup` -> `view --zombie-agents` + `team prune` path, with bounded delete guards in `team_delete`.
-5. `pr`/fleet queue: `maw pr` targets the fork `origin` repo, writes `Closes #N` + `REQ: #N`, and rejects `Soul-Brews-Studio/*` origin URLs case-insensitively.
-6. `spawn`: `swarm` and `tile` no longer hardcode `zsh`; they use a safe absolute `$SHELL` value with `/bin/bash` fallback.
+3. `cleanup`: leaked internal session/team cleanup stays on the native `cleanup` -> `view --zombie-agents` + `team prune` path, with bounded delete guards in `team_delete`.
+4. `pr`/fleet queue: `maw pr` targets the fork `origin` repo, writes `Closes #N` + `REQ: #N`, and rejects `Soul-Brews-Studio/*` origin URLs case-insensitively.
+5. `spawn`: `swarm` and `tile` no longer hardcode `zsh`; they use a safe absolute `$SHELL` value with `/bin/bash` fallback.
 
 Remaining genuine parity work is no longer fork-patch migration of the daily workflow. Treat further gaps as normal command parity issues with their own source rows/tests.
 

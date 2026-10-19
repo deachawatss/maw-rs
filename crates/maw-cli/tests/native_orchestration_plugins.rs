@@ -111,25 +111,24 @@ fn native_about_matches_committed_maw_js_golden_without_ref_checkout() {
 }
 
 #[test]
-fn native_overview_kill_matches_committed_maw_js_golden_without_ref_checkout() {
-    let root = temp_dir("overview-kill");
+fn overview_is_an_unknown_command() {
+    let root = temp_dir("overview-removed");
     let maw_home = root.join("home");
     let ghq = root.join("ghq");
     let cwd = root.join("repo");
     fs::create_dir_all(&cwd).expect("cwd");
 
-    let output = run(&["overview", "--color", "--kill"], &cwd, &maw_home, &ghq);
+    let output = run(&["overview", "--help"], &cwd, &maw_home, &ghq);
 
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "");
+    assert!(String::from_utf8(output.stderr)
+        .expect("stderr")
+        .contains("unknown command 'overview'"));
     assert_eq!(
-        String::from_utf8(output.stdout).expect("stdout"),
-        include_str!("fixtures/native-orchestration/overview-kill.stdout")
+        maw_cli::dispatcher_status("overview"),
+        maw_cli::DispatchKind::NativeError
     );
-    assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
 }
 
 #[test]
@@ -144,10 +143,6 @@ fn native_dispatcher_registers_orchestration_plugins() {
     );
     assert_eq!(
         maw_cli::dispatcher_status("about"),
-        maw_cli::DispatchKind::Native
-    );
-    assert_eq!(
-        maw_cli::dispatcher_status("overview"),
         maw_cli::DispatchKind::Native
     );
 }
