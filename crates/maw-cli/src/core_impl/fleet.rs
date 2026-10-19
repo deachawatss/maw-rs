@@ -1090,7 +1090,7 @@ fn fleet_renumber_only_99_plan(
     let mut candidates = entries
         .iter()
         .filter_map(|entry| fleet_renumber_candidate(entry, true))
-        .filter(|(number, stem, _)| *number == 99 && stem != "overview")
+        .filter(|(number, _, _)| *number == 99)
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.1.cmp(&right.1));
     let mut items = Vec::with_capacity(candidates.len());
@@ -2329,7 +2329,6 @@ mod fleet_tests {
             std::fs::write(root.join("config/fleet/01-root.json"), r#"{"name":"01-root","windows":[]}"#).expect("root");
             std::fs::write(root.join("config/fleet/99-bud.json"), r#"{"name":"99-bud","windows":[],"mystery":true}"#).expect("bud");
             std::fs::write(root.join("config/fleet/99-cat.json"), r#"{"name":"99-cat","windows":[]}"#).expect("cat");
-            std::fs::write(root.join("config/fleet/99-overview.json"), r#"{"name":"99-overview","windows":[]}"#).expect("overview");
             let mut runtime = FleetFakeRuntime::default();
 
             let (code, stdout) = fleet_run_with(&fleet_strings(&["renumber", "--only-99", "--dry-run", "--json"]), &mut runtime).expect("renumber");
