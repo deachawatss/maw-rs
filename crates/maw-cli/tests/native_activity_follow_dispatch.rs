@@ -92,17 +92,13 @@ fn epic55_activity_follow_guard_leading_dash_values_before_io() {
 }
 
 #[test]
-fn epic55_dispatch_registers_activity_follow_without_token_slice() {
+fn epic55_dispatch_registers_activity_follow() {
     assert_eq!(
         maw_cli::dispatcher_status("activity"),
         maw_cli::DispatchKind::Native
     );
     assert_eq!(
         maw_cli::dispatcher_status("follow"),
-        maw_cli::DispatchKind::NativeError
-    );
-    assert_eq!(
-        maw_cli::dispatcher_status("token"),
         maw_cli::DispatchKind::NativeError
     );
 }

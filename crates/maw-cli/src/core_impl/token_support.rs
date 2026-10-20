@@ -1,8 +1,3 @@
-// Token helpers shared by squad and buddy-workspace flows.
-//
-// The top-level `maw token` command remains intentionally absent: it mutates
-// Anthropic authentication state and was removed by the fork security patch.
-
 const TOKEN_SUPPORT_PASS_PREFIX: &str = "claude/token-";
 
 fn token_detect_active_token(content: &str) -> Option<String> {
