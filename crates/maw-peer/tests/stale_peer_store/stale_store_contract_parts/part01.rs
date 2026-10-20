@@ -7,7 +7,7 @@ use std::{
 
 use maw_peer::{
     default_stale_ttl_ms, empty_peer_store, is_peer_stale, load_peer_store, mutate_peer_store,
-    parse_stale_ttl_ms, peer_store_path, remove_stale_peers, save_peer_store, stale_age_ms,
+    parse_peer_timestamp_ms, parse_stale_ttl_ms, peer_store_path, remove_stale_peers, save_peer_store, stale_age_ms,
     stale_peer_check, stale_peers, PeerRecord, PeerStoreEnv, PeerStoreFile,
 };
 
@@ -39,6 +39,20 @@ fn stale_ttl_parsing_matches_maw_js_env_contract() {
         default_stale_ttl_ms()
     );
     assert_eq!(parse_stale_ttl_ms(Some("")), default_stale_ttl_ms());
+}
+
+#[test]
+fn peer_timestamps_read_iso_epoch_ms_and_epoch_seconds() {
+    let noon = Some(1_779_105_600_000);
+
+    assert_eq!(parse_peer_timestamp_ms("2026-05-18T12:00:00.000Z"), noon);
+    assert_eq!(parse_peer_timestamp_ms("1779105600000"), noon);
+    assert_eq!(parse_peer_timestamp_ms("1779105600"), noon);
+    assert_eq!(parse_peer_timestamp_ms("99999999999"), Some(99_999_999_999_000));
+    assert_eq!(parse_peer_timestamp_ms("100000000000"), Some(100_000_000_000));
+    assert_eq!(parse_peer_timestamp_ms(""), None);
+    assert_eq!(parse_peer_timestamp_ms("-1779105600"), None);
+    assert_eq!(parse_peer_timestamp_ms("1779105600s"), None);
 }
 
 #[test]
