@@ -357,7 +357,7 @@ fn peers_format_list(rows: &[(String, PeersPeerNative, bool, Option<u64>)]) -> S
         if *stale {
             let suffix = age.map_or_else(
                 || "never seen".to_owned(),
-                |value| format!("last seen {}d ago", value / PEERS_DEFAULT_STALE_TTL_MS),
+                |value| format!("last seen {}d ago", value / 86_400_000),
             );
             let _ = write!(line, "  \x1b[2m(stale, {suffix})\x1b[0m");
         }
@@ -434,7 +434,7 @@ fn peers_stale_ttl_ms() -> u64 {
 
 fn peers_stale_age_ms(peer: &PeersPeerNative) -> Option<u64> {
     let stamp = peer.last_seen.as_ref().unwrap_or(&peer.added_at);
-    let then = stamp.parse::<u64>().ok()?;
+    let then = maw_peer::parse_peer_timestamp_ms(stamp)?;
     Some(peers_now_ms().saturating_sub(then))
 }
 
