@@ -211,8 +211,9 @@ fn token_cmd_use(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Token
 fn token_cmd_use_name(name: &str, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
     token_validate_name("token name", name)?;
     let dir = token_envrc_dir("use")?;
-    let pass_path = format!("{TOKEN_TOKEN_PREFIX}{name}");
-    if !token_pass_exists(runner, &pass_path) { return Err(format!("token \"{name}\" not found in pass ({pass_path})")); }
+    if !token_list_token_names(runner).iter().any(|known| known == name) {
+        return Err(format!("token \"{name}\" not found in pass ({TOKEN_TOKEN_PREFIX}{name})"));
+    }
     let existing = std::fs::read_to_string(dir.envrc()).unwrap_or_default();
     let content = token_build_envrc_content(&existing, name, true);
     token_write_envrc("use", &dir, &content, format!("Now using: {name}\n"), runner)
@@ -261,6 +262,7 @@ fn token_cmd_save(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Toke
     let path = format!("{TOKEN_PASS_PREFIX}/{name}");
     let envrc_path = cwd.join(".envrc");
     let content = std::fs::read_to_string(&envrc_path).map_err(|_| "no .envrc in current directory".to_owned())?;
+    token_reject_literal_secret(&content)?;
     if token_pass_exists(runner, &path) && !args.force && !token_confirm_overwrite(runner, &format!("Overwrite {path}?")) {
         return Ok(token_ok(format!("Skipped (would overwrite {path})\n")));
     }
@@ -278,7 +280,7 @@ fn token_cmd_load(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Toke
         return Ok(token_ok(format!("Skipped (would overwrite .envrc; {path})\n")));
     }
     let content = runner.token_pass_show(&path).map_err(|()| "pass show failed".to_owned())?;
-    token_reject_literal_oauth_value(&content)?;
+    token_reject_literal_secret(&content)?;
     token_write_envrc("load", &dir, &content, format!("Loaded {path} into .envrc\n"), runner)
 }
 
@@ -417,13 +419,17 @@ fn token_prompt_confirm(prompt: &str) -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
 }
 
-fn token_reject_literal_oauth_value(content: &str) -> Result<(), String> {
+fn token_reject_literal_secret(content: &str) -> Result<(), String> {
     let literal_secret = content.contains("sk-ant-");
-    let unreferenced_oauth_line = content.lines().map(str::trim).any(|line| {
-        line.contains("CLAUDE_CODE_OAUTH_TOKEN") && !line.starts_with('#') && !line.contains("$(pass show claude/token-")
+    let unreferenced_oauth_value = content.lines().map(str::trim).filter(|line| !line.starts_with('#')).any(|line| {
+        let assignment = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        assignment.strip_prefix("CLAUDE_CODE_OAUTH_TOKEN=").is_some_and(|value| {
+            !value.trim_start_matches('"').starts_with("$(pass show claude/token-")
+                || value.split_once(')').is_some_and(|(_, rest)| !rest.trim_start_matches('"').trim().is_empty())
+        })
     });
-    if literal_secret || unreferenced_oauth_line {
-        return Err("saved envrc contains literal token value; refusing to write".to_owned());
+    if literal_secret || unreferenced_oauth_value {
+        return Err("envrc contains a literal token value; refusing to write".to_owned());
     }
     Ok(())
 }

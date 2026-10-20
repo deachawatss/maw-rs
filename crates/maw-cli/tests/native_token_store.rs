@@ -139,7 +139,7 @@ fn epic55_token_save_transits_envrc_via_pass_stdin_and_hides_pass_failures() {
     fs::create_dir_all(cwd.join(".git")).expect("cwd");
     fs::write(
         cwd.join(".envrc"),
-        format!("export CLAUDE_CODE_OAUTH_TOKEN={SECRET_VALUE}\n"),
+        "export CLAUDE_TOKEN_NAME=\"nova\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\n",
     )
     .expect("envrc");
 
@@ -151,7 +151,7 @@ fn epic55_token_save_transits_envrc_via_pass_stdin_and_hides_pass_failures() {
     );
     let stored = fs::read_to_string(root.join("fake/pass/envrc/repo")).expect("saved envrc");
     assert!(
-        stored.contains(SECRET_VALUE),
+        stored.contains("$(pass show claude/token-nova)"),
         "fake pass receives stdin payload"
     );
 
@@ -421,4 +421,110 @@ fn token_load_refuses_any_literal_claude_secret() {
         assert!(!stderr.contains("secretvalue"), "{name}: {stderr}");
         assert!(!cwd.join(".envrc").exists(), "{name}");
     }
+}
+
+#[test]
+fn token_use_removes_an_agent_teams_line_without_export() {
+    let root = epic55_temp_dir("bare-teams");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        cwd.join(".envrc"),
+        "KEEP=1\nCLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1\n",
+    )
+    .expect("envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "pym"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envrc = fs::read_to_string(cwd.join(".envrc")).expect("envrc");
+    assert!(envrc.contains("KEEP=1"));
+    assert!(!envrc.contains("AGENT_TEAMS"), "{envrc}");
+}
+
+#[test]
+fn token_load_checks_the_assigned_value_not_the_whole_line() {
+    let root = epic55_temp_dir("load-value");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        root.join("fake/pass/envrc/tail-ref"),
+        "export CLAUDE_CODE_OAUTH_TOKEN=abc123literal # $(pass show claude/token-nova)\n",
+    )
+    .expect("tail-ref");
+    fs::write(
+        root.join("fake/pass/envrc/unset"),
+        "unset CLAUDE_CODE_OAUTH_TOKEN\nexport CLAUDE_TOKEN_NAME=\"nova\"\nCLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\n",
+    )
+    .expect("unset");
+
+    let refused = epic55_run(&root, &cwd, &["token", "load", "tail-ref", "--force"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8(refused.stderr).expect("stderr");
+    assert!(stderr.contains("refusing to write"), "{stderr}");
+    assert!(!stderr.contains("abc123literal"), "{stderr}");
+
+    let loaded = epic55_run(&root, &cwd, &["token", "load", "unset", "--force"]);
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+}
+
+#[test]
+fn token_save_refuses_an_envrc_with_a_literal_secret() {
+    let root = epic55_temp_dir("save-literal");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        cwd.join(".envrc"),
+        "export ANTHROPIC_API_KEY=sk-ant-api03-secretvalue\n",
+    )
+    .expect("envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "save", "leaky", "--force"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("refusing"), "{stderr}");
+    assert!(!stderr.contains("secretvalue"), "{stderr}");
+    assert!(!root.join("fake/pass/envrc/leaky").exists());
+}
+
+#[test]
+fn token_use_checks_the_token_exists_without_reading_its_value() {
+    let root = epic55_temp_dir("use-no-show");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+
+    let output = Command::new(epic55_bin())
+        .args(["token", "use", "pym"])
+        .current_dir(&cwd)
+        .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("MAW_RS_TOKEN_FAKE_ROOT", root.join("fake"))
+        .env("MAW_RS_TOKEN_FAKE_FAIL", "show")
+        .env("HOME", root.join("home"))
+        .env_remove("CLAUDE_TOKEN_NAME")
+        .output()
+        .expect("run maw-rs");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let missing = epic55_run(&root, &cwd, &["token", "use", "nobody"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8(missing.stderr)
+        .expect("stderr")
+        .contains("not found in pass"));
 }
