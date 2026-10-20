@@ -126,3 +126,16 @@ fn remove_stale_peers_reports_plural_removed_count() {
     assert_eq!(removed.message, "removed 2 stale peers");
     assert!(load_peer_store(&env).peers.is_empty());
 }
+
+#[test]
+fn stale_age_reads_epoch_millisecond_timestamps_written_by_peers_add() {
+    let added = "1792122845399";
+    let four_days_later = 1_792_122_845_399 + 4 * 86_400_000;
+
+    assert_eq!(stale_age_ms(&peer(added, Some(added)), four_days_later), Some(4 * 86_400_000));
+    assert_eq!(stale_age_ms(&peer(added, None), 1_792_122_845_409), Some(10));
+    assert!(!is_peer_stale(&peer(added, Some(added)), default_stale_ttl_ms(), four_days_later));
+    assert!(is_peer_stale(&peer(added, Some(added)), default_stale_ttl_ms(), four_days_later + 4 * 86_400_000));
+    assert_eq!(stale_age_ms(&peer("12ab", None), four_days_later), None);
+    assert_eq!(stale_age_ms(&peer("1792122845", None), 1_792_122_845_000 + 10), Some(10));
+}

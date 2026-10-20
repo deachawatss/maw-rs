@@ -31,13 +31,28 @@ pub fn parse_stale_ttl_ms(raw: Option<&str>) -> u64 {
 
 /// Age of a peer's most informative timestamp in milliseconds.
 ///
-/// Mirrors maw-js: use `lastSeen` when present, otherwise `addedAt`; invalid
-/// provenance returns `None`, and future timestamps clamp to `0`.
+/// Uses `lastSeen` when present, otherwise `addedAt`. An unreadable
+/// timestamp returns `None`, and future timestamps clamp to `0`.
 #[must_use]
 pub fn stale_age_ms(peer: &PeerRecord, now_ms: u64) -> Option<u64> {
     let reference = peer.last_seen.as_deref().unwrap_or(&peer.added_at);
-    let timestamp = parse_iso_timestamp_ms(reference)?;
+    let timestamp = parse_peer_timestamp_ms(reference)?;
     Some(now_ms.saturating_sub(timestamp))
+}
+
+/// A `peers.json` timestamp in epoch milliseconds. Reads ISO `...Z`
+/// (maw-js), epoch milliseconds (`maw peers add`) and epoch seconds
+/// (`maw pair`); an all-digit value below 10^11 is seconds.
+#[must_use]
+pub fn parse_peer_timestamp_ms(value: &str) -> Option<u64> {
+    if let Some(ms) = parse_iso_timestamp_ms(value) {
+        return Some(ms);
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = value.parse::<u64>().ok()?;
+    if number < 100_000_000_000 { number.checked_mul(1000) } else { Some(number) }
 }
 
 /// Is a peer stale for a given TTL and wall-clock timestamp?
