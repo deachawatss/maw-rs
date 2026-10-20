@@ -79,11 +79,11 @@ fn epic55_token_use_writes_reference_atomically_without_value() {
     fs::create_dir_all(cwd.join(".git")).expect("cwd");
     fs::write(
         cwd.join(".envrc"),
-        "export KEEP_ME=1\nexport CLAUDE_CODE_OAUTH_TOKEN=old-literal\n",
+        "export KEEP_ME=1\nexport CLAUDE_CODE_OAUTH_TOKEN=old-literal\nexport CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1\n",
     )
     .expect("old envrc");
 
-    let output = epic55_run(&root, &cwd, &["token", "use", "pym", "--no-team"]);
+    let output = epic55_run(&root, &cwd, &["token", "use", "pym"]);
 
     assert!(
         output.status.success(),
@@ -111,7 +111,7 @@ fn epic55_token_name_shorthand_switches_active_account() {
     fs::create_dir_all(cwd.join(".git")).expect("cwd");
     fs::write(cwd.join(".envrc"), "export KEEP_ME=1\n").expect("old envrc");
 
-    let output = epic55_run(&root, &cwd, &["token", "pym", "--no-team"]);
+    let output = epic55_run(&root, &cwd, &["token", "pym"]);
 
     assert!(
         output.status.success(),
@@ -244,8 +244,9 @@ fn epic55_token_scan_outputs_names_only_and_guards_bad_names_before_io() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("stdout");
-    assert!(stdout.contains("pym (1 repos)"));
-    assert!(stdout.contains("acme/demo"));
+    assert!(stdout.contains("unknown (1 repos)"), "{stdout}");
+    assert!(stdout.contains("acme/demo *"), "{stdout}");
+    assert!(!stdout.contains("pym"), "{stdout}");
     assert!(!stdout.contains(SECRET_VALUE));
 
     let guarded = epic55_run(&root, &cwd, &["token", "use", "../bad"]);
@@ -378,4 +379,46 @@ fn token_current_reads_the_name_direnv_loaded_from_a_parent_folder() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "gale\n");
+}
+
+#[test]
+fn token_use_no_longer_takes_the_no_team_flag() {
+    let root = epic55_temp_dir("no-team");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "pym", "--no-team"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("unknown flag --no-team"), "{stderr}");
+    assert!(!cwd.join(".envrc").exists());
+}
+
+#[test]
+fn token_load_refuses_any_literal_claude_secret() {
+    let root = epic55_temp_dir("load-literal");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    let cases = [
+        ("other-name", "export ANTHROPIC_API_KEY=sk-ant-api03-secretvalue\n"),
+        (
+            "comment-bypass",
+            "export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-secretvalue # $(pass show claude/token-nova)\n",
+        ),
+        ("in-a-comment", "# sk-ant-oat01-secretvalue\nexport KEEP=1\n"),
+    ];
+    for (name, content) in cases {
+        fs::write(root.join("fake/pass/envrc").join(name), content).expect("saved envrc");
+
+        let output = epic55_run(&root, &cwd, &["token", "load", name, "--force"]);
+
+        assert!(!output.status.success(), "{name}");
+        let stderr = String::from_utf8(output.stderr).expect("stderr");
+        assert!(stderr.contains("refusing to write"), "{name}: {stderr}");
+        assert!(!stderr.contains("secretvalue"), "{name}: {stderr}");
+        assert!(!cwd.join(".envrc").exists(), "{name}");
+    }
 }
