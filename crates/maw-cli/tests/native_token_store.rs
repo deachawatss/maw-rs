@@ -528,3 +528,24 @@ fn token_use_checks_the_token_exists_without_reading_its_value() {
         .expect("stderr")
         .contains("not found in pass"));
 }
+
+#[test]
+fn token_use_gives_each_token_its_own_secure_storage_profile() {
+    let root = epic55_temp_dir("profile");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        cwd.join(".envrc"),
+        "export KEEP_ME=1\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/nova\"\n",
+    )
+    .expect("old envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "pym"]);
+
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(cwd.join(".envrc")).expect("envrc"),
+        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"pym\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-pym)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/pym\"\n"
+    );
+}

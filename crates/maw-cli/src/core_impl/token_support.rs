@@ -36,6 +36,7 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
         format!(
             "export CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show {TOKEN_SUPPORT_PASS_PREFIX}{name})\""
         ),
+        format!("export CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/{name}\""),
     ];
     if !no_team {
         token_lines.push("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1".to_owned());
@@ -51,6 +52,8 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
             || trimmed.starts_with("CLAUDE_TOKEN_NAME=")
             || trimmed.starts_with("export CLAUDE_CODE_OAUTH_TOKEN=")
             || trimmed.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")
+            || trimmed.starts_with("export CLAUDE_SECURESTORAGE_CONFIG_DIR=")
+            || trimmed.starts_with("CLAUDE_SECURESTORAGE_CONFIG_DIR=")
             || trimmed.starts_with("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
             || trimmed.starts_with("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
             || token_is_legacy_token_line(trimmed)
@@ -133,7 +136,7 @@ mod token_support_tests {
 
         assert_eq!(
             token_build_envrc_content(existing, "blue", true),
-            "export OLD=keep\n\nexport CLAUDE_TOKEN_NAME=\"blue\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-blue)\"\n"
+            "export OLD=keep\n\nexport CLAUDE_TOKEN_NAME=\"blue\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-blue)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/blue\"\n"
         );
         assert_eq!(
             token_detect_active_token("export CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-blue)\""),
