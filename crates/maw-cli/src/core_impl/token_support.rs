@@ -41,10 +41,6 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
     if !no_team {
         token_lines.push("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1".to_owned());
     }
-    if existing.is_empty() {
-        return format!("{}\n", token_lines.join("\n"));
-    }
-
     let mut kept = Vec::new();
     for line in existing.split('\n') {
         let trimmed = line.trim();
@@ -64,6 +60,9 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
     }
     while kept.last().is_some_and(|line| line.trim().is_empty()) {
         kept.pop();
+    }
+    if kept.is_empty() {
+        return format!("{}\n", token_lines.join("\n"));
     }
 
     let mut content = kept.join("\n");

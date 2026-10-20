@@ -549,3 +549,24 @@ fn token_use_gives_each_token_its_own_secure_storage_profile() {
         "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"pym\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-pym)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/pym\"\n"
     );
 }
+
+#[test]
+fn token_use_over_an_envrc_of_only_token_lines_writes_no_leading_blank_line() {
+    let root = epic55_temp_dir("only-token-lines");
+    epic55_seed_fake_pass(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        cwd.join(".envrc"),
+        "export CLAUDE_TOKEN_NAME=\"nova\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/nova\"\n",
+    )
+    .expect("old envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "pym"]);
+
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(cwd.join(".envrc")).expect("envrc"),
+        "export CLAUDE_TOKEN_NAME=\"pym\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-pym)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/pym\"\n"
+    );
+}
