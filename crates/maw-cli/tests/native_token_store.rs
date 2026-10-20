@@ -41,6 +41,7 @@ fn epic55_run(root: &Path, cwd: &Path, args: &[&str]) -> Output {
         .env("MAW_JS_REF_DIR", "/nonexistent")
         .env("MAW_RS_TOKEN_FAKE_ROOT", root.join("fake"))
         .env("HOME", root.join("home"))
+        .env_remove("CLAUDE_TOKEN_NAME")
         .output()
         .expect("run maw-rs")
 }
@@ -234,6 +235,7 @@ fn epic55_token_scan_outputs_names_only_and_guards_bad_names_before_io() {
         .env("MAW_RS_TOKEN_FAKE_ROOT", root.join("fake"))
         .env("GHQ_ROOT", root.join("ghq"))
         .env("HOME", root.join("home"))
+        .env_remove("CLAUDE_TOKEN_NAME")
         .output()
         .expect("scan");
     assert!(
@@ -323,4 +325,57 @@ fn token_use_works_in_a_subfolder_of_a_git_repo() {
     let envrc = fs::read_to_string(sub.join(".envrc")).expect("envrc");
     assert!(envrc.contains("pass show claude/token-nova"));
     assert!(!envrc.contains("nova-token-value"));
+}
+
+#[test]
+fn token_use_refuses_a_subfolder_when_the_home_directory_is_the_repo() {
+    let root = epic55_temp_dir("home-repo");
+    epic55_seed_fake_pass(&root);
+    let home = root.join("home");
+    let downloads = home.join("Downloads");
+    fs::create_dir_all(home.join(".git")).expect("home repo");
+    fs::create_dir_all(&downloads).expect("downloads");
+
+    let output = epic55_run(&root, &downloads, &["token", "use", "nova"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("not inside a git repo"), "{stderr}");
+    assert!(!downloads.join(".envrc").exists());
+}
+
+#[test]
+fn token_use_refuses_before_it_reads_pass() {
+    let root = epic55_temp_dir("guard-first");
+    epic55_seed_fake_pass(&root);
+    let plain = root.join("plain");
+    fs::create_dir_all(&plain).expect("plain");
+
+    let output = epic55_run(&root, &plain, &["token", "use", "missing"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert!(stderr.contains("not inside a git repo"), "{stderr}");
+    assert!(!stderr.contains("not found in pass"), "{stderr}");
+}
+
+#[test]
+fn token_current_reads_the_name_direnv_loaded_from_a_parent_folder() {
+    let root = epic55_temp_dir("current-env");
+    epic55_seed_fake_pass(&root);
+    let sub = root.join("repo/crates/app");
+    fs::create_dir_all(&sub).expect("sub");
+
+    let output = Command::new(epic55_bin())
+        .args(["token", "current"])
+        .current_dir(&sub)
+        .env("MAW_JS_REF_DIR", "/nonexistent")
+        .env("MAW_RS_TOKEN_FAKE_ROOT", root.join("fake"))
+        .env("HOME", root.join("home"))
+        .env("CLAUDE_TOKEN_NAME", "gale")
+        .output()
+        .expect("run maw-rs");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).expect("stdout"), "gale\n");
 }

@@ -212,34 +212,48 @@ fn token_cmd_use(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Token
 
 fn token_cmd_use_name(name: &str, args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
     token_validate_name("token name", name)?;
+    let dir = token_envrc_dir("use")?;
     let pass_path = format!("{TOKEN_TOKEN_PREFIX}{name}");
     if !token_pass_exists(runner, &pass_path) { return Err(format!("token \"{name}\" not found in pass ({pass_path})")); }
-    let cwd = std::env::current_dir().map_err(|_| "maw token use: current directory unavailable".to_owned())?;
-    token_require_repo_dir("use", &cwd)?;
-    let envrc_path = cwd.join(".envrc");
-    let existing = std::fs::read_to_string(&envrc_path).unwrap_or_default();
+    let existing = std::fs::read_to_string(dir.envrc()).unwrap_or_default();
     let content = token_build_envrc_content(&existing, name, args.no_team);
-    token_atomic_write(&envrc_path, &content).map_err(|_| "maw token use: failed to write .envrc".to_owned())?;
-    let direnv_ok = runner.token_direnv_allow(&cwd).is_ok();
-    let mut stdout = format!("Now using: {name}\n");
-    if !direnv_ok { stdout.push_str("warning: direnv allow failed — run `direnv allow .` manually\n"); }
-    Ok(token_ok(stdout))
+    token_write_envrc("use", &dir, &content, format!("Now using: {name}\n"), runner)
 }
 
-fn token_require_repo_dir(command: &str, cwd: &std::path::Path) -> Result<(), String> {
+struct TokenEnvrcDir(std::path::PathBuf);
+
+impl TokenEnvrcDir {
+    fn envrc(&self) -> std::path::PathBuf {
+        self.0.join(".envrc")
+    }
+}
+
+fn token_envrc_dir(command: &str) -> Result<TokenEnvrcDir, String> {
+    let cwd = std::env::current_dir().map_err(|_| format!("maw token {command}: current directory unavailable"))?;
     let canonical = |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let here = canonical(cwd);
-    let home = std::env::var_os("HOME").map(|home| canonical(std::path::Path::new(&home)));
+    let here = canonical(&cwd);
+    let home = std::env::home_dir().map(|home| canonical(&home));
     if home.as_deref() == Some(here.as_path()) {
         return Err(format!(
             "maw token {command}: refusing to write {}/.envrc: direnv would load it in every folder under the home directory",
             here.display()
         ));
     }
-    if !here.ancestors().any(|dir| dir.join(".git").exists()) {
+    let in_repo_below_home = here
+        .ancestors()
+        .take_while(|dir| Some(*dir) != home.as_deref())
+        .any(|dir| dir.join(".git").exists());
+    if !in_repo_below_home {
         return Err(format!("maw token {command}: refusing to write {}/.envrc: not inside a git repo", here.display()));
     }
-    Ok(())
+    Ok(TokenEnvrcDir(here))
+}
+
+fn token_write_envrc(command: &str, dir: &TokenEnvrcDir, content: &str, mut stdout: String, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
+    let envrc = dir.envrc();
+    token_atomic_write(&envrc, content).map_err(|error| format!("maw token {command}: failed to write {}: {error}", envrc.display()))?;
+    if runner.token_direnv_allow(&dir.0).is_err() { stdout.push_str("warning: direnv allow failed — run `direnv allow .` manually\n"); }
+    Ok(token_ok(stdout))
 }
 
 fn token_cmd_save(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
@@ -257,23 +271,17 @@ fn token_cmd_save(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Toke
 }
 
 fn token_cmd_load(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
-    let cwd = std::env::current_dir().map_err(|_| "maw token load: current directory unavailable".to_owned())?;
-    token_require_repo_dir("load", &cwd)?;
-    let name = token_default_name(args.positionals.get(1).map(String::as_str), &cwd)?;
+    let dir = token_envrc_dir("load")?;
+    let name = token_default_name(args.positionals.get(1).map(String::as_str), &dir.0)?;
     token_validate_name("envrc name", &name)?;
     let path = format!("{TOKEN_PASS_PREFIX}/{name}");
-    let envrc_path = cwd.join(".envrc");
     if !token_pass_exists(runner, &path) { return Err(format!("{path} not found in pass")); }
-    if envrc_path.exists() && !args.force && !token_confirm_overwrite(runner, "Overwrite .envrc?") {
+    if dir.envrc().exists() && !args.force && !token_confirm_overwrite(runner, "Overwrite .envrc?") {
         return Ok(token_ok(format!("Skipped (would overwrite .envrc; {path})\n")));
     }
     let content = runner.token_pass_show(&path).map_err(|()| "pass show failed".to_owned())?;
     token_reject_literal_oauth_value(&content)?;
-    token_atomic_write(&envrc_path, &content).map_err(|_| "maw token load: failed to write .envrc".to_owned())?;
-    let direnv_ok = runner.token_direnv_allow(&cwd).is_ok();
-    let mut stdout = format!("Loaded {path} into .envrc\n");
-    if !direnv_ok { stdout.push_str("warning: direnv allow failed — run `direnv allow .` manually\n"); }
-    Ok(token_ok(stdout))
+    token_write_envrc("load", &dir, &content, format!("Loaded {path} into .envrc\n"), runner)
 }
 
 fn token_cmd_scan(runner: &mut dyn TokenRunner) -> Result<String, String> {
@@ -301,9 +309,11 @@ fn token_help() -> &'static str {
 }
 
 fn token_current() -> Option<String> {
-    let path = std::env::current_dir().ok()?.join(".envrc");
-    let content = std::fs::read_to_string(path).ok()?;
-    token_detect_active_token(&content)
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::read_to_string(cwd.join(".envrc")).ok())
+        .and_then(|content| token_detect_active_token(&content))
+        .or_else(|| std::env::var("CLAUDE_TOKEN_NAME").ok().filter(|name| !name.is_empty()))
 }
 
 fn token_pass_exists(runner: &mut dyn TokenRunner, name: &str) -> bool {
