@@ -177,7 +177,7 @@ Legend: **native ✅** = Rust dispatcher/implementation exists; **WASM ✅** = w
 | `profile` | active/current/info/list/ls/set/show/use | maw-js source | WASM ✅ | WASM parity covers current/list/show/use. |
 | `triggers` | no notable flags | maw-js source | WASM ✅ | WASM parity covers no-arg output. |
 | `on` | --once --timeout | maw-js source | NOT-PORTED ❌ | No native entry/WASM fixture. |
-| `token / tokens` | current\|list/ls/tokens\|load\|save\|scan\|use; --force --no-team | maw-js source | stub ⚠️ | Issue #55 native primitive: list/current implemented; use/save/load/scan return deferred stub. |
+| `token / tokens` | current\|list/ls/tokens\|load\|save\|scan\|use; --force | maw-js source | native ✅ | All subcommands native (#222, #225). use/load refuse ~ and folders outside a git repo; load/save refuse literal secrets; scan and use read no token value. No --no-team. |
 | `find` | --oracle | maw-js source | stub ⚠️ | Issue #55 ported native, but verify full maw-js output/source search parity before green. |
 | `locate` | --json --path | maw-js source | NOT-PORTED ❌ | No native entry/WASM fixture. |
 | `rename` | no notable flags | maw-js source | NOT-PORTED ❌ | No native entry/WASM fixture. |

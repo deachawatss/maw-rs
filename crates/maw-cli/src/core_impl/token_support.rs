@@ -52,6 +52,7 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
             || trimmed.starts_with("export CLAUDE_CODE_OAUTH_TOKEN=")
             || trimmed.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")
             || trimmed.starts_with("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
+            || trimmed.starts_with("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
             || token_is_legacy_token_line(trimmed)
         {
             continue;

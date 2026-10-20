@@ -142,8 +142,8 @@ fn token_dispatch(argv: &[String], runner: &mut dyn TokenRunner) -> Result<Token
         "use" => token_cmd_use(&parsed, runner),
         "save" => token_cmd_save(&parsed, runner),
         "load" => token_cmd_load(&parsed, runner),
-        "scan" => token_cmd_scan(runner).map(token_ok),
-        _ if parsed.positionals.len() == 1 => token_cmd_use_name(sub, &parsed, runner),
+        "scan" => token_cmd_scan().map(token_ok),
+        _ if parsed.positionals.len() == 1 => token_cmd_use_name(sub, runner),
         _ => Ok(TokenCommandResult { ok: false, stdout: format!("{}\n", token_help()) }),
     }
 }
@@ -151,7 +151,6 @@ fn token_dispatch(argv: &[String], runner: &mut dyn TokenRunner) -> Result<Token
 #[derive(Debug, Default)]
 struct TokenArgs {
     positionals: Vec<String>,
-    no_team: bool,
     force: bool,
 }
 
@@ -159,7 +158,6 @@ fn token_parse_args(argv: &[String]) -> Result<TokenArgs, String> {
     let mut parsed = TokenArgs::default();
     for value in argv {
         match value.as_str() {
-            "--no-team" => parsed.no_team = true,
             "--force" | "-f" => parsed.force = true,
             "--" => return Err("maw token: -- separator is not allowed".to_owned()),
             _ if value.starts_with('-') => return Err(format!("maw token: unknown flag {value}")),
@@ -205,18 +203,19 @@ fn token_cmd_list(runner: &mut dyn TokenRunner) -> Result<String, String> {
 fn token_cmd_use(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
     let Some(name) = args.positionals.get(1).map(String::as_str) else {
         let list = token_cmd_list(runner)?;
-        return Ok(token_ok(format!("{list}Usage: maw token use <name> [--no-team]\n")));
+        return Ok(token_ok(format!("{list}Usage: maw token use <name>\n")));
     };
-    token_cmd_use_name(name, args, runner)
+    token_cmd_use_name(name, runner)
 }
 
-fn token_cmd_use_name(name: &str, args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
+fn token_cmd_use_name(name: &str, runner: &mut dyn TokenRunner) -> Result<TokenCommandResult, String> {
     token_validate_name("token name", name)?;
     let dir = token_envrc_dir("use")?;
-    let pass_path = format!("{TOKEN_TOKEN_PREFIX}{name}");
-    if !token_pass_exists(runner, &pass_path) { return Err(format!("token \"{name}\" not found in pass ({pass_path})")); }
+    if !token_list_token_names(runner).iter().any(|known| known == name) {
+        return Err(format!("token \"{name}\" not found in pass ({TOKEN_TOKEN_PREFIX}{name})"));
+    }
     let existing = std::fs::read_to_string(dir.envrc()).unwrap_or_default();
-    let content = token_build_envrc_content(&existing, name, args.no_team);
+    let content = token_build_envrc_content(&existing, name, true);
     token_write_envrc("use", &dir, &content, format!("Now using: {name}\n"), runner)
 }
 
@@ -263,6 +262,7 @@ fn token_cmd_save(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Toke
     let path = format!("{TOKEN_PASS_PREFIX}/{name}");
     let envrc_path = cwd.join(".envrc");
     let content = std::fs::read_to_string(&envrc_path).map_err(|_| "no .envrc in current directory".to_owned())?;
+    token_reject_literal_secret(&content)?;
     if token_pass_exists(runner, &path) && !args.force && !token_confirm_overwrite(runner, &format!("Overwrite {path}?")) {
         return Ok(token_ok(format!("Skipped (would overwrite {path})\n")));
     }
@@ -280,20 +280,18 @@ fn token_cmd_load(args: &TokenArgs, runner: &mut dyn TokenRunner) -> Result<Toke
         return Ok(token_ok(format!("Skipped (would overwrite .envrc; {path})\n")));
     }
     let content = runner.token_pass_show(&path).map_err(|()| "pass show failed".to_owned())?;
-    token_reject_literal_oauth_value(&content)?;
+    token_reject_literal_secret(&content)?;
     token_write_envrc("load", &dir, &content, format!("Loaded {path} into .envrc\n"), runner)
 }
 
-fn token_cmd_scan(runner: &mut dyn TokenRunner) -> Result<String, String> {
+fn token_cmd_scan() -> Result<String, String> {
     let ghq_root = token_resolve_ghq_root()?;
-    let fingerprints = token_fingerprint_tokens(runner);
     let files = token_find_envrc_files(&ghq_root);
     let mut rows = Vec::new();
     for (label, path) in files {
         let Ok(content) = std::fs::read_to_string(path) else { continue; };
         if let Some(name) = token_detect_active_token(&content) { rows.push((label, name, "named".to_owned())); continue; }
-        if let Some(name) = token_match_fingerprint(&content, &fingerprints) { rows.push((label, name, "matched".to_owned())); }
-        else if content.contains("CLAUDE_CODE_OAUTH_TOKEN") { rows.push((label, "unknown".to_owned(), "unmatched".to_owned())); }
+        if content.contains("CLAUDE_CODE_OAUTH_TOKEN") { rows.push((label, "unknown".to_owned(), "unmatched".to_owned())); }
     }
     Ok(token_format_scan(&rows))
 }
@@ -305,7 +303,7 @@ fn token_error(message: &str) -> CliOutput {
 }
 
 fn token_help() -> &'static str {
-    "usage: maw token [<name>|<list|use|current|save|load|scan>] [...]\n  <name> [--no-team]                    — shortcut for `use <name>`\n  list                                  — list vault tokens + saved .envrcs (active marked)\n  use <name> [--no-team]                — switch active Claude token in local .envrc\n  current                               — print active token name (for statuslines)\n  save [name] [-f|--force]              — save .envrc to pass vault (default name = cwd basename)\n  load [name] [-f|--force]              — restore .envrc from pass vault + direnv allow\n  scan                                  — scan ghq repos, map tokens to oracles\n\naliases:\n  tokens                                — same as `list`\n  ls                                    — same as `list`\n\nsecurity: token values are never printed, logged, or stored outside\n          memory. use and load refuse the home directory and any folder\n          outside a git repo."
+    "usage: maw token [<name>|<list|use|current|save|load|scan>] [...]\n  <name>                                — shortcut for `use <name>`\n  list                                  — list vault tokens + saved .envrcs (active marked)\n  use <name>                            — switch active Claude token in local .envrc\n  current                               — print active token name (for statuslines)\n  save [name] [-f|--force]              — save .envrc to pass vault (default name = cwd basename)\n  load [name] [-f|--force]              — restore .envrc from pass vault + direnv allow\n  scan                                  — scan ghq repos, map tokens to oracles\n\naliases:\n  tokens                                — same as `list`\n  ls                                    — same as `list`\n\nsecurity: token values are never printed, logged, or stored outside\n          memory. use and load refuse the home directory and any folder\n          outside a git repo."
 }
 
 fn token_current() -> Option<String> {
@@ -350,21 +348,6 @@ fn token_parse_envrc_ls_line(raw: &str) -> Option<String> {
     (name != TOKEN_PASS_PREFIX).then(|| name.to_owned())
 }
 
-fn token_fingerprint_tokens(runner: &mut dyn TokenRunner) -> Vec<(String, String)> {
-    token_list_token_names(runner)
-        .into_iter()
-        .filter_map(|name| {
-            let path = format!("{TOKEN_TOKEN_PREFIX}{name}");
-            let token = runner.token_pass_show(&path).ok()?.trim().to_owned();
-            (token.len() >= 8).then_some((token, name))
-        })
-        .collect()
-}
-
-fn token_match_fingerprint(content: &str, fingerprints: &[(String, String)]) -> Option<String> {
-    fingerprints.iter().find_map(|(value, name)| content.contains(value).then(|| name.clone()))
-}
-
 fn token_format_scan(rows: &[(String, String, String)]) -> String {
     if rows.is_empty() { return "No .envrc files with Claude tokens found\n".to_owned(); }
     let mut by_token = std::collections::BTreeMap::<String, Vec<(String, String)>>::new();
@@ -378,7 +361,7 @@ fn token_format_scan(rows: &[(String, String, String)]) -> String {
         }
         out.push('\n');
     }
-    if rows.iter().any(|(_, _, method)| method == "unmatched") { out.push_str("  * = token not in pass vault (unknown)\n"); }
+    if rows.iter().any(|(_, _, method)| method == "unmatched") { out.push_str("  * = no `pass show claude/token-<name>` reference (literal value or unknown token)\n"); }
     out
 }
 
@@ -436,12 +419,17 @@ fn token_prompt_confirm(prompt: &str) -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
 }
 
-fn token_reject_literal_oauth_value(content: &str) -> Result<(), String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.contains("CLAUDE_CODE_OAUTH_TOKEN") { continue; }
-        if trimmed.contains("$(pass show claude/token-") || trimmed.starts_with('#') { continue; }
-        return Err("saved envrc contains literal token value; refusing to write".to_owned());
+fn token_reject_literal_secret(content: &str) -> Result<(), String> {
+    let literal_secret = content.contains("sk-ant-");
+    let unreferenced_oauth_value = content.lines().map(str::trim).filter(|line| !line.starts_with('#')).any(|line| {
+        let assignment = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        assignment.strip_prefix("CLAUDE_CODE_OAUTH_TOKEN=").is_some_and(|value| {
+            !value.trim_start_matches('"').starts_with("$(pass show claude/token-")
+                || value.split_once(')').is_some_and(|(_, rest)| !rest.trim_start_matches('"').trim().is_empty())
+        })
+    });
+    if literal_secret || unreferenced_oauth_value {
+        return Err("envrc contains a literal token value; refusing to write".to_owned());
     }
     Ok(())
 }
