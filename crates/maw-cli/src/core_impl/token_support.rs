@@ -81,7 +81,7 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool, endpoint
 }
 
 fn token_is_endpoint_env_key(key: &str) -> bool {
-    key == "API_TIMEOUT_MS" || key.strip_prefix("ANTHROPIC_").is_some_and(|rest| !rest.is_empty())
+    matches!(key, "API_TIMEOUT_MS" | "CLAUDE_CODE_EFFORT_LEVEL") || key.strip_prefix("ANTHROPIC_").is_some_and(|rest| !rest.is_empty())
 }
 
 fn token_parse_endpoint_env(entry: &str) -> Result<Vec<(String, String)>, String> {
