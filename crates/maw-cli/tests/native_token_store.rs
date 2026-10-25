@@ -579,7 +579,7 @@ fn seed_api_key_token(root: &Path) {
     .expect("glm token");
     fs::write(
         root.join("fake/pass/claude/endpoint-glm"),
-        "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic\nANTHROPIC_MODEL=glm-5.3[1m]\nAPI_TIMEOUT_MS=3000000\nurl: https://z.ai\n",
+        "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic\nANTHROPIC_MODEL=glm-5.3[1m]\nAPI_TIMEOUT_MS=3000000\nCLAUDE_CODE_EFFORT_LEVEL=high\nurl: https://z.ai\n",
     )
     .expect("glm endpoint");
 }
@@ -605,7 +605,7 @@ fn token_use_writes_an_api_key_token_as_anthropic_auth_token_with_its_endpoint()
     assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(
         fs::read_to_string(cwd.join(".envrc")).expect("envrc"),
-        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"glm\"\nexport ANTHROPIC_AUTH_TOKEN=\"$(pass show claude/token-glm | head -n 1)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/glm\"\nexport ANTHROPIC_BASE_URL=\"https://api.z.ai/api/anthropic\"\nexport ANTHROPIC_MODEL=\"glm-5.3[1m]\"\nexport API_TIMEOUT_MS=\"3000000\"\n"
+        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"glm\"\nexport ANTHROPIC_AUTH_TOKEN=\"$(pass show claude/token-glm | head -n 1)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/glm\"\nexport ANTHROPIC_BASE_URL=\"https://api.z.ai/api/anthropic\"\nexport ANTHROPIC_MODEL=\"glm-5.3[1m]\"\nexport API_TIMEOUT_MS=\"3000000\"\nexport CLAUDE_CODE_EFFORT_LEVEL=\"high\"\n"
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET_VALUE));
 }
