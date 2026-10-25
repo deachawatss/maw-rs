@@ -5,6 +5,7 @@ const DISPATCH_106: &[DispatcherEntry] = &[
 
 const TOKEN_PASS_PREFIX: &str = "envrc";
 const TOKEN_TOKEN_PREFIX: &str = "claude/token-";
+const TOKEN_ENDPOINT_PREFIX: &str = "claude/endpoint-";
 const TOKEN_FAKE_ROOT_ENV: &str = "MAW_RS_TOKEN_FAKE_ROOT";
 const TOKEN_FAKE_FAIL_ENV: &str = "MAW_RS_TOKEN_FAKE_FAIL";
 
@@ -214,8 +215,14 @@ fn token_cmd_use_name(name: &str, runner: &mut dyn TokenRunner) -> Result<TokenC
     if !token_list_token_names(runner).iter().any(|known| known == name) {
         return Err(format!("token \"{name}\" not found in pass ({TOKEN_TOKEN_PREFIX}{name})"));
     }
+    let endpoint_env = if token_list_endpoint_names(runner).iter().any(|known| known == name) {
+        let entry = runner.token_pass_show(&format!("{TOKEN_ENDPOINT_PREFIX}{name}")).map_err(|()| "pass show failed".to_owned())?;
+        token_parse_endpoint_env(&entry)?
+    } else {
+        Vec::new()
+    };
     let existing = std::fs::read_to_string(dir.envrc()).unwrap_or_default();
-    let content = token_build_envrc_content(&existing, name, true);
+    let content = token_build_envrc_content(&existing, name, true, &endpoint_env);
     token_write_envrc("use", &dir, &content, format!("Now using: {name}\n"), runner)
 }
 
@@ -324,6 +331,17 @@ fn token_list_token_names(runner: &mut dyn TokenRunner) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+fn token_list_endpoint_names(runner: &mut dyn TokenRunner) -> Vec<String> {
+    let Ok(raw) = runner.token_pass_ls("claude") else { return Vec::new(); };
+    raw.lines()
+        .filter_map(|line| {
+            let clean = token_strip_ansi(line);
+            let name = clean[clean.find("endpoint-")? + "endpoint-".len()..].split_whitespace().next()?.to_owned();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
 }
 
 fn token_list_envrc_names(runner: &mut dyn TokenRunner) -> Vec<String> {

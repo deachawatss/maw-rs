@@ -30,14 +30,18 @@ fn token_detect_active_token(content: &str) -> Option<String> {
     None
 }
 
-fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> String {
+fn token_build_envrc_content(existing: &str, name: &str, no_team: bool, endpoint_env: &[(String, String)]) -> String {
+    let secret_line = if endpoint_env.iter().any(|(key, _)| key == "ANTHROPIC_BASE_URL") {
+        format!("export ANTHROPIC_AUTH_TOKEN=\"$(pass show {TOKEN_SUPPORT_PASS_PREFIX}{name} | head -n 1)\"")
+    } else {
+        format!("export CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show {TOKEN_SUPPORT_PASS_PREFIX}{name})\"")
+    };
     let mut token_lines = vec![
         format!("export CLAUDE_TOKEN_NAME=\"{name}\""),
-        format!(
-            "export CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show {TOKEN_SUPPORT_PASS_PREFIX}{name})\""
-        ),
+        secret_line,
         format!("export CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/{name}\""),
     ];
+    token_lines.extend(endpoint_env.iter().map(|(key, value)| format!("export {key}=\"{value}\"")));
     if !no_team {
         token_lines.push("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1".to_owned());
     }
@@ -53,6 +57,7 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
             || trimmed.starts_with("export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
             || trimmed.starts_with("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=")
             || token_is_legacy_token_line(trimmed)
+            || token_is_endpoint_env_key(trimmed.strip_prefix("export ").unwrap_or(trimmed).split('=').next().unwrap_or_default())
         {
             continue;
         }
@@ -73,6 +78,28 @@ fn token_build_envrc_content(existing: &str, name: &str, no_team: bool) -> Strin
     content.push_str(&token_lines.join("\n"));
     content.push('\n');
     content
+}
+
+fn token_is_endpoint_env_key(key: &str) -> bool {
+    key == "API_TIMEOUT_MS" || key.strip_prefix("ANTHROPIC_").is_some_and(|rest| !rest.is_empty())
+}
+
+fn token_parse_endpoint_env(entry: &str) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for line in entry.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else { continue };
+        if !token_is_endpoint_env_key(key) || !key.chars().all(|character| character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_') {
+            continue;
+        }
+        if key == "ANTHROPIC_AUTH_TOKEN" || key == "ANTHROPIC_API_KEY" {
+            return Err(format!("maw token: {key} belongs in claude/token-<name>, not in the endpoint entry"));
+        }
+        if value.is_empty() || value.chars().any(|character| matches!(character, '"' | '$' | '`' | '\\') || character.is_control()) {
+            return Err(format!("maw token: {key} in the endpoint entry has an unsafe value"));
+        }
+        env.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(env)
 }
 
 fn token_is_legacy_token_line(line: &str) -> bool {
@@ -134,7 +161,7 @@ mod token_support_tests {
         let existing = "export OLD=keep\nexport CLAUDE_TOKEN_NAME=old\n";
 
         assert_eq!(
-            token_build_envrc_content(existing, "blue", true),
+            token_build_envrc_content(existing, "blue", true, &[]),
             "export OLD=keep\n\nexport CLAUDE_TOKEN_NAME=\"blue\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-blue)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/blue\"\n"
         );
         assert_eq!(
