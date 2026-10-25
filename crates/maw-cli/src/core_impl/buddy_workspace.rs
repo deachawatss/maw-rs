@@ -498,7 +498,7 @@ fn bud_prepare_env(target: &std::path::Path, options: &BudOptions, gh: &mut impl
         token_validate_name("token name", &name).map_err(|error| format!("bud: {error}"))?;
         let no_team = !source.contains("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
             && std::env::var_os("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS").is_none();
-        fs.bud_write_atomic(&target_envrc, token_build_envrc_content(&existing, &name, no_team).as_bytes())?;
+        fs.bud_write_atomic(&target_envrc, token_build_envrc_content(&existing, &name, no_team, &[]).as_bytes())?;
     }
     let allow = gh.bud_run("direnv", &["allow".to_owned(), path_string(target)]);
     if !allow.ok {

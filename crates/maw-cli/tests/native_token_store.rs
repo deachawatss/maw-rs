@@ -570,3 +570,86 @@ fn token_use_over_an_envrc_of_only_token_lines_writes_no_leading_blank_line() {
         "export CLAUDE_TOKEN_NAME=\"pym\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-pym)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/pym\"\n"
     );
 }
+
+fn seed_api_key_token(root: &Path) {
+    fs::write(
+        root.join("fake/pass/claude/token-glm"),
+        format!("{SECRET_VALUE}\n"),
+    )
+    .expect("glm token");
+    fs::write(
+        root.join("fake/pass/claude/endpoint-glm"),
+        "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic\nANTHROPIC_MODEL=glm-5.3[1m]\nAPI_TIMEOUT_MS=3000000\nurl: https://z.ai\n",
+    )
+    .expect("glm endpoint");
+}
+
+#[test]
+fn token_use_writes_an_api_key_token_as_anthropic_auth_token_with_its_endpoint() {
+    let root = epic55_temp_dir("api-key-use");
+    epic55_seed_fake_pass(&root);
+    seed_api_key_token(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(
+        cwd.join(".envrc"),
+        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"nova\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/nova\"\n",
+    )
+    .expect("old envrc");
+
+    let secret = root.join("fake/pass/claude/token-glm");
+    fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o000)).expect("lock token");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "glm"]);
+
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(cwd.join(".envrc")).expect("envrc"),
+        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"glm\"\nexport ANTHROPIC_AUTH_TOKEN=\"$(pass show claude/token-glm | head -n 1)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/glm\"\nexport ANTHROPIC_BASE_URL=\"https://api.z.ai/api/anthropic\"\nexport ANTHROPIC_MODEL=\"glm-5.3[1m]\"\nexport API_TIMEOUT_MS=\"3000000\"\n"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(SECRET_VALUE));
+}
+
+#[test]
+fn token_use_of_an_oauth_token_removes_the_api_key_endpoint_lines() {
+    let root = epic55_temp_dir("api-key-back");
+    epic55_seed_fake_pass(&root);
+    seed_api_key_token(&root);
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(cwd.join(".envrc"), "export KEEP_ME=1\n").expect("old envrc");
+
+    assert!(epic55_run(&root, &cwd, &["token", "use", "glm"]).status.success());
+    let output = epic55_run(&root, &cwd, &["token", "use", "nova"]);
+
+    assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fs::read_to_string(cwd.join(".envrc")).expect("envrc"),
+        "export KEEP_ME=1\n\nexport CLAUDE_TOKEN_NAME=\"nova\"\nexport CLAUDE_CODE_OAUTH_TOKEN=\"$(pass show claude/token-nova)\"\nexport CLAUDE_SECURESTORAGE_CONFIG_DIR=\"$HOME/.config/claude/profiles/nova\"\n"
+    );
+}
+
+#[test]
+fn token_use_refuses_an_endpoint_value_that_would_run_in_the_envrc() {
+    let root = epic55_temp_dir("api-key-inject");
+    epic55_seed_fake_pass(&root);
+    fs::write(
+        root.join("fake/pass/claude/token-glm"),
+        format!("{SECRET_VALUE}\n"),
+    )
+    .expect("glm token");
+    fs::write(
+        root.join("fake/pass/claude/endpoint-glm"),
+        "ANTHROPIC_BASE_URL=https://x\"$(touch pwned)\"\n",
+    )
+    .expect("glm endpoint");
+    let cwd = root.join("repo");
+    fs::create_dir_all(cwd.join(".git")).expect("cwd");
+    fs::write(cwd.join(".envrc"), "export KEEP_ME=1\n").expect("old envrc");
+
+    let output = epic55_run(&root, &cwd, &["token", "use", "glm"]);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(SECRET_VALUE));
+    assert_eq!(fs::read_to_string(cwd.join(".envrc")).expect("envrc"), "export KEEP_ME=1\n");
+}
