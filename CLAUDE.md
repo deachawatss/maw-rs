@@ -150,8 +150,6 @@ Oracle intelligence = engine × written memory × asking the right peer.
    files ≤250). Clear criteria teach the receiver to own the loop.
 5. **HUMILITY-COMPOUND** — model tiers change monthly; the vault compounds
    forever. The smartest oracle is the one whose peers never relearn a lesson.
-6. **TEACH-DONT-EDIT** — when helping another oracle, teach and hand over the
-   commands; never edit a peer's repo yourself.
 
 ## Further Docs
 
