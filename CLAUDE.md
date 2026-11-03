@@ -10,9 +10,8 @@ For repo-wide agent execution conventions, read `AGENTS.md` first; this file rem
 orchestrator in the main checkout as much as a subagent in a worktree — may run exactly
 two cargo commands, each `flock`-ed on the shared target dir and capped at `-j 4`.
 
-**`cargo test --workspace` is banned outright** (Wind, 2026-09-11, after it froze the
-machine). Enforced in three layers, not remembered: `jobs = 4` in this repo's
-`.cargo/config.toml`, a `cargo` shim at `~/.local/bin/cargo`
+**`cargo test --workspace` is banned outright** (it froze the machine). Enforced in three layers,
+not remembered: `jobs = 4` in this repo's `.cargo/config.toml`, a `cargo` shim at `~/.local/bin/cargo`
 (Wind-Framework `scripts/cargo-gate.sh`) that refuses it on argv however it was invoked,
 and a PreToolUse hook that explains it when an agent types it.
 
