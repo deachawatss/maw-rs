@@ -110,5 +110,5 @@ fn triggers_pad_136(value: &str, width: usize) -> String {
 }
 
 fn triggers_truncate_action_136(value: &str) -> String {
-    if value.len() > 38 { format!("{}...", &value[..35]) } else { value.to_owned() }
+    if value.chars().count() > 38 { format!("{}...", value.chars().take(35).collect::<String>()) } else { value.to_owned() }
 }
