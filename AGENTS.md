@@ -31,16 +31,15 @@ flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> --test <f
 `-p maw-cli` is a full test in practice, because that crate holds most of the workspace's
 test binaries.
 
-**Forbidden for every agent, in every role:** `cargo build --release`, anything
-`--workspace` or `--all`, a `cargo test` with no single target, and any cargo invocation *without* the lock or *without* the
-`-j` cap. Do not set a private `CARGO_TARGET_DIR` to get around it — the shared
+**Forbidden for every agent, in every role:** anything `--workspace` or `--all`, a
+`cargo test` with no single target, and any cargo invocation *without* the lock or
+*without* the `-j` cap. A subagent also runs no `cargo build --release`: the orchestrator's
+build is below. Do not set a private `CARGO_TARGET_DIR` to get around it — the shared
 `/tmp/maw-rs-target` is precisely what makes one lock able to serialize every agent on
 the box, and a private target dir is a second 30 GB tree.
 
-**`cargo test --workspace` is the specific command that froze Wind's machine on
-2026-09-11** — disk at 100%, WSL2 unresponsive, the shared target dir destroyed. There
-is no cheap or careful form of it. Wind's ruling that day: *"you must never run test
---workspace anymore"*.
+**`cargo test --workspace` froze the machine:** disk at 100%, WSL2 unresponsive, the shared
+target dir destroyed. There is no cheap or careful form of it.
 
 **This rule is now enforced, not just written**, in three layers. It exists because
 this paragraph was already correct on 2026-09-11 and still did not prevent the freeze:
@@ -228,7 +227,7 @@ read its output.
 result and each live command with its real output. Mark everything else as not verified.
 
 Plugin artifact work still needs `maw plugin build fleet-plugins/<name>` — that is a
-maw command, not cargo, and it is fine. Its pin-check test is CI's job.
+maw command, not cargo, and it is fine.
 
 **Clean up when done:** if a `/tmp/maw-rs-target-*` dir already exists from an earlier
 delivery, remove it. They are ~30 GB each.

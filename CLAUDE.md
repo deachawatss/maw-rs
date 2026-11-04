@@ -22,9 +22,8 @@ mode is **concurrency** — that is why the control is a lock plus a core cap ra
 a role. `AGENTS.md` carries the measurements and the incident history.
 
 **Toolchain:** the deps need rustc >= 1.91 (`wasmtime-internal-*`, `wiggle`).
-CI does `rustup default stable`. If your local default is pinned older the
-build fails in ~18s with "requires rustc 1.91.0" — that is a toolchain
-mismatch, not the build gate. Fix with `rustup default stable`.
+An older pin makes the build fail in ~18s with "requires rustc 1.91.0". That is
+a toolchain mismatch, not the build gate. Fix the pin in `rust-toolchain.toml`.
 
 **The live `maw` is the gate.** GitHub Actions is off on this fork, so a push starts no CI
 run. Rebuild with `maw update`, run the command that the change touches, and read its output.
