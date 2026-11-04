@@ -6,11 +6,13 @@ For repo-wide agent execution conventions, read `AGENTS.md` first; this file rem
 
 ## Build Gate — `AGENTS.md` is the single source
 
-**The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** Any agent —
-orchestrator in the main checkout as much as a subagent in a worktree — may run exactly
-two cargo commands, each `flock`-ed on the shared target dir and capped at `-j 4`.
+**The gate lives in `AGENTS.md` §"Build gate". Read it there, not here.** A small fix needs
+no test run: commit and merge it, rebuild, and try it on the live `maw`. For a larger change,
+any agent — orchestrator in the main checkout as much as a subagent in a worktree — may run
+exactly two cargo commands, each `flock`-ed on the shared target dir and capped at `-j 4`.
 
-**`cargo test --workspace` is banned outright** (it froze the machine). Enforced in three layers,
+**A full test is banned outright: `--workspace`, and any `cargo test` with no single target**
+(they freeze the machine). Enforced in three layers,
 not remembered: `jobs = 4` in this repo's `.cargo/config.toml`, a `cargo` shim at `~/.local/bin/cargo`
 (Wind-Framework `scripts/cargo-gate.sh`) that refuses it on argv however it was invoked,
 and a PreToolUse hook that explains it when an agent types it.
@@ -24,46 +26,21 @@ CI does `rustup default stable`. If your local default is pinned older the
 build fails in ~18s with "requires rustc 1.91.0" — that is a toolchain
 mismatch, not the build gate. Fix with `rustup default stable`.
 
-**CI is the gate.** Push, then read the GitHub Actions result. If CI is red,
-fix from the log — do not reproduce locally to "see it fail".
-
-Consequences to be honest about, so nobody is surprised:
-
-- Report exactly what you ran. The local checks for this repo are the
-  two locked commands in `AGENTS.md` and nothing wider — everything
-  workspace-scale is CI-pending. Do not claim a check you did not run.
-- The review reads the diff and the CI result, not a claimed test run.
-- **Verify `main`'s current CI state; do not assume it from this file.** Issue
-  #127 (7 `maw-cli --lib` tests failing on Linux) is **closed**, and the
-  `workon_hardening` fixture failures that followed it were fixed by #144.
-  Run `gh run list --branch main --workflow CI --limit 3` and diff your
-  failures against `main`'s before concluding a PR broke something. This
-  bullet has been stale twice; treat it as a pointer to the check, not as the
-  answer.
+**The live `maw` is the gate.** GitHub Actions is off on this fork, so a push starts no CI
+run. Rebuild with `maw update`, run the command that the change touches, and read its output.
+Report exactly what you ran, and mark everything else as not verified.
 
 This rule is maw-rs only. Other repos keep their normal proportional
 verification.
 
-## Development Lane — Lightweight, but worktrees ARE used
+## Development Lane — Lightweight
 
-maw-rs is infra, so the **merge lane** is lightweight. That governs how a
-change lands, not where it is written.
+maw-rs is infra, so the **merge lane** is lightweight. A small fix lands directly on `main`.
 
-**Deliveries here run in worktrees, like everywhere else.** An earlier
-revision of this file said "do not use `maw workon` or worktrees" and
-justified it with "worktrees duplicate the entire Cargo dependency tree
-(~100GB)". Both halves are now wrong:
+A larger delivery runs in a git worktree. `.cargo/config.toml` points every build at a shared
+`/tmp/maw-rs-target`, so a worktree carries no dependency tree of its own, and the work
+survives when a pane dies.
 
-- `.cargo/config.toml` points every build at a shared `/tmp/maw-rs-target`,
-  so worktrees do **not** each carry a dependency tree.
-- maw-rs #116 (`d713b94`, 2026-07-26) made worktree creation unconditional
-  on every lane. There is no supported way to dispatch without one short of
-  `--no-wt`.
-
-Worktrees are also what saved three in-flight deliveries when the machine
-ran out of memory on 2026-07-26 — the panes died, the work did not.
-
-- Dispatch: `maw workon maw-rs --wt issue-N-<slug> -e codex`.
 - Build artifacts go to `/tmp/maw-rs-target` (`.cargo/config.toml`), not
   inside the repo — and see the Build Gate above for what you may run.
 - The orchestrator merges, after re-reading the rebased diff cold; subagents

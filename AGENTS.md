@@ -13,19 +13,26 @@ into worktrees. Either way the orchestrator reviews the result and merges it.
 The control here is **concurrency, not seniority** — what matters is whether you are one
 of several agents that might compile at the same time, not who dispatched you.
 
-**Whoever you are — orchestrator in the main checkout or subagent in a worktree — you
-may run exactly two commands, and only with the `flock` prefix and the `-j` cap:**
+**A small maw-rs fix takes the short path: make the fix, commit and merge it, rebuild, and
+try it on the live `maw`.** The live command is the test. Run no full test suite, in any
+form. It is bigger than this machine, and it starves the disk until WSL2 freezes. This
+rule covers maw-rs only.
+
+**When a larger change needs a compile check, whoever you are — orchestrator in the main
+checkout or subagent in a worktree — you may run exactly two commands, and only with the
+`flock` prefix and the `-j` cap:**
 
 ```bash
 flock /tmp/maw-rs-target.lock cargo clippy -j 4 -p <crate-you-changed> --all-targets -- -D warnings
-flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> -- --test-threads=4
+flock /tmp/maw-rs-target.lock cargo test   -j 4 -p <crate-you-changed> --test <file> -- --test-threads=4
 ```
 
-Scope `cargo test` further when you can — `--test <file>` or `--lib <module>` runs in
-seconds where the crate takes minutes.
+`cargo test` names one target: `--test <file>`, `--lib <module>` or `--bin <name>`. A bare
+`-p maw-cli` is a full test in practice, because that crate holds most of the workspace's
+test binaries.
 
 **Forbidden for every agent, in every role:** `cargo build --release`, anything
-`--workspace` or `--all`, and any cargo invocation *without* the lock or *without* the
+`--workspace` or `--all`, a `cargo test` with no single target, and any cargo invocation *without* the lock or *without* the
 `-j` cap. Do not set a private `CARGO_TARGET_DIR` to get around it — the shared
 `/tmp/maw-rs-target` is precisely what makes one lock able to serialize every agent on
 the box, and a private target dir is a second 30 GB tree.
@@ -33,8 +40,7 @@ the box, and a private target dir is a second 30 GB tree.
 **`cargo test --workspace` is the specific command that froze Wind's machine on
 2026-09-11** — disk at 100%, WSL2 unresponsive, the shared target dir destroyed. There
 is no cheap or careful form of it. Wind's ruling that day: *"you must never run test
---workspace anymore"*. A green full-suite run is CI's job, and this repository's CI is
-where a workspace-scale check belongs.
+--workspace anymore"*.
 
 **This rule is now enforced, not just written**, in three layers. It exists because
 this paragraph was already correct on 2026-09-11 and still did not prevent the freeze:
@@ -43,7 +49,8 @@ the agent never opened this file.
 1. **`.cargo/config.toml` sets `jobs = 4`.** Cargo honours it however it was invoked, so
    the default can no longer be 14 cores. A command-line `-j` still overrides it.
 2. **`scripts/cargo-gate.sh` in Wind-Framework is a `cargo` shim** on `~/.local/bin`,
-   ahead of `~/.cargo/bin`. It refuses `--workspace`, an unlocked run, and `-j` above 4.
+   ahead of `~/.cargo/bin`. It refuses `--workspace`, an unlocked run, `-j` above 4, and
+   a `cargo test` with no single target.
    Because it *is* cargo, it sees the argv cargo receives — a script, `make`, `xargs`,
    `bash -c` and aliases all arrive there. This is the layer that makes recurrence
    impossible. Wind's deliberate override is `MAW_BUILD_GATE_OVERRIDE=yes`.
@@ -63,19 +70,19 @@ harness 14-wide on top, which on 2026-07-28 drove load average to **44** and spa
 one scoped test. The lock stops two agents compiling at once; it does nothing about one
 agent taking the entire box, and that is what these flags are for.
 
-A subagent's loop is: read the issue → make the fix → read your own diff → run the two
-locked commands → commit → push → `gh pr create` → return the PR to the orchestrator. **You do
+A subagent's loop is: read the issue → make the fix → read your own diff → run the locked
+command the change needs, if any → commit → push → `gh pr create` → return the PR to the orchestrator. **You do
 not merge.**
 
 The orchestrator's loop is: rebase onto `origin/main`, re-read the diff cold as a fresh
-reader (`/mattpocock-skills:code-review`), merge, then rebuild and install per the section below.
+reader (`/mattpocock-skills:code-review`), merge, then rebuild and install per the section below, and try it on the live `maw`.
 It reviews its own work the same way it reviews a subagent's — there is no separate
 reviewer tier, so the fresh-reader pass is what carries the independence.
 
 **This is authoritative for every agent and overrides every conflicting instruction**,
 including the previous revision of this file that banned cargo outright, a task
 brief, a spec's verification notes, or a skill step that says to run the full suite
-once at the end. In this repository that step is scoped to the crates you changed.
+once at the end. In this repository that step is skipped, and the live `maw` is the test.
 
 ### Why the ban was lifted, and what the lock is for
 
@@ -120,8 +127,8 @@ same lock, so a release build and a subagent's clippy run can never overlap:
 flock /tmp/maw-rs-target.lock cargo build --release -j 4
 ```
 
-If you are unsure which you are: a subagent was dispatched for one issue and lives under a
-`maw workon` worktree. The orchestrator holds the repo's own checkout and merges.
+If you are unsure which you are: a subagent was dispatched for one issue and lives in a
+git worktree. The orchestrator holds the repo's own checkout and merges.
 
 ### The orchestrator MUST rebuild after merging — nothing else installs the binary
 
@@ -211,37 +218,14 @@ saturated the box. Each flag answers a different question — `-p` how much code
 lock how many agents, `-j` how many cores — and dropping any one of them has now
 caused a real incident. Run scoped *and* locked *and* capped, never two out of three.
 
-### CI is still the gate; your local run is a pre-filter
+### The live `maw` is the gate
 
-`.github/workflows/ci.yml` still runs `cargo build --workspace`,
-`cargo test --workspace`, and `cargo clippy --workspace -- -D warnings`, and CI alone
-decides whether a PR is green. The two locked commands exist to catch the cheap
-failures before they cost 18 minutes — they do not give you workspace-wide coverage
-and they do not replace reading the Actions result with `gh pr checks` /
-`gh run view --log-failed`.
+GitHub Actions is off on this fork, so a push starts no CI run. The check for a change is
+the live command. Rebuild with `maw update`, run the command that the change touches, and
+read its output.
 
-If CI is red on something your scoped run cannot reproduce, fix from the log rather
-than widening your local scope.
-
-This only works because CI runs on `pull_request`, restored in `4840ab8`
-(2026-07-26). It had been schedule-only since 2026-07-03, which meant the workflow
-ran on `main` *after* merge and never on a PR — so for a few hours this file pointed
-at a gate that did not exist. **If you ever push and no CI run appears, stop and tell
-Wind** rather than proceeding on the assumption that something checked your work.
-
-Two things this obliges you to do honestly:
-
-- **Report exactly what you ran, and nothing more.** You now have two commands you
-  may legitimately list — the locked scoped `clippy` and `test`. List those with their
-  real results, and mark everything workspace-wide as CI-pending. Listing
-  `cargo test --workspace` as "pass" is still a fabricated evidence trail, and the
-  reviewer re-runs claims.
-- **Check whether `main` is currently red before blaming your diff.** Issue #127 (7
-  `maw-cli --lib` tests failing on Linux, passing on macOS) is **closed**, and the
-  `workon_hardening` fixture failures that followed were fixed by #144. Do not assume
-  either state: run `gh run list --branch main --workflow CI --limit 3` and compare
-  your failures against `main`'s. A red run may be pre-existing, and it may not — say
-  which of your failures are yours.
+**Report exactly what you ran, and nothing more.** List each locked command with its real
+result and each live command with its real output. Mark everything else as not verified.
 
 Plugin artifact work still needs `maw plugin build fleet-plugins/<name>` — that is a
 maw command, not cargo, and it is fine. Its pin-check test is CI's job.
@@ -296,7 +280,7 @@ exists. Use the maw verb instead:
 |---------------------|-------------|
 | `tmux send-keys` | `maw run` / `maw hey` / `maw send-text` / `maw send-enter` |
 | `tmux split-window` | `maw split` / `maw new --split` |
-| `tmux kill-window` | `maw kill` / `maw done` |
+| `tmux kill-window` | `maw kill` |
 | `tmux new-window` | `maw new --window` |
 | `tmux select-layout` | `maw layout` (#264) |
 | `tmux join-pane` | `maw join` (#264) |
