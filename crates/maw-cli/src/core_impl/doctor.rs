@@ -392,8 +392,28 @@ fn doctor_check_peer_duplicates() -> DoctorCheckNative {
 }
 
 fn doctor_check_stale_peers() -> DoctorCheckNative {
+    doctor_refresh_answering_stale_peers();
     let result = maw_peer::stale_peer_check(&doctor_peer_env(), doctor_now_ms());
     doctor_from_peer_check(&result, "maw doctor --fix-stale")
+}
+
+fn doctor_refresh_answering_stale_peers() {
+    let env = doctor_peer_env();
+    let answering = maw_peer::stale_peers(&env, doctor_now_ms())
+        .into_iter()
+        .filter(|peer| peers_probe_peer(&peer.url, PEERS_DEFAULT_PROBE_TIMEOUT_MS, &peers_now_iso()).error.is_none())
+        .map(|peer| peer.alias)
+        .collect::<Vec<_>>();
+    if answering.is_empty() { return; }
+    let seen = peers_now_iso();
+    let _ = maw_peer::mutate_peer_store(&env, |data| {
+        for alias in &answering {
+            if let Some(peer) = data.peers.get_mut(alias) {
+                peer.last_seen = Some(seen.clone());
+                peer.last_error = None;
+            }
+        }
+    });
 }
 
 fn doctor_check_hub() -> DoctorCheckNative {
@@ -548,6 +568,7 @@ fn doctor_smoke_checks() -> Vec<DoctorCheckNative> {
 }
 
 fn doctor_fix_stale(options: &DoctorOptions) -> Result<(i32, String), String> {
+    doctor_refresh_answering_stale_peers();
     let result = if options.dry_run || options.plan { maw_peer::stale_peer_check(&doctor_peer_env(), doctor_now_ms()) } else { maw_peer::remove_stale_peers(&doctor_peer_env(), doctor_now_ms()).map_err(|error| error.to_string())? };
     let check = doctor_from_peer_check(&result, "maw doctor --fix-stale");
     let ok = check.ok;
@@ -983,6 +1004,43 @@ mod doctor_tests {
         let parsed: serde_json::Value = serde_json::from_str(&output.stdout).expect("json");
         assert_eq!(parsed["checks"][0]["name"], "peers:fix-stale");
         assert!(parsed["checks"][0]["message"].as_str().expect("message").contains("removed 1 stale peer"));
+    }
+
+    fn doctor_serve_info_forever() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut request = [0_u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let body = r#"{"maw":{"schema":"1"},"node":"live"}"#;
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+            }
+        });
+        url
+    }
+
+    #[test]
+    fn doctor_keeps_a_peer_that_answers_even_when_its_last_seen_is_old() {
+        let (_lock, temp, _restore) = doctor_seed_env("live-old-peer");
+        let peers = temp.join("peers.json");
+        std::env::set_var("PEERS_FILE", &peers);
+        std::env::set_var("MAW_PEER_STALE_TTL_MS", "86400000");
+        let url = doctor_serve_info_forever();
+        fs::write(&peers, format!(r#"{{"version":1,"peers":{{"live":{{"url":"{url}","addedAt":"1970-01-01T00:00:00.000Z","lastSeen":"1970-01-01T00:00:00.000Z"}}}}}}"#)).expect("peers");
+
+        let check = run_doctor_command(&doctor_strings(&["--json", "peers"]));
+        let parsed: serde_json::Value = serde_json::from_str(&check.stdout).expect("json");
+        let stale = parsed["checks"].as_array().expect("checks").iter().find(|c| c["name"] == "peers:stale").expect("stale check");
+        assert_eq!(stale["message"], "no stale peers");
+
+        fs::write(&peers, format!(r#"{{"version":1,"peers":{{"live":{{"url":"{url}","addedAt":"1970-01-01T00:00:00.000Z","lastSeen":"1970-01-01T00:00:00.000Z"}}}}}}"#)).expect("peers");
+        let fix = run_doctor_command(&doctor_strings(&["--json", "--fix-stale"]));
+        let parsed: serde_json::Value = serde_json::from_str(&fix.stdout).expect("json");
+        assert_eq!(parsed["checks"][0]["message"], "no stale peers");
+        assert!(fs::read_to_string(&peers).expect("read").contains("\"live\""));
     }
 
     #[test]
