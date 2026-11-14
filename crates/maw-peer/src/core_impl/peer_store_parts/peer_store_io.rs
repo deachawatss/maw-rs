@@ -105,7 +105,16 @@ pub fn stale_peers(env: &PeerStoreEnv, now_ms: u64) -> Vec<StalePeer> {
 /// Return the maw-js `peers:stale` doctor check shape.
 #[must_use]
 pub fn stale_peer_check(env: &PeerStoreEnv, now_ms: u64) -> PeerDoctorCheck {
-    let stale = stale_peers(env, now_ms);
+    stale_peer_check_excluding(env, now_ms, &[])
+}
+
+/// Return the `peers:stale` doctor check shape, not counting the peers in `answering`.
+#[must_use]
+pub fn stale_peer_check_excluding(env: &PeerStoreEnv, now_ms: u64, answering: &[String]) -> PeerDoctorCheck {
+    let stale = stale_peers(env, now_ms)
+        .into_iter()
+        .filter(|peer| !answering.contains(&peer.alias))
+        .collect::<Vec<_>>();
     if stale.is_empty() {
         return PeerDoctorCheck {
             name: "peers:stale".to_owned(),
