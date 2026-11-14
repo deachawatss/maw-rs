@@ -392,28 +392,38 @@ fn doctor_check_peer_duplicates() -> DoctorCheckNative {
 }
 
 fn doctor_check_stale_peers() -> DoctorCheckNative {
-    doctor_refresh_answering_stale_peers();
-    let result = maw_peer::stale_peer_check(&doctor_peer_env(), doctor_now_ms());
+    let env = doctor_peer_env();
+    let now = doctor_now_ms();
+    let answering = doctor_answering_stale_peers(&env, now);
+    if let Err(error) = doctor_record_seen(&env, &answering, now) {
+        return doctor_warn("peers:stale", &format!("{} answered, but lastSeen was not saved: {error}", answering.join(", ")), &["maw peers probe-all"]);
+    }
+    let result = maw_peer::stale_peer_check_excluding(&env, now, &answering);
     doctor_from_peer_check(&result, "maw doctor --fix-stale")
 }
 
-fn doctor_refresh_answering_stale_peers() {
-    let env = doctor_peer_env();
-    let answering = maw_peer::stale_peers(&env, doctor_now_ms())
-        .into_iter()
-        .filter(|peer| peers_probe_peer(&peer.url, PEERS_DEFAULT_PROBE_TIMEOUT_MS, &peers_now_iso()).error.is_none())
-        .map(|peer| peer.alias)
-        .collect::<Vec<_>>();
-    if answering.is_empty() { return; }
-    let seen = peers_now_iso();
-    let _ = maw_peer::mutate_peer_store(&env, |data| {
-        for alias in &answering {
+fn doctor_answering_stale_peers(env: &maw_peer::PeerStoreEnv, now: u64) -> Vec<String> {
+    let mut answering = Vec::new();
+    for peer in maw_peer::stale_peers(env, now) {
+        if peers_probe_peer(&peer.url, PEERS_DEFAULT_PROBE_TIMEOUT_MS, &now.to_string()).error.is_none() {
+            answering.push(peer.alias);
+        }
+    }
+    answering
+}
+
+fn doctor_record_seen(env: &maw_peer::PeerStoreEnv, aliases: &[String], now: u64) -> Result<(), String> {
+    if aliases.is_empty() { return Ok(()); }
+    maw_peer::mutate_peer_store(env, |data| {
+        for alias in aliases {
             if let Some(peer) = data.peers.get_mut(alias) {
-                peer.last_seen = Some(seen.clone());
+                peer.last_seen = Some(now.to_string());
                 peer.last_error = None;
             }
         }
-    });
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 fn doctor_check_hub() -> DoctorCheckNative {
@@ -568,8 +578,15 @@ fn doctor_smoke_checks() -> Vec<DoctorCheckNative> {
 }
 
 fn doctor_fix_stale(options: &DoctorOptions) -> Result<(i32, String), String> {
-    doctor_refresh_answering_stale_peers();
-    let result = if options.dry_run || options.plan { maw_peer::stale_peer_check(&doctor_peer_env(), doctor_now_ms()) } else { maw_peer::remove_stale_peers(&doctor_peer_env(), doctor_now_ms()).map_err(|error| error.to_string())? };
+    let env = doctor_peer_env();
+    let now = doctor_now_ms();
+    let answering = doctor_answering_stale_peers(&env, now);
+    let result = if options.dry_run || options.plan {
+        maw_peer::stale_peer_check_excluding(&env, now, &answering)
+    } else {
+        doctor_record_seen(&env, &answering, now)?;
+        maw_peer::remove_stale_peers(&env, now).map_err(|error| error.to_string())?
+    };
     let check = doctor_from_peer_check(&result, "maw doctor --fix-stale");
     let ok = check.ok;
     let checks = vec![check];
@@ -892,7 +909,7 @@ mod doctor_tests {
     fn doctor_seed_env(name: &str) -> (std::sync::MutexGuard<'static, ()>, std::path::PathBuf, Vec<DoctorEnvRestore>) {
         let lock = super::env_test_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = doctor_temp_root(name);
-        let restores = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "MAW_CACHE_DIR", "MAW_HOME", "MAW_XDG", "GHQ_ROOT", "TMUX", "PEERS_FILE", "MAW_PORT", "MAW_GATEWAY"]
+        let restores = ["HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "MAW_CONFIG_DIR", "MAW_DATA_DIR", "MAW_STATE_DIR", "MAW_CACHE_DIR", "MAW_HOME", "MAW_XDG", "GHQ_ROOT", "TMUX", "PEERS_FILE", "MAW_PEER_STALE_TTL_MS", "MAW_PORT", "MAW_GATEWAY"]
             .into_iter().map(DoctorEnvRestore::capture).collect::<Vec<_>>();
         let home = temp.join(name);
         let config = home.join("xdg-config");
@@ -1029,18 +1046,28 @@ mod doctor_tests {
         std::env::set_var("PEERS_FILE", &peers);
         std::env::set_var("MAW_PEER_STALE_TTL_MS", "86400000");
         let url = doctor_serve_info_forever();
-        fs::write(&peers, format!(r#"{{"version":1,"peers":{{"live":{{"url":"{url}","addedAt":"1970-01-01T00:00:00.000Z","lastSeen":"1970-01-01T00:00:00.000Z"}}}}}}"#)).expect("peers");
+        let old_store = format!(r#"{{"version":1,"peers":{{"live":{{"url":"{url}","addedAt":"1970-01-01T00:00:00.000Z","lastSeen":"1970-01-01T00:00:00.000Z"}}}}}}"#);
+        let stale_message = |output: &CliOutput| -> serde_json::Value {
+            let parsed: serde_json::Value = serde_json::from_str(&output.stdout).expect("json");
+            parsed["checks"].as_array().expect("checks").iter()
+                .find(|check| check["name"] == "peers:stale" || check["name"] == "peers:fix-stale").expect("stale check")["message"].clone()
+        };
+
+        fs::write(&peers, &old_store).expect("peers");
+        let dry_run = run_doctor_command(&doctor_strings(&["--json", "--fix-stale", "--dry-run"]));
+        assert_eq!(stale_message(&dry_run), "no stale peers");
+        assert_eq!(fs::read_to_string(&peers).expect("read"), old_store);
 
         let check = run_doctor_command(&doctor_strings(&["--json", "peers"]));
-        let parsed: serde_json::Value = serde_json::from_str(&check.stdout).expect("json");
-        let stale = parsed["checks"].as_array().expect("checks").iter().find(|c| c["name"] == "peers:stale").expect("stale check");
-        assert_eq!(stale["message"], "no stale peers");
+        assert_eq!(stale_message(&check), "no stale peers");
+        let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&peers).expect("read")).expect("store json");
+        assert_ne!(saved["peers"]["live"]["lastSeen"], "1970-01-01T00:00:00.000Z");
 
-        fs::write(&peers, format!(r#"{{"version":1,"peers":{{"live":{{"url":"{url}","addedAt":"1970-01-01T00:00:00.000Z","lastSeen":"1970-01-01T00:00:00.000Z"}}}}}}"#)).expect("peers");
+        fs::write(&peers, &old_store).expect("peers");
         let fix = run_doctor_command(&doctor_strings(&["--json", "--fix-stale"]));
-        let parsed: serde_json::Value = serde_json::from_str(&fix.stdout).expect("json");
-        assert_eq!(parsed["checks"][0]["message"], "no stale peers");
-        assert!(fs::read_to_string(&peers).expect("read").contains("\"live\""));
+        assert_eq!(stale_message(&fix), "no stale peers");
+        let saved: serde_json::Value = serde_json::from_str(&fs::read_to_string(&peers).expect("read")).expect("store json");
+        assert!(saved["peers"]["live"].is_object(), "a peer that answers was removed");
     }
 
     #[test]
