@@ -199,6 +199,7 @@ fn run_with_missing_remote_head(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_from_with_git_clean(
     cwd: &Path,
     root: &Path,
